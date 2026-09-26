@@ -6,6 +6,7 @@ use opentake_core::{
 use opentake_domain::{
     ClipType, GenerationInput, GenerationJobStatus, MediaManifestEntry, MediaSource,
 };
+use opentake_ops::{ClipEntry, EditCommand};
 use opentake_project::Project;
 
 fn saved_project() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -68,6 +69,172 @@ fn update(status: GenerationJobStatus, progress: Option<f64>) -> GenerationState
         cost_credits: None,
         created_at: Some(800_000_001.0),
     }
+}
+
+fn add_history_clip(core: &AppCore) {
+    core.apply(EditCommand::AddClipsAutoTrack {
+        entries: vec![ClipEntry {
+            media_ref: "source-image".into(),
+            media_type: ClipType::Image,
+            source_clip_type: ClipType::Image,
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 30,
+            trim_start_frame: None,
+            trim_end_frame: None,
+            has_audio: false,
+            add_linked_audio: false,
+            transform: None,
+        }],
+    })
+    .unwrap();
+}
+
+fn history_image_probe() -> ProbedMedia {
+    ProbedMedia {
+        duration_secs: 0.0,
+        width: Some(8),
+        height: Some(6),
+        fps: None,
+        has_audio: false,
+        color: None,
+    }
+}
+
+fn finish_history_generation(
+    core: &AppCore,
+    epoch: u64,
+    bundle: &std::path::Path,
+    job_id: &str,
+    asset_id: &str,
+) -> String {
+    for (status, progress) in [
+        (GenerationJobStatus::Generating, 0.2),
+        (GenerationJobStatus::Downloading, 0.8),
+        (GenerationJobStatus::Finalizing, 0.9),
+    ] {
+        core.update_generation_job_for_project(
+            epoch,
+            bundle,
+            job_id,
+            update(status, Some(progress)),
+        )
+        .unwrap();
+    }
+    let leaf = format!("{asset_id}.png");
+    let relative_path = format!("media/{leaf}");
+    let bytes = b"paid-result-fixture";
+    core.finalize_generation_output_with_media_for_project(
+        epoch,
+        bundle,
+        PreparedGenerationOutput {
+            asset_id: asset_id.into(),
+            relative_path: relative_path.clone(),
+            probe: history_image_probe(),
+            created_at: Some(800_000_002.0),
+        },
+        &leaf,
+        bytes.len() as u64,
+        &mut std::io::Cursor::new(bytes),
+    )
+    .unwrap();
+    relative_path
+}
+
+#[test]
+fn undo_after_import_and_generation_keeps_placeholders_finalizable_and_durable() {
+    let (temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    add_history_clip(&core);
+    let imported_path = temp.path().join("imported.png");
+    fs::write(&imported_path, b"imported-image").unwrap();
+    let imported = core
+        .import_media_file(&imported_path, "Imported", &history_image_probe())
+        .unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    let asset_id = &job.placeholder_asset_ids[0];
+
+    let undone = core.undo().unwrap();
+    assert!(undone.timeline_changed);
+    assert!(!undone.manifest_changed);
+    let manifest = core.media();
+    assert!(manifest.entries.iter().any(|entry| entry.id == imported.id));
+    let placeholder = manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(
+        placeholder.generation_input.as_ref().unwrap().status,
+        Some(GenerationJobStatus::Queued)
+    );
+
+    let relative_path = finish_history_generation(&core, epoch, &bundle, &job.job_id, asset_id);
+    core.save_project(None).unwrap();
+    let reopened = AppCore::new();
+    reopened.open_project(&bundle).unwrap();
+    let manifest = reopened.media();
+    assert!(manifest.entries.iter().any(|entry| entry.id == imported.id));
+    let output = manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(
+        output.generation_input.as_ref().unwrap().status,
+        Some(GenerationJobStatus::Ready)
+    );
+    assert_eq!(
+        output.source,
+        MediaSource::Project {
+            relative_path: relative_path.clone()
+        }
+    );
+    assert_eq!(
+        fs::read(bundle.join(relative_path)).unwrap(),
+        b"paid-result-fixture"
+    );
+}
+
+#[test]
+fn undo_of_edit_during_generation_never_reverts_a_ready_result_to_pending() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    let asset_id = &job.placeholder_asset_ids[0];
+    add_history_clip(&core);
+    let relative_path = finish_history_generation(&core, epoch, &bundle, &job.job_id, asset_id);
+    let ready = core.media();
+
+    for _ in 0..3 {
+        core.undo().unwrap();
+        assert_eq!(core.media(), ready);
+        core.redo().unwrap();
+        assert_eq!(core.media(), ready);
+    }
+    core.undo().unwrap();
+    core.save_project(None).unwrap();
+    let reopened = AppCore::new();
+    reopened.open_project(&bundle).unwrap();
+    let manifest = reopened.media();
+    let output = manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(
+        output.generation_input.as_ref().unwrap().status,
+        Some(GenerationJobStatus::Ready)
+    );
+    assert_eq!(output.source, MediaSource::Project { relative_path });
 }
 
 #[test]

@@ -39,6 +39,8 @@ crates/opentake-ops/src/
 ├── lib.rs            模块声明 + 公开 API re-export
 ├── command.rs        EditCommand 枚举 + apply 事务 + 各命令实现
 ├── editor_state.rs   EditorState + DocSnapshot + 撤销/重做栈
+├── editor_state/
+│   └── manifest_delta.rs  素材/文件夹事务增量，保留带外写入
 ├── intent.rs         高层编辑意图预检与归一（EditPlan）
 ├── id.rs             IdGen trait + SeqIdGen（注入式 id 生成）
 ├── engines/

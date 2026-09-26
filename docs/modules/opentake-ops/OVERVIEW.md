@@ -1,6 +1,7 @@
 # opentake-ops 总览
 
 > 状态：draft · 阶段：implementation-backed · 源码同步：2026-09-06。
+> 2026-09-26 定向更新：撤销历史保留时间线快照与素材事务增量，不覆盖导入、重新链接和生成任务的带外写入。
 > 本次定向来源：`crates/opentake-ops/src/ops/`、`web/src/store/editActions.ts`。
 > 编辑仍经过 Rust 命令与撤销事务；本轮选区驱动 split/trim、链接移动、Option trim 和范围选择的接线进展见同步报告。旧 GAP 文档不是当前未实现列表。
 > 当前验收见[公开 Beta 审计](../../audit/2026-09-06/public-beta-validation.md)；下文历史里程碑和测试记录保留其原时点边界。
@@ -9,7 +10,7 @@
 
 ## 一句话定位
 
-`opentake-ops` 是 OpenTake 的**纯编辑引擎 + 命令事务层**：它持有唯一的编辑入口 `EditCommand`，把所有 UI 手势 / Agent / MCP 工具归一成一条 `apply()` 事务，内含整树快照撤销/重做栈与三大无副作用引擎（Overwrite / Ripple / Snap）。
+`opentake-ops` 是 OpenTake 的**纯编辑引擎 + 命令事务层**：它持有唯一的编辑入口 `EditCommand`，把所有 UI 手势 / Agent / MCP 工具归一成一条 `apply()` 事务，内含时间线快照与素材增量组成的撤销/重做栈，以及三大无副作用引擎（Overwrite / Ripple / Snap）。
 
 ### 依赖分层位置
 
@@ -29,7 +30,7 @@ src-tauri / web        Tauri 壳 + React 只读镜像
 
 **做：**
 - 定义统一编辑命令枚举 `EditCommand`，与执行函数 `apply()`（命令事务模型）。
-- 持有可编辑文档 `EditorState`（`Timeline` + `MediaManifest`）及整树快照撤销/重做栈、单调版本号。
+- 持有可编辑文档 `EditorState`（`Timeline` + `MediaManifest`）及时间线快照/素材增量历史、单调版本号。
 - 三个纯函数引擎：覆盖清区（Overwrite）、波纹位移（Ripple）、拖拽吸附（Snap）。
 - 各编辑算法（放置 / 分割 / 修剪 / 移动 / 复制 / 波纹删插 / 链接 / 建删轨 / 文件夹），逐个 1:1 移植上游 `EditorViewModel` 的纯逻辑部分。
 - 高层编辑意图的预检与归一（`intent.rs`：自动建轨、卡点放置、修剪到播放头等）。
@@ -54,17 +55,17 @@ UI 手势 / Agent / MCP 工具
   → opentake-ops::apply(state, command, ids)
        1. snapshot   ：克隆整个文档（timeline + manifest）
        2. mutate     ：跑命令的纯函数变更（校验失败 → Err，文档不动）
-       3. commit-if-changed：before != after（PartialEq 短路）才推快照入撤销栈 + version++
+       3. commit-if-changed：before != after 才记录时间线快照/素材增量 + version++
        4. → EditResult{ changed, timeline_changed, manifest_changed,
                         action_name, affected_clip_ids, timeline_version, summary }
   → 前端据 version 失效并重取只读镜像
 ```
 
-这就是上游 `withTimelineSwap` 事务的泛化（从「整 timeline 交换」扩到「整文档交换」）。实现见 `command.rs` 的 `transact()`，撤销栈见 `editor_state.rs`。详见 [command-apply.md](command-apply.md)。
+这就是上游 `withTimelineSwap` 事务的泛化：时间线使用快照交换，显式素材编辑使用字段级增量；失败的事务仍恢复完整文档。实现见 `command.rs` 的 `transact()`，撤销栈见 `editor_state.rs`。详见 [command-apply.md](command-apply.md)。
 
-### 撤销栈：整树 Clone 快照
+### 撤销栈：时间线快照 + 素材事务增量
 
-撤销模型是**整文档值快照**，不是逆操作 / diff：`DocSnapshot { timeline, manifest }` 整棵 `Clone`，`commit` 推入 `undo_stack` 并清空 `redo_stack`，`undo`/`redo` 互相倒栈。`version` 在每次提交、每次撤销/重做时都 +1。用内存换实现简单与正确性，对齐 ARCHITECTURE「撤销栈在 Rust、整树快照」的决策。
+`DocSnapshot { timeline, manifest }` 用于事务失败时的原子回滚，不直接作为历史恢复目标。`commit` 保存整棵时间线及本次命令对素材/文件夹的增删和字段变化，并清空 `redo_stack`。Undo/Redo 在**当前素材清单**上应用增量，只恢复命令实际改动且尚未被带外写入覆盖的字段。导入、重新链接、代理、生成状态、收藏和格式版本不会被无关撤销覆盖；显式注册/删除素材和文件夹编辑仍可撤销。反向历史从实际恢复前后的状态生成，重做会保留被撤销条目的最新内容与原顺序。提供商音色记录继续不受普通历史影响。`version` 仅在真实提交或恢复时递增。
 
 ### 原子性与不变量（贯穿全模块）
 
