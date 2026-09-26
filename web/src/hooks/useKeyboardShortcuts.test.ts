@@ -30,6 +30,30 @@ function event(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
 }
 
 describe("keyboard transport Space shortcut", () => {
+  it.each(["number", "date", "time", "datetime-local", "month", "week"])(
+    "leaves editing and transport keys to %s inputs",
+    (type) => {
+      const input = document.createElement("input");
+      input.type = type;
+      const context = {
+        view: "editor" as const, blocked: false, focusedPanel: "timeline" as const,
+        compatibilityReadOnly: false, cropEditingActive: false,
+      };
+      for (const code of ["Backspace", "Delete", "Space"]) {
+        for (const shiftKey of [false, true]) {
+          expect(resolveDocumentedShortcut(event({ code, shiftKey, target: input }), context)).toBeNull();
+        }
+      }
+      for (const code of ["KeyA", "KeyC", "KeyV", "KeyX", "KeyZ", "KeyY"]) {
+        for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+          expect(resolveDocumentedShortcut(event({ code, target: input, ...modifier }), context)).toBeNull();
+          expect(resolveDocumentedShortcut(event({ code, shiftKey: true, target: input, ...modifier }), context)).toBeNull();
+        }
+      }
+      expect(shouldHandleTransportSpaceKey(event({ target: input }), "editor")).toBe(false);
+    },
+  );
+
   it("handles plain Space in the editor", () => {
     expect(shouldHandleTransportSpaceKey(event(), "editor")).toBe(true);
   });

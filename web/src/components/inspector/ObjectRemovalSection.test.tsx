@@ -4,6 +4,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useI18nStore } from "../../i18n";
+import * as editActions from "../../store/editActions";
+import { useEditorUiStore } from "../../store/uiStore";
+import { useUpdateStore } from "../../store/updateStore";
+import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import type { Clip, RemoveObjectResult } from "../../lib/types";
 import {
   ObjectRemovalSection,
@@ -90,6 +94,41 @@ describe("ObjectRemovalSection", () => {
   afterEach(async () => {
     await act(async () => root.unmount());
     container.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps Backspace inside frame inputs without deleting selected clips", async () => {
+    const savedUi = useEditorUiStore.getState();
+    const savedUpdate = useUpdateStore.getState();
+    const deleteClips = vi.spyOn(editActions, "deleteSelectedClips").mockResolvedValue(undefined);
+    const Harness = () => {
+      useKeyboardShortcuts();
+      return <ObjectRemovalSection clip={clip()} />;
+    };
+    try {
+      useEditorUiStore.setState({
+        view: "editor", focusedPanel: "timeline", selectedClipIds: new Set(["clip-1"]),
+        settingsOpen: false, exportDialogOpen: false, saveAsProgress: null,
+        projectSettingsPrompt: null, pendingSwapClipId: null,
+      });
+      useUpdateStore.setState({ phase: "idle", dialogOpen: false });
+      await act(async () => root.render(<Harness />));
+      const inputs = container.querySelectorAll<HTMLInputElement>('input[type="number"]');
+      expect(inputs.length).toBe(2);
+      for (const input of inputs) {
+        input.focus();
+        const key = new KeyboardEvent("keydown", {
+          key: "Backspace", code: "Backspace", bubbles: true, cancelable: true,
+        });
+        await act(async () => input.dispatchEvent(key));
+        expect(key.defaultPrevented).toBe(false);
+        expect(deleteClips).not.toHaveBeenCalled();
+        expect(useEditorUiStore.getState().selectedClipIds).toEqual(new Set(["clip-1"]));
+      }
+    } finally {
+      useEditorUiStore.setState(savedUi);
+      useUpdateStore.setState(savedUpdate);
+    }
   });
 
   it("retries_then_applies_and_undoes_the_reviewed_derivative", async () => {
