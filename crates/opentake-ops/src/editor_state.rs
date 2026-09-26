@@ -3,15 +3,18 @@
 //! Holds the `Timeline` plus the `MediaManifest` (folder commands mutate the
 //! manifest, not the timeline), the undo/redo stacks, and a monotonic version
 //! counter. The undo model is upstream `withTimelineSwap` generalized: a command
-//! snapshots the whole document, mutates it, and only commits (pushes the
-//! snapshot onto the undo stack + bumps the version) when the document actually
-//! changed (`PartialEq` short-circuit).
+//! snapshots the document for atomic rollback, mutates it, and only commits
+//! when the document actually changed (`PartialEq` short-circuit).
 //!
-//! Snapshots are whole-tree clones (`Timeline` + `MediaManifest` both derive
-//! `Clone`/`PartialEq`), matching the "undo stack in Rust, integral-tree
-//! snapshot" decision from `ARCHITECTURE.md §5`.
+//! History retains a whole-tree timeline snapshot and a directional manifest
+//! delta. Undo/redo must preserve imports, relinking and generation updates
+//! made outside command transactions, while explicit library edits remain
+//! undoable. Failed transactions still restore the complete `DocSnapshot`.
 
 use opentake_domain::{ClipLocation, MediaManifest, Timeline};
+
+mod manifest_delta;
+use manifest_delta::ManifestDelta;
 
 /// Immutable snapshot of everything an [`crate::command::EditCommand`] can touch.
 #[derive(Clone, PartialEq, Debug)]
@@ -22,7 +25,8 @@ pub struct DocSnapshot {
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
-    snapshot: DocSnapshot,
+    timeline: Timeline,
+    manifest: ManifestDelta,
     action_name: String,
     transaction_version: u64,
 }
@@ -112,12 +116,12 @@ impl EditorState {
         self.manifest = snap.manifest;
     }
 
-    /// Commit a structural change: push `before` onto the undo stack, clear the
-    /// redo stack (a new edit invalidates redo), bump the version. Called only
-    /// when `before != after`.
+    /// Commit a structural change: retain the timeline and inverse manifest
+    /// delta, clear redo, and bump the version. Called only for a changed document.
     pub(crate) fn commit(&mut self, before: DocSnapshot, action_name: impl Into<String>) {
         self.undo_stack.push(HistoryEntry {
-            snapshot: before,
+            manifest: ManifestDelta::between(&self.manifest, &before.manifest),
+            timeline: before.timeline,
             action_name: action_name.into(),
             transaction_version: self.version.saturating_add(1),
         });
@@ -138,14 +142,23 @@ impl EditorState {
     /// version.
     pub(crate) fn undo(&mut self) -> bool {
         let current = self.snapshot();
-        while let Some(mut entry) = self.undo_stack.pop() {
-            preserve_voice_models(&mut entry.snapshot, &current);
-            if entry.snapshot == current {
+        while let Some(entry) = self.undo_stack.pop() {
+            let mut target = DocSnapshot {
+                timeline: entry.timeline,
+                manifest: current.manifest.clone(),
+            };
+            entry.manifest.apply(&mut target.manifest);
+            preserve_voice_models(&mut target, &current);
+            if target == current {
                 continue;
             }
-            self.restore(entry.snapshot);
+            // Capture what Undo actually changed. In particular, Redo must
+            // reinsert the latest removed entry, not its stale registration.
+            let inverse = ManifestDelta::between(&target.manifest, &current.manifest);
+            self.restore(target);
             self.redo_stack.push(HistoryEntry {
-                snapshot: current,
+                timeline: current.timeline,
+                manifest: inverse,
                 action_name: entry.action_name,
                 transaction_version: entry.transaction_version,
             });
@@ -160,14 +173,21 @@ impl EditorState {
     /// version.
     pub(crate) fn redo(&mut self) -> bool {
         let current = self.snapshot();
-        while let Some(mut entry) = self.redo_stack.pop() {
-            preserve_voice_models(&mut entry.snapshot, &current);
-            if entry.snapshot == current {
+        while let Some(entry) = self.redo_stack.pop() {
+            let mut target = DocSnapshot {
+                timeline: entry.timeline,
+                manifest: current.manifest.clone(),
+            };
+            entry.manifest.apply(&mut target.manifest);
+            preserve_voice_models(&mut target, &current);
+            if target == current {
                 continue;
             }
-            self.restore(entry.snapshot);
+            let inverse = ManifestDelta::between(&target.manifest, &current.manifest);
+            self.restore(target);
             self.undo_stack.push(HistoryEntry {
-                snapshot: current,
+                timeline: current.timeline,
+                manifest: inverse,
                 action_name: entry.action_name,
                 transaction_version: self.version.saturating_add(1),
             });

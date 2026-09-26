@@ -4,11 +4,12 @@
 
 ## 职责
 
-这是本模块的中枢：定义**唯一编辑入口** `EditCommand` 枚举与执行函数 `apply()`，把所有编辑收敛成一条 `withTimelineSwap` 式事务；并由 `EditorState` 持有可编辑文档与整树快照撤销/重做栈。撤销 / 校验 / 版本号因此只写一次。
+这是本模块的中枢：定义**唯一编辑入口** `EditCommand` 枚举与执行函数 `apply()`，把所有编辑收敛成一条 `withTimelineSwap` 式事务；并由 `EditorState` 持有可编辑文档与时间线快照/素材增量历史。撤销 / 校验 / 版本号因此只写一次。
 
 源文件：
 - `../../../crates/opentake-ops/src/command.rs`（`EditCommand` + `apply` + 各命令实现）
 - `../../../crates/opentake-ops/src/editor_state.rs`（`EditorState` + `DocSnapshot` + 撤销栈）
+- `../../../crates/opentake-ops/src/editor_state/manifest_delta.rs`（素材/文件夹字段级增量，保留带外写入）
 
 ## 关键类型 / 函数 / 算法
 
@@ -58,7 +59,8 @@ fn transact(state, action_name, summarize, work):
 
 `EditorState`（`editor_state.rs`）：
 - 字段：`timeline` / `manifest`（文件夹命令改的是 manifest 不是 timeline）/ `undo_stack` / `redo_stack` / `version`。
-- `DocSnapshot { timeline, manifest }`：`apply` 能触及的一切的不可变快照，整棵 `Clone` + `PartialEq`。
+- `DocSnapshot { timeline, manifest }`：事务变更检测与失败回滚使用的完整快照，整棵 `Clone` + `PartialEq`。
+- `HistoryEntry`：时间线快照、定向 `ManifestDelta`、操作标签和事务版本。素材增量只保留被命令增删/修改的条目与文件夹，按 id 定位、按字段恢复。
 - 查询：`version()` / `can_undo()` / `can_redo()` / `undo_depth()` / `find_clip(id) -> Option<ClipLocation>`（1:1 上游 `findClip`）/ `track_index(track_id)`。
 - 事务内部 API（`pub(crate)`）：`snapshot` / `restore` / `commit` / `undo` / `redo`。
 
@@ -66,7 +68,7 @@ fn transact(state, action_name, summarize, work):
 
 - **原子性**：`work` 返回 `Err` 时 `transact` 显式恢复 `before` 后返回，timeline、manifest、history、version 均不留下部分变化；波纹拒绝（`Err(Refused)`）执行同样的「整次不改」。
 - **commit-if-changed**：只有 `before != after` 才入栈 + `version++`。无实质变化的命令（如 `SwapMedia` 换到相同 `media_ref`）返回 `changed = false`、不污染撤销栈。
-- **撤销 = 整树快照交换**：`commit(before)` 推 before 入 `undo_stack` 并**清空 `redo_stack`**（新编辑使 redo 失效）；`undo` 把当前推入 redo、还原栈顶；`redo` 反之。`version` 在提交、撤销、重做时都 +1（前端据此判失效）。对齐 ARCHITECTURE「撤销栈在 Rust、整树快照」。
+- **撤销只作用于编辑事务**：`commit(before)` 记录时间线快照和逆向素材增量，并**清空 `redo_stack`**。Undo/Redo 保留当前素材清单中的无关导入；字段只有在本命令确实修改、且当前仍等于命令写入值时才恢复，后续带外写入优先。收藏、格式版本和提供商音色不属于普通历史。恢复后根据实际变化生成反向增量，保持显式注册/删除、文件夹命令和多轮撤销/重做语义。真实恢复才递增 `version`；非法时间线候选仍原子拒绝。
 - **pin-by-id**：放置类命令在 `clear_region`（可能 prune / 移位索引）后用 `track_index(track_id)` 重新定位轨道，避免索引失效。
 - **关键帧绝对帧**：命令公开 API 用绝对时间线帧，内部转 clip 相对偏移（拆分逻辑在 domain）。
 - 单次 rename（媒体 / 文件夹）= 一元素 vec，与批量同走一个撤销组（对齐上游 `withUndoGroup`）。
