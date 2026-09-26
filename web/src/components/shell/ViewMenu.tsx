@@ -22,6 +22,7 @@ import { Icon } from "../ui/Icon";
 import { useEditorUiStore, type LayoutPreset } from "../../store/uiStore";
 import { t, useI18nStore, useT } from "../../i18n";
 import { isTauri } from "../../lib/api";
+import { hasTextEntryFocus } from "../../lib/textEntry";
 import { useProjectStore } from "../../store/projectStore";
 import { useClipboardStore } from "../../store/clipboardStore";
 import { useMediaStore } from "../../store/mediaStore";
@@ -91,6 +92,10 @@ export const APPLICATION_MENU_SPEC: readonly ApplicationMenuSpecEntry[] = [
   { group: "help", id: "feedback", labelKey: "menu.feedback", kind: "disabled" },
 ] as const;
 
+const DOCUMENT_EDIT_COMMANDS: ReadonlySet<string> = new Set(
+  APPLICATION_MENU_SPEC.filter((entry) => entry.group === "edit").map((entry) => entry.id),
+);
+
 const PRESETS: Array<{ id: LayoutPreset; icon: typeof PanelLeft; labelKey: string; key: string }> = [
   { id: "default", icon: Columns3, labelKey: "view.layoutDefault", key: "⌘1" },
   { id: "media", icon: PanelLeft, labelKey: "view.layoutMedia", key: "⌘2" },
@@ -115,6 +120,9 @@ function reportMediaDeleteFailure(operation: Promise<void>): void {
  *  testable without requiring an OS menu server. */
 export function runApplicationMenuCommand(id: string): void {
   if (isUpdateInstallationBlocking(useUpdateStore.getState().phase)) return;
+  // Native accelerators can arrive before asynchronous menu enablement catches
+  // up with focus. Never route a text/value editing gesture to the document.
+  if (DOCUMENT_EDIT_COMMANDS.has(id) && hasTextEntryFocus()) return;
   const ui = useEditorUiStore.getState();
   switch (id) {
     case "checkUpdates":
@@ -301,6 +309,9 @@ export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
     mcp: actionsEnabled,
     feedback: false,
   };
+  if (hasTextEntryFocus()) {
+    for (const id of DOCUMENT_EDIT_COMMANDS) enabled[id] = false;
+  }
   const checked: Record<string, boolean> = {
     mediaPanel: ui.mediaPanelVisible,
     inspector: ui.inspectorPanelVisible,
@@ -471,7 +482,9 @@ async function installNativeApplicationMenu(): Promise<() => void> {
   let syncQueue = Promise.resolve();
   let stateSignature = "";
   let localeSignature = "";
+  let disposed = false;
   const syncState = () => {
+    if (disposed) return;
     const snapshot = applicationMenuStateSnapshot();
     const nextSignature = JSON.stringify(snapshot);
     if (nextSignature === stateSignature) return;
@@ -498,9 +511,19 @@ async function installNativeApplicationMenu(): Promise<() => void> {
     useUpdateStore.subscribe(syncState),
     useI18nStore.subscribe(syncText),
   ];
+  // Local input focus need not change any store. Read activeElement after
+  // focusout completes so blur restores the document menu and its shortcuts.
+  const syncFocusOut = () => queueMicrotask(syncState);
+  document.addEventListener("focusin", syncState);
+  document.addEventListener("focusout", syncFocusOut);
   syncState();
   syncText();
-  return () => unsubs.forEach((unsubscribe) => unsubscribe());
+  return () => {
+    disposed = true;
+    document.removeEventListener("focusin", syncState);
+    document.removeEventListener("focusout", syncFocusOut);
+    unsubs.forEach((unsubscribe) => unsubscribe());
+  };
 }
 
 /** Installs the full native application menu once for packaged Tauri builds.

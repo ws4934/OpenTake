@@ -16,6 +16,7 @@ import { saveCurrentProject } from "../store/projectActions";
 import { ZOOM } from "../lib/theme";
 import type { AppView } from "../store/uiStore";
 import { isTauri } from "../lib/api";
+import { isTextEntry } from "../lib/textEntry";
 import { resolveTimelinePlaybackRoute } from "../components/preview/playbackRoute";
 import { rustEngineEnabled } from "../components/preview/rustEngine";
 import { runApplicationMenuCommand } from "../components/shell/ViewMenu";
@@ -26,27 +27,6 @@ import {
 
 /** Per-keypress zoom step for ⌘+ / ⌘- (剪映: Cmd + +/-). */
 const ZOOM_KEY_STEP = 1.3;
-const TEXT_INPUT_TYPES: ReadonlySet<string> = new Set([
-  "email",
-  "password",
-  "search",
-  "tel",
-  "text",
-  "url",
-]);
-
-function isTextEntry(target: EventTarget | null): boolean {
-  if (typeof Element === "undefined" || !(target instanceof Element)) return false;
-  const editable = target.closest<HTMLElement>(
-    "input, textarea, [contenteditable]",
-  );
-  if (!editable) return false;
-  if (editable.isContentEditable || editable.matches("textarea")) return true;
-  return (
-    editable.matches("input") &&
-    TEXT_INPUT_TYPES.has((editable as HTMLInputElement).type)
-  );
-}
 
 function isNativeInteractionControl(target: EventTarget | null): boolean {
   if (typeof Element === "undefined" || !(target instanceof Element)) return false;

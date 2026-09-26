@@ -102,6 +102,7 @@ beforeEach(async () => {
     mediaPanelVisible: true,
     inspectorPanelVisible: true,
     fullscreen: false,
+    selectedClipIds: new Set(),
     selectedMediaAssetIds: new Set(),
     selectedFolderIds: new Set(),
     previewMediaId: null,
@@ -131,6 +132,44 @@ afterEach(async () => {
 });
 
 describe("ViewMenu aggregate command contract", () => {
+  it.each(["number", "date", "time"])(
+    "blocks stale native editing commands while a %s input has focus",
+    async (type) => {
+      const commands = ["undo", "redo", "cut", "copy", "paste", "selectAll", "split", "trimStart", "trimEnd", "delete"];
+      const spies = [
+        vi.spyOn(editActions, "undo").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "redo").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "cutClips").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "copyClips").mockImplementation(() => {}),
+        vi.spyOn(editActions, "pasteClipsAtPlayhead").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "splitAtPlayhead").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "trimStartToPlayhead").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "trimEndToPlayhead").mockResolvedValue(undefined),
+        vi.spyOn(editActions, "deleteSelectedClips").mockResolvedValue(undefined),
+      ];
+      const input = document.createElement("input");
+      input.type = type;
+      container!.append(input);
+      await act(async () => {
+        useProjectStore.setState({ canUndo: true, canRedo: true });
+        useEditorUiStore.setState({ selectedClipIds: new Set(["keep-selected"]) });
+      });
+      input.focus();
+      const snapshot = applicationMenuStateSnapshot();
+      for (const command of commands) expect(snapshot.enabled[command], command).toBe(false);
+      await act(async () => {
+        for (const command of commands) runApplicationMenuCommand(command);
+      });
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      expect(useEditorUiStore.getState().selectedClipIds).toEqual(new Set(["keep-selected"]));
+      input.blur();
+      expect(applicationMenuStateSnapshot().enabled.undo).toBe(true);
+      expect(applicationMenuStateSnapshot().enabled.redo).toBe(true);
+      await act(async () => runApplicationMenuCommand("undo"));
+      expect(spies[0]).toHaveBeenCalledOnce();
+    },
+  );
+
   it("blocks native menu mutations and stale accelerators throughout installation", async () => {
     await act(async () => {
       useProjectStore.setState({
