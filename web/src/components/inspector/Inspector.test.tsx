@@ -79,6 +79,36 @@ afterEach(() => {
 });
 
 describe("Inspector completion surface", () => {
+  it("commits speed through the retime command rather than generic properties", async () => {
+    const clip = visualClip();
+    const speed = vi.spyOn(edit, "setClipSpeed").mockResolvedValue(undefined);
+    const properties = vi.spyOn(edit, "setClipProperties").mockResolvedValue(undefined);
+    useProjectStore.setState({ timeline: timelineWith(clip) });
+    useEditorUiStore.setState({ selectedClipIds: new Set([clip.id]), inspectorTab: "video" });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<Inspector />));
+      const field = container.querySelector<HTMLElement>(`[role="spinbutton"][aria-label="${t("inspector.field.speed")}"]`);
+      expect(field).not.toBeNull();
+      await act(async () => field!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+      const input = container.querySelector<HTMLInputElement>(`input[aria-label="${t("inspector.field.speed")}"]`);
+      expect(input).not.toBeNull();
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "2.00");
+        input!.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      });
+      await act(async () => input!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+      expect(speed).toHaveBeenCalledExactlyOnceWith([clip.id], 2);
+      expect(properties).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      speed.mockRestore();
+      properties.mockRestore();
+    }
+  });
+
   it("keeps compact transform, crop, and HSL glyphs inside 24px hit frames", async () => {
     const clip = visualClip();
     useProjectStore.setState({ timeline: timelineWith(clip) });

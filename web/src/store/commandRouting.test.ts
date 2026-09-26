@@ -80,6 +80,7 @@ import {
   rippleDeleteRanges,
   setChromaKey,
   setClipProperties,
+  setClipSpeed,
   setColorGrade,
   setLut,
   setLoudnessNormalization,
@@ -164,6 +165,13 @@ describe("edit gesture command routing", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  it("speed_can_explicitly_disable_ripple_without_sending_empty_edits", async () => {
+    await setClipSpeed([], 2);
+    expect(ipc.calls).toEqual([]);
+    await setClipSpeed(["clip-a"], 0.5, false);
+    expect(ipc.calls).toEqual([{ type: "setClipSpeed", clipIds: ["clip-a"], speed: 0.5, ripple: false }]);
+  });
 
   it("every_edit_action_emits_exact_edit_request", async () => {
     expect(EDIT_GESTURE_COMMAND_MATRIX_IS_EXHAUSTIVE).toBe(true);
@@ -287,6 +295,10 @@ describe("edit gesture command routing", () => {
     await route(
       { type: "setClipProperties", clipIds: ["clip-a"], properties: { opacity: 0.5 } },
       () => setClipProperties(["clip-a"], { opacity: 0.5 }),
+    );
+    await route(
+      { type: "setClipSpeed", clipIds: ["clip-a"], speed: 2, ripple: true },
+      () => setClipSpeed(["clip-a"], 2),
     );
     await route(
       { type: "setTransformAtFrame", clipId: "clip-a", frame: 15, transform },

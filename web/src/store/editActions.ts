@@ -83,6 +83,7 @@ export const EDIT_GESTURE_COMMAND_MATRIX = [
   { gesture: "freeze frame", action: "freezeFrame", requestType: "freezeFrame", backend: "FreezeFrame" },
   { gesture: "trim handle commit", action: "trimClips", requestType: "trimClips", backend: "TrimClips" },
   { gesture: "inspector property commit", action: "setClipProperties", requestType: "setClipProperties", backend: "SetClipProperties" },
+  { gesture: "inspector speed commit", action: "setClipSpeed", requestType: "setClipSpeed", backend: "SetClipSpeed" },
   { gesture: "canvas transform commit", action: "setTransformAtFrame", requestType: "setTransformAtFrame", backend: "SetTransformAtFrame" },
   { gesture: "replace keyframe lane", action: "setKeyframes", requestType: "setKeyframes", backend: "SetKeyframes" },
   { gesture: "stamp keyframe", action: "stampKeyframe", requestType: "stampKeyframe", backend: "StampKeyframe" },
@@ -398,6 +399,17 @@ export async function freezeClipAtPlayhead(
 export async function trimClips(edits: TrimEditReq[]) {
   if (edits.length === 0) return;
   await applyAndRefresh({ type: "trimClips", edits });
+}
+
+/** Retime animation and the adjacent chain as one undoable backend edit. */
+export async function setClipSpeed(
+  clipIds: string[],
+  speed: number,
+  ripple = true,
+  context?: ProjectEditContext,
+) {
+  if (clipIds.length === 0) return;
+  await applyAndRefresh({ type: "setClipSpeed", clipIds, speed, ripple }, context);
 }
 
 export async function setClipProperties(

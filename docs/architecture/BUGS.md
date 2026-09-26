@@ -103,7 +103,7 @@
 
 详见 [EDITING-ENGINE-PLAN.md](EDITING-ENGINE-PLAN.md) 和 [PORT-1TO1-GAP.md](PORT-1TO1-GAP.md)：
 
-- Speed 改变时 contiguous 后续链 ripple push 未在 ops 层调用
+- Speed 的关键帧缩放和 contiguous 后续链 ripple 已由 `SetClipSpeed` 接入 Inspector（#40）；增长碰撞采用整次拒绝，回归见 `crates/opentake-ops/tests/clip_speed.rs`。Agent 通用属性工具保留非 ripple 语义。
 - Snap DPI 容差未缩放
 - 轨间 insertThreshold 未在前端实现
 - Batch folders 的 Agent 工具未实现完整
