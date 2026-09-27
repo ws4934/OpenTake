@@ -894,11 +894,13 @@ fn build_exec_args(endpoint_url: &str, isolated_cwd: &Path) -> Vec<OsString> {
     args
 }
 
+/// Cancel-safe: bytes consumed from `reader` stay in `buffer` until a full
+/// line is returned, so dropping this future inside `select!` and calling it
+/// again with the same buffer resumes the partial line instead of losing it.
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
 ) -> Result<Option<String>, CodexTurnError> {
-    buffer.clear();
     loop {
         let available = reader
             .fill_buf()
@@ -924,7 +926,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     if buffer.last() == Some(&b'\r') {
         buffer.pop();
     }
-    String::from_utf8(buffer.clone())
+    String::from_utf8(std::mem::take(buffer))
         .map(Some)
         .map_err(|_| CodexTurnError::Protocol)
 }
@@ -1884,6 +1886,74 @@ mod tests {
             Err(CodexTurnError::Protocol)
         );
         assert!(buffer.len() <= MAX_JSONL_LINE_BYTES);
+    }
+
+    /// Same shape as `consume_exec_stream`: a fresh read future races the
+    /// cancel-poll tick on every loop iteration.
+    async fn read_line_racing_cancel_poll<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Option<String>, CodexTurnError> {
+        let mut poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+        loop {
+            tokio::select! {
+                line = read_bounded_line(reader, buffer) => return line,
+                _ = poll.tick() => {}
+            }
+        }
+    }
+
+    async fn read_line_written_in_delayed_segments(
+        bytes: Vec<u8>,
+        splits: Vec<usize>,
+    ) -> Result<Option<String>, CodexTurnError> {
+        let (mut writer, stdout) = tokio::io::duplex(64 * 1024);
+        let feeder = tokio::spawn(async move {
+            let mut start = 0;
+            for end in splits.into_iter().chain([bytes.len()]) {
+                writer.write_all(&bytes[start..end]).await.unwrap();
+                start = end;
+                tokio::time::sleep(CANCEL_POLL_INTERVAL * 2 + Duration::from_millis(20)).await;
+            }
+        });
+        let mut reader = BufReader::new(stdout);
+        let mut buffer = Vec::new();
+        let line = read_line_racing_cancel_poll(&mut reader, &mut buffer).await;
+        feeder.await.unwrap();
+        line
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_jsonl_reader_keeps_a_large_line_split_across_cancel_ticks() {
+        let text = "x".repeat(100 * 1024);
+        let line = format!(
+            r#"{{"type":"item.completed","item":{{"id":"m1","type":"agent_message","text":"{text}"}}}}"#
+        );
+        let mut bytes = line.clone().into_bytes();
+        bytes.push(b'\n');
+        let splits = vec![30, 40 * 1024, 80 * 1024];
+        let read = read_line_written_in_delayed_segments(bytes, splits)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, line);
+        let mut calls = HashMap::new();
+        assert_eq!(
+            parse_exec_event(&read, &mut calls),
+            Ok(ExecEvent::AgentMessage(text))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_jsonl_reader_splits_at_any_byte_including_crlf_and_utf8() {
+        let line = r#"{"type":"thread.started","note":"你好"}"#;
+        let bytes = format!("{line}\r\n").into_bytes();
+        for split in 1..bytes.len() {
+            let read = read_line_written_in_delayed_segments(bytes.clone(), vec![split])
+                .await
+                .unwrap();
+            assert_eq!(read.as_deref(), Some(line), "split at byte {split}");
+        }
     }
 
     #[cfg(unix)]
