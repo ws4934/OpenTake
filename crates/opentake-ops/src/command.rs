@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 use opentake_domain::{
     AudioDenoise, CaptionTranslationInput, ChromaKey, Clip, ClipType, ColorGrade, ColorMatchInput,
     Crop, Effect, Interpolation, LoudnessNormalization, LutReference, Mask, MaskShape,
-    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, StabilizationTrack, Timeline, Track,
-    Transform, Transition, TransitionKind, VoiceModelRecord, MAX_MASKS_PER_CLIP,
-    MAX_POLYGON_MASK_POINTS,
+    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, StabilizationTrack, TextStyle,
+    Timeline, Track, Transform, Transition, TransitionKind, VoiceModelRecord, VolumeScale,
+    MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
 };
 
 use crate::editor_state::EditorState;
@@ -3930,6 +3930,7 @@ fn validate_clip_property_target(
     clip_id: &str,
     props: &ClipProperties,
 ) -> Result<(), EditError> {
+    validate_clip_property_values(props, &format!("clip {clip_id}"))?;
     let location = state
         .find_clip(clip_id)
         .ok_or_else(|| EditError::Invalid(format!("Clip not found: {clip_id}")))?;
@@ -3955,6 +3956,48 @@ fn validate_clip_property_target(
         )));
     }
     validate_effective_clip_timing(clip, props, &format!("clip {clip_id}"))
+}
+
+fn validate_clip_property_values(props: &ClipProperties, label: &str) -> Result<(), EditError> {
+    if let Some(volume) = props.volume {
+        let max = VolumeScale::linear_from_db(VolumeScale::CEILING_DB);
+        if !volume.is_finite() || !(0.0..=max).contains(&volume) {
+            return Err(EditError::Invalid(format!(
+                "{label}: volume must be finite and between 0 and {max}"
+            )));
+        }
+    }
+    if let Some(opacity) = props.opacity {
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(EditError::Invalid(format!(
+                "{label}: opacity must be finite and between 0 and 1"
+            )));
+        }
+    }
+    if let Some(transform) = props.transform {
+        transform
+            .validate()
+            .map_err(|message| EditError::Invalid(format!("{label}: {message}")))?;
+    }
+    if let Some(text_style) = &props.text_style {
+        text_style
+            .validate()
+            .map_err(|message| EditError::Invalid(format!("{label}: {message}")))?;
+    }
+    Ok(())
+}
+
+fn validate_text_overlay(
+    text_style: &TextStyle,
+    transform: Transform,
+    label: &str,
+) -> Result<(), EditError> {
+    text_style
+        .validate()
+        .map_err(|message| EditError::Invalid(format!("{label}: {message}")))?;
+    transform
+        .validate()
+        .map_err(|message| EditError::Invalid(format!("{label}: {message}")))
 }
 
 fn validate_effective_clip_timing(
@@ -6009,6 +6052,7 @@ fn add_texts(
                 e.track_index
             )));
         }
+        validate_text_overlay(&e.text_style, e.transform, &format!("entries[{i}]"))?;
         entry_ends.push(checked_clip_frame_arithmetic(
             e.start_frame,
             e.duration_frames,
@@ -6081,6 +6125,11 @@ fn add_texts_auto_track(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
+            validate_text_overlay(
+                &entry.text_style,
+                entry.transform,
+                &format!("entries[{index}]"),
+            )?;
             checked_clip_frame_arithmetic(
                 entry.start_frame,
                 entry.duration_frames,
@@ -6153,6 +6202,11 @@ fn add_captions(
         ));
     }
     for (index, entry) in entries.iter().enumerate() {
+        validate_text_overlay(
+            &entry.text_style,
+            entry.transform,
+            &format!("entries[{index}]"),
+        )?;
         checked_clip_frame_arithmetic(
             entry.start_frame,
             entry.duration_frames,
@@ -8863,6 +8917,107 @@ mod add_texts_auto_track_tests {
             if clip.text_content.as_deref() == Some("first") {
                 assert!(clip.start_frame + clip.duration_frames <= 20);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod numeric_property_validation_tests {
+    use super::*;
+    use crate::id::SeqIdGen;
+
+    fn state_with_clip() -> EditorState {
+        let mut timeline = Timeline::new();
+        let mut track = Track::new("v1", ClipType::Video);
+        track.clips.push(Clip::new("c1", "asset", 0, 30));
+        timeline.tracks.push(track);
+        EditorState::from_timeline(timeline)
+    }
+
+    fn text_entry(font_size: f64, transform: Transform) -> TextAutoTrackEntry {
+        TextAutoTrackEntry {
+            start_frame: 0,
+            duration_frames: 30,
+            content: "title".into(),
+            text_style: TextStyle {
+                font_size,
+                ..TextStyle::default()
+            },
+            transform,
+        }
+    }
+
+    #[test]
+    fn invalid_clip_properties_are_rejected_before_mutation() {
+        let invalid = [
+            ClipProperties {
+                volume: Some(1000.0),
+                ..Default::default()
+            },
+            ClipProperties {
+                volume: Some(-1.0),
+                ..Default::default()
+            },
+            ClipProperties {
+                opacity: Some(2.0),
+                ..Default::default()
+            },
+            ClipProperties {
+                text_style: Some(TextStyle {
+                    font_size: 1e308,
+                    ..TextStyle::default()
+                }),
+                ..Default::default()
+            },
+            ClipProperties {
+                transform: Some(Transform {
+                    width: 0.0,
+                    ..Transform::default()
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let mut state = state_with_clip();
+        let original = state.timeline.clone();
+        for properties in invalid {
+            let result = apply(
+                &mut state,
+                EditCommand::SetClipProperties {
+                    clip_ids: vec!["c1".into()],
+                    properties: Box::new(properties),
+                },
+                &SeqIdGen::default(),
+            );
+            assert!(matches!(result, Err(EditError::Invalid(_))));
+            assert_eq!(state.timeline, original);
+        }
+    }
+
+    #[test]
+    fn text_commands_reject_invalid_styles_and_transforms_atomically() {
+        for entry in [
+            text_entry(0.0, Transform::default()),
+            text_entry(1e308, Transform::default()),
+            text_entry(
+                TextStyle::default().font_size,
+                Transform {
+                    width: 0.0,
+                    ..Transform::default()
+                },
+            ),
+        ] {
+            let mut state = state_with_clip();
+            let original = state.timeline.clone();
+            let result = apply(
+                &mut state,
+                EditCommand::AddTextsAutoTrack {
+                    entries: vec![entry],
+                },
+                &SeqIdGen::default(),
+            );
+            assert!(matches!(result, Err(EditError::Invalid(_))));
+            assert_eq!(state.timeline, original);
         }
     }
 }
