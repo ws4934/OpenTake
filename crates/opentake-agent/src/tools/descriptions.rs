@@ -39,7 +39,7 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::MoveClips => "Moves one or more clips to a new track and/or frame position. Single undoable action. Each move specifies the clip ID and at least one of toTrack (must be compatible with the clip's media type) and toFrame. Overlap on the destination is resolved as in add_clips (existing clips on the destination track are trimmed/split/removed). Linked partners follow the named clip: startFrame propagates as a delta to preserve l-cut / j-cut offsets; tracks stay with the named clip.",
 
-        ToolName::SetClipProperties => "Apply the same property values to one or more clips in a single undoable action. Pass any combination of durationFrames, trimStartFrame, trimEndFrame, speed, volume, opacity, transform, reversed, or — for text clips only — content, fontName, fontSize, color, alignment. All values are applied to every clip in clipIds; for per-clip differences, make separate calls. transform is currently single-clip only because partial width/height merges depend on each clip's source aspect; make separate calls for multiple transform edits. trimStartFrame/trimEndFrame are offsets from the source media, not the timeline. speed 1.0 is normal, <1.0 slows (clip gets longer on the timeline), >1.0 speeds up. Changing speed or durationFrames proportionally rescales existing animation keyframes before clamping. This tool does NOT ripple following clips: inspect available space and use move_clips explicitly when needed. The Inspector uses a separate ripple-enabled speed command that rejects collisions rather than overwriting unrelated content. reversed=true plays video clips backward through their referenced source window; non-video clips ignore it. volume and opacity are 0.0–1.0. transform uses 0–1 normalized canvas coords, partial merge (pass only centerY to reposition vertically); flipHorizontal/flipVertical mirror the clip across the corresponding axis (no effect on text clips). When a text clip's content or font changes without an explicit transform, the bounding box auto-refits. Text-only fields with any non-text clip in clipIds are rejected.\n\nFor moves and start-frame changes, use move_clips. For animated values (keyframes), use set_keyframes — setting volume or opacity here clears any existing keyframe track on that property.\n\nTiming changes (durationFrames, trimStartFrame, trimEndFrame, speed) on a linked clip carry over to its linked partner so audio/video stay in sync — same as the timeline UI. Per-clip fields (volume, opacity, transform, reversed, text*) don't propagate. trim and speed are skipped for text partners.",
+        ToolName::SetClipProperties => "Apply the same property values to one or more clips in a single undoable action. Pass any combination of durationFrames, trimStartFrame, trimEndFrame, speed, volume, opacity, transform, reversed, or — for text clips only — content, fontName, fontSize, color, alignment. All values are applied to every clip in clipIds; for per-clip differences, make separate calls. transform is currently single-clip only because partial width/height merges depend on each clip's source aspect; make separate calls for multiple transform edits. trimStartFrame/trimEndFrame are offsets from the source media, not the timeline. speed 1.0 is normal, <1.0 slows (clip gets longer on the timeline), >1.0 speeds up. Changing speed or durationFrames proportionally rescales existing animation keyframes before clamping. This tool does NOT ripple following clips: inspect available space and use move_clips explicitly when needed. The Inspector uses a separate ripple-enabled speed command that rejects collisions rather than overwriting unrelated content. reversed=true plays video clips backward through their referenced source window; non-video clips ignore it. volume is linear gain from 0 to the Inspector's +15 dB ceiling (about 5.6234); opacity is 0.0–1.0. transform uses normalized canvas coords; partial merge (pass only centerY to reposition vertically); flipHorizontal/flipVertical mirror the clip across the corresponding axis (no effect on text clips). When a text clip's content or font changes without an explicit transform, the bounding box auto-refits. Text-only fields with any non-text clip in clipIds are rejected.\n\nFor moves and start-frame changes, use move_clips. For animated values (keyframes), use set_keyframes — setting volume or opacity here clears any existing keyframe track on that property.\n\nTiming changes (durationFrames, trimStartFrame, trimEndFrame, speed) on a linked clip carry over to its linked partner so audio/video stay in sync — same as the timeline UI. Per-clip fields (volume, opacity, transform, reversed, text*) don't propagate. trim and speed are skipped for text partners.",
 
         ToolName::SetKeyframes => "Set animated keyframes on one property of one clip. Replaces the existing keyframe track for that property (pass an empty array to clear). Frames are CLIP-RELATIVE offsets (0 = first frame of the clip), so keyframes follow the clip when it moves. Rows are sorted by frame internally and the LAST row for any duplicate frame wins. Values must be finite numbers. Each row is `[frame, ...values, interp?]` where interp ∈ {linear, hold, smooth} (default smooth).\n\nProperties and their value layouts:\n  • volume `[frame, value]` — value 0.0–1.0\n  • opacity `[frame, value]` — value 0.0–1.0\n  • rotation `[frame, degrees]` — clockwise degrees\n  • position `[frame, topLeftX, topLeftY]` — TOP-LEFT corner in 0–1 normalized canvas coords. NOT the center. (Default static transform centers a full-canvas clip, so top-left of the static is (0, 0); a centered half-size clip has top-left (0.25, 0.25).)\n  • scale `[frame, width, height]` — clip's normalized width and height in 0–1 canvas coords (1.0 = fills the canvas axis). NOT a scale factor.\n  • crop `[frame, top, right, bottom, left]` — side insets in 0–1 of the source media.\n\nMotion keyframes (position/scale/rotation) override the static `transform` value when active.",
 
@@ -215,7 +215,7 @@ pub fn input_schema(tool: ToolName) -> Value {
         ToolName::InsertClips => object(
             json!({
                 "trackIndex": {"type": "integer", "description": "Track index (0-based, from get_timeline) to insert into and ripple."},
-                "atFrame": {"type": "integer", "description": "Timeline frame (project frames) where insertion begins. Every clip at or after this frame on rippled tracks shifts right by the total inserted duration."},
+                "atFrame": {"type": "integer", "minimum": 0, "description": "Non-negative timeline frame (project frames) where insertion begins. Every clip at or after this frame on rippled tracks shifts right by the total inserted duration."},
                 "entries": {
                     "type": "array",
                     "description": "Clips to insert, placed sequentially from atFrame. Validated up front; one bad entry rejects the whole call.",
@@ -223,9 +223,9 @@ pub fn input_schema(tool: ToolName) -> Value {
                         "type": "object",
                         "properties": {
                             "mediaRef": {"type": "string", "description": "ID of the media asset from get_media."},
-                            "durationFrames": {"type": "integer", "description": "Optional. Timeline length in project frames. Omit to use the asset's full source duration."},
-                            "trimStartFrame": {"type": "integer", "description": "Optional. Frames skipped from the START of the source media — a SOURCE offset in PROJECT frames (same units as atFrame/durationFrames, never the source's own fps). 0 (default) starts at the source's first frame."},
-                            "trimEndFrame": {"type": "integer", "description": "Optional. Frames trimmed off the END of the source media, in PROJECT frames. 0 (default) trims nothing."}
+                            "durationFrames": {"type": "integer", "minimum": 1, "description": "Optional positive timeline length in project frames. Omit to use the asset's full source duration."},
+                            "trimStartFrame": {"type": "integer", "minimum": 0, "description": "Optional non-negative frames skipped from the START of the source media — a SOURCE offset in PROJECT frames (same units as atFrame/durationFrames, never the source's own fps). 0 (default) starts at the source's first frame."},
+                            "trimEndFrame": {"type": "integer", "minimum": 0, "description": "Optional non-negative frames trimmed off the END of the source media, in PROJECT frames. 0 (default) trims nothing."}
                         },
                         "required": ["mediaRef"]
                     }
@@ -274,23 +274,23 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "trimStartFrame": {"type": "integer", "description": "SOURCE-media offset, NOT a timeline frame: frames trimmed off the start of the source — measured in PROJECT frames (the timeline's fps, same units as startFrame/durationFrames; never the source's own fps). To turn a get_transcript project frame P into this clip's source offset, use trimStartFrame + (P − startFrame) × speed; setting trimStartFrame to that value makes the clip begin at P's source content."},
                 "trimEndFrame": {"type": "integer", "description": "SOURCE-media offset, NOT a timeline frame: frames trimmed off the end of the source, in PROJECT frames. Maps the same way as trimStartFrame via startFrame/speed."},
                 "speed": {"type": "number", "description": "Playback speed multiplier (default 1.0). >1 speeds up, <1 slows down. The clip's timeline length is rescaled to keep the same source content (2x speed → half the frames), unless you also pass durationFrames to set the length explicitly."},
-                "volume": {"type": "number", "description": "Volume 0.0-1.0. Clears any existing volume keyframes."},
-                "opacity": {"type": "number", "description": "Opacity 0.0-1.0. Clears any existing opacity keyframes."},
+                "volume": {"type": "number", "minimum": 0, "maximum": 5.623413251903491, "description": "Linear gain from 0 to the Inspector's +15 dB ceiling. Clears any existing volume keyframes."},
+                "opacity": {"type": "number", "minimum": 0, "maximum": 1, "description": "Opacity 0.0-1.0. Clears any existing opacity keyframes."},
                 "transform": {
                     "type": "object",
-                    "description": "Partial transform. Any combination of centerX, centerY, width, height, flipHorizontal, flipVertical; omitted fields keep their current value.",
+                    "description": "Partial transform. Centers are finite normalized values from -10 to 10; width and height are finite values greater than 0 and at most 10. Omitted fields keep their current value.",
                     "properties": {
-                        "centerX": {"type": "number"},
-                        "centerY": {"type": "number"},
-                        "width": {"type": "number"},
-                        "height": {"type": "number"},
+                        "centerX": {"type": "number", "minimum": -10, "maximum": 10},
+                        "centerY": {"type": "number", "minimum": -10, "maximum": 10},
+                        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
+                        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
                         "flipHorizontal": {"type": "boolean", "description": "Mirror across the vertical axis."},
                         "flipVertical": {"type": "boolean", "description": "Mirror across the horizontal axis."}
                     }
                 },
                 "content": {"type": "string", "description": "Text clips only. New text content."},
                 "fontName": {"type": "string", "description": "Text clips only. Font PostScript or family name."},
-                "fontSize": {"type": "number", "description": "Text clips only. Font size in canvas points."},
+                "fontSize": {"type": "number", "minimum": 4, "maximum": 512, "description": "Text clips only. Font size in canvas points (4-512)."},
                 "color": {"type": "string", "description": "Text clips only. Hex '#RRGGBB' or '#RRGGBBAA'."},
                 "alignment": {"type": "string", "enum": ["left", "center", "right"], "description": "Text clips only."},
                 "reversed": {"type": "boolean", "description": "Video clips only. true plays the clip backward through its referenced source window; false restores normal playback."}
@@ -341,18 +341,18 @@ pub fn input_schema(tool: ToolName) -> Value {
                             "content": {"type": "string", "description": "Text to display. Supports \\n for line breaks."},
                             "transform": {
                                 "type": "object",
-                                "description": "Optional position/size. Omit for center + auto-fit. Pass centerX+centerY only for a specific position with auto-fit size. Pass all four for full override.",
+                                "description": "Optional normalized position/size. Centers are finite values from -10 to 10; width and height are greater than 0 and at most 10. Omit for center + auto-fit. Pass centerX+centerY only for a specific position with auto-fit size. Pass all four for full override.",
                                 "properties": {
-                                    "centerX": {"type": "number", "description": "Horizontal center 0–1 (0=left edge, 1=right edge)"},
-                                    "centerY": {"type": "number", "description": "Vertical center 0–1 (0=top, 1=bottom)"},
-                                    "width": {"type": "number", "description": "Width 0–1 (optional; omit for auto-fit)"},
-                                    "height": {"type": "number", "description": "Height 0–1 (optional; omit for auto-fit)"},
+                                    "centerX": {"type": "number", "minimum": -10, "maximum": 10, "description": "Horizontal normalized center; 0-1 spans the canvas."},
+                                    "centerY": {"type": "number", "minimum": -10, "maximum": 10, "description": "Vertical normalized center; 0-1 spans the canvas."},
+                                    "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Normalized width (optional; omit for auto-fit)."},
+                                    "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Normalized height (optional; omit for auto-fit)."},
                                     "flipHorizontal": {"type": "boolean", "description": "Mirror across the vertical axis."},
                                     "flipVertical": {"type": "boolean", "description": "Mirror across the horizontal axis."}
                                 }
                             },
                             "fontName": {"type": "string", "description": "Font PostScript or family name, e.g. 'Helvetica-Bold', 'Georgia-Bold'. Default 'Helvetica-Bold'. Falls back to bold system font if not found."},
-                            "fontSize": {"type": "number", "description": "Font size in canvas points (default 96). On a 1080p canvas ~50 is a caption, ~120 is a title."},
+                            "fontSize": {"type": "number", "minimum": 4, "maximum": 512, "description": "Font size in canvas points (4-512, default 96). On a 1080p canvas ~50 is a caption, ~120 is a title."},
                             "color": {"type": "string", "description": "Hex '#RRGGBB' or '#RRGGBBAA' (default '#FFFFFF')"},
                             "alignment": {"type": "string", "enum": ["left", "center", "right"], "description": "Text alignment (default 'center')"}
                         },
@@ -368,10 +368,10 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "clipIds": {"type": "array", "items": {"type": "string"}, "description": "Optional. Audio/video clips to caption. Omit to auto-detect the primary spoken track."},
                 "language": {"type": "string", "description": "Optional BCP-47 language of the speech (e.g. 'es', 'ja', 'en-GB'). Defaults to the system language — set this when the footage is in another language, or transcription will be garbage."},
                 "fontName": {"type": "string", "description": "Optional font PostScript or family name (default 'Helvetica-Bold'). Falls back to bold system font if not found."},
-                "fontSize": {"type": "number", "description": "Optional font size in canvas points (default 48)."},
+                "fontSize": {"type": "number", "minimum": 4, "maximum": 512, "description": "Optional font size in canvas points (4-512, default 48)."},
                 "color": {"type": "string", "description": "Optional hex '#RRGGBB' or '#RRGGBBAA' (default white)."},
-                "centerX": {"type": "number", "description": "Optional horizontal center 0–1 (default 0.5)."},
-                "centerY": {"type": "number", "description": "Optional vertical center 0–1 (default 0.9, near the bottom)."},
+                "centerX": {"type": "number", "minimum": -10, "maximum": 10, "description": "Optional normalized horizontal center; 0-1 spans the canvas (default 0.5)."},
+                "centerY": {"type": "number", "minimum": -10, "maximum": 10, "description": "Optional normalized vertical center; 0-1 spans the canvas (default 0.9, near the bottom)."},
                 "textCase": {"type": "string", "enum": ["auto", "upper", "lower"], "description": "Optional letter case (default auto)."},
                 "censorProfanity": {"type": "boolean", "description": "Optional. Mask profanity (default false)."}
             }),
@@ -419,8 +419,8 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "clipIds": {"type": "array", "items": {"type": "string"}, "description": "Optional clip ids to analyze. Omit to analyze the primary spoken track in the future backend."},
                 "trackIndex": {"type": "integer", "description": "Optional track index to analyze."},
                 "thresholdDb": {"type": "number", "description": "Optional silence threshold in dB."},
-                "minSilenceFrames": {"type": "integer", "description": "Optional minimum silence span to cut."},
-                "paddingFrames": {"type": "integer", "description": "Optional context to preserve around each silence."}
+                "minSilenceFrames": {"type": "integer", "minimum": 1, "description": "Optional minimum silence span to cut (at least 1 frame)."},
+                "paddingFrames": {"type": "integer", "minimum": 0, "description": "Optional non-negative context to preserve around each silence."}
             }),
             &[],
         ),
