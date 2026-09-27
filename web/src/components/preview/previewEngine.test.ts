@@ -78,7 +78,8 @@ import type { ActiveMedia } from "./timelinePlayback";
 import type { Clip, ClipType, Timeline, Track } from "../../lib/types";
 import { useProjectStore } from "../../store/projectStore";
 import { useEditorUiStore } from "../../store/uiStore";
-import { nativePlaybackController } from "./nativePlaybackSession";
+import { nativePlaybackController, publishNativePlaybackFrame } from "./nativePlaybackSession";
+import * as playbackRoute from "./playbackRoute";
 
 function installReactHost(): Element {
   const document = {
@@ -759,5 +760,73 @@ describe("previewElementKey", () => {
     } as ActiveMedia;
 
     expect(previewElementKey(base)).not.toBe(previewElementKey(pip));
+  });
+});
+
+describe("playback engine subscription cost", () => {
+  async function startNativePlayback(): Promise<{ root: Root; renders: () => number }> {
+    useProjectStore.setState({
+      projectEpoch: 4,
+      timelineVersion: 7,
+      timeline: temporalCompositorTimeline(),
+    });
+    useEditorUiStore.setState({
+      activeFrame: 10,
+      currentFrame: 10,
+      isPlaying: true,
+      isScrubbing: false,
+      rustEngineFailed: false,
+    });
+    let count = 0;
+    function CountingHost(): null {
+      count += 1;
+      previewEngine.useTimelinePlaybackEngine();
+      return null;
+    }
+    const root = createRoot(installReactHost());
+    await act(async () => {
+      root.render(React.createElement(CountingHost));
+      await Promise.resolve();
+    });
+    expect(nativeApiHarness.playbackStart).toHaveBeenCalledTimes(1);
+    return { root, renders: () => count };
+  }
+
+  it("re-renders its host once per whole frame and resolves the route once per revision", async () => {
+    const { root, renders } = await startNativePlayback();
+    const resolveRoute = vi.spyOn(playbackRoute, "resolveTimelinePlaybackRoute");
+    const rendersBefore = renders();
+
+    // 60 fractional playback ticks across two whole-frame boundaries (10 -> 12).
+    for (let tick = 1; tick <= 60; tick += 1) {
+      await act(async () => useEditorUiStore.getState().setActiveFrame(10 + tick * (2 / 60)));
+    }
+
+    expect(renders() - rendersBefore).toBe(2);
+    expect(resolveRoute).not.toHaveBeenCalled();
+
+    await act(async () => useProjectStore.setState({ timelineVersion: 8 }));
+    const perRevision = resolveRoute.mock.calls.length;
+    expect(perRevision).toBeGreaterThan(0);
+    expect(perRevision).toBeLessThanOrEqual(2);
+
+    resolveRoute.mockRestore();
+    await unmountPlaybackHook(root);
+  });
+
+  it("still forwards an external seek to the native engine while playing", async () => {
+    const { root } = await startNativePlayback();
+    const identity = nativePlaybackController.currentIdentity();
+    expect(identity).not.toBeNull();
+    await act(async () =>
+      publishNativePlaybackFrame({ ...identity!, frame: 12, sequence: 1, terminal: false }),
+    );
+    expect(useEditorUiStore.getState().activeFrame).toBe(12);
+    expect(nativeApiHarness.playbackSeek).not.toHaveBeenCalled();
+
+    await act(async () => useEditorUiStore.getState().setCurrentFrame(90));
+
+    expect(nativeApiHarness.playbackSeek).toHaveBeenCalledWith(identity, 90);
+    await unmountPlaybackHook(root);
   });
 });

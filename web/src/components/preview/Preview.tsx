@@ -121,7 +121,9 @@ export function Preview() {
     )?.timeline ?? rootTimeline;
   const projectEpoch = useProjectStore((s) => s.projectEpoch);
   const timelineVersion = useProjectStore((s) => s.timelineVersion);
-  const activeFrame = useEditorUiStore((s) => s.activeFrame);
+  // Whole frames: every consumer below floors or rounds the playhead, and a
+  // fractional subscription would re-render the whole preview per rAF tick.
+  const activeFrame = useEditorUiStore((s) => Math.floor(s.activeFrame));
   const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
   const isPlaying = useEditorUiStore((s) => s.isPlaying);
   const isScrubbing = useEditorUiStore((s) => s.isScrubbing);
@@ -308,14 +310,27 @@ export function Preview() {
     : totalFrames(timeline);
   const activeShownFrame = previewing ? Math.round(mediaTime * fps) : activeFrame;
   const playing = previewing ? mediaPlaying : isPlaying;
-  const playbackRoute = resolveTimelinePlaybackRoute(timeline, {
-    rustAvailable:
-      !activeNestedSequenceId &&
-      (rustPlaybackCapability.checked ? rustPlaybackCapability.available : isTauri),
-    rustEnabled: rustEngineEnabled() && !rustEngineFailed,
-    forceRust:
-      webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
-  });
+  const playbackRoute = useMemo(
+    () =>
+      resolveTimelinePlaybackRoute(timeline, {
+        rustAvailable:
+          !activeNestedSequenceId &&
+          (rustPlaybackCapability.checked ? rustPlaybackCapability.available : isTauri),
+        rustEnabled: rustEngineEnabled() && !rustEngineFailed,
+        forceRust:
+          webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
+      }),
+    [
+      timeline,
+      activeNestedSequenceId,
+      rustPlaybackCapability.checked,
+      rustPlaybackCapability.available,
+      rustEngineFailed,
+      webkitPlaybackFailedRevision,
+      projectEpoch,
+      timelineVersion,
+    ],
+  );
   const retryableRustFailure = isRetryableRustPlaybackFailure(
     playbackRoute,
     rustEngineFailed,
