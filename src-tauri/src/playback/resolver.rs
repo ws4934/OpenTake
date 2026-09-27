@@ -34,7 +34,9 @@ use opentake_domain::LutReference;
 use opentake_media::decode::{
     spawn_video_stream, StreamVideoFrame, VideoStream, VideoStreamRequest,
 };
-use opentake_media::{decode_frame_at_cancellable, FrameRequest, MediaCancelToken, MediaError};
+use opentake_media::{
+    decode_frame_at_cancellable, ContentHashCache, FrameRequest, MediaCancelToken, MediaError,
+};
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::wgpu;
@@ -209,6 +211,8 @@ pub struct PlaybackResolverState {
     /// Image, text, and bounded Lottie-frame textures (persistent across frames).
     static_cache: TextureCache,
     lottie: LottieMaterializer,
+    /// Image content hashes, revalidated by file identity on every lookup.
+    content_hashes: ContentHashCache,
     text_rasterizer: CosmicTextRasterizer,
     media: HashMap<String, MediaInfo>,
     text: HashMap<String, TextInfo>,
@@ -244,6 +248,7 @@ impl PlaybackResolverState {
             streams: HashMap::new(),
             static_cache: TextureCache::new(STATIC_CACHE_CAP),
             lottie: LottieMaterializer::new(),
+            content_hashes: ContentHashCache::new(),
             text_rasterizer: CosmicTextRasterizer::new(),
             media,
             text,
@@ -433,7 +438,7 @@ impl<'d, 's> StreamingResolver<'d, 's> {
                 .state
                 .fail_materialization(format!("image source {media_ref} is unauthorized"));
         };
-        let content_hash = match opentake_media::file_sha256(&info.path) {
+        let content_hash = match self.state.content_hashes.sha256(&info.path) {
             Ok(hash) => hash,
             Err(error) => {
                 return self.state.fail_materialization(format!(
@@ -852,6 +857,86 @@ mod tests {
         assert_eq!(preview_pixels, export_pixels);
         let center = &preview_pixels.rgba[(8 * 16 + 8) * 4..][..4];
         assert!(center[0] > 200 && center[1] < 30, "{center:?}");
+    }
+
+    #[test]
+    fn unchanged_image_is_hashed_once_across_playback_frames() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            return;
+        };
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("image fixture");
+        let path = temp.path().join("overlay.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .expect("write first image");
+        let mut media = HashMap::new();
+        media.insert("overlay".into(), MediaInfo { path: path.clone() });
+        let mut state = PlaybackResolverState::new(
+            media,
+            HashMap::new(),
+            30,
+            (16, 16),
+            MediaCancelToken::new(),
+        );
+        let source = TextureSource::Image {
+            media_ref: "overlay".into(),
+        };
+        let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
+        let first = resolver.resolve(&source, 0).expect("first image texture");
+        for frame in 1..1000 {
+            let again = resolver.resolve(&source, frame).expect("cached image");
+            assert!(Rc::ptr_eq(&first, &again));
+        }
+        assert_eq!(resolver.state.content_hashes.hashes(), 1);
+
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .expect("replace image");
+        let replaced = resolver.resolve(&source, 1000).expect("replaced image");
+        assert!(!Rc::ptr_eq(&first, &replaced));
+        assert_eq!(resolver.state.content_hashes.hashes(), 2);
+        drop(resolver);
+        assert!(state.take_materialization_error().is_none());
+    }
+
+    #[test]
+    fn lottie_document_is_read_once_until_replaced() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("Lottie fixture");
+        let path = temp.path().join("overlay.json");
+        std::fs::write(&path, lottie_fixture("[1,0,0,1]", "[0,0,1,1]")).expect("write Lottie");
+        let mut media = HashMap::new();
+        media.insert("overlay".into(), MediaInfo { path: path.clone() });
+        let mut state = PlaybackResolverState::new(
+            media,
+            HashMap::new(),
+            30,
+            (16, 16),
+            MediaCancelToken::new(),
+        );
+        let source = TextureSource::Lottie {
+            media_ref: "overlay".into(),
+        };
+        let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
+        for frame in 0..1000 {
+            resolver.resolve(&source, frame).expect("Lottie frame");
+        }
+        assert_eq!(resolver.state.lottie.document_reads(), 1);
+
+        // Different length, so the identity changes even on coarse mtimes.
+        std::fs::write(&path, lottie_fixture("[0,1,0,1]", "[0,1,0,1.0]")).expect("replace Lottie");
+        let replaced = resolver.resolve(&source, 0).expect("replaced Lottie frame");
+        assert_eq!(resolver.state.lottie.document_reads(), 2);
+        let pixels = composite_texture(&dev.device, &dev.queue, replaced);
+        let center = &pixels.rgba[(8 * 16 + 8) * 4..][..4];
+        assert!(center[1] > 200 && center[0] < 30, "{center:?}");
+        drop(resolver);
+        assert!(state.take_materialization_error().is_none());
     }
 
     #[test]

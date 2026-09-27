@@ -77,7 +77,7 @@ fn partial_path(output: &Path) -> PathBuf {
     }
 }
 
-fn open_retained_regular_file(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_retained_regular_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
