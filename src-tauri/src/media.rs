@@ -6522,6 +6522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("CancelAudio.opentake");
         let source = tmp.path().join("speech.wav");
+        fs::write(&source, b"").unwrap();
         crate::export::write_wav_s16le(&vec![0.2; 48_000 * 10], 48_000, &source).unwrap();
         let mut project = opentake_project::Project::new(&bundle);
         project.timeline.fps = 30;
