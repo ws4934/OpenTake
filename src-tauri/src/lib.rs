@@ -10,6 +10,7 @@ mod account;
 mod advanced;
 mod captions;
 mod chat;
+mod close_coordinator;
 mod codex;
 mod commands;
 // `pub` so the ffmpeg-gated integration test (`tests/export_integration.rs`) can
@@ -25,7 +26,9 @@ mod fs_availability;
 mod generation;
 mod haptic;
 mod home;
+mod instance_lock;
 mod library;
+mod lifecycle;
 mod lut;
 mod mcp;
 mod media;
@@ -77,12 +80,9 @@ impl IdGen for UuidIdGen {
 
 /// Build and run the Tauri application. The `main.rs` binary calls this.
 ///
-/// Lifecycle mirrors upstream's "the app stays resident; closing the window
-/// returns to Home" (AppDelegate). Tauri's default — quit when the last window
-/// closes — is overridden: [`WindowEvent::CloseRequested`] is intercepted to
-/// **hide** the window and tell the front end to return Home, so the process
-/// keeps running in the background. Dock-reopen ([`RunEvent::Reopen`]) shows it
-/// again. `Cmd+Q` still exits (it raises `ExitRequested`, not prevented here).
+/// Window close and user Quit share one final save barrier. macOS hides the
+/// saved window for Dock reopen; Windows/Linux exit after saving. A failed
+/// save keeps the project visible. Duplicate launches focus the storage owner.
 pub fn run() {
     // File Provider placeholders must never trigger an implicit network
     // hydration from Tauri's main-thread asset protocol. Callers see them as
@@ -132,22 +132,31 @@ pub fn run() {
         .plugin(tauri_plugin_persisted_scope::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Background-run: don't quit. The actual hide waits for the
-                // bounded off-thread composite-cover save, so CloseRequested
-                // has parity with explicit Save without blocking the UI event
-                // thread on ffmpeg/GPU/bundle I/O.
                 api.prevent_close();
-                let window = window.clone();
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = commands::save_current_project_with_composite_cover(app).await;
-                    let _ = window.hide();
-                    let _ = window.app_handle().emit("go_home", ());
-                });
+                #[cfg(target_os = "macos")]
+                let intent = close_coordinator::CloseIntent::Hide;
+                #[cfg(not(target_os = "macos"))]
+                let intent = close_coordinator::CloseIntent::Exit;
+                lifecycle::request_close(window.app_handle(), intent);
             }
         })
         .setup(|app| {
+            // Claim shared storage before loading the registry, media library,
+            // Motion caches or any other writable application state.
+            match instance_lock::InstanceLock::claim(&app.path().app_data_dir()?)? {
+                instance_lock::InstanceClaim::Secondary => {
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+                instance_lock::InstanceClaim::Primary(instance) => {
+                    app.manage(instance);
+                }
+            }
+            app.manage(close_coordinator::CloseCoordinator::default());
             // Keep a Dock icon + normal app behavior while the window is hidden,
             // so the user can reopen from the Dock (upstream: NSApp .regular).
             #[cfg(target_os = "macos")]
@@ -353,6 +362,7 @@ pub fn run() {
                 app.manage(preview_server);
                 app.manage(playback::commands::PlaybackState::new());
             }
+            lifecycle::watch_duplicate_launches(app.handle().clone())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -506,21 +516,16 @@ pub fn run() {
             if matches!(&_event, RunEvent::Exit) {
                 external_mcp::shutdown_on_exit(_app);
             }
-            // A user-driven Quit must not interrupt bundle replacement. The
-            // updater's own restart has a programmatic exit code and remains
-            // allowed after both save barriers succeed.
+            // Programmatic exits (including updater restart and a successful
+            // save barrier) bypass this handler to avoid recursive saves.
             if let RunEvent::ExitRequested { code, api, .. } = &_event {
-                if code.is_none()
-                    && _app
-                        .try_state::<updater::UpdateCoordinator>()
-                        .is_some_and(|coordinator| coordinator.prevents_user_exit())
-                {
+                if code.is_none() {
                     api.prevent_exit();
+                    lifecycle::request_close(_app, close_coordinator::CloseIntent::Exit);
                 }
             }
             // Dock-reopen with no visible window (we hide on close) shows it again.
-            // `RunEvent::Reopen` only exists on macOS; other platforms rely on the
-            // tray / OS to re-surface the window (a cross-platform follow-up).
+            // Windows/Linux close exits instead of leaving a hidden process.
             #[cfg(target_os = "macos")]
             if let RunEvent::Reopen {
                 has_visible_windows,

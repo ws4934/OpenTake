@@ -2481,10 +2481,9 @@ export async function onProjectSaved(
   });
 }
 
-/** Subscribe to `go_home` (emitted when the window is closed/hidden so the app
- *  keeps running in the background — the front end returns to the launcher so a
- *  Dock-reopen shows Home, mirroring upstream "close window → Home"). No-op
- *  outside Tauri. */
+/** Subscribe to `go_home` after macOS window close saves and hides the window.
+ * Dock reopen shows the launcher. Windows/Linux close saves and exits instead.
+ * No-op outside Tauri. */
 export async function onGoHome(handler: () => void): Promise<() => void> {
   await ensureTauri();
   if (!listenImpl) return () => {};
