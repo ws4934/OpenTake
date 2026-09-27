@@ -9218,6 +9218,30 @@ mod numeric_property_validation_tests {
     }
 
     #[test]
+    fn inspector_zoom_of_a_portrait_clip_is_accepted() {
+        // The Inspector keeps the source aspect, so 9:16 media on a 16:9 canvas
+        // zoomed to 400% of the canvas width is more than ten canvases tall.
+        let mut state = state_with_clip();
+        let transform = Transform {
+            width: 4.0,
+            height: 4.0 / ((9.0 / 16.0) / (16.0 / 9.0)),
+            ..Transform::default()
+        };
+        let result = apply(
+            &mut state,
+            EditCommand::SetClipProperties {
+                clip_ids: vec!["c1".into()],
+                properties: Box::new(ClipProperties {
+                    transform: Some(transform),
+                    ..Default::default()
+                }),
+            },
+            &SeqIdGen::default(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn text_commands_reject_invalid_styles_and_transforms_atomically() {
         for entry in [
             text_entry(0.0, Transform::default()),

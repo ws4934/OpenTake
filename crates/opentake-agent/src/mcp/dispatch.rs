@@ -2133,12 +2133,15 @@ impl Dispatcher {
         if a.min_silence_frames.is_some_and(|frames| frames < 1) {
             return Err(ToolError::new("minSilenceFrames must be at least 1"));
         }
-        if targets
-            .iter()
-            .any(|target| padding >= target.clip.duration_frames)
+        // Clips no longer than the padding keep all their audio and are
+        // skipped; only a padding that leaves nothing to tighten is an error.
+        if !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| padding >= target.clip.duration_frames)
         {
             return Err(ToolError::new(
-                "paddingFrames must be shorter than every target clip",
+                "paddingFrames must be shorter than at least one target clip",
             ));
         }
         let spec = analysis_pcm_spec();
@@ -9575,6 +9578,30 @@ mod tests {
         assert!(result.is_error, "{}", result.text_joined());
         assert!(result.text_joined().contains("paddingFrames"));
         assert_eq!(handle.timeline(), before);
+    }
+
+    #[test]
+    fn tighten_silences_skips_clips_shorter_than_the_padding() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 10;
+        let mut track = Track::new("audio-track", ClipType::Audio);
+        track.clips.push(Clip::new("tiny", "asset-1", 0, 2));
+        track.clips.push(Clip::new("long", "asset-1", 2, 10));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("asset-1", "Voice"));
+        let handle = Arc::new(AnalysisHandle {
+            timeline,
+            manifest,
+            pcm: pcm(vec![0.5f32; 1_000], 1_000),
+            extract_error: None,
+        });
+        let dispatcher = dispatcher_with(handle);
+        let result = dispatcher.dispatch(
+            "tighten_silences",
+            serde_json::json!({"clipIds": ["tiny", "long"]}),
+        );
+        assert!(!result.is_error, "{}", result.text_joined());
     }
 
     #[test]
