@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1864,7 +1866,9 @@ fn encode_frames(
             )
         })?
         .join("frame_%05d.png");
-    let mut command = Command::new(opentake_media::ffmpeg_status::ffmpeg_path());
+    let mut command = opentake_media::process_tree::background_command(
+        opentake_media::ffmpeg_status::ffmpeg_path(),
+    );
     command
         .args(["-v", "error", "-nostdin", "-framerate"])
         .arg(rendered.fps.to_string())

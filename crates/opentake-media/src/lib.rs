@@ -65,7 +65,7 @@ pub mod ort_worker;
 pub mod probe;
 #[doc(hidden)]
 pub mod process_tree {
-    pub use opentake_process_tree::{configure_command, ProcessTree};
+    pub use opentake_process_tree::{background_command, configure_command, ProcessTree};
 }
 pub mod proxy;
 pub mod search;
@@ -99,7 +99,7 @@ pub fn trim_video_range(
         std::fs::create_dir_all(parent)?;
     }
     let duration = end_seconds - start_seconds;
-    let mut child = std::process::Command::new(ff::ffmpeg_path())
+    let mut child = opentake_process_tree::background_command(ff::ffmpeg_path())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .arg("-ss")
         .arg(format!("{start_seconds:.6}"))
@@ -412,7 +412,7 @@ fn extract_audio_file(input: &Path, output: &Path) -> Result<()> {
         ))
     })?;
 
-    let mut cmd = std::process::Command::new(ff::ffmpeg_path());
+    let mut cmd = opentake_process_tree::background_command(ff::ffmpeg_path());
     cmd.arg("-y")
         .arg("-i")
         .arg(input)

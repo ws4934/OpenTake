@@ -7,7 +7,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -223,7 +225,7 @@ pub fn create_proxy(
         "scale=w={}:h={}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         request.max_size.0, request.max_size.1
     );
-    let mut child = Command::new(ff::ffmpeg_path())
+    let mut child = opentake_process_tree::background_command(ff::ffmpeg_path())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .arg("-i")
         .arg("fd:")

@@ -795,7 +795,7 @@ fn move_project_to_trash(path: &Path) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("powershell.exe");
+        let mut command = opentake_media::process_tree::background_command("powershell.exe");
         command.args([
             "-NoProfile",
             "-NonInteractive",

@@ -1878,7 +1878,7 @@ fn open_url_in_default_browser(url: &str) -> std::io::Result<()> {
     let mut child = std::process::Command::new("open").arg(url).spawn()?;
 
     #[cfg(target_os = "windows")]
-    let mut child = std::process::Command::new("cmd.exe")
+    let mut child = opentake_media::process_tree::background_command("cmd.exe")
         .args(["/C", "start", "", url])
         .spawn()?;
 
