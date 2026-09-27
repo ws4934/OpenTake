@@ -100,7 +100,7 @@ OpenTake 提供兼容 Agent 工具，并按当前媒体、生成能力和 provid
 
 | 能力 | 技术 |
 |:--|:--|
-| 编解码 | FFmpeg (`ffmpeg-next`) — 成熟 Rust 绑定 |
+| 编解码 | 内置 FFmpeg/ffprobe CLI（`ffmpeg-sidecar`），不链接 libav |
 | 帧合成 | wgpu 自写合成器 — 多轨叠加 + 逐帧属性采样 + 仿射/裁剪/混合 |
 | 音频播放 | cpal |
 | 语音转写 | whisper-rs (word/segment 时间戳) |
@@ -243,7 +243,7 @@ PRIMARY-CN/
 
 - **Rust** ≥ 1.96 (via [rustup](https://rustup.rs))
 - **Node.js** ≥ 20 + **pnpm**
-- **FFmpeg** ≥ 6.0
+- **Python** ≥ 3.10（`python3`）— Tauri 开发/构建前自动准备校验固定版本的 FFmpeg/ffprobe，无需安装系统 FFmpeg 或 Homebrew
 
 ### 构建
 

@@ -416,7 +416,7 @@ impl TauriGenerationBridge {
                 .map(|(_, asset_id)| asset_id)
                 .collect::<Vec<_>>();
             let Some(provider_job_id) = job.provider_job_id else {
-                let _ = self.core.update_generation_job_for_project(
+                if let Err(error) = self.core.update_generation_job_for_project(
                     snapshot.project_epoch,
                     &project_dir,
                     &job_id,
@@ -428,7 +428,11 @@ impl TauriGenerationBridge {
                         cost_credits: None,
                         created_at: Some(now_apple_reference_seconds()),
                     },
-                );
+                ) {
+                    eprintln!(
+                        "[generation] job {job_id}: recovery failure was not persisted: {error}"
+                    );
+                }
                 continue;
             };
             if job.provider.is_empty() {
@@ -499,13 +503,17 @@ impl TauriGenerationBridge {
                     )
                 });
             if !terminal {
-                let _ = self.core.fail_generation_output_for_project(
+                if let Err(error) = self.core.fail_generation_output_for_project(
                     project_epoch,
                     project_dir,
                     asset_id,
                     code,
                     Some(now_apple_reference_seconds()),
-                );
+                ) {
+                    eprintln!(
+                        "[generation] output {asset_id}: failure {code} was not persisted: {error}"
+                    );
+                }
             }
         }
     }
@@ -517,12 +525,16 @@ impl TauriGenerationBridge {
         placeholder_ids: &[String],
     ) {
         for asset_id in placeholder_ids {
-            let _ = self.core.cancel_generation_output_for_project(
+            if let Err(error) = self.core.cancel_generation_output_for_project(
                 project_epoch,
                 project_dir,
                 asset_id,
                 Some(now_apple_reference_seconds()),
-            );
+            ) {
+                eprintln!(
+                    "[generation] output {asset_id}: cancellation was not persisted: {error}"
+                );
+            }
         }
     }
 
@@ -1172,7 +1184,10 @@ impl TauriGenerationBridge {
             match job.status {
                 JobStatus::Queued => {}
                 JobStatus::Running => {
-                    let _ = self.core.update_generation_job_for_project(
+                    // Identical polls are no-ops in the core and progress-only
+                    // polls stay in memory, so this never rewrites the bundle.
+                    // A failure here does not end the job, but is not silent.
+                    if let Err(error) = self.core.update_generation_job_for_project(
                         project_epoch,
                         project_dir,
                         local_job_id,
@@ -1184,7 +1199,11 @@ impl TauriGenerationBridge {
                             cost_credits: None,
                             created_at: Some(now_apple_reference_seconds()),
                         },
-                    );
+                    ) {
+                        eprintln!(
+                            "[generation] job {local_job_id}: progress update failed: {error}"
+                        );
+                    }
                 }
                 JobStatus::Failed => return Err("GENERATION_PROVIDER_FAILED".to_string()),
                 JobStatus::Succeeded => {
@@ -2582,6 +2601,100 @@ mod tests {
                 .expected_path(&entry.id)
                 .is_some_and(|path| path.is_file())
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifty_running_polls_never_republish_the_bundle_before_ready() {
+        let (_temp, bundle, core) = saved_core();
+        let held = opentake_project::ProjectRoot::open(&bundle).unwrap();
+        let authority = core.project_asset_authority().unwrap();
+        let siblings = |bundle: &Path| {
+            let prefix = format!(".{}", bundle.file_name().unwrap().to_string_lossy());
+            let mut names = std::fs::read_dir(bundle.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(&prefix))
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let siblings_before = siblings(&bundle);
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockfal/flux-pro",
+            200,
+            json!({"request_id": "poll-1", "status": "IN_QUEUE"}),
+        );
+        let mut polls = vec![(200, json!({"status": "IN_PROGRESS"})); 50];
+        polls.push((200, json!({"status": "COMPLETED"})));
+        mock.on_sequence(
+            Method::Get,
+            "https://mockfal/flux-pro/requests/poll-1/status",
+            polls,
+        );
+        mock.on(
+            Method::Get,
+            "https://mockfal/flux-pro/requests/poll-1",
+            200,
+            json!({"images": [{"url": png_data_url()}]}),
+        );
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client(&mock),
+            }),
+        );
+
+        let submitted = bridge
+            .submit(
+                GenerationRequest::Image(GenerateImageArgs {
+                    cost_authorized: Some(true),
+                    prompt: "polled fixture".to_string(),
+                    model: Some("fal:flux-pro".to_string()),
+                    aspect_ratio: Some("1:1".to_string()),
+                    num_images: Some(1),
+                    ..Default::default()
+                }),
+                &MediaCancelToken::new(),
+            )
+            .unwrap();
+        let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
+
+        assert_eq!(ready.id, submitted.placeholder_asset_ids[0]);
+        let status_polls = mock
+            .calls()
+            .iter()
+            .filter(|call| call.url.ends_with("/requests/poll-1/status"))
+            .count();
+        assert!(status_polls >= 51, "{status_polls} status polls");
+        // Zero complete-bundle publications: the root keeps its identity and
+        // no stage/backup/journal sibling ever appeared.
+        assert_eq!(core.project_asset_authority().unwrap(), authority);
+        core.ensure_project_root_identity_for_project(
+            authority.project_epoch,
+            &bundle,
+            held.identity(),
+        )
+        .unwrap();
+        assert_eq!(siblings(&bundle), siblings_before);
+        // Queued, Generating (provider id), Downloading, Ready: the 50
+        // Running polls add no audit rows.
+        let persisted = Project::open(&bundle).unwrap();
+        assert_eq!(persisted.generation_log.unwrap().entries.len(), 4);
+        assert_eq!(
+            persisted
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.id == ready.id)
+                .and_then(|entry| entry.generation_input.as_ref())
+                .and_then(|input| input.status),
+            Some(GenerationJobStatus::Ready)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -216,3 +216,54 @@ it("retries_native_sync_instead_of_overwriting_a_concurrent_local_mutation", asy
     "/tmp/Added-During-Sync.opentake",
   );
 });
+
+it("never_persists_live_offline_or_pending_probe_state", async () => {
+  (window as Window & { __TAURI_INTERNALS__?: object }).__TAURI_INTERNALS__ = {};
+  const preview = { canvasWidth: 1080, canvasHeight: 1920, trackKinds: ["video"] };
+  useRecentStore.setState({
+    recents: [
+      { path: "/tmp/Slow.opentake", name: "Slow", openedAt: 2, preview },
+      { path: "/tmp/Cloud.opentake", name: "Cloud", openedAt: 1 },
+    ] as never,
+  });
+  mocks.homeProjectsSync.mockImplementationOnce(async () => [
+    {
+      path: "/tmp/Slow.opentake",
+      name: "Slow",
+      createdAt: 1,
+      openedAt: 2,
+      modifiedAt: 2,
+      thumbnailPath: null,
+      missing: false,
+      offline: false,
+      pending: true,
+    },
+    {
+      path: "/tmp/Cloud.opentake",
+      name: "Cloud",
+      createdAt: 1,
+      openedAt: 1,
+      modifiedAt: 1,
+      thumbnailPath: null,
+      missing: false,
+      offline: true,
+    },
+  ]);
+
+  await useRecentStore.getState().validateRecents();
+
+  const [slow, cloud] = useRecentStore.getState().recents;
+  expect(slow).toMatchObject({ pending: true, preview });
+  expect(cloud?.offline).toBe(true);
+  const stored = JSON.parse(localStorage.getItem("recentProjects") ?? "[]") as object[];
+  expect(stored).toHaveLength(2);
+  for (const entry of stored) {
+    expect(entry).not.toHaveProperty("offline");
+    expect(entry).not.toHaveProperty("pending");
+  }
+  expect(decodeRecentProjects(JSON.stringify([{
+    path: "/tmp/Legacy.opentake",
+    openedAt: 1,
+    offline: true,
+  }]))[0]?.offline).toBeUndefined();
+});

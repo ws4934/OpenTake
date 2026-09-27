@@ -29,6 +29,7 @@ const zh: Dict = {
   "project.createFailed": "创建失败：{error}",
   "project.openFailed": "打开失败：{error}",
   "project.saveFailed": "保存失败：{error}",
+  "project.unsavedBlocksSwitch": "当前工程的修改未能保存，已取消切换",
   "projectSettingsMismatch.title": "素材与项目设置不一致",
   "projectSettingsMismatch.description":
     "时间线还没有内容。你可以保留当前项目设置，或改为匹配第一个视频素材。",
@@ -1229,6 +1230,7 @@ const en: Dict = {
   "project.createFailed": "Create failed: {error}",
   "project.openFailed": "Open failed: {error}",
   "project.saveFailed": "Save failed: {error}",
+  "project.unsavedBlocksSwitch": "The current project's changes could not be saved, so it was kept open",
   "projectSettingsMismatch.title": "Media and project settings differ",
   "projectSettingsMismatch.description":
     "The timeline is still empty. Keep the current project settings or match the first video asset.",

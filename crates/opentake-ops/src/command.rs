@@ -1339,7 +1339,7 @@ pub fn apply(
             duration_frames,
             media_ref,
         } => freeze_frame(state, clip_id, at_frame, duration_frames, media_ref, ids),
-        EditCommand::TrimClips { edits } => trim(state, edits),
+        EditCommand::TrimClips { edits } => trim(state, edits, ids),
         EditCommand::SetClipSpeed {
             clip_ids,
             speed,
@@ -2060,14 +2060,9 @@ fn transact(
             return Err(error);
         }
     };
-    if let Err(error) = validate_timeline_frame_arithmetic(&state.timeline, "timeline") {
+    if let Err(error) = validate_edited_timeline(&mut state.timeline) {
         state.restore(before);
         return Err(error);
-    }
-    prune_invalid_transitions(&mut state.timeline);
-    if let Err(reason) = state.timeline.validate_nested_sequences() {
-        state.restore(before);
-        return Err(EditError::Invalid(reason));
     }
     let after = state.snapshot();
     let timeline_changed = before.timeline != after.timeline;
@@ -2085,6 +2080,15 @@ fn transact(
         affected,
         &summary,
     ))
+}
+
+/// One post-edit invariant boundary for normal and ripple transactions.
+fn validate_edited_timeline(timeline: &mut Timeline) -> Result<(), EditError> {
+    validate_timeline_frame_arithmetic(timeline, "timeline")?;
+    prune_invalid_transitions(timeline);
+    timeline
+        .validate_nested_sequences()
+        .map_err(EditError::Invalid)
 }
 
 /// Keep transition pair identity aligned with the actual cut graph after every
@@ -3892,7 +3896,11 @@ fn freeze_frame(
     )
 }
 
-fn trim(state: &mut EditorState, edits: Vec<TrimEdit>) -> Result<EditResult, EditError> {
+fn trim(
+    state: &mut EditorState,
+    edits: Vec<TrimEdit>,
+    ids: &dyn IdGen,
+) -> Result<EditResult, EditError> {
     if edits.is_empty() {
         return Err(EditError::Invalid("Missing or empty trim edits".into()));
     }
@@ -3901,19 +3909,17 @@ fn trim(state: &mut EditorState, edits: Vec<TrimEdit>) -> Result<EditResult, Edi
             return Err(EditError::Invalid(format!("Clip not found: {id}")));
         }
     }
-    let mut candidate = state.timeline.clone();
-    if !ops::trim_clips(&mut candidate, &edits) {
-        return Err(EditError::Invalid(
-            "trim edits produce invalid or overflowing frame arithmetic".into(),
-        ));
-    }
     let n = edits.len();
     transact(
         state,
         if n == 1 { "Trim Clip" } else { "Trim Clips" },
         move |_| format!("Trimmed {n} clip(s)"),
         move |st| {
-            st.timeline = candidate;
+            if !ops::trim_clips(&mut st.timeline, &edits, ids) {
+                return Err(EditError::Invalid(
+                    "trim edits produce invalid frame arithmetic or overlapping targets".into(),
+                ));
+            }
             Ok(edits.iter().map(|(id, _, _)| id.clone()).collect())
         },
     )
@@ -5899,7 +5905,7 @@ fn ripple_delete_ranges(
             Err(EditError::Refused(reason))
         }
         RippleOutcome::Ok(report) => {
-            if let Err(error) = validate_timeline_frame_arithmetic(&state.timeline, "timeline") {
+            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }
@@ -5956,7 +5962,7 @@ fn ripple_delete_clips(
             Err(EditError::Refused(reason))
         }
         Ok(()) => {
-            if let Err(error) = validate_timeline_frame_arithmetic(&state.timeline, "timeline") {
+            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }

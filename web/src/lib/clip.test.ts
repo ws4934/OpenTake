@@ -71,6 +71,7 @@ function timeline(tracks: Track[]): Timeline {
 
 function tc(
   over: Partial<{
+    startFrame: number;
     durationFrames: number;
     speed: number;
     trimStartFrame: number;
@@ -80,6 +81,7 @@ function tc(
   }> = {},
 ) {
   return {
+    startFrame: over.startFrame ?? 0,
     durationFrames: over.durationFrames ?? 100,
     speed: over.speed ?? 1,
     trimStartFrame: over.trimStartFrame ?? 0,
@@ -127,7 +129,7 @@ describe("clampTrimDeltaFrames", () => {
   });
   it("left: caps negative extend by available leading source (video)", () => {
     // trimStart 10, speed 1 → can extend left at most 10 timeline frames
-    expect(clampTrimDeltaFrames(tc({ trimStartFrame: 10 }), "left", -50)).toBe(-10);
+    expect(clampTrimDeltaFrames(tc({ startFrame: 100, trimStartFrame: 10 }), "left", -50)).toBe(-10);
   });
   it("right: caps negative delta so duration stays >=1", () => {
     expect(clampTrimDeltaFrames(tc({ durationFrames: 30 }), "right", -100)).toBe(-29);
@@ -136,11 +138,15 @@ describe("clampTrimDeltaFrames", () => {
     expect(clampTrimDeltaFrames(tc({ trimEndFrame: 8 }), "right", 50)).toBe(8);
   });
   it("reversed video swaps which source edge bounds each drag direction", () => {
-    expect(clampTrimDeltaFrames(tc({ reversed: true, trimEndFrame: 8 }), "left", -50)).toBe(-8);
+    expect(clampTrimDeltaFrames(tc({ startFrame: 100, reversed: true, trimEndFrame: 8 }), "left", -50)).toBe(-8);
     expect(clampTrimDeltaFrames(tc({ reversed: true, trimStartFrame: 6 }), "right", 50)).toBe(6);
   });
-  it("image/text left: no source floor on negative extend", () => {
-    expect(clampTrimDeltaFrames(tc({ trimStartFrame: 0, mediaType: "image" as ClipType }), "left", -50)).toBe(-50);
+  it("left extension cannot cross the timeline origin", () => {
+    for (const mediaType of ["image", "text", "video"] as ClipType[]) {
+      const clip = tc({ startFrame: 20, trimStartFrame: 100, mediaType });
+      expect(clampTrimDeltaFrames(clip, "left", -50)).toBe(-20);
+      expect(clampTrimDeltaFrames(clip, "left", -10)).toBe(-10);
+    }
   });
 });
 

@@ -18,6 +18,20 @@ build hosts.
 FFmpeg is distributed under GPL-compatible terms; OpenTake itself is
 GPL-3.0-or-later and packages its complete GPL license and this source notice.
 
+The Linux x86_64 assets in that release are John Van Sickle static builds of
+FFmpeg **7.0.2**, despite the release tag being `b6.1.1`. Their extracted-binary
+hashes and reported version are pinned separately in the lock.
+
+Tauri dev/build automatically provisions only the selected target (the Tauri
+hook target, explicit `--target`, or native Rust host). Cached binaries are
+verified again; missing or corrupt downloads fail the hook. Supported targets:
+macOS arm64/x86_64, Windows x86_64 MSVC, and Linux x86_64 GNU. Binaries stay in
+`src-tauri/binaries/` locally and are gitignored. Tauri `externalBin` packages
+the selected pair beside the application executable; development uses that
+pair or the target-named source binaries, never implicit host/PATH discovery.
+Debug-only `OPENTAKE_FFMPEG` / `OPENTAKE_FFPROBE` overrides remain available.
+
 FFmpeg source tags used by the locked target assets:
 https://github.com/FFmpeg/FFmpeg/tree/n7.0 and
-https://github.com/FFmpeg/FFmpeg/tree/n6.1.1
+https://github.com/FFmpeg/FFmpeg/tree/n6.1.1 and
+https://github.com/FFmpeg/FFmpeg/tree/n7.0.2

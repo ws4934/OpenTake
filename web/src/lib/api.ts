@@ -401,6 +401,8 @@ export interface HomeProjectEntry {
   preview?: HomeProjectPreview;
   missing: boolean;
   offline: boolean;
+  /** The native probe did not finish in time; availability is unknown. */
+  pending?: boolean;
 }
 
 export interface HomeProjectPreview {

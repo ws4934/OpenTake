@@ -26,6 +26,7 @@ export interface RecentProject {
   preview?: HomeProjectPreview;
   missing?: boolean;
   offline?: boolean;
+  pending?: boolean;
 }
 
 function finiteTimestamp(value: unknown): number | undefined {
@@ -107,7 +108,6 @@ export function decodeRecentProjects(raw: string | null): RecentProject[] {
         thumbnailPath,
         preview: decodeProjectPreview(source.preview),
         missing: source.missing === true,
-        offline: source.offline === true,
       });
     }
     return recents;
@@ -123,7 +123,10 @@ function load(): RecentProject[] {
 
 function persist(list: RecentProject[]) {
   if (typeof localStorage !== "undefined") {
-    localStorage.setItem(LS_RECENTS, JSON.stringify(list));
+    // Offline/pending are live probe results, not durable facts: a cached
+    // offline flag would keep a project unopenable after the next restart.
+    const durable = list.map(({ offline: _offline, pending: _pending, ...entry }) => entry);
+    localStorage.setItem(LS_RECENTS, JSON.stringify(durable));
   }
 }
 
@@ -266,7 +269,12 @@ export const useRecentStore = create<RecentState>((set, get) => ({
           // If the user changed the list while this request was in flight,
           // resynchronize the newest state instead of publishing stale data.
           if (snapshot.mutationRevision !== get().mutationRevision) continue;
-          const recents = native.slice(0, MAX_RECENTS);
+          const recents = native.slice(0, MAX_RECENTS).map((entry) => {
+            if (!entry.pending || entry.preview) return entry;
+            // A probe that timed out keeps the last known canvas preview.
+            const cached = snapshot.recents.find((recent) => recent.path === entry.path);
+            return cached?.preview ? { ...entry, preview: cached.preview } : entry;
+          });
           persist(recents);
           set({ recents, thumbnailPathsValidated: true });
           return;
