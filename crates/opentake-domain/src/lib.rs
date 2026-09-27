@@ -26,6 +26,7 @@ pub mod clip;
 pub mod clip_type;
 mod clip_wire;
 pub mod grade;
+pub mod inpaint;
 pub mod keyframe;
 pub mod lut;
 pub mod media;
@@ -53,6 +54,7 @@ pub use grade::{
     EffectParameterDescriptor, EffectValidationError, HslSecondary, LiftGammaGain, Mask, MaskShape,
     MaskTransform, Point2, Rgb, MAX_EFFECTS_PER_CLIP, MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
 };
+pub use inpaint::{InpaintPlan, InpaintPlanError};
 pub use keyframe::{
     smoothstep, split_keyframe_track, AnimPair, AnimatableProperty, Interpolation, Keyframe,
     KeyframeInterpolatable, KeyframeTrack,

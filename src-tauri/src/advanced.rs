@@ -1,6 +1,5 @@
 //! Production desktop implementations for capability-gated advanced workflows.
 
-use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3408,7 +3407,17 @@ fn materialize_object_removal_video(
     };
     let width = first.frame.width;
     let height = first.frame.height;
-    validate_removal_mask(mask, width, height)?;
+    let inpaint =
+        match opentake_domain::InpaintPlan::prepare(mask, width, height, || cancel.checkpoint())
+            .map_err(inpaint_error)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                stream.request_stop();
+                let _ = stream.join();
+                return Err(error);
+            }
+        };
     let partial_path = cache_dir.join(format!(
         ".object-removal-{}.partial.mov",
         uuid::Uuid::new_v4()
@@ -3430,7 +3439,7 @@ fn materialize_object_removal_video(
             clip,
             removal_start,
             removal_end,
-            mask,
+            &inpaint,
             &mut encoder,
             cancel,
         )?;
@@ -3451,7 +3460,7 @@ fn materialize_object_removal_video(
                 clip,
                 removal_start,
                 removal_end,
-                mask,
+                &inpaint,
                 &mut encoder,
                 cancel,
             )?;
@@ -3504,35 +3513,6 @@ fn materialize_object_removal_video(
     Ok(())
 }
 
-fn validate_removal_mask(
-    mask: &Mask,
-    width: u32,
-    height: u32,
-) -> Result<(), AdvancedWorkflowError> {
-    let mut selected = 0_usize;
-    for y in 0..height {
-        for x in 0..width {
-            let coverage = mask.coverage(
-                (f64::from(x) + 0.5) / f64::from(width),
-                (f64::from(y) + 0.5) / f64::from(height),
-            );
-            selected += usize::from(coverage > 0.001);
-        }
-    }
-    let pixels = width as usize * height as usize;
-    if selected == 0 {
-        return Err(advanced_invalid(
-            "the selected mask does not cover any source pixels",
-        ));
-    }
-    if selected == pixels {
-        return Err(advanced_invalid(
-            "the selected mask covers the entire frame; object removal needs surrounding pixels",
-        ));
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn encode_object_removal_frame(
     mut frame: RgbaFrame,
@@ -3540,129 +3520,46 @@ fn encode_object_removal_frame(
     clip: &opentake_domain::Clip,
     removal_start: i32,
     removal_end: i32,
-    mask: &Mask,
+    inpaint: &opentake_domain::InpaintPlan,
     encoder: &mut VideoEncoder,
     cancel: &MediaCancelToken,
 ) -> Result<(), AdvancedWorkflowError> {
     let project_frame = clip.start_frame + output_index;
     if (removal_start..removal_end).contains(&project_frame) {
-        inpaint_masked_region(&mut frame, mask, cancel)?;
+        inpaint_masked_region(&mut frame, inpaint, cancel)?;
     }
     encoder.push_frame(&frame).map_err(media_workflow_error)
 }
 
+fn inpaint_error(error: opentake_domain::InpaintPlanError) -> AdvancedWorkflowError {
+    use opentake_domain::InpaintPlanError;
+    match error {
+        InpaintPlanError::Cancelled => cancelled_workflow("object removal cancelled"),
+        InpaintPlanError::EmptyMask => {
+            advanced_invalid("the selected mask does not cover any source pixels")
+        }
+        InpaintPlanError::FullMask => advanced_invalid(
+            "the selected mask covers the entire frame; object removal needs surrounding pixels",
+        ),
+        InpaintPlanError::TooLarge => {
+            advanced_invalid("object-removal frame dimensions are too large")
+        }
+        InpaintPlanError::Unfillable => {
+            advanced_execution("object-removal mask could not be filled from its boundary")
+        }
+        InpaintPlanError::DimensionsChanged => {
+            advanced_execution("object-removal source dimensions changed during decode")
+        }
+    }
+}
+
 fn inpaint_masked_region(
     frame: &mut RgbaFrame,
-    mask: &Mask,
+    plan: &opentake_domain::InpaintPlan,
     cancel: &MediaCancelToken,
 ) -> Result<(), AdvancedWorkflowError> {
-    validate_removal_mask(mask, frame.width, frame.height)?;
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let pixels = width * height;
-    let mut coverage = Vec::with_capacity(pixels);
-    let mut known = Vec::with_capacity(pixels);
-    for y in 0..height {
-        if y % 32 == 0 && cancel.checkpoint() {
-            return Err(cancelled_workflow("object removal cancelled"));
-        }
-        for x in 0..width {
-            let value = mask.coverage(
-                (x as f64 + 0.5) / width as f64,
-                (y as f64 + 0.5) / height as f64,
-            );
-            coverage.push(value);
-            known.push(value <= 0.001);
-        }
-    }
-    let original = frame.rgba.clone();
-    let mut filled = frame.rgba.clone();
-    let mut queued = vec![false; pixels];
-    let mut queue = VecDeque::new();
-    for index in 0..pixels {
-        if !known[index] && has_known_neighbour(index, width, height, &known) {
-            queue.push_back(index);
-            queued[index] = true;
-        }
-    }
-    let mut processed = 0_usize;
-    while let Some(index) = queue.pop_front() {
-        if processed.is_multiple_of(4096) && cancel.checkpoint() {
-            return Err(cancelled_workflow("object removal cancelled"));
-        }
-        let mut sums = [0_u32; 3];
-        let mut count = 0_u32;
-        for neighbour in neighbours(index, width, height).into_iter().flatten() {
-            if known[neighbour] {
-                let offset = neighbour * 4;
-                sums[0] += u32::from(filled[offset]);
-                sums[1] += u32::from(filled[offset + 1]);
-                sums[2] += u32::from(filled[offset + 2]);
-                count += 1;
-            }
-        }
-        if count == 0 {
-            continue;
-        }
-        let offset = index * 4;
-        for channel in 0..3 {
-            filled[offset + channel] = (sums[channel] / count) as u8;
-        }
-        known[index] = true;
-        processed += 1;
-        for neighbour in neighbours(index, width, height).into_iter().flatten() {
-            if !known[neighbour] && !queued[neighbour] {
-                queue.push_back(neighbour);
-                queued[neighbour] = true;
-            }
-        }
-    }
-    if known.iter().any(|value| !value) {
-        return Err(advanced_execution(
-            "object-removal mask could not be filled from its boundary",
-        ));
-    }
-    for (index, alpha) in coverage.into_iter().enumerate() {
-        if alpha <= 0.0 {
-            continue;
-        }
-        let offset = index * 4;
-        for channel in 0..3 {
-            frame.rgba[offset + channel] = (f64::from(original[offset + channel]) * (1.0 - alpha)
-                + f64::from(filled[offset + channel]) * alpha)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
-    }
-    Ok(())
-}
-
-fn has_known_neighbour(index: usize, width: usize, height: usize, known: &[bool]) -> bool {
-    neighbours(index, width, height)
-        .into_iter()
-        .flatten()
-        .any(|neighbour| known[neighbour])
-}
-
-fn neighbours(index: usize, width: usize, height: usize) -> [Option<usize>; 8] {
-    let x = index % width;
-    let y = index / width;
-    let mut result = [None; 8];
-    let mut cursor = 0;
-    for dy in -1_i32..=1 {
-        for dx in -1_i32..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx >= 0 && ny >= 0 && nx < width as i32 && ny < height as i32 {
-                result[cursor] = Some(ny as usize * width + nx as usize);
-                cursor += 1;
-            }
-        }
-    }
-    result
+    plan.apply(&mut frame.rgba, || cancel.checkpoint())
+        .map_err(inpaint_error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4096,7 +3993,10 @@ mod tests {
             ..Mask::default()
         };
 
-        inpaint_masked_region(&mut frame, &mask, &MediaCancelToken::new()).unwrap();
+        let cancel = MediaCancelToken::new();
+        let plan =
+            opentake_domain::InpaintPlan::prepare(&mask, 16, 12, || cancel.checkpoint()).unwrap();
+        inpaint_masked_region(&mut frame, &plan, &cancel).unwrap();
 
         let center = (6 * 16 + 8) * 4;
         assert!(frame.rgba[center] < 80);
