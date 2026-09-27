@@ -42,6 +42,7 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,14 +54,17 @@ use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
 use opentake_domain::{AudioDenoise, Clip, ClipType, LutReference, MediaSource, TextStyle};
+use opentake_media::decode::spawn_video_stream;
 #[cfg(test)]
 use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
-    decode_frame_at, extract_pcm, extract_pcm_cancellable_with_progress, interpolate_frame_pair,
-    source_frame_pair, ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
+    decode_frame_at, decode_frame_at_cancellable, extract_pcm,
+    extract_pcm_cancellable_with_progress, interpolate_frame_pair, source_frame_pair,
+    ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
     FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer,
-    PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
+    PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder,
+    VideoStream, VideoStreamRequest,
 };
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::compositor::{
@@ -70,9 +74,9 @@ use opentake_render::gpu::compositor::{
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::{
     export_render_size, source_frame_index, try_build_render_plan, AudioClipPlan, Compositor,
-    CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, GpuLutTexture,
-    GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest, TextRasterizer,
-    TextureCache, TextureResolver, TextureSource,
+    CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, FramePlan,
+    GpuLutTexture, GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest,
+    TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
@@ -528,14 +532,178 @@ struct MediaResolver<'d> {
     lottie: &'d mut LottieMaterializer,
     content_hashes: &'d mut ContentHashCache,
     media: &'d HashMap<String, MediaInfo>,
-    timeline_fps: i32,
     text: &'d HashMap<String, TextInfo>,
     text_rasterizer: &'d CosmicTextRasterizer,
     /// Decode/raster box for source frames (matches the export render size).
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
+    video_frames: &'d HashMap<String, RgbaFrame>,
     materialization_error: Option<String>,
+}
+
+struct ExportClipStream {
+    stream: Option<VideoStream>,
+    last: Option<StreamVideoFrame>,
+    last_target: i64,
+    reversed: bool,
+}
+
+/// One forward decoder per visible clip. A clip whose source frame moves
+/// backwards stays on cancellable random access until it leaves the frame.
+/// The encoder thread owns this state; no GPU resource crosses threads.
+#[derive(Default)]
+struct ExportVideoStreams {
+    clips: HashMap<String, ExportClipStream>,
+    #[cfg(test)]
+    spawned_streams: usize,
+}
+
+impl Drop for ExportVideoStreams {
+    fn drop(&mut self) {
+        for (_, mut state) in self.clips.drain() {
+            if let Some(stream) = state.stream.take() {
+                let _ = stream.join();
+            }
+        }
+    }
+}
+
+impl ExportVideoStreams {
+    fn prepare(
+        &mut self,
+        plan: &FramePlan<'_>,
+        media: &HashMap<String, MediaInfo>,
+        fps: i32,
+        render_box: (u32, u32),
+        cancel: &MediaCancelToken,
+    ) -> Result<HashMap<String, RgbaFrame>, String> {
+        let visible: HashSet<&str> = plan.draws.iter().map(|draw| draw.clip_id).collect();
+        let departed = self
+            .clips
+            .keys()
+            .filter(|clip_id| !visible.contains(clip_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for clip_id in departed {
+            if let Some(mut state) = self.clips.remove(&clip_id) {
+                if let Some(stream) = state.stream.take() {
+                    let _ = stream.join();
+                }
+            }
+        }
+
+        let mut frames = HashMap::new();
+        for draw in &plan.draws {
+            let TextureSource::Decoded { media_ref } = draw.source else {
+                continue;
+            };
+            let info = media
+                .get(media_ref)
+                .ok_or_else(|| format!("export video source {media_ref} is unavailable"))?;
+            let target = draw.source_frame;
+            if target < 0 {
+                return Err(format!(
+                    "export video source {media_ref} has negative frame {target}"
+                ));
+            }
+            if !self.clips.contains_key(draw.clip_id) {
+                let mut request = VideoStreamRequest::new(info.path.clone(), fps);
+                request.start_frame = target;
+                request.max_size = render_box;
+                let stream = spawn_video_stream(request).map_err(|error| {
+                    format!("export video {media_ref} stream init failed: {error}")
+                })?;
+                #[cfg(test)]
+                {
+                    self.spawned_streams += 1;
+                }
+                self.clips.insert(
+                    draw.clip_id.to_owned(),
+                    ExportClipStream {
+                        stream: Some(stream),
+                        last: None,
+                        last_target: target,
+                        reversed: false,
+                    },
+                );
+            }
+            let state = self
+                .clips
+                .get_mut(draw.clip_id)
+                .expect("stream was installed");
+            if target < state.last_target {
+                if let Some(stream) = state.stream.take() {
+                    let _ = stream.join();
+                }
+                state.reversed = true;
+            }
+            state.last_target = target;
+            if state.reversed {
+                let (_, frame) = decode_frame_at_cancellable(
+                    &info.path,
+                    &FrameRequest {
+                        time_secs: project_frame_time_secs(target, fps),
+                        max_size: render_box,
+                        apply_rotation: true,
+                    },
+                    cancel,
+                )
+                .map_err(|error| {
+                    format!("export reversed video {media_ref} frame {target}: {error}")
+                })?;
+                state.last = Some(StreamVideoFrame {
+                    source_frame: target,
+                    pts_secs: project_frame_time_secs(target, fps),
+                    frame,
+                });
+            } else if state
+                .last
+                .as_ref()
+                .is_none_or(|frame| frame.source_frame != target)
+            {
+                let stream = state.stream.as_ref().expect("forward clip has a decoder");
+                loop {
+                    if cancel.is_cancelled() {
+                        stream.request_stop();
+                        return Err(CANCELLED_SENTINEL.to_string());
+                    }
+                    match stream.receiver().recv_timeout(Duration::from_millis(25)) {
+                        Ok(Ok(frame)) if frame.source_frame < target => continue,
+                        Ok(Ok(frame)) if frame.source_frame == target => {
+                            state.last = Some(frame);
+                            break;
+                        }
+                        Ok(Ok(frame)) => {
+                            return Err(format!(
+                                "export video {media_ref} skipped source frame {target} (next {})",
+                                frame.source_frame
+                            ));
+                        }
+                        Ok(Err(error)) => {
+                            return Err(format!("export video {media_ref} stream failed: {error}"));
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(format!(
+                                "export video {media_ref} ended before frame {target}"
+                            ));
+                        }
+                    }
+                }
+            }
+            frames.insert(
+                format!("v:{media_ref}:{target}"),
+                state
+                    .last
+                    .as_ref()
+                    .expect("frame was decoded")
+                    .frame
+                    .clone(),
+            );
+        }
+        Ok(frames)
+    }
 }
 
 impl MediaResolver<'_> {
@@ -720,14 +888,25 @@ impl TextureResolver for MediaResolver<'_> {
             return Some(tex);
         }
 
-        let time_secs = if is_image {
-            0.0
-        } else {
-            project_frame_time_secs(source_frame, self.timeline_fps)
-        };
+        if !is_image {
+            let Some(frame) = self.video_frames.get(&key) else {
+                return self.fail_materialization(format!(
+                    "video source {media_ref} frame {source_frame} was not prepared"
+                ));
+            };
+            let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba.clone(), false);
+            let tex = upload_rgba(
+                self.device,
+                self.queue,
+                &decoded,
+                false,
+                Some("export-stream"),
+            );
+            return Some(self.cache.insert(key, tex));
+        }
 
         let req = FrameRequest {
-            time_secs,
+            time_secs: 0.0,
             max_size: self.render_box,
             apply_rotation: true,
         };
@@ -1871,6 +2050,11 @@ pub(crate) fn run_export_with_control(
     let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
     let mut lottie = LottieMaterializer::new();
     let mut content_hashes = ContentHashCache::new();
+    let mut video_streams = ExportVideoStreams::default();
+    let video_cancel = control
+        .map(ExportControl::media_cancel_token)
+        .or_else(|| external_cancel.clone())
+        .unwrap_or_default();
     for f in start_frame..end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
@@ -1888,6 +2072,13 @@ pub(crate) fn run_export_with_control(
 
         let mut frame_plan = plan.frame(timeline, f);
         frame_plan.clear_rgba = export_clear_rgba(req.codec);
+        let video_frames = video_streams.prepare(
+            &frame_plan,
+            &media,
+            plan.fps,
+            (render_size.width, render_size.height),
+            &video_cancel,
+        )?;
         let mut resolver = MediaResolver {
             device: &dev.device,
             queue: &dev.queue,
@@ -1895,12 +2086,12 @@ pub(crate) fn run_export_with_control(
             lottie: &mut lottie,
             content_hashes: &mut content_hashes,
             media: &media,
-            timeline_fps: plan.fps,
             text: &text,
             text_rasterizer: &text_rasterizer,
             render_box: (render_size.width, render_size.height),
             project_root: project_root.as_ref(),
             lut_cache: &mut lut_cache,
+            video_frames: &video_frames,
             materialization_error: None,
         };
         let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
@@ -3122,6 +3313,118 @@ fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequential_export_decodes_300_frames_with_one_stream_per_clip() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("long-gop.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=30",
+                "-frames:v",
+                "300",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "250",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .expect("native export qualification requires pinned ffmpeg");
+        assert!(status.success(), "long GOP fixture must encode");
+
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        timeline.width = 64;
+        timeline.height = 64;
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("first", "video-source", 0, 300));
+        timeline.tracks.push(track);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::from([("video-source".to_string(), (64, 64))]),
+        };
+        let media = HashMap::from([(
+            "video-source".to_string(),
+            MediaInfo {
+                path: source.clone(),
+                source_fps: Some(30.0),
+            },
+        )]);
+        let render_size = opentake_render::RenderSize::new(64, 64);
+        let plan = try_build_render_plan(&timeline, render_size, &metrics).unwrap();
+        let cancel = MediaCancelToken::new();
+        let mut streams = ExportVideoStreams::default();
+        for frame in 0..300 {
+            let prepared = streams
+                .prepare(&plan.frame(&timeline, frame), &media, 30, (64, 64), &cancel)
+                .unwrap_or_else(|error| panic!("frame {frame}: {error}"));
+            let video = &prepared[&format!("v:video-source:{frame}")];
+            if matches!(frame, 0 | 149 | 299) {
+                let (_, direct) = decode_frame_at(
+                    &source,
+                    &FrameRequest {
+                        time_secs: f64::from(frame) / 30.0,
+                        max_size: (64, 64),
+                        apply_rotation: true,
+                    },
+                )
+                .unwrap();
+                assert_eq!((video.width, video.height), (direct.width, direct.height));
+                let squared_error = video
+                    .rgba
+                    .iter()
+                    .zip(&direct.rgba)
+                    .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                    .sum::<f64>()
+                    / video.rgba.len() as f64;
+                assert!(
+                    squared_error < 0.65,
+                    "frame {frame} diverged: mse={squared_error}"
+                );
+            }
+        }
+        assert_eq!(streams.spawned_streams, 1, "one decoder per visible clip");
+
+        timeline.tracks.push({
+            let mut track = opentake_domain::Track::new("overlay", ClipType::Video);
+            track.clips.push(Clip::new("second", "video-source", 0, 30));
+            track
+        });
+        let dual = try_build_render_plan(&timeline, render_size, &metrics).unwrap();
+        let mut streams = ExportVideoStreams::default();
+        for frame in 0..30 {
+            streams
+                .prepare(&dual.frame(&timeline, frame), &media, 30, (64, 64), &cancel)
+                .unwrap();
+        }
+        assert_eq!(
+            streams.spawned_streams, 2,
+            "two clips keep independent decoders"
+        );
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        match streams.prepare(&dual.frame(&timeline, 30), &media, 30, (64, 64), &cancel) {
+            Err(error) => assert_eq!(error, CANCELLED_SENTINEL),
+            Ok(_) => panic!("cancelled export advanced the video stream"),
+        }
+        drop(streams); // joins both FFmpeg workers before the assertion
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "cancellation must reap all decoders promptly"
+        );
+    }
 
     #[test]
     fn owned_export_lease_preserves_cancellation_across_worker_handoff() {
