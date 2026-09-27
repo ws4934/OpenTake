@@ -26,12 +26,12 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{Manager, State};
 
 use opentake_core::{AppCore, EditCommand, ProjectRevision};
 use opentake_domain::{ClipType, LutReference, MediaSource, TextStyle, Timeline};
@@ -50,8 +50,8 @@ use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::wgpu;
 use opentake_render::{
     even, try_build_render_plan, Compositor, CosmicTextRasterizer, DecodedFrame, FramePlan,
-    GpuLutTexture, GpuTexture, LayerDraw, RenderDevice, RenderPlan, RenderSize, SourceMetrics,
-    TextRasterRequest, TextRasterizer, TextureCache, TextureResolver, TextureSource,
+    GpuLutTexture, GpuTexture, LayerDraw, RenderDevice, RenderError, RenderPlan, RenderSize,
+    SourceMetrics, TextRasterRequest, TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
 
 /// Cap (longest canvas side, px) for a composite when the caller passes no
@@ -111,6 +111,7 @@ pub(crate) struct TimelineResultPng {
 /// keyed per source-frame so adjacent scrub positions reuse nothing, but a small
 /// cache still helps repeated seeks to the same frame.
 const TEXTURE_CACHE_CAP: usize = 64;
+const LUT_CACHE_CAP: usize = 16;
 
 /// The composited frame handed back to the WebView.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -147,11 +148,13 @@ struct GpuContext {
     /// Text rasterizer (system fonts discovered once on first composite).
     text_rasterizer: CosmicTextRasterizer,
     /// Vector pipelines are discarded when the GPU context is rebuilt, so they
-    /// never cross a device-loss boundary. Rc texture caches remain local to a
+    /// never cross a device-loss boundary. Rc image caches remain local to a
     /// composite call because Tauri managed state must be Send + Sync.
     lottie: LottieMaterializer,
     /// Image content hashes, revalidated by file identity on every lookup.
     content_hashes: ContentHashCache,
+    /// Immutable content-addressed LUTs survive seek requests on this device.
+    lut_cache: HashMap<String, Arc<GpuLutTexture>>,
 }
 
 /// Tauri managed state holding the (lazily created) GPU context. `None` until the
@@ -160,6 +163,8 @@ struct GpuContext {
 pub struct RenderState {
     ctx: Mutex<Option<GpuContext>>,
     preview: PreviewCompositeCoordinator,
+    #[cfg(test)]
+    gpu_acquisitions: AtomicU64,
 }
 
 impl RenderState {
@@ -168,6 +173,8 @@ impl RenderState {
         Self {
             ctx: Mutex::new(None),
             preview: PreviewCompositeCoordinator::default(),
+            #[cfg(test)]
+            gpu_acquisitions: AtomicU64::new(0),
         }
     }
 }
@@ -182,6 +189,7 @@ impl Default for RenderState {
 struct ActivePreviewComposite {
     seek_generation: u64,
     cancel: MediaCancelToken,
+    cancelled: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -217,6 +225,7 @@ impl PreviewCompositeCoordinator {
         if !same_revision || session_generation > state.session_generation {
             if let Some(active) = state.active.take() {
                 active.cancel.cancel();
+                let _ = active.cancelled.send(true);
             }
             state.revision = Some(revision);
             state.session_id = session_id.to_string();
@@ -232,7 +241,7 @@ impl PreviewCompositeCoordinator {
         session_id: &str,
         session_generation: u64,
         seek_generation: u64,
-    ) -> Result<MediaCancelToken, String> {
+    ) -> Result<(MediaCancelToken, tokio::sync::watch::Receiver<bool>), String> {
         let mut state = self
             .0
             .lock()
@@ -243,13 +252,16 @@ impl PreviewCompositeCoordinator {
         }
         if let Some(active) = state.active.take() {
             active.cancel.cancel();
+            let _ = active.cancelled.send(true);
         }
         let cancel = MediaCancelToken::new();
+        let (cancelled, receiver) = tokio::sync::watch::channel(false);
         state.active = Some(ActivePreviewComposite {
             seek_generation,
             cancel: cancel.clone(),
+            cancelled,
         });
-        Ok(cancel)
+        Ok((cancel, receiver))
     }
 
     fn cancel_before(
@@ -284,6 +296,7 @@ impl PreviewCompositeCoordinator {
         {
             if let Some(active) = state.active.take() {
                 active.cancel.cancel();
+                let _ = active.cancelled.send(true);
             }
         }
     }
@@ -827,7 +840,7 @@ struct MediaResolver<'d> {
     preview_box: (u32, u32),
     cancel: &'d MediaCancelToken,
     project_root: Option<&'d ProjectRoot>,
-    lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
+    lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
     materialization_error: Option<String>,
     strict_materialization: bool,
 }
@@ -1086,7 +1099,7 @@ impl TextureResolver for MediaResolver<'_> {
     fn resolve_lut(
         &mut self,
         reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, opentake_render::RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, opentake_render::RenderError> {
         if let Some(cached) = self.lut_cache.get(&reference.id) {
             return Ok(Some(cached.clone()));
         }
@@ -1098,6 +1111,9 @@ impl TextureResolver for MediaResolver<'_> {
             "preview-lut",
         )?;
         if let Some(texture) = &resolved {
+            if self.lut_cache.len() >= LUT_CACHE_CAP {
+                self.lut_cache.clear();
+            }
             self.lut_cache.insert(reference.id.clone(), texture.clone());
         }
         Ok(resolved)
@@ -1332,11 +1348,14 @@ fn composite_empty_timeline_canvas(
         .map_err(|_| "render state lock poisoned".to_string())?;
     if guard.is_none() {
         let dev = RenderDevice::try_new().map_err(|error| format!("no GPU device: {error}"))?;
+        #[cfg(test)]
+        render.gpu_acquisitions.fetch_add(1, Ordering::Relaxed);
         *guard = Some(GpuContext {
             compositor: Compositor::new(&dev.device),
             text_rasterizer: CosmicTextRasterizer::new(),
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
+            lut_cache: HashMap::new(),
             device: dev.device,
             queue: dev.queue,
         });
@@ -1616,6 +1635,8 @@ fn composite_timeline_frame_with_authority(
         .map_err(|_| "render state lock poisoned".to_string())?;
     if guard.is_none() {
         let dev = RenderDevice::try_new().map_err(|e| format!("no GPU device: {e}"))?;
+        #[cfg(test)]
+        render.gpu_acquisitions.fetch_add(1, Ordering::Relaxed);
         let compositor = Compositor::new(&dev.device);
         let text_rasterizer = CosmicTextRasterizer::new();
         if !text_rasterizer.has_fonts() {
@@ -1628,12 +1649,12 @@ fn composite_timeline_frame_with_authority(
             text_rasterizer,
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
+            lut_cache: HashMap::new(),
         });
     }
-    let result = {
+    let (result, device_failed) = {
         let ctx = guard.as_mut().expect("ctx set above");
         let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
-        let mut lut_cache = HashMap::new();
         let mut resolver = MediaResolver {
             device: &ctx.device,
             queue: &ctx.queue,
@@ -1647,31 +1668,32 @@ fn composite_timeline_frame_with_authority(
             preview_box: (render_size.width, render_size.height),
             cancel,
             project_root: project_root.as_ref(),
-            lut_cache: &mut lut_cache,
+            lut_cache: &mut ctx.lut_cache,
             materialization_error: None,
             strict_materialization,
         };
         let interpolation = timeline_interpolation_config(plan.fps)?;
-        let composite = ctx
-            .compositor
-            .render_to_rgba_with_interpolation(
-                &ctx.device,
-                &ctx.queue,
-                render_size,
-                &frame_plan,
-                &mut resolver,
-                interpolation,
-            )
-            .map_err(|e| format!("composite render failed: {e}"));
-        match resolver.materialization_error.take() {
+        let composite = ctx.compositor.render_to_rgba_with_interpolation(
+            &ctx.device,
+            &ctx.queue,
+            render_size,
+            &frame_plan,
+            &mut resolver,
+            interpolation,
+        );
+        let device_failed = matches!(
+            composite,
+            Err(RenderError::Readback(_) | RenderError::DeviceRequest(_))
+        );
+        let result = match resolver.materialization_error.take() {
             Some(error) => Err(format!("layer materialization failed: {error}")),
-            None => composite,
-        }
+            None => composite.map_err(|error| format!("composite render failed: {error}")),
+        };
+        (result, device_failed)
     };
-    if result.is_err() {
-        // A wgpu device loss or validation failure invalidates every pipeline
-        // and parsed-document renderer bound to this context. The next preview
-        // request reacquires a fresh device and starts with empty caches.
+    if device_failed {
+        // Source/LUT/validation errors belong to this frame; only GPU readback
+        // and device errors make the cached context unusable.
         guard.take();
     }
     result
@@ -1716,11 +1738,13 @@ fn composite_rgba(
     )
 }
 
-/// `composite_frame`: render the timeline at `frame` to a PNG data URL.
+/// `composite_frame`: render the timeline at `frame` on a blocking worker.
+/// A replacement seek wakes the awaiting command even while a decoder is busy.
 ///
 /// `max_size` caps the longest side (px); omit it for the default preview cap.
 #[tauri::command]
-pub fn composite_frame(
+pub async fn composite_frame(
+    app: tauri::AppHandle,
     core: State<'_, AppCore>,
     render: State<'_, RenderState>,
     request: CompositeFrameRequest,
@@ -1733,23 +1757,43 @@ pub fn composite_frame(
     if core.project_revision() != revision {
         return Err("preview composite revision was superseded".to_string());
     }
-    let cancel = render.preview.begin(
+    let (cancel, mut cancelled) = render.preview.begin(
         revision,
         &request.session_id,
         request.session_generation,
         request.seek_generation,
     )?;
+    let core = core.inner().clone();
+    let mut work = tauri::async_runtime::spawn_blocking(move || {
+        let render = app.state::<RenderState>();
+        composite_frame_blocking(&core, &render, request, max_size, revision, &cancel)
+    });
+    tokio::select! {
+        result = &mut work => result.map_err(|error| format!("preview composite worker failed: {error}"))?,
+        _ = cancelled.changed() => Err("preview composite was superseded".to_string()),
+    }
+}
+
+fn composite_frame_blocking(
+    core: &AppCore,
+    render: &RenderState,
+    request: CompositeFrameRequest,
+    max_size: Option<u32>,
+    revision: ProjectRevision,
+    cancel: &MediaCancelToken,
+) -> Result<CompositeFrameDto, String> {
+    if cancel.is_cancelled() || core.project_revision() != revision {
+        return Err("preview composite was superseded".to_string());
+    }
     let preview_cap = max_size.unwrap_or(DEFAULT_PREVIEW_CAP);
     let composite = match request.source_media_id.as_deref() {
-        Some(media_id) => {
-            decode_source_frame(&core, media_id, request.frame, preview_cap, &cancel)?
-        }
+        Some(media_id) => decode_source_frame(core, media_id, request.frame, preview_cap, cancel)?,
         None => composite_rgba(
-            &core,
-            &render,
+            core,
+            render,
             request.frame,
             preview_cap,
-            &cancel,
+            cancel,
             request.sequence_id.as_deref(),
         )?,
     };
@@ -1827,28 +1871,38 @@ pub fn cancel_composite_frame(
 /// composite). Both then import identically.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri injects shared render/media/update state
-pub fn capture_frame_to_media(
+pub async fn capture_frame_to_media(
+    app: tauri::AppHandle,
     core: State<'_, AppCore>,
-    render: State<'_, RenderState>,
-    media: State<'_, crate::media::MediaState>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     frame: i32,
     name_base: String,
     folder_id: Option<String>,
     source_media_id: Option<String>,
 ) -> Result<crate::media::MediaListDto, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    capture_frame_to_media_impl(&core, || {
-        capture_frame_to_media_workflow(
-            &core,
-            &render,
-            media.engine(),
-            frame,
-            &name_base,
-            folder_id,
-            source_media_id.as_deref(),
-        )
+    let activity = crate::updater::begin_mutating_activity(&admission)?;
+    // Check before queuing the expensive capture as well as inside the worker.
+    core.ensure_project_mutable()
+        .map_err(|error| error.to_string())?;
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let render = app.state::<RenderState>();
+        let media = app.state::<crate::media::MediaState>();
+        capture_frame_to_media_impl(&core, || {
+            capture_frame_to_media_workflow(
+                &core,
+                &render,
+                media.engine(),
+                frame,
+                &name_base,
+                folder_id,
+                source_media_id.as_deref(),
+            )
+        })
     })
+    .await
+    .map_err(|error| format!("capture frame worker failed: {error}"))?
 }
 
 fn capture_frame_to_media_impl(
@@ -2154,19 +2208,45 @@ mod tests {
             project_epoch: 3,
             version: 7,
         };
-        let old = coordinator
+        let (old, mut old_cancelled) = coordinator
             .begin(revision, "idle-session", 1, 0)
             .expect("initial request accepted");
 
         coordinator.cancel_before(revision, "idle-session", 1, 1);
         assert!(old.is_cancelled());
+        assert!(old_cancelled.has_changed().unwrap());
+        assert!(*old_cancelled.borrow_and_update());
 
-        let current = coordinator
+        let (current, current_cancelled) = coordinator
             .begin(revision, "idle-session", 1, 1)
             .expect("request at the cancel floor accepted");
         coordinator.cancel_before(revision, "idle-session", 1, 1);
         assert!(!current.is_cancelled());
+        assert!(!current_cancelled.has_changed().unwrap());
         assert!(coordinator.is_current(revision, "idle-session", 1, 1));
+    }
+
+    #[tokio::test]
+    async fn preview_cancellation_returns_while_blocking_work_is_occupied() {
+        let coordinator = PreviewCompositeCoordinator::default();
+        let revision = ProjectRevision {
+            project_epoch: 9,
+            version: 2,
+        };
+        let (_, mut cancelled) = coordinator.begin(revision, "slow-seek", 1, 4).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let slow = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        ready.await.unwrap();
+        let start = std::time::Instant::now();
+        coordinator.cancel_before(revision, "slow-seek", 1, 5);
+        tokio::select! {
+            _ = slow => panic!("stale preview waited for blocking render"),
+            result = cancelled.changed() => result.unwrap(),
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
     }
 
     #[test]
@@ -2313,6 +2393,10 @@ mod tests {
     #[test]
     fn preview_composite_rejects_missing_image_instead_of_returning_a_black_frame() {
         if RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
             return;
         }
         let tmp = tempfile::tempdir().expect("missing image fixture");
@@ -2350,17 +2434,99 @@ mod tests {
             cached_remote_url_expires_at: None,
         });
 
+        let render = RenderState::new();
         let error = composite_timeline_frame(
             &timeline,
             &manifest,
             &None,
-            &RenderState::new(),
+            &render,
             0,
             32,
             &MediaCancelToken::new(),
         )
         .expect_err("missing preview media must not become a successful black frame");
         assert!(error.contains("image source missing-image"), "{error}");
+        assert!(render.ctx.lock().unwrap().is_some());
+        assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
+        let empty = Timeline {
+            tracks: Vec::new(),
+            ..timeline
+        };
+        composite_timeline_frame(
+            &empty,
+            &MediaManifest::new(),
+            &None,
+            &render,
+            0,
+            32,
+            &MediaCancelToken::new(),
+        )
+        .expect("the next frame still renders on the same device");
+        assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_still_frames_reuse_managed_lut_without_rereading_it() {
+        if RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("LutPreview.opentake");
+        opentake_project::Project::new(&bundle).save().unwrap();
+        let mut bytes = b"LUT_3D_SIZE 17\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n".to_vec();
+        for _ in 0..17_usize.pow(3) {
+            bytes.extend_from_slice(b"0 0 0\n");
+        }
+        let id = Sha256::digest(&bytes)
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let reference = LutReference::new(id.clone(), "Preview LUT", 1.0).unwrap();
+        ProjectRoot::open(&bundle)
+            .unwrap()
+            .write_lut_atomic(&format!("{id}.cube"), &bytes)
+            .unwrap();
+
+        let mut timeline = Timeline {
+            width: 64,
+            height: 64,
+            fps: 30,
+            ..Timeline::new()
+        };
+        let mut text = Clip::new("text", "", 0, 1);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = Some("LUT".into());
+        text.text_style = Some(TextStyle::default());
+        text.lut = Some(reference.clone());
+        let mut track = Track::new("text", ClipType::Text);
+        track.clips.push(text);
+        timeline.tracks.push(track);
+        let render = RenderState::new();
+        let project_dir = Some(bundle.clone());
+        let composite = || {
+            composite_timeline_frame(
+                &timeline,
+                &MediaManifest::new(),
+                &project_dir,
+                &render,
+                0,
+                64,
+                &MediaCancelToken::new(),
+            )
+        };
+        composite().expect("first preview resolves the managed LUT");
+        assert_eq!(
+            render.ctx.lock().unwrap().as_ref().unwrap().lut_cache.len(),
+            1
+        );
+        fs::remove_file(bundle.join(reference.relative_path())).unwrap();
+        composite().expect("second preview reuses the already validated LUT");
+        assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
     }
 
     #[test]
