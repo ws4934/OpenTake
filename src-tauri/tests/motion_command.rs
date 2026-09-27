@@ -290,6 +290,7 @@ fn sandbox_progress_cancel_validated_mp4_result() {
             &opentake_media::MediaCancelToken::new(),
         )
         .unwrap();
+    assert_eq!(edited.output.output_file, "output.mp4");
     assert_eq!(edited.clip_id, added.clip_id);
     assert_ne!(edited.asset_id, added.asset_id);
     assert_eq!(core.media().entries.len(), 2);
@@ -437,4 +438,51 @@ fn transparent_motion_publishes_prores_alpha_and_marks_manifest() {
     assert!(alpha.status.success(), "decode alpha: {:?}", alpha.stderr);
     assert!(alpha.stdout.contains(&0));
     assert!(alpha.stdout.iter().any(|value| *value > 0 && *value < 255));
+
+    let edited = bridge
+        .edit(
+            EditMotionRequest {
+                clip_id: added.clip_id,
+                code: None,
+                params: Some(
+                    serde_json::from_value(serde_json::json!({"title": "Edited"})).unwrap(),
+                ),
+            },
+            &opentake_media::MediaCancelToken::new(),
+        )
+        .expect("edit transparent motion");
+    assert_eq!(edited.output.output_file, "output.mov");
+    let snapshot = core.runtime_snapshot();
+    let entry = snapshot
+        .media
+        .entries
+        .iter()
+        .find(|entry| entry.id == edited.asset_id)
+        .expect("edited transparent motion manifest entry");
+    assert!(entry.carries_straight_alpha());
+    let path = MediaResolver::new(&snapshot.media, snapshot.project_dir.as_deref())
+        .expected_path(&entry.id)
+        .unwrap();
+    assert_eq!(
+        opentake_media::probe(&path).unwrap().video_codec.as_deref(),
+        Some("prores")
+    );
+    let alpha = std::process::Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+        .args([
+            "-v",
+            "error",
+            "-i",
+            path.to_str().expect("UTF-8 edited output path"),
+            "-vf",
+            "alphaextract",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "pipe:1",
+        ])
+        .output()
+        .expect("decode edited transparent motion alpha");
+    assert!(alpha.status.success(), "decode alpha: {:?}", alpha.stderr);
+    assert!(alpha.stdout.contains(&0));
 }

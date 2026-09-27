@@ -1380,6 +1380,10 @@ fn timeline_duration_frames(
     Ok(rounded)
 }
 
+fn edit_motion_transparency(recorded: Option<bool>, carries_straight_alpha: bool) -> bool {
+    recorded.unwrap_or(carries_straight_alpha)
+}
+
 impl MotionBridge for TauriMotionBridge {
     fn can_render_motion(&self) -> bool {
         HeadlessChromiumRenderer::find_browser().is_some()
@@ -1529,7 +1533,10 @@ impl MotionBridge for TauriMotionBridge {
                 document_source: None,
                 expected_authority: None,
                 duration_frames: clip.duration_frames,
-                transparent: false,
+                transparent: edit_motion_transparency(
+                    provenance.transparent,
+                    entry.carries_straight_alpha(),
+                ),
                 render_dimensions: None,
                 placement: MotionPlacement::Replace {
                     clip_id: request.clip_id,
@@ -1825,6 +1832,14 @@ fn io_motion_error(error: std::io::Error) -> MotionBridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_edit_preserves_recorded_transparency() {
+        assert!(edit_motion_transparency(Some(true), false));
+        assert!(!edit_motion_transparency(Some(false), false));
+        assert!(edit_motion_transparency(None, true));
+        assert!(!edit_motion_transparency(None, false));
+    }
 
     fn saved_document() -> (
         tempfile::TempDir,
