@@ -245,6 +245,29 @@ it("cloud_only_project_is_accessible_but_cannot_open_or_mount_its_thumbnail", as
   expect(mocks.openProjectPath).not.toHaveBeenCalled();
 });
 
+it("pending_project_whose_probe_timed_out_still_opens", async () => {
+  useRecentStore.setState({
+    recents: [{
+      path: "/tmp/Slow.opentake",
+      name: "Slow",
+      openedAt: 1,
+      thumbnailPath: null,
+      missing: false,
+      offline: false,
+      pending: true,
+    }],
+    thumbnailPathsValidated: true,
+  });
+  await act(async () => root.render(<HomeView />));
+
+  const card = container.querySelector<HTMLButtonElement>('button[aria-label="Slow"]');
+  expect(card).not.toBeNull();
+  expect(container.textContent).not.toContain("home.fileOffline");
+  await act(async () => card?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+
+  expect(mocks.openProjectPath).toHaveBeenCalledWith("/tmp/Slow.opentake");
+});
+
 it("revalidates_an_offline_project_when_the_window_regains_focus", async () => {
   const validateRecents = vi
     .fn()

@@ -6,10 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex, OnceLock,
-};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{ambient_authority, DirExt};
@@ -37,16 +34,29 @@ struct ProjectBundleIdentity {
     file: u64,
 }
 
+/// Per-project single-flight: a probe stuck on a hung volume keeps only its own
+/// path busy (reported as pending) and frees it when the blocking call returns.
 struct HomeProbeCoordinator {
-    gate: tokio::sync::Mutex<()>,
-    circuit_open: AtomicBool,
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl HomeProbeCoordinator {
     fn new() -> Self {
         Self {
-            gate: tokio::sync::Mutex::new(()),
-            circuit_open: AtomicBool::new(false),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+struct InFlightProbe {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for InFlightProbe {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&self.key);
         }
     }
 }
@@ -85,6 +95,8 @@ pub struct HomeProjectEntry {
     preview: Option<HomeProjectPreview>,
     missing: bool,
     offline: bool,
+    /// The probe did not finish in time; availability is unknown, not offline.
+    pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -394,6 +406,7 @@ fn home_entry(
         preview: None,
         missing,
         offline,
+        pending: false,
     }
 }
 
@@ -404,8 +417,14 @@ fn read_project_preview(bundle: &Path) -> Option<HomeProjectPreview> {
     if !metadata.is_file() || metadata.len() > MAX_PROJECT_PREVIEW_BYTES {
         return None;
     }
+    parse_project_preview(file.take(MAX_PROJECT_PREVIEW_BYTES + 1))
+}
+
+fn parse_project_preview(reader: impl Read) -> Option<HomeProjectPreview> {
+    // serde_json reads byte-by-byte from an unbuffered reader (one syscall per
+    // byte on a raw File), so the buffer is what keeps large projects fast.
     let wire: HomeProjectPreviewWire =
-        serde_json::from_reader(file.take(MAX_PROJECT_PREVIEW_BYTES + 1)).ok()?;
+        serde_json::from_reader(std::io::BufReader::with_capacity(64 * 1024, reader)).ok()?;
     let (Some(canvas_width), Some(canvas_height), Some(track_kinds)) =
         (wire.width, wire.height, wire.track_kinds)
     else {
@@ -429,11 +448,10 @@ fn stored_modified_at(entry: &ProjectEntry) -> u64 {
     }
 }
 
-fn fail_closed_entries(entries: &[ProjectEntry]) -> Vec<HomeProjectEntry> {
-    entries
-        .iter()
-        .map(|entry| home_entry(entry, stored_modified_at(entry), None, false, true))
-        .collect()
+fn pending_entry(entry: &ProjectEntry) -> HomeProjectEntry {
+    let mut result = home_entry(entry, stored_modified_at(entry), None, false, false);
+    result.pending = true;
+    result
 }
 
 fn probe_project_entry(
@@ -517,6 +535,7 @@ fn valid_home_thumbnail(path: &Path) -> bool {
     })
 }
 
+#[cfg(test)]
 fn probe_project_entries_with(
     entries: Vec<ProjectEntry>,
     mut authorize_thumbnail: impl FnMut(&Path) -> bool,
@@ -545,33 +564,53 @@ async fn probe_project_entries_bounded<F>(
     probe: F,
 ) -> Vec<HomeProjectEntry>
 where
-    F: FnOnce(Vec<ProjectEntry>) -> Vec<HomeProjectEntry> + Send + 'static,
+    F: Fn(&ProjectEntry) -> HomeProjectEntry + Send + Sync + 'static,
 {
-    let fail_closed = fail_closed_entries(&entries);
-    if entries.is_empty() || coordinator.circuit_open.load(Ordering::Acquire) {
-        return fail_closed;
-    }
-    let Ok(_singleflight) = coordinator.gate.try_lock() else {
-        return fail_closed;
-    };
-    if coordinator.circuit_open.load(Ordering::Acquire) {
-        return fail_closed;
-    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let probe = Arc::new(probe);
+    let tasks = entries
+        .iter()
+        .map(|entry| {
+            let key = path_identity_key(&entry.path);
+            let claimed = coordinator
+                .in_flight
+                .lock()
+                .map(|mut in_flight| in_flight.insert(key.clone()))
+                .unwrap_or(false);
+            claimed.then(|| {
+                let guard = InFlightProbe {
+                    in_flight: Arc::clone(&coordinator.in_flight),
+                    key,
+                };
+                let probe = Arc::clone(&probe);
+                let entry = entry.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _guard = guard;
+                    probe(&entry)
+                })
+            })
+        })
+        .collect::<Vec<_>>();
 
-    let task = tauri::async_runtime::spawn_blocking(move || probe(entries));
-    match tokio::time::timeout(timeout, task).await {
-        Ok(Ok(snapshot)) => snapshot,
-        Ok(Err(error)) => {
-            coordinator.circuit_open.store(true, Ordering::Release);
-            eprintln!("[home] recent-project probe crashed; validation disabled: {error}");
-            fail_closed
-        }
-        Err(_) => {
-            coordinator.circuit_open.store(true, Ordering::Release);
-            eprintln!("[home] recent-project probe timed out; validation disabled");
-            fail_closed
-        }
+    let mut results = Vec::with_capacity(entries.len());
+    for (entry, task) in entries.iter().zip(tasks) {
+        let Some(task) = task else {
+            results.push(pending_entry(entry));
+            continue;
+        };
+        results.push(match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                eprintln!("[home] recent-project probe crashed: {error}");
+                home_entry(entry, stored_modified_at(entry), None, false, true)
+            }
+            Err(_) => {
+                eprintln!("[home] recent-project probe timed out; reporting it as pending");
+                pending_entry(entry)
+            }
+        });
     }
+    results
 }
 
 fn validated_project_path(path: &Path) -> Result<PathBuf, String> {
@@ -1174,8 +1213,8 @@ pub async fn home_projects_sync(
         home_probe_coordinator(),
         registry_entries,
         HOME_PROBE_TIMEOUT,
-        move |entries| {
-            probe_project_entries_with(entries, |thumbnail| {
+        move |entry| {
+            probe_project_entry(entry, &mut |thumbnail| {
                 authorize_home_thumbnail(&scope, thumbnail)
             })
         },
@@ -1824,79 +1863,175 @@ mod tests {
         assert!(!same_path(&target, &alias));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hung_probe_is_singleflight_times_out_and_opens_the_circuit() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering as AtomicOrdering},
-            mpsc, Arc,
-        };
+    fn large_project_json(target_bytes: usize) -> Vec<u8> {
+        let clip = r#"{"id":"00000000-0000-0000-0000-000000000000","mediaRef":"media","startFrame":0,"durationFrames":30,"keyframes":[{"frame":0,"value":1.0}]}"#;
+        let mut clips = String::with_capacity(target_bytes + clip.len());
+        while clips.len() < target_bytes {
+            if !clips.is_empty() {
+                clips.push(',');
+            }
+            clips.push_str(clip);
+        }
+        format!(
+            r#"{{"width":1920,"height":1080,"tracks":[{{"type":"video","clips":[{clips}]}},{{"type":"audio","clips":[]}}]}}"#
+        )
+        .into_bytes()
+    }
 
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("Hung.opentake");
-        let entries = vec![ProjectEntry {
-            id: "hung".into(),
-            path: path.clone(),
+    fn preview_test_entry(path: PathBuf, id: &str) -> ProjectEntry {
+        ProjectEntry {
+            id: id.into(),
+            path,
             created_at: 1,
             last_opened_at: 2,
             modified_at: 3,
-            thumbnail_path: Some(path.join("thumbnail.jpg")),
+            thumbnail_path: None,
             bundle_identity: None,
-        }];
-        let coordinator = Arc::new(HomeProbeCoordinator::new());
-        let probes = Arc::new(AtomicUsize::new(0));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let first_coordinator = Arc::clone(&coordinator);
-        let first_entries = entries.clone();
-        let first_probes = Arc::clone(&probes);
-        let first = tokio::spawn(async move {
-            probe_project_entries_bounded(
-                &first_coordinator,
-                first_entries,
-                Duration::from_millis(50),
-                move |entries| {
-                    first_probes.fetch_add(1, AtomicOrdering::SeqCst);
-                    let _ = started_tx.send(());
-                    let _ = release_rx.recv();
-                    fail_closed_entries(&entries)
-                },
-            )
-            .await
-        });
-        started_rx.await.unwrap();
+        }
+    }
 
-        let concurrent_probes = Arc::clone(&probes);
-        let concurrent = probe_project_entries_bounded(
-            &coordinator,
-            entries.clone(),
-            Duration::from_millis(50),
-            move |entries| {
-                concurrent_probes.fetch_add(1, AtomicOrdering::SeqCst);
-                fail_closed_entries(&entries)
-            },
-        )
-        .await;
-        assert!(concurrent[0].offline);
-        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+    #[test]
+    fn project_preview_parse_buffers_reads_of_large_projects() {
+        struct CountingReader<R> {
+            inner: R,
+            reads: usize,
+        }
+        impl<R: Read> Read for CountingReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buffer)
+            }
+        }
 
-        let timed_out = first.await.unwrap();
-        assert!(timed_out[0].offline);
-        assert!(REGISTRY_LOCK.try_lock().is_ok());
+        let json = large_project_json(16 * 1024 * 1024);
+        let mut reader = CountingReader {
+            inner: std::io::Cursor::new(json.as_slice()),
+            reads: 0,
+        };
+        let preview = parse_project_preview(&mut reader).unwrap();
 
-        let after_timeout_probes = Arc::clone(&probes);
-        let after_timeout = probe_project_entries_bounded(
-            &coordinator,
+        assert_eq!((preview.canvas_width, preview.canvas_height), (1920, 1080));
+        assert_eq!(
+            preview.track_kinds,
+            vec![
+                opentake_domain::ClipType::Video,
+                opentake_domain::ClipType::Audio
+            ]
+        );
+        // Unbuffered parsing issues one read per byte (~16.7M reads).
+        assert!(
+            reader.reads <= json.len() / (64 * 1024) + 2,
+            "{} reads for {} bytes",
+            reader.reads,
+            json.len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn twelve_four_megabyte_projects_probe_within_the_home_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let json = large_project_json(4 * 1024 * 1024);
+        let entries = (0..MAX_RECENT_PROJECTS)
+            .map(|index| {
+                let project = directory.path().join(format!("Large{index}.opentake"));
+                fs::create_dir(&project).unwrap();
+                fs::write(project.join("project.json"), &json).unwrap();
+                preview_test_entry(project, &format!("large-{index}"))
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = probe_project_entries_bounded(
+            &HomeProbeCoordinator::new(),
             entries,
-            Duration::from_millis(50),
-            move |entries| {
-                after_timeout_probes.fetch_add(1, AtomicOrdering::SeqCst);
-                fail_closed_entries(&entries)
-            },
+            HOME_PROBE_TIMEOUT,
+            |entry| probe_project_entry(entry, &mut |_| false),
         )
         .await;
-        assert!(after_timeout[0].offline);
-        assert_eq!(probes.load(AtomicOrdering::SeqCst), 1);
+
+        assert_eq!(snapshot.len(), MAX_RECENT_PROJECTS);
+        for entry in snapshot {
+            assert!(
+                !entry.offline && !entry.pending && !entry.missing,
+                "{entry:?}"
+            );
+            assert_eq!(entry.preview.unwrap().canvas_width, 1920);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hung_probe_only_blocks_its_own_entry_and_recovers_after_release() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            mpsc,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let hung_path = directory.path().join("Hung.opentake");
+        let ready_path = directory.path().join("Ready.opentake");
+        for project in [&hung_path, &ready_path] {
+            fs::create_dir(project).unwrap();
+            fs::write(
+                project.join("project.json"),
+                br#"{"width":1280,"height":720,"tracks":[{"type":"video"}]}"#,
+            )
+            .unwrap();
+        }
+        let entries = vec![
+            preview_test_entry(hung_path.clone(), "hung"),
+            preview_test_entry(ready_path, "ready"),
+        ];
+        let coordinator = HomeProbeCoordinator::new();
+        let hung_probes = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let probe = {
+            let hung_probes = Arc::clone(&hung_probes);
+            let hung_path = hung_path.clone();
+            move |entry: &ProjectEntry| {
+                if entry.path == hung_path {
+                    hung_probes.fetch_add(1, AtomicOrdering::SeqCst);
+                    let receiver = release_rx.lock().unwrap().take();
+                    if let Some(receiver) = receiver {
+                        let _ = receiver.recv();
+                    }
+                }
+                probe_project_entry(entry, &mut |_| false)
+            }
+        };
+        let probe = Arc::new(probe);
+        let run = |probe: Arc<dyn Fn(&ProjectEntry) -> HomeProjectEntry + Send + Sync>| {
+            probe_project_entries_bounded(
+                &coordinator,
+                entries.clone(),
+                Duration::from_millis(200),
+                move |entry| probe(entry),
+            )
+        };
+
+        let first = run(probe.clone()).await;
+        assert!(first[0].pending && !first[0].offline);
+        assert!(!first[1].pending && !first[1].offline);
+        assert_eq!(first[1].preview.as_ref().unwrap().canvas_width, 1280);
+
+        // While the first probe is still stuck, a new sync must not stack a
+        // second blocking probe on the same path, but the other entry is live.
+        let concurrent = run(probe.clone()).await;
+        assert!(concurrent[0].pending);
+        assert!(!concurrent[1].pending && !concurrent[1].offline);
+        assert_eq!(hung_probes.load(AtomicOrdering::SeqCst), 1);
+
         release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !coordinator.in_flight.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let recovered = run(probe).await;
+        assert_eq!(hung_probes.load(AtomicOrdering::SeqCst), 2);
+        assert!(!recovered[0].pending && !recovered[0].offline);
+        assert_eq!(recovered[0].preview.as_ref().unwrap().canvas_height, 720);
+        assert!(REGISTRY_LOCK.try_lock().is_ok());
     }
 
     #[test]
