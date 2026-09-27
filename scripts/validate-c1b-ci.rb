@@ -153,8 +153,8 @@ module C1bCiValidator
 
     events = document["on"] || document[true]
     raise "missing on mapping" unless events.is_a?(Hash)
-    raise "push must be independently bound to main" unless events.dig("push", "branches") == ["main"]
-    raise "pull_request trigger missing" unless events.key?("pull_request")
+    raise "push must be bound to release tags only" unless events["push"] == { "tags" => ["v*"] }
+    raise "pull_request belongs to pr.yml, not the full CI" if events.key?("pull_request")
 
     inputs = events.dig("workflow_dispatch", "inputs")
     raise "workflow_dispatch inputs missing" unless inputs.is_a?(Hash)

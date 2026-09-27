@@ -1,9 +1,11 @@
 name: CI
 
+# Full verification (Windows product/bundle, Windows security, safe-filesystem
+# matrix). Pull requests use the lightweight pr.yml; this runs for release tags
+# and manual dispatch only.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       commit_sha:
