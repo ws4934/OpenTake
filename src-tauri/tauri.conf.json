@@ -64,6 +64,7 @@
         "scope": {
           "allow": [
             "$APPCACHE/**/*",
+            "$APPDATA/Projects/**/*",
             "$APPDATA/OpenTake/Library/**/*",
             "$RESOURCE/**/*"
           ],

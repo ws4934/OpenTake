@@ -63,7 +63,7 @@ const srv = vi.hoisted(() => {
       };
     }),
     projectSave: vi.fn(async (path: string | null) => path ?? ""),
-    sampleProjectMaterialize: vi.fn(async () => "/tmp/cache/quick-tutorial/Tutorial.opentake"),
+    sampleProjectMaterialize: vi.fn(async () => "/tmp/data/Projects/quick-tutorial-copy/Tutorial.opentake"),
     getMedia: vi.fn(async () => media),
     openDialog: vi.fn(async () => undefined),
     save: vi.fn(async (..._args: unknown[]): Promise<string | null> => "/tmp/fresh.opentake"),
@@ -495,7 +495,7 @@ describe("openSampleProject", () => {
       timeline: srv.timeline,
       projectEpoch: 8,
       version: 2,
-      projectPath: "/tmp/cache/quick-tutorial/Tutorial.opentake",
+      projectPath: "/tmp/data/Projects/quick-tutorial-copy/Tutorial.opentake",
       compatibilityReadOnly: false,
       compatibilityBlockers: [],
     }));
@@ -507,14 +507,16 @@ describe("openSampleProject", () => {
     useI18nStore.setState({ locale: "en" });
   });
 
-  it("opens a completed tutorial sample without registering its cache path", async () => {
+  it("opens a durable tutorial copy and registers it in recent projects", async () => {
     await openSampleProject("quick-tutorial", true);
 
     expect(srv.sampleProjectMaterialize).toHaveBeenCalledWith("quick-tutorial");
     expect(srv.projectOpen).toHaveBeenCalledWith(
-      "/tmp/cache/quick-tutorial/Tutorial.opentake",
+      "/tmp/data/Projects/quick-tutorial-copy/Tutorial.opentake",
     );
-    expect(useRecentStore.getState().recents.map(({ name }) => name)).toEqual(["User"]);
+    expect(useRecentStore.getState().recents.map(({ name }) => name)).toEqual(["Tutorial", "User"]);
+    expect(useProjectStore.getState().projectPath).not.toContain("/cache/");
+    expect(useRecentStore.getState().recents[0].path).toBe(useProjectStore.getState().projectPath);
     expect(useEditorUiStore.getState().view).toBe("editor");
     expect(useEditorUiStore.getState().toast?.message).toContain("Tutorial project opened");
   });
@@ -949,6 +951,39 @@ describe("project boundaries save the current project first", () => {
     expect(srv.projectSave.mock.invocationCallOrder[0]).toBeLessThan(
       srv.sampleProjectMaterialize.mock.invocationCallOrder[0],
     );
+  });
+
+  it("saves edits made during sample download before opening the new copy", async () => {
+    srv.sampleProjectMaterialize.mockImplementationOnce(async () => {
+      useProjectStore.setState({ timelineVersion: 8 });
+      return "/tmp/data/Projects/quick-tutorial-copy/Tutorial.opentake";
+    });
+
+    await openSampleProject("quick-tutorial", false);
+
+    expect(srv.projectSave).toHaveBeenCalledTimes(2);
+    expect(srv.projectSave.mock.invocationCallOrder[1]).toBeGreaterThan(
+      srv.sampleProjectMaterialize.mock.invocationCallOrder[0],
+    );
+    expect(srv.projectSave.mock.invocationCallOrder[1]).toBeLessThan(
+      srv.projectOpen.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the current project if edits made during sample download cannot be saved", async () => {
+    srv.sampleProjectMaterialize.mockImplementationOnce(async () => {
+      useProjectStore.setState({ timelineVersion: 8 });
+      return "/tmp/data/Projects/quick-tutorial-copy/Tutorial.opentake";
+    });
+    srv.projectSave.mockResolvedValueOnce("/tmp/current.opentake");
+    srv.projectSave.mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(openSampleProject("quick-tutorial", false)).rejects.toThrow("当前工程的修改未能保存");
+
+    expect(srv.projectOpen).not.toHaveBeenCalled();
+    expect(useProjectStore.getState().projectPath).toBe("/tmp/current.opentake");
+    expect(useProjectStore.getState().timelineVersion).toBe(8);
+    expect(useProjectStore.getState().lastSavedVersion).toBe(7);
   });
 
   it.each(Object.keys(openers) as Array<keyof typeof openers>)(

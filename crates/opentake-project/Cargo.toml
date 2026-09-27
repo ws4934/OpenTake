@@ -36,4 +36,7 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
+# Exercise the desktop sample service without building Tauri, media or GPU crates.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tempfile = "3"
 serde_json = { workspace = true }
