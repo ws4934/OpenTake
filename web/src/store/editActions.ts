@@ -167,6 +167,126 @@ const ROOT_SCOPED_EDIT_REQUEST_TYPES = new Set<EditRequest["type"]>([
   "setTimelineSettings",
 ]);
 
+/** Absolute-value setters: re-sending one against the refreshed document
+ *  applies exactly what the user asked for, so a stale rejection retries once.
+ *  Everything else was planned from the stale view and is reported instead. */
+const STALE_RETRYABLE_EDIT_REQUEST_TYPES = new Set<EditRequest["type"]>([
+  "setClipProperties",
+  "setMasks",
+  "setColorGrade",
+  "setLut",
+  "setChromaKey",
+  "setEffects",
+  "setTransition",
+  "setTrackProps",
+  "setKeyframeInterpolation",
+  "setLoudnessNormalization",
+  "setAudioDenoise",
+  "setTimelineSettings",
+]);
+
+// Every edit runs through one FIFO queue. An item reads the edit identity when
+// it executes (not when its gesture fired), after the mirror has caught up with
+// the previous item's committed version, so rapid gestures (repeated undo,
+// nudges, drags) all apply instead of racing each other into StaleProject.
+let editQueue: Promise<unknown> = Promise.resolve();
+let lastCommittedEdit: { projectEpoch: number; timelineVersion: number } | null = null;
+
+function enqueueEdit<T>(run: () => Promise<T>): Promise<T> {
+  const { projectEpoch, projectPath } = useProjectStore.getState();
+  const task = editQueue.then(async () => {
+    await catchUpMirrorToLastEdit();
+    const current = useProjectStore.getState();
+    // Never deliver an edit queued in one project to its replacement.
+    if (current.projectEpoch !== projectEpoch || current.projectPath !== projectPath) {
+      throw new Error("the project changed before the queued edit ran");
+    }
+    return run();
+  });
+  editQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function catchUpMirrorToLastEdit(): Promise<void> {
+  const last = lastCommittedEdit;
+  const mirror = useProjectStore.getState();
+  if (
+    !last ||
+    mirror.projectEpoch !== last.projectEpoch ||
+    mirror.timelineVersion >= last.timelineVersion
+  ) {
+    return;
+  }
+  // Tauri publishes the previous edit through the async `timeline_changed`
+  // refresh; fetch it now rather than send the next edit with its old version.
+  await forceRefresh().catch(() => undefined);
+}
+
+/** `TauriCommandError` code for an edit whose identity is behind core. */
+function isStaleProjectError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "staleProject"
+  );
+}
+
+/** Send one edit with the current identity (or a caller-pinned one). Any
+ *  StaleProject rejection resyncs the mirror, so a missed or failed event
+ *  refresh cannot leave every later edit rejected. */
+async function commitEdit(
+  send: (expected: ProjectEditIdentity) => Promise<EditResult>,
+  options: { expected?: ProjectEditIdentity; retryOnStale: boolean },
+): Promise<EditResult> {
+  let expected = options.expected ?? captureProjectEditIdentity();
+  let res: EditResult;
+  try {
+    res = await send(expected);
+  } catch (error) {
+    if (!isStaleProjectError(error)) throw error;
+    try {
+      await forceRefresh();
+    } catch {
+      throw error;
+    }
+    const fresh = captureProjectEditIdentity();
+    if (
+      options.expected ||
+      !options.retryOnStale ||
+      fresh.projectEpoch !== expected.projectEpoch ||
+      fresh.projectPath !== expected.projectPath
+    ) {
+      throw error;
+    }
+    expected = fresh;
+    res = await send(expected);
+  }
+  if (res.changed) {
+    lastCommittedEdit = {
+      projectEpoch: expected.projectEpoch,
+      timelineVersion: res.timelineVersion,
+    };
+  }
+  // Tauri pushes timeline_changed -> sync re-fetches. The browser fallback has
+  // no event channel, so refresh explicitly there.
+  if (!isTauri && res.changed) await forceRefresh();
+  return res;
+}
+
+function scopedEditRequest(
+  cmd: EditRequest,
+  options: { root?: boolean; sequenceId?: string | null },
+): EditRequest {
+  const sequenceId =
+    options.sequenceId === undefined
+      ? useEditorUiStore.getState().activeNestedSequenceId
+      : options.sequenceId;
+  const targetsRoot = options.root || ROOT_SCOPED_EDIT_REQUEST_TYPES.has(cmd.type);
+  return sequenceId && !targetsRoot
+    ? ({ type: "editNestedSequence", sequenceId, command: cmd } as const)
+    : cmd;
+}
+
 async function applyAndRefresh(
   cmd: Parameters<typeof api.editApply>[0],
   options: {
@@ -175,21 +295,23 @@ async function applyAndRefresh(
     sequenceId?: string | null;
   } = {},
 ) {
-  const expected = options.expected ?? captureProjectEditIdentity();
-  const sequenceId =
-    options.sequenceId === undefined
-      ? useEditorUiStore.getState().activeNestedSequenceId
-      : options.sequenceId;
-  const targetsRoot = options.root || ROOT_SCOPED_EDIT_REQUEST_TYPES.has(cmd.type);
-  const request =
-    sequenceId && !targetsRoot
-      ? ({ type: "editNestedSequence", sequenceId, command: cmd } as const)
-      : cmd;
-  const res = await api.editApply(request, expected);
-  // Tauri pushes timeline_changed -> sync re-fetches. The browser fallback has
-  // no event channel, so refresh explicitly there.
-  if (!isTauri && res.changed) await forceRefresh();
-  return res;
+  // The editor scope is the one the gesture saw; the identity is read later.
+  const request = scopedEditRequest(cmd, options);
+  return enqueueEdit(() =>
+    commitEdit((expected) => api.editApply(request, expected), {
+      expected: options.expected,
+      retryOnStale: STALE_RETRYABLE_EDIT_REQUEST_TYPES.has(cmd.type),
+    }),
+  );
+}
+
+/** Error exit for fire-and-forget edit gestures (keyboard, menus, drag
+ *  commits): a rejected edit becomes a toast, never an unhandled rejection. */
+export function runTimelineEdit(operation: Promise<unknown>): void {
+  void operation.catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    useEditorUiStore.getState().pushToast(t("edit.failed", { error: message }));
+  });
 }
 
 /** Capture the complete authority token at gesture time. Rust rechecks all
@@ -734,13 +856,15 @@ export async function tightenSilenceRanges(trackIndex: number, ranges: FrameRang
   await rippleDeleteRanges(trackIndex, ranges);
 }
 
+// Undo/redo act on core history, not on the mirror's view, so re-sending one
+// after a stale rejection still does exactly what the user asked for.
 export async function undo() {
-  await api.undo(captureProjectEditIdentity());
+  await enqueueEdit(() => commitEdit(api.undo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }
 
 export async function redo() {
-  await api.redo(captureProjectEditIdentity());
+  await enqueueEdit(() => commitEdit(api.redo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }
 
@@ -998,15 +1122,20 @@ export async function rippleDeleteSelectedGap(): Promise<boolean> {
  *  expanded to full link groups, then routed through `moveClips`). No-op when
  *  nothing is selected or the floored delta is zero. */
 export async function nudgeSelectedClips(deltaFrames: number) {
-  const ui = useEditorUiStore.getState();
-  if (ui.selectedClipIds.size === 0) return;
-  const timeline = currentTimeline();
-  // Linked partners travel together (the backend moveClips does NOT auto-expand
-  // link groups — the drag path expands them too).
-  const expanded = expandLinkGroup(timeline, ui.selectedClipIds);
-  const moves = planNudge(timeline, expanded, deltaFrames);
-  if (moves.length === 0) return;
-  await moveClips(moves);
+  if (useEditorUiStore.getState().selectedClipIds.size === 0) return;
+  // Plan inside the edit queue: a repeated nudge must start from the positions
+  // the previous nudge committed, not from the mirror its keypress saw.
+  await enqueueEdit(async () => {
+    const ui = useEditorUiStore.getState();
+    const timeline = currentTimeline();
+    // Linked partners travel together (the backend moveClips does NOT auto-expand
+    // link groups — the drag path expands them too).
+    const expanded = expandLinkGroup(timeline, ui.selectedClipIds);
+    const moves = planNudge(timeline, expanded, deltaFrames);
+    if (moves.length === 0) return;
+    const request = scopedEditRequest({ type: "moveClips", moves }, {});
+    await commitEdit((expected) => api.editApply(request, expected), { retryOnStale: false });
+  });
 }
 
 // MARK: - Media -> timeline (drag and drop)

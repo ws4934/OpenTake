@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import { useEditorUiStore } from "../store/uiStore";
 import { useUpdateStore } from "../store/updateStore";
+import * as edit from "../store/editActions";
 import {
   DOCUMENTED_SHORTCUT_ROWS,
   handleAgentPanelKeyDown,
@@ -441,5 +442,49 @@ describe("Agent panel shortcut", () => {
         },
       ),
     ).toBe(false);
+  });
+});
+
+describe("keyboard edit failures", () => {
+  it("toasts a rejected ⌘Z instead of leaking an unhandled rejection", async () => {
+    const undo = vi.spyOn(edit, "undo").mockRejectedValue(new Error("history locked"));
+    useEditorUiStore.setState({
+      view: "editor",
+      settingsOpen: false,
+      exportDialogOpen: false,
+      saveAsProgress: null,
+      projectSettingsPrompt: null,
+      pendingSwapClipId: null,
+      focusedPanel: "timeline",
+      toast: null,
+    });
+    const unhandled = vi.fn();
+    const onUnhandled = (event: PromiseRejectionEvent) => unhandled(event.reason);
+    window.addEventListener("unhandledrejection", onUnhandled);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const Harness = () => {
+      useKeyboardShortcuts();
+      return null;
+    };
+    try {
+      await act(async () => root.render(createElement(Harness)));
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { code: "KeyZ", key: "z", metaKey: true, bubbles: true, cancelable: true }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(undo).toHaveBeenCalledOnce();
+      expect(useEditorUiStore.getState().toast?.message).toContain("history locked");
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+      await act(async () => root.unmount());
+      container.remove();
+      undo.mockRestore();
+    }
   });
 });

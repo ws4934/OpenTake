@@ -15,7 +15,7 @@ import { trackColor } from "../../lib/clip";
 import { trackDisplayLabel, firstAudioIndex } from "../../lib/zones";
 import { trackDisplayHeight } from "../../lib/geometry";
 import { useEditorUiStore } from "../../store/uiStore";
-import { setTrackProps, swapTracks } from "../../store/editActions";
+import { runTimelineEdit, setTrackProps, swapTracks } from "../../store/editActions";
 import type { Timeline } from "../../lib/types";
 
 interface Props {
@@ -343,8 +343,8 @@ function TrackHeaderRow(p: RowProps) {
             y={menu.y}
             canSwapUp={p.canSwapUp}
             canSwapDown={p.canSwapDown}
-            onSwapUp={() => void swapTracks(p.index, p.index - 1)}
-            onSwapDown={() => void swapTracks(p.index, p.index + 1)}
+            onSwapUp={() => runTimelineEdit(swapTracks(p.index, p.index - 1))}
+            onSwapDown={() => runTimelineEdit(swapTracks(p.index, p.index + 1))}
             onClose={closeMenu}
             menuLabel={p.label}
             labels={{

@@ -550,16 +550,16 @@ export function useKeyboardShortcuts() {
             // EditorWindowController: a selected gap closes first; else a marked
             // range on the selected clip's track; else the selected clips.
               if (ui.selectedGap) {
-                void edit.rippleDeleteSelectedGap();
+                edit.runTimelineEdit(edit.rippleDeleteSelectedGap());
               } else {
-                void (async () => {
+                edit.runTimelineEdit((async () => {
                   if (!(await edit.rippleDeleteMarkedRange())) {
                     await edit.rippleDeleteSelectedClips();
                   }
-                })();
+                })());
               }
             } else {
-              void edit.deleteSelectedClips();
+              edit.runTimelineEdit(edit.deleteSelectedClips());
             }
             return;
           case "setTool":
@@ -570,10 +570,10 @@ export function useKeyboardShortcuts() {
             else ui.markRangeEnd(Math.round(ui.activeFrame));
             return;
           case "trimStart":
-            void edit.trimStartToPlayhead();
+            edit.runTimelineEdit(edit.trimStartToPlayhead());
             return;
           case "trimEnd":
-            void edit.trimEndToPlayhead();
+            edit.runTimelineEdit(edit.trimEndToPlayhead());
             return;
           case "maximize":
             ui.toggleMaximizedFocusedPanel();
@@ -600,16 +600,16 @@ export function useKeyboardShortcuts() {
             }
             return;
           case "history":
-            void (command.redo ? edit.redo() : edit.undo());
+            edit.runTimelineEdit(command.redo ? edit.redo() : edit.undo());
             return;
           case "clipboard":
             if (command.action === "copy") edit.copyClips();
-            else if (command.action === "cut") void edit.cutClips();
+            else if (command.action === "cut") edit.runTimelineEdit(edit.cutClips());
             else if (command.action === "selectAll") runApplicationMenuCommand("selectAll");
             else if (!useClipboardStore.getState().hasContent) {
               ui.pushToast(t("edit.clipboardEmpty"));
             } else {
-              void edit.pasteClipsAtPlayhead();
+              edit.runTimelineEdit(edit.pasteClipsAtPlayhead());
             }
             return;
           case "split":
@@ -647,7 +647,9 @@ export function useKeyboardShortcuts() {
       if (!mod && !e.altKey && (e.code === "Comma" || e.code === "Period")) {
         e.preventDefault();
         if (!e.repeat && !useProjectStore.getState().compatibilityReadOnly) {
-          void edit.nudgeSelectedClips((e.code === "Comma" ? -1 : 1) * (e.shiftKey ? 5 : 1));
+          edit.runTimelineEdit(
+            edit.nudgeSelectedClips((e.code === "Comma" ? -1 : 1) * (e.shiftKey ? 5 : 1)),
+          );
         }
       } else if (!mod && !e.altKey && e.shiftKey && e.code === "KeyZ") {
         e.preventDefault();

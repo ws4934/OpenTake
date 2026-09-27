@@ -1188,6 +1188,7 @@ const zh: Dict = {
   "edit.paste": "粘贴 (⌘V)",
   "edit.clipboardEmpty": "剪贴板为空",
   "edit.pasteFailed": "粘贴失败：{error}",
+  "edit.failed": "编辑失败：{error}",
 
   // Global asset library (#56)
   "library.title": "素材库",
@@ -2374,6 +2375,7 @@ const en: Dict = {
   "edit.paste": "Paste (⌘V)",
   "edit.clipboardEmpty": "Clipboard is empty",
   "edit.pasteFailed": "Paste failed: {error}",
+  "edit.failed": "Edit failed: {error}",
 
   // Global asset library (#56)
   "library.title": "Library",

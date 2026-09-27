@@ -49,7 +49,7 @@ import {
   previewPoster,
 } from "../../lib/api";
 import { findCropEditingClip, findSelectedVisualClip, mediaCanvasAspect } from "../../lib/clip";
-import { setTimelineSettings } from "../../store/editActions";
+import { runTimelineEdit, setTimelineSettings } from "../../store/editActions";
 import { applyScrollZoom, type CanvasOffset } from "../../lib/previewZoom";
 import {
   ASPECT_PRESETS,
@@ -1600,7 +1600,7 @@ function ProjectSettingsBadges({ fps, width, height }: { fps: number; width: num
   };
 
   const applyAspect = (preset: AspectPreset) => {
-    void setTimelineSettings(fps, preset.width, preset.height);
+    runTimelineEdit(setTimelineSettings(fps, preset.width, preset.height));
   };
 
   const applyQuality = (preset: QualityPreset) => {

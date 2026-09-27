@@ -153,19 +153,19 @@ export function runApplicationMenuCommand(id: string): void {
       if (applicationMenuStateSnapshot().enabled.export) ui.setExportDialogOpen(true);
       return;
     case "undo":
-      ignoreRejected(edit.undo());
+      edit.runTimelineEdit(edit.undo());
       return;
     case "redo":
-      ignoreRejected(edit.redo());
+      edit.runTimelineEdit(edit.redo());
       return;
     case "cut":
-      ignoreRejected(edit.cutClips());
+      edit.runTimelineEdit(edit.cutClips());
       return;
     case "copy":
       edit.copyClips();
       return;
     case "paste":
-      ignoreRejected(edit.pasteClipsAtPlayhead());
+      edit.runTimelineEdit(edit.pasteClipsAtPlayhead());
       return;
     case "selectAll": {
       if (ui.focusedPanel === "media") {
@@ -180,13 +180,13 @@ export function runApplicationMenuCommand(id: string): void {
       return;
     }
     case "split":
-      ignoreRejected(edit.splitAtPlayhead());
+      edit.runTimelineEdit(edit.splitAtPlayhead());
       return;
     case "trimStart":
-      ignoreRejected(edit.trimStartToPlayhead());
+      edit.runTimelineEdit(edit.trimStartToPlayhead());
       return;
     case "trimEnd":
-      ignoreRejected(edit.trimEndToPlayhead());
+      edit.runTimelineEdit(edit.trimEndToPlayhead());
       return;
     case "delete":
       if (ui.focusedPanel === "media") {
@@ -196,7 +196,7 @@ export function runApplicationMenuCommand(id: string): void {
             : deleteSelectedMediaAssets(),
         );
       } else {
-        ignoreRejected(edit.deleteSelectedClips());
+        edit.runTimelineEdit(edit.deleteSelectedClips());
       }
       return;
     case "mediaPanel":
