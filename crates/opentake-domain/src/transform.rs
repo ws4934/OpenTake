@@ -8,7 +8,8 @@
 //! `center_x = old_x + width - 0.5` (likewise for y).
 
 use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// Normalized 2D point `(x, y)` in canvas space.
@@ -18,8 +19,7 @@ pub struct Point {
     pub y: f64,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Transform {
     pub center_x: f64,
     pub center_y: f64,
@@ -29,6 +29,37 @@ pub struct Transform {
     pub rotation: f64,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
+}
+
+impl Serialize for Transform {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        for (field, value) in [
+            ("centerX", self.center_x),
+            ("centerY", self.center_y),
+            ("width", self.width),
+            ("height", self.height),
+            ("rotation", self.rotation),
+        ] {
+            if !value.is_finite() {
+                return Err(serde::ser::Error::custom(format!(
+                    "transform.{field} must be finite"
+                )));
+            }
+        }
+
+        let mut state = serializer.serialize_struct("Transform", 7)?;
+        state.serialize_field("centerX", &self.center_x)?;
+        state.serialize_field("centerY", &self.center_y)?;
+        state.serialize_field("width", &self.width)?;
+        state.serialize_field("height", &self.height)?;
+        state.serialize_field("rotation", &self.rotation)?;
+        state.serialize_field("flipHorizontal", &self.flip_horizontal)?;
+        state.serialize_field("flipVertical", &self.flip_vertical)?;
+        state.end()
+    }
 }
 
 impl Default for Transform {
@@ -46,6 +77,35 @@ impl Default for Transform {
 }
 
 impl Transform {
+    pub const MAX_NORMALIZED_CENTER: f64 = 10.0;
+    pub const MAX_NORMALIZED_SIZE: f64 = 10.0;
+    pub const MAX_ROTATION_DEGREES: f64 = 3600.0;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let center_limit = Self::MAX_NORMALIZED_CENTER;
+        if !self.center_x.is_finite()
+            || !self.center_y.is_finite()
+            || self.center_x.abs() > center_limit
+            || self.center_y.abs() > center_limit
+        {
+            return Err("transform centers must be finite and between -10 and 10");
+        }
+        let size_limit = Self::MAX_NORMALIZED_SIZE;
+        if !self.width.is_finite()
+            || !self.height.is_finite()
+            || self.width <= 0.0
+            || self.height <= 0.0
+            || self.width > size_limit
+            || self.height > size_limit
+        {
+            return Err("transform width and height must be finite and between 0 and 10");
+        }
+        if !self.rotation.is_finite() || self.rotation.abs() > Self::MAX_ROTATION_DEGREES {
+            return Err("transform rotation must be finite and between -3600 and 3600 degrees");
+        }
+        Ok(())
+    }
+
     /// Persisted keys emitted by the current transform encoder.
     pub const WIRE_FIELDS: &'static [&'static str] = &[
         "centerX",
@@ -215,15 +275,15 @@ impl<'de> Deserialize<'de> for Transform {
 
                 while let Some(key) = map.next_key::<Field>()? {
                     match key {
-                        Field::CenterX => center_x = Some(map.next_value()?),
-                        Field::CenterY => center_y = Some(map.next_value()?),
-                        Field::Width => width = Some(map.next_value()?),
-                        Field::Height => height = Some(map.next_value()?),
-                        Field::Rotation => rotation = Some(map.next_value()?),
+                        Field::CenterX => center_x = map.next_value()?,
+                        Field::CenterY => center_y = map.next_value()?,
+                        Field::Width => width = map.next_value()?,
+                        Field::Height => height = map.next_value()?,
+                        Field::Rotation => rotation = map.next_value()?,
                         Field::FlipHorizontal => flip_horizontal = Some(map.next_value()?),
                         Field::FlipVertical => flip_vertical = Some(map.next_value()?),
-                        Field::X => old_x = Some(map.next_value()?),
-                        Field::Y => old_y = Some(map.next_value()?),
+                        Field::X => old_x = map.next_value()?,
+                        Field::Y => old_y = map.next_value()?,
                         Field::Ignore => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
                         }
@@ -408,6 +468,19 @@ mod tests {
     }
 
     #[test]
+    fn null_transform_dimension_defaults_without_losing_sibling_fields() {
+        let t: Transform = serde_json::from_str(
+            r#"{"centerX":0.2,"centerY":0.3,"width":null,"height":0.4,"flipHorizontal":true}"#,
+        )
+        .unwrap();
+        approx(t.center_x, 0.2);
+        approx(t.center_y, 0.3);
+        approx(t.width, 1.0);
+        approx(t.height, 0.4);
+        assert!(t.flip_horizontal);
+    }
+
+    #[test]
     fn serialize_emits_camel_case_keys() {
         let t = Transform::default();
         let json = serde_json::to_string(&t).unwrap();
@@ -415,6 +488,16 @@ mod tests {
         assert!(json.contains("\"flipHorizontal\":false"));
         // No legacy keys on the way out.
         assert!(!json.contains("\"x\":"));
+    }
+
+    #[test]
+    fn serialize_rejects_non_finite_transform_values_with_field_name() {
+        let t = Transform {
+            width: f64::INFINITY,
+            ..Transform::default()
+        };
+        let error = serde_json::to_string(&t).unwrap_err();
+        assert!(error.to_string().contains("transform.width"));
     }
 
     #[test]

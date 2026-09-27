@@ -436,6 +436,14 @@ impl RenderLoop {
     }
 }
 
+/// An exact resume can continue the existing decoder streams. An explicit
+/// seek has already cleared them; a resume elsewhere invalidates old data.
+fn resume_decode_streams(paused_frame: Option<i32>, requested_frame: i32, mut reset: impl FnMut()) {
+    if paused_frame != Some(requested_frame) {
+        reset();
+    }
+}
+
 /// Owns the playback render thread and a control channel to it. Dropping (or
 /// `stop`) requests a cooperative shutdown.
 pub struct PlaybackEngine {
@@ -850,6 +858,7 @@ fn run_render_thread(
     }
     let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut paused = false;
+    let mut paused_frame = initial_frame;
     let mut buffered_first: Option<(i32, DecodedFrame)> = None;
 
     loop {
@@ -857,11 +866,16 @@ fn run_render_thread(
             match rx.recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
                     clock.seek(frame);
+                    resume_decode_streams(paused_frame, frame, || render_loop.seek());
+                    if paused_frame != Some(frame) {
+                        buffered_first = None;
+                    }
+                    paused_frame = Some(frame);
                     let _ = reply.send(());
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     clock.seek(frame);
-                    render_loop.seek();
+                    resume_decode_streams(paused_frame, frame, || render_loop.seek());
                     if let Some((buffered_frame, image)) = buffered_first.take() {
                         sink.push_frame(&image);
                         emitter.emit(buffered_frame);
@@ -874,6 +888,7 @@ fn run_render_thread(
                     if let Some(request) = seek_mailbox.take() {
                         clock.seek(request.frame);
                         render_loop.seek();
+                        paused_frame = Some(request.frame);
                         buffered_first = None;
                     }
                 }
@@ -889,12 +904,14 @@ fn run_render_thread(
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
                     clock.seek(frame);
                     paused = true;
+                    paused_frame = Some(frame);
                     let _ = reply.send(());
                     break;
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
+                    let current_frame = clock.frame(fps);
                     clock.seek(frame);
-                    render_loop.seek();
+                    resume_decode_streams(Some(current_frame), frame, || render_loop.seek());
                     pause_requested.store(false, Ordering::Release);
                     let _ = reply.send(());
                 }
@@ -928,6 +945,7 @@ fn run_render_thread(
                     }
                     buffered_first = Some((clamped, frame));
                     paused = true;
+                    paused_frame = Some(clamped);
                 } else {
                     sink.push_frame(&frame);
                     emitter.emit(clamped);
@@ -1069,6 +1087,35 @@ mod tests {
             (500..=501).contains(&f),
             "expected ~500 right after seek, got {f}"
         );
+    }
+
+    #[test]
+    fn resuming_paused_frame_preserves_decoders_but_moving_clears_them() {
+        let mut decoder_starts = 1;
+        let mut streams = HashMap::from([("visible_clip".to_string(), decoder_starts)]);
+
+        // A paused frame already has an active decode stream. Resume at the
+        // same frame must use it rather than launching another process.
+        resume_decode_streams(Some(30), 30, || streams.clear());
+        streams
+            .entry("visible_clip".to_string())
+            .or_insert_with(|| {
+                decoder_starts += 1;
+                decoder_starts
+            });
+        assert_eq!(decoder_starts, 1);
+        assert_eq!(streams["visible_clip"], 1);
+
+        // A different requested position still discards the old stream.
+        resume_decode_streams(Some(30), 90, || streams.clear());
+        streams
+            .entry("visible_clip".to_string())
+            .or_insert_with(|| {
+                decoder_starts += 1;
+                decoder_starts
+            });
+        assert_eq!(decoder_starts, 2);
+        assert_eq!(streams["visible_clip"], 2);
     }
 
     #[test]

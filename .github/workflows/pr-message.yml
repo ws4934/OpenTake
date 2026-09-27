@@ -1,0 +1,30 @@
+name: PR message
+
+# Enforces the PR title and description conventions in
+# .agent/message-conventions.md. Runs again when the title or description is
+# edited; draft PRs only receive warnings.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  message:
+    name: PR title and description
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Checker unit tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_check_pr_message.py'
+
+      - name: Check PR title and description
+        run: python3 -B scripts/check_pr_message.py --event "$GITHUB_EVENT_PATH"

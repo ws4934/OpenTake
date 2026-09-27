@@ -1,0 +1,4 @@
+#!/bin/sh
+# Validate the commit message against .agent/message-conventions.md §3.
+# Enable once per clone: git config core.hooksPath .githooks
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_pr_message.py" --commit-msg-file "$1"
