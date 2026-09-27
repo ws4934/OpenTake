@@ -158,7 +158,7 @@ describe("Toolbar command controls", () => {
     const rustSource = readFileSync(join(webRoot, "../src-tauri/src/commands.rs"), "utf8");
     expect(toolbarSource).toMatch(/await edit\.undo\(\)/);
     expect(actionSource).toMatch(
-      /export async function undo\(\)[\s\S]*?api\.undo\(captureProjectEditIdentity\(\)\)/,
+      /export async function undo\(\)[\s\S]*?enqueueEdit\(\(\) => commitEdit\(api\.undo,/,
     );
     expect(apiSource).toMatch(
       /export async function undo\(expected: ProjectEditIdentity\)[\s\S]*?invokeImpl<EditResult>\("undo", editIdentityArgs\(expected\)\)/,
@@ -215,7 +215,7 @@ describe("Toolbar command controls", () => {
     const rustSource = readFileSync(join(webRoot, "../src-tauri/src/commands.rs"), "utf8");
     expect(toolbarSource).toMatch(/await edit\.redo\(\)/);
     expect(actionSource).toMatch(
-      /export async function redo\(\)[\s\S]*?api\.redo\(captureProjectEditIdentity\(\)\)/,
+      /export async function redo\(\)[\s\S]*?enqueueEdit\(\(\) => commitEdit\(api\.redo,/,
     );
     expect(apiSource).toMatch(
       /export async function redo\(expected: ProjectEditIdentity\)[\s\S]*?invokeImpl<EditResult>\("redo", editIdentityArgs\(expected\)\)/,

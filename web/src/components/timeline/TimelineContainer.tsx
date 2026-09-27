@@ -2032,11 +2032,11 @@ export function TimelineContainer() {
           // Option/Alt-drag duplicate: deep-copy each clip to its target. The
           // backend mints fresh ids, shifts start_frame by offsetFrames, and
           // clears link_group_id (copies aren't linked to the originals).
-          void edit.duplicateClips(
+          edit.runTimelineEdit(edit.duplicateClips(
             resolved.targets.map((target) => target.clipId),
             frameDelta,
             resolved.targets.map((target) => target.toTrack),
-          );
+          ));
         } else {
           // Single clip dragged across tracks onto exactly one existing clip:
           // swap their places (exchange track + start) instead of overwriting —
@@ -2063,7 +2063,7 @@ export function TimelineContainer() {
                 )
               : [];
             if (overlap.length === 1) {
-              void edit.swapClips(d.hit.clip.id, overlap[0].id);
+              edit.runTimelineEdit(edit.swapClips(d.hit.clip.id, overlap[0].id));
               return;
             }
           }
@@ -2072,7 +2072,7 @@ export function TimelineContainer() {
             toTrack: target.toTrack,
             toFrame: target.toFrame,
           }));
-          void edit.moveClips(moves);
+          edit.runTimelineEdit(edit.moveClips(moves));
         }
         return;
       }
@@ -2108,7 +2108,7 @@ export function TimelineContainer() {
             d.edge === "left"
               ? { fadeInFrames: d.currentFrames }
               : { fadeOutFrames: d.currentFrames };
-          void edit.setClipProperties([d.clipId], properties);
+          edit.runTimelineEdit(edit.setClipProperties([d.clipId], properties));
         }
         return;
       }
@@ -2129,7 +2129,7 @@ export function TimelineContainer() {
             return { clipId: id, trimStartFrame: v.trimStartFrame, trimEndFrame: v.trimEndFrame };
           })
           .filter((e): e is NonNullable<typeof e> => e !== null);
-        void edit.trimClips(edits);
+        edit.runTimelineEdit(edit.trimClips(edits));
       }
     },
     [
@@ -2391,7 +2391,9 @@ export function TimelineContainer() {
           plan.trackIndex,
         );
         if (insertPlan) {
-          void edit.insertClips(insertPlan.trackIndex, insertPlan.atFrame, insertPlan.entries);
+          edit.runTimelineEdit(
+            edit.insertClips(insertPlan.trackIndex, insertPlan.atFrame, insertPlan.entries),
+          );
           return;
         }
       }

@@ -296,7 +296,7 @@ export function ClipContextMenu({
       currentClip,
       fadeEdge,
       (properties) => {
-        void edit.setClipProperties([clipId], properties);
+        edit.runTimelineEdit(edit.setClipProperties([clipId], properties));
       },
       {
         linear: t("inspector.interpolation.linear"),
@@ -349,7 +349,7 @@ export function ClipContextMenu({
         await edit.freezeClipAtPlayhead(currentClip, frames);
       },
       onReverse: () => {
-        void edit.setClipProperties([clipId], { reversed: !currentClip.reversed });
+        edit.runTimelineEdit(edit.setClipProperties([clipId], { reversed: !currentClip.reversed }));
       },
       reverseInfo: {
         isReversed: Boolean(currentClip.reversed),
@@ -380,7 +380,7 @@ export function ClipContextMenu({
       if (!activeNestedSequenceId) {
         items.push({
           label: t("contextMenu.dissolveCompound"),
-          action: () => void edit.dissolveNestedSequence(clipId),
+          action: () => edit.runTimelineEdit(edit.dissolveNestedSequence(clipId)),
         });
       }
     } else if (!activeNestedSequenceId) {
@@ -388,7 +388,7 @@ export function ClipContextMenu({
         label: t("contextMenu.createCompound"),
         action: () => {
           ensureSelected();
-          void edit.createNestedSequence(t("compound.defaultName"));
+          edit.runTimelineEdit(edit.createNestedSequence(t("compound.defaultName")));
         },
       });
     }
