@@ -6,7 +6,7 @@
  * re-rasterizes the text box on the next `timeline_changed`).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlignCenter, AlignLeft, AlignRight, type LucideIcon } from "lucide-react";
 import * as edit from "../../store/editActions";
 import { Icon } from "../ui/Icon";
@@ -66,8 +66,12 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
   const [value, setValue] = useState(clip.textContent ?? "");
   const [style, setStyle] = useState<TextStyle>(() => completeTextStyle(clip.textStyle));
 
+  // Typed text not yet committed (null when clean).
+  const pendingText = useRef<string | null>(null);
+
   // Reset local state when the selected clip (or its persisted style) changes.
   useEffect(() => {
+    pendingText.current = null;
     setValue(clip.textContent ?? "");
   }, [clip.id, clip.textContent]);
   useEffect(() => {
@@ -75,9 +79,16 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
   }, [clip.id, clip.textStyle]);
 
   const commitText = () => {
-    if (value === (clip.textContent ?? "")) return;
-    void edit.setClipProperties([clip.id], { textContent: value });
+    const next = pendingText.current;
+    pendingText.current = null;
+    if (next === null || next === (clip.textContent ?? "")) return;
+    void edit.setClipProperties([clip.id], { textContent: next });
   };
+  // The Inspector remounts per clip, so switching clips mid-edit unmounts this
+  // tab before the textarea blurs: commit to the clip the text was typed for.
+  const commitTextRef = useRef(commitText);
+  commitTextRef.current = commitText;
+  useEffect(() => () => commitTextRef.current(), []);
 
   // Commit a whole new style (style edits are immediate, like the grade panel).
   const commitStyle = (next: TextStyle) => {
@@ -93,7 +104,10 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
           aria-label={t("inspector.section.text")}
           value={value}
           placeholder={t("inspector.textPlaceholder")}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => {
+            pendingText.current = e.target.value;
+            setValue(e.target.value);
+          }}
           onBlur={commitText}
           rows={4}
           style={{
