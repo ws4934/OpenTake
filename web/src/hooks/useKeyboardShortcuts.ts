@@ -535,7 +535,7 @@ export function useKeyboardShortcuts() {
             // before nested controls can consume it.
             return;
           case "stepFrame":
-            ui.setCurrentFrame(Math.max(0, Math.min(total, ui.activeFrame + command.delta)));
+            ui.setCurrentFrame(Math.max(0, Math.min(total, edit.playheadEditFrame(ui.activeFrame) + command.delta)));
             return;
           case "moveMediaSelection":
             moveMediaSelection(command.delta);

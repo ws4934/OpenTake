@@ -946,6 +946,23 @@ describe("addMediaToTimeline", () => {
     expect(transforms.at(-1)?.height).toBe(1);
   });
 
+  it("pastes every copied clip at whole frames during fractional playback", async () => {
+    await addMediaToTimeline(video("seed"));
+    const clip = useProjectStore.getState().timeline.tracks[0].clips[0];
+    useClipboardStore.getState().set([
+      { clip: { ...clip, id: "first", startFrame: 10 }, sourceTrackIndex: 0 },
+      { clip: { ...clip, id: "second", startFrame: 80 }, sourceTrackIndex: 0 },
+    ], 10);
+    useEditorUiStore.setState({ activeFrame: 50.6, currentFrame: 50 });
+
+    await pasteClipsAtPlayhead();
+
+    const command = srv.state.commands.at(-1);
+    expect(command?.type).toBe("pasteClips");
+    expect(command?.entries?.map((entry) => entry.startFrame)).toEqual([51, 121]);
+    expect(command?.entries?.every((entry) => Number.isInteger(entry.startFrame))).toBe(true);
+  });
+
   it("forwards an explicit insertTrack index", async () => {
     await insertTrack("video");
     await insertTrack("audio");
@@ -1217,6 +1234,18 @@ describe("addTextClip (Toolbar 'T' button)", () => {
     srv.reset();
     setMirror(EMPTY, 0, 1);
     useEditorUiStore.setState({ activeFrame: 0, currentFrame: 0, selectedClipIds: new Set() });
+  });
+
+  it("sends an integer start frame when playback is between frames", async () => {
+    useEditorUiStore.setState({ activeFrame: 123.4, currentFrame: 123 });
+
+    await addTextClip();
+
+    const command = srv.state.commands.at(-1);
+    expect(command?.type).toBe("addTextsAutoTrack");
+    const startFrame = command?.entries?.[0].startFrame;
+    expect(startFrame).toBe(123);
+    expect(Number.isInteger(startFrame ?? NaN)).toBe(true);
   });
 
   it("creates a fresh track and leaves an existing visual track's clip untouched", async () => {
