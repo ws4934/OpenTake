@@ -781,6 +781,11 @@ struct PreparedMotionCommit {
     document_source: Option<DocumentMotionSource>,
     expected_authority: Option<ProjectAssetAuthority>,
     duration_frames: i32,
+    /// The visible clip starts here in the original animation timeline. The
+    /// encoded replacement itself starts at frame zero.
+    source_start_frame: u32,
+    /// Keep template animation timing tied to the original source length.
+    source_total_frames: u32,
     transparent: bool,
     render_dimensions: Option<(u32, u32, u32)>,
     placement: MotionPlacement,
@@ -850,6 +855,8 @@ impl TauriMotionBridge {
                 document_source: Some(request.source),
                 expected_authority: Some(request.project_authority),
                 duration_frames: request.duration_frames,
+                source_start_frame: 0,
+                source_total_frames: request.duration_frames as u32,
                 transparent: request.transparent,
                 render_dimensions: Some((request.width, request.height, request.fps)),
                 placement: MotionPlacement::Add {
@@ -922,6 +929,16 @@ impl TauriMotionBridge {
                 document_source: Some(request.source),
                 expected_authority: Some(request.project_authority),
                 duration_frames: request.duration_frames,
+                source_start_frame: motion_source_frame(
+                    clip.trim_start_frame,
+                    request.fps,
+                    snapshot.timeline.fps,
+                )?,
+                source_total_frames: motion_source_frame(
+                    clip.source_duration_frames(),
+                    request.fps,
+                    snapshot.timeline.fps,
+                )?,
                 transparent: entry.carries_straight_alpha(),
                 render_dimensions: Some((request.width, request.height, request.fps)),
                 placement: MotionPlacement::Replace {
@@ -937,6 +954,8 @@ impl TauriMotionBridge {
         stored_source: &StoredMotionSource,
         document_source: Option<&DocumentMotionSource>,
         duration_frames: i32,
+        source_start_frame: u32,
+        source_total_frames: u32,
         transparent: bool,
         render_dimensions: Option<(u32, u32, u32)>,
         cancel: &opentake_media::MediaCancelToken,
@@ -982,11 +1001,19 @@ impl TauriMotionBridge {
                     )
                 })?
         } else {
-            source_document(stored_source, fps, width, height, frames, transparent)?
+            source_document(
+                stored_source,
+                fps,
+                width,
+                height,
+                source_total_frames,
+                transparent,
+            )?
         };
         let request =
             MotionRenderRequest::new(MotionSource::code(html), fps, frames, width, height)
-                .with_transparent(transparent);
+                .with_transparent(transparent)
+                .with_start_frame(source_start_frame);
         request.validate().map_err(map_motion_error)?;
         let render_cancel = MotionCancellationToken::new();
         if cancel.is_cancelled() {
@@ -1084,6 +1111,8 @@ impl TauriMotionBridge {
             document_source,
             expected_authority,
             duration_frames,
+            source_start_frame,
+            source_total_frames,
             transparent,
             render_dimensions,
             placement,
@@ -1110,6 +1139,8 @@ impl TauriMotionBridge {
             &stored_source,
             document_source.as_ref(),
             duration_frames,
+            source_start_frame,
+            source_total_frames,
             transparent,
             render_dimensions,
             cancel,
@@ -1380,6 +1411,29 @@ fn timeline_duration_frames(
     Ok(rounded)
 }
 
+fn motion_source_frame(
+    timeline_frame: i32,
+    source_fps: u32,
+    timeline_fps: i32,
+) -> Result<u32, MotionBridgeError> {
+    let invalid = || {
+        MotionBridgeError::new(
+            MotionBridgeErrorKind::InvalidArguments,
+            "Motion source trim or frame rate is out of range",
+        )
+    };
+    if timeline_frame < 0 || source_fps == 0 || timeline_fps <= 0 {
+        return Err(invalid());
+    }
+    let timeline_fps = timeline_fps as u64;
+    (timeline_frame as u64)
+        .checked_mul(u64::from(source_fps))
+        .and_then(|value| value.checked_add(timeline_fps / 2))
+        .map(|value| value / timeline_fps)
+        .and_then(|frame| u32::try_from(frame).ok())
+        .ok_or_else(invalid)
+}
+
 fn edit_motion_transparency(recorded: Option<bool>, carries_straight_alpha: bool) -> bool {
     recorded.unwrap_or(carries_straight_alpha)
 }
@@ -1433,6 +1487,8 @@ impl MotionBridge for TauriMotionBridge {
                 document_source: None,
                 expected_authority: None,
                 duration_frames: request.duration_frames,
+                source_start_frame: 0,
+                source_total_frames: request.duration_frames as u32,
                 transparent: request.transparent,
                 render_dimensions: None,
                 placement: MotionPlacement::Add {
@@ -1533,6 +1589,16 @@ impl MotionBridge for TauriMotionBridge {
                 document_source: None,
                 expected_authority: None,
                 duration_frames: clip.duration_frames,
+                source_start_frame: motion_source_frame(
+                    clip.trim_start_frame,
+                    snapshot.timeline.fps as u32,
+                    snapshot.timeline.fps,
+                )?,
+                source_total_frames: motion_source_frame(
+                    clip.source_duration_frames(),
+                    snapshot.timeline.fps as u32,
+                    snapshot.timeline.fps,
+                )?,
                 transparent: edit_motion_transparency(
                     provenance.transparent,
                     entry.carries_straight_alpha(),
