@@ -26,6 +26,7 @@ import {
   clipVolumeAt,
   frameForSourceTime,
   isExternalSeekWhilePlaying,
+  playbackFrameFromActiveFrame,
   sourceTimeSec,
   type ActiveMedia,
 } from "./timelinePlayback";
@@ -414,14 +415,16 @@ function scrubTo(tl: Timeline, frame: number, fps: number): void {
 }
 
 /**
- * The single timeline playback clock. Mount once (App). Runs only while playing
- * or scrubbing; otherwise every registered element is paused on its current
- * decoded frame.
+ * The single timeline playback clock. Mount once (App's `PlaybackEngineHost`).
+ * Runs only while playing or scrubbing; otherwise every registered element is
+ * paused on its current decoded frame.
  */
 export function useTimelinePlaybackEngine(): void {
   const isPlaying = useEditorUiStore((s) => s.isPlaying);
   const isScrubbing = useEditorUiStore((s) => s.isScrubbing);
-  const activeFrame = useEditorUiStore((s) => s.activeFrame);
+  // Whole frames only: the paused sync cares which frame is shown, and a
+  // fractional subscription would re-render the host on every WebKit rAF tick.
+  const playheadFrame = useEditorUiStore((s) => playbackFrameFromActiveFrame(s.activeFrame));
   // Re-run the paused sync when the timeline itself changes (a clip added /
   // removed / swapped while paused). The pause-sync effect's other deps don't
   // change on an edit, so without this a just-dropped clip would hold its source
@@ -467,6 +470,7 @@ export function useTimelinePlaybackEngine(): void {
 
   useEffect(() => {
     const prev = previousTransportState.current;
+    const activeFrame = useEditorUiStore.getState().activeFrame;
     if (!isPlaying && !isScrubbing) {
       cancelPendingInteractiveSeek();
       pauseAll();
@@ -509,7 +513,7 @@ export function useTimelinePlaybackEngine(): void {
       }
     }
     previousTransportState.current = { isPlaying, isScrubbing };
-  }, [activeFrame, engineFailed, isPlaying, isScrubbing, projectEpoch, timelineVersion]);
+  }, [playheadFrame, engineFailed, isPlaying, isScrubbing, projectEpoch, timelineVersion]);
 
   useEffect(() => {
     if (!rustPlaybackCapability.checked) {
@@ -752,19 +756,26 @@ export function useTimelinePlaybackEngine(): void {
     if (route.kind !== "rust" || !isPlaying || isScrubbing) {
       return;
     }
-    const identity = activeNativeIdentityRef.current;
-    if (
-      identity &&
-      isExternalSeekWhilePlaying({
-        activeFrame,
-        lastEngineFrame: lastEngineFrameRef.current,
-      })
-    ) {
-      lastEngineFrameRef.current = Math.max(0, Math.floor(activeFrame));
-      void nativePlaybackController.seek(identity, activeFrame);
-    }
+    // Watch the playhead through the store, not a render dependency: the route
+    // is resolved once per transport/timeline change instead of once per frame.
+    const forwardExternalSeek = (activeFrame: number) => {
+      const identity = activeNativeIdentityRef.current;
+      if (
+        identity &&
+        isExternalSeekWhilePlaying({
+          activeFrame,
+          lastEngineFrame: lastEngineFrameRef.current,
+        })
+      ) {
+        lastEngineFrameRef.current = Math.max(0, Math.floor(activeFrame));
+        void nativePlaybackController.seek(identity, activeFrame);
+      }
+    };
+    forwardExternalSeek(useEditorUiStore.getState().activeFrame);
+    return useEditorUiStore.subscribe((state, previous) => {
+      if (state.activeFrame !== previous.activeFrame) forwardExternalSeek(state.activeFrame);
+    });
   }, [
-    activeFrame,
     engineFailed,
     isPlaying,
     isScrubbing,

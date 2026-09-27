@@ -68,6 +68,13 @@ function Toast() {
   );
 }
 
+/** Leaf host for the playback clock. Its playhead subscription re-renders only
+ *  this null component, never the App tree (every panel) on each playback tick. */
+function PlaybackEngineHost() {
+  useTimelinePlaybackEngine();
+  return null;
+}
+
 const PRIMARY_VIEWS = ["home", "library", "editor", "motion"] as const;
 type PrimaryView = (typeof PRIMARY_VIEWS)[number];
 
@@ -100,7 +107,6 @@ export default function App() {
   // shown (no selection / no focus). Keeping them unconditional preserves hook
   // order across navigation.
   useKeyboardShortcuts();
-  useTimelinePlaybackEngine();
   useAutosave();
 
   const view = useEditorUiStore((s) => s.view);
@@ -243,6 +249,7 @@ export default function App() {
         background: "var(--bg-base)",
       }}
     >
+      <PlaybackEngineHost />
       <CompatibilityBanner />
       <ApplicationMenuBridge />
       {PRIMARY_VIEWS.filter((candidate) => mountedPrimaryViews.current.has(candidate)).map(
