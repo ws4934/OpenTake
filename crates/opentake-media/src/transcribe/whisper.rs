@@ -266,7 +266,7 @@ impl Transcriber for WhisperTranscriber {
             params.set_abort_callback_safe(Some(move || cancel.is_cancelled()));
         }
         if let Some(progress) = opts.progress.clone() {
-            params.set_progress_callback_safe(Some(move |percent| {
+            params.set_progress_callback_safe(Some(move |percent: i32| {
                 (progress.0)(0.25 + 0.75 * (percent as f64 / 100.0).clamp(0.0, 1.0));
             }));
         }
