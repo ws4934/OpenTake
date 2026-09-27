@@ -1680,7 +1680,7 @@ fn finalize_saved_media_with_hooks(
 ///   directories still create their folder. Files are visited in
 ///   case-insensitive name order so ids mint deterministically.
 #[tauri::command]
-pub fn import_folder(
+pub async fn import_folder(
     core: State<'_, AppCore>,
     media: State<'_, MediaState>,
     prewarm: State<'_, prewarm::PrewarmScheduler>,
@@ -1688,8 +1688,18 @@ pub fn import_folder(
     path: String,
     recursive: Option<bool>,
 ) -> Result<MediaListDto, String> {
-    let _activity = begin_direct_media_project_write(&admission)?;
-    import_folder_impl(&core, media.engine(), &prewarm, path, recursive)
+    let activity = begin_direct_media_project_write(&admission)?;
+    let core = core.inner().clone();
+    let prewarm = prewarm.inner().clone();
+    let cache_root = media.engine().cache_root().to_path_buf();
+    let models_dir = media.engine().models_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let engine = MediaEngine::new(cache_root, models_dir);
+        import_folder_impl(&core, &engine, &prewarm, path, recursive)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn import_folder_impl(
@@ -1699,11 +1709,21 @@ fn import_folder_impl(
     path: String,
     recursive: Option<bool>,
 ) -> Result<MediaListDto, String> {
+    import_folder_impl_with_verify_hook(core, engine, prewarm, path, recursive, || {})
+}
+
+fn import_folder_impl_with_verify_hook(
+    core: &AppCore,
+    engine: &MediaEngine,
+    prewarm: &prewarm::PrewarmScheduler,
+    path: String,
+    recursive: Option<bool>,
+    before_verify: impl FnOnce(),
+) -> Result<MediaListDto, String> {
     core.ensure_project_mutable().map_err(|e| e.to_string())?;
-    let project = core.runtime_snapshot();
-    let project_dir = project
-        .project_dir
-        .as_ref()
+    let project_epoch = core.project_revision().project_epoch;
+    let project_dir = core
+        .project_dir()
         .ok_or_else(|| "no project open".to_string())?;
     let root = PathBuf::from(&path);
     let recursive = recursive.unwrap_or(false);
@@ -1726,17 +1746,20 @@ fn import_folder_impl(
         recursive,
         limits,
     } = prepared;
+    // The potentially large tree walk must finish before core takes its
+    // session lock. The short locked precondition still checks that the root
+    // namespace identity has not changed since planning.
+    before_verify();
+    root.verify_snapshot(&snapshot, recursive, None, limits)
+        .map_err(|error| CoreError::from(error).to_string())?;
     let committed = if plan.is_empty() {
         Vec::new()
     } else {
         core.import_media_batch_for_project_persisted_checked(
-            project.project_epoch,
-            project_dir,
+            project_epoch,
+            &project_dir,
             plan,
-            || {
-                root.verify_snapshot(&snapshot, recursive, None, limits)
-                    .map_err(CoreError::from)
-            },
+            || root.reopen_current().map(|_| ()).map_err(CoreError::from),
         )
         .map_err(|e| e.to_string())?
     };
@@ -2551,49 +2574,60 @@ fn directory_entry_name_cmp(left: &OsStr, right: &OsStr) -> std::cmp::Ordering {
         .then_with(|| left.to_string_lossy().cmp(&right.to_string_lossy()))
 }
 
-/// Schedule the grid poster for every committed import, re-attempting the ones
-/// the bounded prewarm queue rejected mid-batch until they fit. The three
-/// workers drain the queue while a large folder import commits, so a tail poster
-/// that lost the queue race fits on a later attempt — without this a 50+ file
-/// import permanently drops its last posters until a card scroll happens to
-/// request them lazily. The drain wait is bounded so a saturated queue can never
-/// stall the import command.
+/// Admit posters using one post-commit snapshot. A full queue reports Busy to
+/// the UI, whose visible cards request their posters lazily; the import command
+/// never polls for scheduler capacity.
 fn schedule_committed_posters(
     core: &AppCore,
     engine: &MediaEngine,
     prewarm: &prewarm::PrewarmScheduler,
     committed: &[CommittedMediaImport],
 ) -> Vec<ImportPrewarmDto> {
-    let mut results: Vec<ImportPrewarmDto> = committed
+    schedule_committed_posters_with_snapshot(engine, prewarm, committed, || core.runtime_snapshot())
+}
+
+fn schedule_committed_posters_with_snapshot(
+    engine: &MediaEngine,
+    prewarm: &prewarm::PrewarmScheduler,
+    committed: &[CommittedMediaImport],
+    snapshot: impl FnOnce() -> opentake_core::ProjectRuntimeSnapshot,
+) -> Vec<ImportPrewarmDto> {
+    if committed.is_empty() {
+        return Vec::new();
+    }
+    let snapshot = snapshot();
+    let current: std::collections::HashMap<&str, &MediaManifestEntry> = snapshot
+        .media
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    committed
         .iter()
         .map(|imported| {
-            schedule_import_poster(core, engine, prewarm, &imported.entry, &imported.path)
+            let entry = &imported.entry;
+            let result = if !current.get(entry.id.as_str()).is_some_and(|candidate| {
+                candidate.kind == entry.kind && candidate.source == entry.source
+            }) {
+                prewarm::PrewarmResult::StaleProject
+            } else if let Ok(key) = cache_key_for(&imported.path) {
+                let target = poster_path_for(engine.cache_root(), &key);
+                prewarm.schedule_grid_poster(
+                    snapshot.project_epoch,
+                    entry.kind,
+                    key,
+                    imported.path.clone(),
+                    target,
+                )
+            } else {
+                prewarm::PrewarmResult::Cached
+            };
+            ImportPrewarmDto {
+                media_ref: entry.id.clone(),
+                result,
+            }
         })
-        .collect();
-    let mut busy: Vec<usize> = results
-        .iter()
-        .enumerate()
-        .filter(|(_, dto)| dto.result == prewarm::PrewarmResult::Busy)
-        .map(|(index, _)| index)
-        .collect();
-    if !busy.is_empty() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !busy.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            busy.retain(|&index| {
-                let imported = &committed[index];
-                let dto =
-                    schedule_import_poster(core, engine, prewarm, &imported.entry, &imported.path);
-                if dto.result == prewarm::PrewarmResult::Busy {
-                    true
-                } else {
-                    results[index].result = dto.result;
-                    false
-                }
-            });
-        }
-    }
-    results
+        .collect()
 }
 
 /// Directory display name (its last path component), falling back to "folder".
@@ -2739,8 +2773,13 @@ fn prepare_explicit_import_batch(
     for path_text in paths {
         let requested_path = PathBuf::from(path_text);
         let Ok(source) = RetainedExplicitImportSource::open(&requested_path) else {
+            skipped.push(display_file_name(&requested_path));
             continue;
         };
+        if importable_clip_type(&source.final_path).is_none() {
+            skipped.push(display_file_name(&source.final_path));
+            continue;
+        }
         aggregate_bytes = aggregate_bytes
             .checked_add(source.admitted_bytes)
             .ok_or_else(|| "explicit_import_aggregate_bytes_limit_exceeded".to_string())?;
@@ -2749,10 +2788,6 @@ fn prepare_explicit_import_batch(
                 "explicit_import_aggregate_bytes_limit_exceeded: limit={}",
                 limits.max_aggregate_bytes
             ));
-        }
-        if importable_clip_type(&source.final_path).is_none() {
-            skipped.push(display_file_name(&source.final_path));
-            continue;
         }
         let probe = if is_lottie_path(&source.final_path) {
             match probe_lottie_file(&source.final_path, source.identity.as_file()) {
@@ -2781,15 +2816,25 @@ fn prepare_explicit_import_batch(
 }
 
 #[tauri::command]
-pub fn import_media(
+pub async fn import_media(
     core: State<'_, AppCore>,
     media: State<'_, MediaState>,
     prewarm: State<'_, prewarm::PrewarmScheduler>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     paths: Vec<String>,
 ) -> Result<MediaListDto, String> {
-    let _activity = begin_direct_media_project_write(&admission)?;
-    import_media_impl(&core, media.engine(), &prewarm, paths)
+    let activity = begin_direct_media_project_write(&admission)?;
+    let core = core.inner().clone();
+    let prewarm = prewarm.inner().clone();
+    let cache_root = media.engine().cache_root().to_path_buf();
+    let models_dir = media.engine().models_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let engine = MediaEngine::new(cache_root, models_dir);
+        import_media_impl(&core, &engine, &prewarm, paths)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn import_media_impl(
@@ -2810,10 +2855,9 @@ fn import_media_impl_with_options(
     before_commit: impl FnOnce(),
 ) -> Result<MediaListDto, String> {
     core.ensure_project_mutable().map_err(|e| e.to_string())?;
-    let project = core.runtime_snapshot();
-    let project_dir = project
-        .project_dir
-        .as_ref()
+    let project_epoch = core.project_revision().project_epoch;
+    let project_dir = core
+        .project_dir()
         .ok_or_else(|| "no project open".to_string())?;
     let PreparedExplicitImportBatch {
         plan,
@@ -2825,8 +2869,8 @@ fn import_media_impl_with_options(
         Vec::new()
     } else {
         core.import_media_batch_for_project_persisted_checked(
-            project.project_epoch,
-            project_dir,
+            project_epoch,
+            &project_dir,
             plan,
             || {
                 let mut verified_aggregate_bytes = 0_u64;
@@ -5989,6 +6033,116 @@ mod tests {
     }
 
     #[test]
+    fn explicit_import_reports_unopenable_and_ignores_oversized_unsupported_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("good.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 255]))
+            .save(&source)
+            .unwrap();
+        let unsupported = tmp.path().join("oversized.txt");
+        fs::write(&unsupported, vec![b'x'; 2048]).unwrap();
+        let missing = tmp.path().join("missing.png");
+        let core = AppCore::new();
+        core.save_project(Some(tmp.path().join("GoodImport.opentake")))
+            .unwrap();
+        let engine = engine_for(tmp.path());
+        let scheduler = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
+        let dto = import_media_impl_with_options(
+            &core,
+            &engine,
+            &scheduler,
+            vec![
+                unsupported.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+                source.to_string_lossy().into_owned(),
+            ],
+            ExplicitImportLimits {
+                max_files: 3,
+                max_aggregate_bytes: 1024,
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(dto.items.len(), 1);
+        assert_eq!(dto.skipped, ["oversized.txt", "missing.png"]);
+    }
+
+    #[test]
+    fn batch_poster_admission_reads_one_snapshot_for_two_thousand_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let engine = engine_for(tmp.path());
+        let scheduler = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
+        let source = tmp.path().join("poster.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([7, 8, 9, 255]))
+            .save(&source)
+            .unwrap();
+        let mut entry = import_one(&core, &engine, &source).unwrap().unwrap();
+        let committed: Vec<CommittedMediaImport> = (0..2000)
+            .map(|index| {
+                entry.id = format!("source-{index}");
+                CommittedMediaImport {
+                    path: source.clone(),
+                    entry: entry.clone(),
+                }
+            })
+            .collect();
+        let snapshots = std::cell::Cell::new(0);
+        let results =
+            schedule_committed_posters_with_snapshot(&engine, &scheduler, &committed, || {
+                snapshots.set(snapshots.get() + 1);
+                core.runtime_snapshot()
+            });
+        assert_eq!(snapshots.get(), 1);
+        assert_eq!(results.len(), 2000);
+        assert!(results
+            .iter()
+            .all(|dto| dto.result == prewarm::PrewarmResult::StaleProject));
+    }
+
+    #[test]
+    fn directory_rescan_does_not_hold_core_session_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("import");
+        fs::create_dir(&folder).unwrap();
+        let source = folder.join("still.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .save(&source)
+            .unwrap();
+        let core = AppCore::new();
+        core.save_project(Some(tmp.path().join("ImportProject.opentake")))
+            .unwrap();
+        let scheduler = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker_core = core.clone();
+        let worker_root = tmp.path().to_path_buf();
+        let task = std::thread::spawn(move || {
+            let engine = engine_for(&worker_root);
+            import_folder_impl_with_verify_hook(
+                &worker_core,
+                &engine,
+                &scheduler,
+                folder.to_string_lossy().into_owned(),
+                Some(false),
+                || {
+                    entered_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let start = std::time::Instant::now();
+        let _snapshot = core.runtime_snapshot();
+        let elapsed = start.elapsed();
+        let imported = task.join().unwrap().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "snapshot waited {elapsed:?}"
+        );
+        assert_eq!(imported.items.len(), 1);
+    }
+
+    #[test]
     fn explicit_import_rejects_file_count_and_aggregate_bytes_before_mutation() {
         let tmp = tempfile::tempdir().expect("create temp root");
         let bundle = tmp.path().join("ImportLimits.opentake");
@@ -7288,13 +7442,12 @@ mod tests {
     }
 
     #[test]
-    fn large_folder_import_schedules_a_poster_for_every_committed_file() {
+    fn large_folder_import_reports_queue_pressure_without_polling() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("batch");
         fs::create_dir(&root).unwrap();
-        // More files than the bounded prewarm queue (64) so the tail of the
-        // batch exercises the Busy re-pass; tiny PNGs keep the import and the
-        // poster decode fast.
+        // More files than the bounded prewarm queue (64): unscheduled cards
+        // report Busy and can request posters lazily when visible.
         let file_count = 72;
         let mut files = Vec::with_capacity(file_count);
         for index in 0..file_count {
@@ -7319,18 +7472,15 @@ mod tests {
         )
         .expect("folder import succeeds");
         assert_eq!(dto.items.len(), file_count);
-        assert!(
-            dto.prewarm
-                .iter()
-                .all(|r| r.result != prewarm::PrewarmResult::Busy),
-            "the bounded queue must not permanently drop batch posters: {:?}",
-            dto.prewarm
-        );
+        assert_eq!(dto.prewarm.len(), file_count);
 
-        // Every poster must land on disk; the re-pass + drain wait converge
-        // well inside the deadline for these tiny images.
+        // Every admitted poster lands on disk; Busy entries are served by the
+        // regular lazy thumbnail request instead of delaying the import IPC.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        for path in &files {
+        for (path, admission) in files.iter().zip(&dto.prewarm) {
+            if admission.result == prewarm::PrewarmResult::Busy {
+                continue;
+            }
             let target = poster_path_for(engine.cache_root(), &cache_key_for(path).unwrap());
             while !target.is_file() && std::time::Instant::now() < deadline {
                 std::thread::yield_now();

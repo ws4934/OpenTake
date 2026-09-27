@@ -1,0 +1,83 @@
+name: Import PR qualification
+
+# #23 touches the native Tauri command and retained-file/directory paths.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - 'src-tauri/src/media.rs'
+      - 'src-tauri/src/media/prewarm.rs'
+      - '.github/workflows/import-qualification.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  native-import:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      PR_BODY: ${{ github.event.pull_request.body }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: native-media-windows-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: native-media-windows-${{ runner.arch }}-
+      - name: Provision pinned FFmpeg for image import fixtures
+        run: |
+          python scripts/provision_ffmpeg_sidecars.py --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg provisioning failed' }
+          $toolsDir = Join-Path $env:RUNNER_TEMP 'opentake-import-ffmpeg'
+          New-Item -ItemType Directory -Force $toolsDir | Out-Null
+          foreach ($tool in @('ffmpeg', 'ffprobe')) {
+            $sidecar = Join-Path $env:GITHUB_WORKSPACE "src-tauri/binaries/$tool-x86_64-pc-windows-msvc.exe"
+            if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) { throw "Missing $tool sidecar" }
+            "OPENTAKE_$($tool.ToUpperInvariant())=$sidecar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Copy-Item -LiteralPath $sidecar -Destination (Join-Path $toolsDir "$tool.exe")
+          }
+          $toolsDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Compile native import commands and run issue 23 regressions
+        run: |
+          if ($env:PR_BODY -cnotmatch '(?im)^\s*(?:closes|fixes|resolves)\s+#23\b') {
+            throw 'Link issue #23 in the pull request description'
+          }
+          cargo clippy --locked -p opentake-tauri --lib -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Native import lint failed' }
+
+          function Assert-CargoCase([string]$case) {
+            $output = cargo test --locked -p opentake-tauri --lib $case -- --exact --nocapture --test-threads=1 2>&1
+            $code = $LASTEXITCODE
+            $lines = @($output | ForEach-Object { "$_" })
+            $lines | ForEach-Object { Write-Output $_ }
+            if ($code -ne 0) { throw "Issue regression failed: $case" }
+            $log = $lines -join "`n"
+            if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -or $log -match 'SKIP:') {
+              throw "Issue regression was skipped or did not run: $case"
+            }
+          }
+
+          foreach ($case in @(
+            'media::tests::explicit_import_reports_unopenable_and_ignores_oversized_unsupported_files',
+            'media::tests::batch_poster_admission_reads_one_snapshot_for_two_thousand_entries',
+            'media::tests::directory_rescan_does_not_hold_core_session_lock',
+            'media::tests::large_folder_import_reports_queue_pressure_without_polling',
+            'media::tests::explicit_import_rejects_a_path_replacement_before_atomic_commit',
+            'media::tests::recursive_mirror_rejects_external_directory_symlink_and_preserves_canary'
+          )) {
+            Assert-CargoCase $case
+          }
