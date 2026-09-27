@@ -3941,6 +3941,13 @@ fn validate_clip_property_target(
             "compound clip {clip_id} does not support retime, reverse, crop, or text properties"
         )));
     }
+    if clip.media_type != ClipType::Text
+        && (props.text_content.is_some() || props.text_style.is_some())
+    {
+        return Err(EditError::Invalid(format!(
+            "clip {clip_id} is not a text clip; text content and style apply only to text clips"
+        )));
+    }
     validate_effective_clip_timing(clip, props, &format!("clip {clip_id}"))
 }
 

@@ -2727,27 +2727,69 @@ impl Dispatcher {
             reversed: a.reversed,
             ..Default::default()
         };
-        let Some(transform_patch) = a.transform else {
+        let style_patch = TextStylePatch::from_args(&a)?;
+        let touches_text = a.content.is_some() || style_patch.is_some();
+        if a.transform.is_none() && !touches_text {
             let res = self.apply(EditCommand::SetClipProperties {
                 clip_ids,
                 properties: Box::new(properties),
             })?;
             return Ok(ToolResult::ok(res.summary));
-        };
+        }
+        // Content or font changes refit the text box unless a transform is given.
+        let refit_text = a.transform.is_none()
+            && (a.content.is_some() || a.font_name.is_some() || a.font_size.is_some());
 
         let mut assignments = Vec::with_capacity(clip_ids.len());
         for clip_id in &clip_ids {
             let clip = find_clip(before, clip_id).ok_or_else(|| {
                 ToolError::new(format!("set_clip_properties: clip not found: {clip_id}"))
             })?;
-            let aspect = media_canvas_aspect(before, manifest, clip)
-                .or_else(|| current_transform_aspect(clip.transform));
+            if touches_text && clip.media_type != opentake_domain::ClipType::Text {
+                return Err(ToolError::new(format!(
+                    "set_clip_properties: content, fontName, fontSize, color and alignment apply only to text clips; {clip_id} is not a text clip"
+                )));
+            }
             let mut clip_properties = properties.clone();
-            clip_properties.transform = Some(merge_transform_arg(
-                clip.transform,
-                transform_patch.clone(),
-                aspect,
-            ));
+            if let Some(transform_patch) = &a.transform {
+                let aspect = media_canvas_aspect(before, manifest, clip)
+                    .or_else(|| current_transform_aspect(clip.transform));
+                clip_properties.transform = Some(merge_transform_arg(
+                    clip.transform,
+                    transform_patch.clone(),
+                    aspect,
+                ));
+            }
+            if let Some(patch) = &style_patch {
+                clip_properties.text_style =
+                    Some(patch.apply(clip.text_style.clone().unwrap_or_default()));
+            }
+            if refit_text {
+                let content = a
+                    .content
+                    .as_deref()
+                    .or(clip.text_content.as_deref())
+                    .unwrap_or("");
+                let default_style = TextStyle::default();
+                let style = clip_properties
+                    .text_style
+                    .as_ref()
+                    .or(clip.text_style.as_ref())
+                    .unwrap_or(&default_style);
+                let fitted = auto_fit_text_transform(
+                    clip.transform.center_x,
+                    clip.transform.center_y,
+                    content,
+                    style,
+                    before.width.max(1) as f64,
+                    before.height.max(1) as f64,
+                );
+                clip_properties.transform = Some(Transform {
+                    width: fitted.width,
+                    height: fitted.height,
+                    ..clip.transform
+                });
+            }
             assignments.push(ClipPropertyAssignment {
                 clip_id: clip_id.clone(),
                 properties: clip_properties,
@@ -4260,6 +4302,79 @@ fn build_text_style(
         style.alignment = a;
     }
     style
+}
+
+/// The `set_clip_properties` text-style fields, validated up front and merged
+/// onto each clip's existing style so shadow/background/border survive.
+struct TextStylePatch {
+    font_name: Option<String>,
+    font_size: Option<f64>,
+    color: Option<Rgba>,
+    alignment: Option<opentake_domain::TextAlignment>,
+}
+
+impl TextStylePatch {
+    fn from_args(a: &SetClipPropertiesArgs) -> Result<Option<Self>, ToolError> {
+        if a.font_name.is_none()
+            && a.font_size.is_none()
+            && a.color.is_none()
+            && a.alignment.is_none()
+        {
+            return Ok(None);
+        }
+        if let Some(name) = &a.font_name {
+            if name.trim().is_empty() {
+                return Err(ToolError::new(
+                    "set_clip_properties: fontName must not be empty",
+                ));
+            }
+        }
+        if let Some(size) = a.font_size {
+            if !(4.0..=512.0).contains(&size) {
+                return Err(ToolError::new(format!(
+                    "set_clip_properties: fontSize must be between 4 and 512, got {size}"
+                )));
+            }
+        }
+        let color = match a.color.as_deref() {
+            Some(hex) => Some(Rgba::from_hex(hex).ok_or_else(|| {
+                ToolError::new(format!(
+                    "set_clip_properties: invalid color '{hex}' (want #RRGGBB)"
+                ))
+            })?),
+            None => None,
+        };
+        let alignment = match a.alignment.as_deref() {
+            Some(raw) => Some(parse_alignment(raw).ok_or_else(|| {
+                ToolError::new(format!(
+                    "set_clip_properties: invalid alignment '{raw}' (want left, center, or right)"
+                ))
+            })?),
+            None => None,
+        };
+        Ok(Some(TextStylePatch {
+            font_name: a.font_name.clone(),
+            font_size: a.font_size,
+            color,
+            alignment,
+        }))
+    }
+
+    fn apply(&self, mut style: TextStyle) -> TextStyle {
+        if let Some(name) = &self.font_name {
+            style.font_name = name.clone();
+        }
+        if let Some(size) = self.font_size {
+            style.font_size = size;
+        }
+        if let Some(color) = self.color {
+            style.color = color;
+        }
+        if let Some(alignment) = self.alignment {
+            style.alignment = alignment;
+        }
+        style
+    }
 }
 
 fn parse_alignment(s: &str) -> Option<opentake_domain::TextAlignment> {
@@ -9167,5 +9282,137 @@ mod tests {
             assert!(r.is_error, "{property} {row} must be rejected");
             assert_eq!(d.timeline(), before);
         }
+    }
+
+    /// Text clip `text-1` (styled, off-center, rotated) on track 0 and video
+    /// clip `clip-v` on track 1, on a 1920x1080 canvas.
+    fn styled_text_dispatcher() -> Dispatcher {
+        let mut tl = Timeline::new();
+        tl.width = 1920;
+        tl.height = 1080;
+        let mut text_track = Track::new("track-t", ClipType::Text);
+        let mut text = Clip::new("text-1", "", 0, 60);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = Some("Hello".into());
+        let mut style = TextStyle::default();
+        style.shadow.enabled = false;
+        style.background.enabled = true;
+        text.text_style = Some(style);
+        text.transform = Transform {
+            center_x: 0.3,
+            center_y: 0.7,
+            width: 0.2,
+            height: 0.1,
+            rotation: 15.0,
+            ..Transform::default()
+        };
+        text_track.clips.push(text);
+        let mut video_track = Track::new("track-v", ClipType::Video);
+        video_track.clips.push(Clip::new("clip-v", "vid", 0, 60));
+        tl.tracks.push(text_track);
+        tl.tracks.push(video_track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(entry("vid", "Camera"));
+        dispatcher_with(Arc::new(StateHandle::new(tl, manifest)))
+    }
+
+    fn styled_text_clip(d: &Dispatcher) -> Clip {
+        find_clip(&d.timeline(), "text-1").cloned().unwrap()
+    }
+
+    #[test]
+    fn set_clip_properties_merges_text_style_and_refits_the_box() {
+        let d = styled_text_dispatcher();
+        let r = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({"clipIds": ["text-1"], "fontSize": 120, "color": "#FF0000"}),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = styled_text_clip(&d);
+        let style = clip.text_style.clone().unwrap();
+        assert_eq!(style.font_size, 120.0);
+        assert_eq!(style.color, Rgba::new(1.0, 0.0, 0.0, 1.0));
+        assert!(!style.shadow.enabled);
+        assert!(style.background.enabled);
+        let fitted = auto_fit_text_transform(0.3, 0.7, "Hello", &style, 1920.0, 1080.0);
+        assert_eq!(clip.transform.width, fitted.width);
+        assert_eq!(clip.transform.height, fitted.height);
+        assert_eq!(clip.transform.center_x, 0.3);
+        assert_eq!(clip.transform.center_y, 0.7);
+        assert_eq!(clip.transform.rotation, 15.0);
+
+        let r = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({"clipIds": ["text-1"], "content": "Hello there, world"}),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = styled_text_clip(&d);
+        let fitted =
+            auto_fit_text_transform(0.3, 0.7, "Hello there, world", &style, 1920.0, 1080.0);
+        assert_eq!(clip.text_content.as_deref(), Some("Hello there, world"));
+        assert_eq!(clip.transform.width, fitted.width);
+        assert!(clip.transform.width > 0.2);
+    }
+
+    #[test]
+    fn set_clip_properties_explicit_transform_skips_the_text_refit() {
+        let d = styled_text_dispatcher();
+        let r = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({
+                "clipIds": ["text-1"],
+                "fontSize": 200,
+                "transform": {"centerX": 0.4},
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = styled_text_clip(&d);
+        assert_eq!(clip.text_style.unwrap().font_size, 200.0);
+        assert_eq!(clip.transform.center_x, 0.4);
+        assert_eq!(clip.transform.width, 0.2);
+        assert_eq!(clip.transform.height, 0.1);
+    }
+
+    #[test]
+    fn set_clip_properties_rejects_bad_text_fields_without_editing() {
+        let d = styled_text_dispatcher();
+        let before = d.timeline();
+        for args in [
+            serde_json::json!({"clipIds": ["clip-v"], "fontSize": 40}),
+            serde_json::json!({"clipIds": ["text-1", "clip-v"], "content": "Hi"}),
+            serde_json::json!({"clipIds": ["text-1"], "color": "red"}),
+            serde_json::json!({"clipIds": ["text-1"], "alignment": "justify"}),
+            serde_json::json!({"clipIds": ["text-1"], "fontSize": 1e308}),
+        ] {
+            let r = d.dispatch("set_clip_properties", args.clone());
+            assert!(r.is_error, "{args} must be rejected");
+            assert_eq!(d.timeline(), before);
+        }
+    }
+
+    #[test]
+    fn get_timeline_reports_non_default_text_style_only() {
+        let d = styled_text_dispatcher();
+        let clips = |d: &Dispatcher| {
+            first_json(&d.dispatch("get_timeline", serde_json::json!({})))["tracks"][0]["clips"][0]
+                .clone()
+        };
+        assert!(clips(&d).get("textStyle").is_none());
+
+        let r = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({
+                "clipIds": ["text-1"],
+                "fontName": "Georgia",
+                "color": "#00FF0080",
+                "alignment": "left",
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        assert_eq!(
+            clips(&d)["textStyle"],
+            serde_json::json!({"fontName": "Georgia", "color": "#00FF0080", "alignment": "left"})
+        );
     }
 }
