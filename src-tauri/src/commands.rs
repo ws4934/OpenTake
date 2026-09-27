@@ -2394,7 +2394,7 @@ mod project_open_async_tests {
         await_project_cover_save_worker, capture_composite_project_thumbnail, internal_error,
         prepare_saved_project_off_thread, project_save_for_project,
         project_save_for_project_with_checkpoint, project_save_for_project_with_commit_gate,
-        run_blocking_with_timeout, save_current_project_with_composite_cover, ProjectCoverCapture,
+        run_blocking_with_timeout, save_current_project_before_exit, ProjectCoverCapture,
         ProjectCoverCommitGate, ProjectLifecycleCoordinator,
     };
     use opentake_core::core::PreparedProjectOpen;
@@ -2943,14 +2943,9 @@ mod project_open_async_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_requested_uses_the_same_authoritative_project_local_cover_save() {
+    async fn close_requested_persists_edits_without_waiting_for_cover_render() {
         use opentake_domain::{Clip, ClipType, MediaManifestEntry, MediaSource, Track};
 
-        if !opentake_media::ffmpeg_status::ffmpeg_available()
-            || opentake_render::RenderDevice::try_new().is_err()
-        {
-            return;
-        }
         let fixture = tempfile::tempdir().expect("close fixture");
         let bundle = fixture.path().join("Close.opentake");
         std::fs::create_dir_all(bundle.join("media")).expect("create retained media");
@@ -2987,28 +2982,32 @@ mod project_open_async_tests {
         project.save().expect("save local project");
         let core = AppCore::new();
         core.open_project(&bundle).expect("open local project");
+        core.apply(opentake_core::EditCommand::SetTimelineSettings {
+            fps: 24,
+            width: 128,
+            height: 72,
+        })
+        .expect("edit before closing");
         let app = tauri::test::mock_builder()
             .manage(core)
-            .manage(crate::render::RenderState::new())
             .manage(crate::updater::InstallAdmissionGate::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("build managed mock app");
 
-        save_current_project_with_composite_cover(app.handle().clone())
+        save_current_project_before_exit(app.handle().clone())
             .await
-            .expect("close parity save");
+            .expect("close save");
 
-        let cover = image::open(bundle.join("thumbnail.jpg"))
-            .expect("close writes cover")
-            .to_rgb8();
-        assert_eq!((cover.width(), cover.height()), (640, 360));
-        let center = cover.get_pixel(320, 180).0;
-        assert!(center[2] > 120 && center[1] > 70, "{center:?}");
-        assert!(cover
-            .get_pixel(20, 180)
-            .0
-            .iter()
-            .all(|channel| *channel < 20));
+        let reopened = AppCore::new();
+        reopened
+            .open_project(&bundle)
+            .expect("reopen saved project");
+        let timeline = reopened.get_timeline().timeline;
+        assert_eq!(
+            (timeline.fps, timeline.width, timeline.height),
+            (24, 128, 72)
+        );
+        assert_eq!(timeline.tracks[0].clips[0].id, "clip");
     }
 
     fn capture_corrupt_external(kind: opentake_domain::ClipType) -> ProjectCoverCapture {
