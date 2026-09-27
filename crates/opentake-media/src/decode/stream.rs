@@ -5,6 +5,7 @@
 //! worker thread runs ffmpeg forward, maps each output image to an integer
 //! project-frame PTS, and pushes frames through a bounded queue.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ffmpeg_sidecar::event::{FfmpegEvent, OutputVideoFrame};
+use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel, OutputVideoFrame};
 
 use crate::error::{MediaError, Result};
 use crate::ff;
@@ -23,6 +24,9 @@ use crate::frame::RgbaFrame;
 pub const DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY: usize = 8;
 
 const BACKPRESSURE_SLEEP: Duration = Duration::from_millis(5);
+
+/// Most recent ffmpeg error/fatal log lines attached to a stream failure.
+const FAILURE_LOG_TAIL_LINES: usize = 20;
 
 /// A continuous video decode request.
 ///
@@ -211,9 +215,13 @@ fn run_video_stream(
         }
     };
 
+    let mut log_tail = VecDeque::with_capacity(FAILURE_LOG_TAIL_LINES);
+    let mut fatal = false;
+    let mut stopped = false;
     for event in iter {
         if control.is_stopped() {
             let _ = child.quit();
+            stopped = true;
             break;
         }
 
@@ -222,27 +230,51 @@ fn run_video_stream(
                 let decoded = stream_frame_from_output(&req, frame);
                 if !send_with_backpressure(&tx, Ok(decoded), &control) {
                     let _ = child.quit();
+                    stopped = true;
                     break;
                 }
             }
-            FfmpegEvent::Error(e) => {
-                if !send_with_backpressure(&tx, Err(MediaError::Ffmpeg(e)), &control) {
-                    let _ = child.quit();
-                    break;
-                }
+            // This worker has a single rawvideo output, so the sidecar's
+            // non-fatal `Error` uses (mismatched multi-output rates) cannot
+            // occur here.
+            FfmpegEvent::Error(e) | FfmpegEvent::Log(LogLevel::Fatal, e) => {
+                fatal = true;
+                push_log_tail(&mut log_tail, e);
             }
-            FfmpegEvent::Log(ffmpeg_sidecar::event::LogLevel::Error, e) => {
-                if !send_with_backpressure(&tx, Err(MediaError::Ffmpeg(e)), &control) {
-                    let _ = child.quit();
-                    break;
-                }
-            }
+            // Decoders log recoverable bitstream damage at [error] and keep
+            // going with error concealment; keep it for diagnostics only.
+            FfmpegEvent::Log(LogLevel::Error, e) => push_log_tail(&mut log_tail, e),
             FfmpegEvent::Done => break,
             _ => {}
         }
     }
 
-    let _ = child.wait();
+    let status = child.wait();
+    if stopped {
+        return;
+    }
+    let failure = match status {
+        Err(e) => Some(format!("wait: {e}")),
+        Ok(status) if !status.success() => Some(format!("ffmpeg exited with {status}")),
+        Ok(_) if fatal => Some("ffmpeg reported a fatal error".to_string()),
+        Ok(_) => None,
+    };
+    if let Some(reason) = failure {
+        let message = if log_tail.is_empty() {
+            reason
+        } else {
+            let tail = log_tail.into_iter().collect::<Vec<_>>().join(" | ");
+            format!("{reason}: {tail}")
+        };
+        let _ = send_with_backpressure(&tx, Err(MediaError::Ffmpeg(message)), &control);
+    }
+}
+
+fn push_log_tail(tail: &mut VecDeque<String>, line: String) {
+    if tail.len() == FAILURE_LOG_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(line);
 }
 
 fn send_with_backpressure(
@@ -450,6 +482,20 @@ mod tests {
         assert!((got.pts_secs - 2.1).abs() < 0.0001);
         assert_eq!(got.frame.width, 2);
         assert_eq!(got.frame.height, 1);
+    }
+
+    #[test]
+    fn failure_log_tail_keeps_only_the_most_recent_lines() {
+        let mut tail = VecDeque::new();
+        for line in 0..FAILURE_LOG_TAIL_LINES + 5 {
+            push_log_tail(&mut tail, line.to_string());
+        }
+        assert_eq!(tail.len(), FAILURE_LOG_TAIL_LINES);
+        assert_eq!(tail.front().map(String::as_str), Some("5"));
+        assert_eq!(
+            tail.back().map(String::as_str),
+            Some((FAILURE_LOG_TAIL_LINES + 4).to_string().as_str())
+        );
     }
 
     #[test]

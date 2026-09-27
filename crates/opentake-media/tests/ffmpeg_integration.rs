@@ -562,3 +562,108 @@ fn continuous_decode_scales_real_main10_frames_without_corruption() {
         );
     }
 }
+
+/// Flip `count` bytes inside the `mdat` payload with a fixed-seed xorshift so
+/// the damage is deterministic and never touches the container index.
+fn corrupt_mdat(path: &Path, count: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let tag = bytes
+        .windows(4)
+        .position(|window| window == b"mdat")
+        .expect("mp4 has an mdat box");
+    let size = u32::from_be_bytes(bytes[tag - 4..tag].try_into().unwrap()) as usize;
+    let (start, end) = (tag + 64, tag - 4 + size - 64);
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    for _ in 0..count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let offset = start + (state as usize) % (end - start);
+        bytes[offset] ^= 0xff;
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn stream_results(path: &Path) -> (usize, Vec<String>) {
+    let stream = spawn_video_stream(VideoStreamRequest::new(path, 30)).unwrap();
+    let (mut frames, mut errors) = (0, Vec::new());
+    while let Ok(result) = stream
+        .receiver()
+        .recv_timeout(std::time::Duration::from_secs(20))
+    {
+        match result {
+            Ok(_) => frames += 1,
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    (frames, errors)
+}
+
+#[test]
+fn continuous_decode_conceals_recoverable_bitstream_errors() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("damaged.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=20:size=160x120:rate=30",
+            "-c:v",
+            "libx264",
+            "-g",
+            "60",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&clip)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !generated {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+    corrupt_mdat(&clip, 40);
+    let check = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-i"])
+        .arg(&clip)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "ffmpeg itself decodes the damage");
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains("error"),
+        "fixture must make the decoder log recoverable errors"
+    );
+
+    let (frames, errors) = stream_results(&clip);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(frames, 600);
+}
+
+#[test]
+fn continuous_decode_reports_real_failures_with_the_log_tail() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let garbage = dir.path().join("garbage.mp4");
+    std::fs::write(&garbage, vec![0x5a_u8; 4096]).unwrap();
+
+    for path in [dir.path().join("missing.mp4"), garbage] {
+        let (frames, errors) = stream_results(&path);
+        assert_eq!(frames, 0);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("ffmpeg exited with"), "{}", errors[0]);
+        assert!(errors[0].contains("Error opening input"), "{}", errors[0]);
+    }
+}
