@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use opentake_domain::{Clip, ClipType, Timeline, Track};
+use opentake_domain::{Clip, ClipType, Rgba, TextStyle, Timeline, Track};
 use serde_json::{json, Map, Value};
 
 const CAPTION_ROW_LIMIT: usize = 200;
@@ -75,6 +75,42 @@ fn intersects(clip: &Clip, start: Option<i32>, end: Option<i32>) -> bool {
         }
     }
     true
+}
+
+/// `#RRGGBB`, or `#RRGGBBAA` when not opaque — the form `add_texts` accepts.
+fn hex_color(color: Rgba) -> String {
+    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let rgb = format!(
+        "#{:02X}{:02X}{:02X}",
+        byte(color.r),
+        byte(color.g),
+        byte(color.b)
+    );
+    if byte(color.a) == 255 {
+        rgb
+    } else {
+        format!("{rgb}{:02X}", byte(color.a))
+    }
+}
+
+/// The agent-editable text style fields (`fontName`, `fontSize`, `color`,
+/// `alignment`) that differ from [`TextStyle::default`]; `None` when all match.
+fn encode_text_style(style: &TextStyle) -> Option<Value> {
+    let default = TextStyle::default();
+    let mut m = Map::new();
+    if style.font_name != default.font_name {
+        m.insert("fontName".into(), json!(style.font_name));
+    }
+    if (style.font_size - default.font_size).abs() > f64::EPSILON {
+        m.insert("fontSize".into(), json!(round3(style.font_size)));
+    }
+    if style.color != default.color {
+        m.insert("color".into(), json!(hex_color(style.color)));
+    }
+    if style.alignment != default.alignment {
+        m.insert("alignment".into(), json!(style.alignment));
+    }
+    (!m.is_empty()).then_some(Value::Object(m))
 }
 
 /// Encode one non-caption clip, omitting default-valued fields.
@@ -158,6 +194,9 @@ fn encode_clip(clip: &Clip) -> Value {
     }
     if let Some(content) = &clip.text_content {
         m.insert("content".into(), json!(content));
+    }
+    if let Some(style) = clip.text_style.as_ref().and_then(encode_text_style) {
+        m.insert("textStyle".into(), style);
     }
     if let Some(g) = &clip.link_group_id {
         m.insert("linkGroupId".into(), json!(g));

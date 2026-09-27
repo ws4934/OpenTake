@@ -1242,6 +1242,35 @@ fn set_clip_properties_scalar_clears_keyframe_track() {
 }
 
 #[test]
+fn set_clip_properties_rejects_text_fields_on_non_text_clips() {
+    let mut st = state(vec![video_track("v", true, vec![clip("c", 0, 60)])]);
+    let before = st.timeline.clone();
+    let g = SeqIdGen::default();
+    for properties in [
+        ClipProperties {
+            text_style: Some(opentake_domain::TextStyle::default()),
+            ..Default::default()
+        },
+        ClipProperties {
+            text_content: Some("Title".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = apply(
+            &mut st,
+            EditCommand::SetClipProperties {
+                clip_ids: vec!["c".into()],
+                properties: Box::new(properties),
+            },
+            &g,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::Invalid(ref m) if m.contains("not a text clip")));
+        assert_eq!(st.timeline, before);
+    }
+}
+
+#[test]
 fn set_clip_properties_crop_sets_and_clears_track() {
     let mut st = state(vec![video_track("v", true, vec![clip("c", 0, 60)])]);
     let g = SeqIdGen::default();
