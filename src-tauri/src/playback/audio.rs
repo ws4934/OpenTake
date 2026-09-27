@@ -273,6 +273,8 @@ struct AudioStreamConsumer {
     receiver: ChunkReceiver<Result<AudioStreamChunk, MediaError>>,
     control: Arc<AudioStreamControl>,
     current: Option<AudioStreamChunk>,
+    /// The producer reported an error or exited, so no later window arrives.
+    terminated: bool,
 }
 
 impl AudioStreamConsumer {
@@ -288,15 +290,21 @@ impl AudioStreamConsumer {
         if self.current.is_some() {
             return;
         }
-        while let Ok(item) = self.receiver.try_recv() {
-            match item {
-                Ok(chunk) if chunk.generation == generation => {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Ok(chunk)) if chunk.generation == generation => {
                     self.current = Some(chunk);
                     break;
                 }
-                Ok(_) => {}
-                Err(error) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
                     eprintln!("[audio] streaming decode failed: {error}");
+                    self.terminated = true;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.terminated = true;
+                    break;
                 }
             }
         }
@@ -1024,8 +1032,13 @@ fn claim_ready_audio_block(
     if let PlaybackSamples::Streaming(consumer) = samples {
         let start = pos.load(Ordering::Acquire);
         if !consumer.ready_at(start) {
-            consumer.control.underruns.fetch_add(1, Ordering::Relaxed);
-            return None;
+            if !consumer.terminated {
+                consumer.control.underruns.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            // A failed or finished producer can never fill the gap. Keep the
+            // clock moving over silence instead of freezing playback.
+            return Some((pos.fetch_add(count as u64, Ordering::AcqRel), count));
         }
         let chunk = consumer.current.as_ref().expect("ready chunk");
         let end = chunk
@@ -1575,6 +1588,7 @@ fn mix_timeline_stereo(
             receiver,
             control: Arc::clone(&control),
             current: None,
+            terminated: false,
         },
         control,
         producer,
@@ -1865,6 +1879,7 @@ mod tests {
             receiver,
             control: Arc::clone(&control),
             current: None,
+            terminated: false,
         };
         assert_eq!(consumer.sample_frame(0), (0.25, -0.25));
 
@@ -1906,6 +1921,7 @@ mod tests {
             receiver,
             control: Arc::clone(&control),
             current: None,
+            terminated: false,
         });
 
         clock.seek(30); // render thread initialization
@@ -1944,6 +1960,7 @@ mod tests {
             receiver,
             control: Arc::clone(&control),
             current: None,
+            terminated: false,
         });
 
         assert_eq!(claim_ready_audio_block(&mut samples, &pos, 128), None);
@@ -1964,6 +1981,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_audio_stream_keeps_the_clock_moving_with_silence() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(4);
+        sender
+            .send(Err(MediaError::Decode("broken clip".into())))
+            .unwrap();
+        drop(sender);
+        let pos = AtomicU64::new(0);
+        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
+            receiver,
+            control,
+            current: None,
+            terminated: false,
+        });
+
+        assert_eq!(
+            claim_ready_audio_block(&mut samples, &pos, 128),
+            Some((0, 128))
+        );
+        assert_eq!(pos.load(Ordering::Acquire), 128);
+        let PlaybackSamples::Streaming(consumer) = &mut samples else {
+            unreachable!()
+        };
+        assert_eq!(consumer.sample_frame(0), (0.0, 0.0));
+    }
+
+    #[test]
     fn callback_crossing_a_window_boundary_waits_without_skipping_samples() {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(4);
@@ -1979,6 +2023,7 @@ mod tests {
             receiver,
             control,
             current: None,
+            terminated: false,
         });
 
         assert_eq!(
@@ -2021,6 +2066,7 @@ mod tests {
             receiver,
             control,
             current: None,
+            terminated: false,
         };
 
         consumer.discard_stale();
