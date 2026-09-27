@@ -78,7 +78,9 @@ impl Default for Transform {
 
 impl Transform {
     pub const MAX_NORMALIZED_CENTER: f64 = 10.0;
-    pub const MAX_NORMALIZED_SIZE: f64 = 10.0;
+    /// Generous enough for Inspector zooms of portrait media, whose height is
+    /// the width divided by the media-to-canvas aspect.
+    pub const MAX_NORMALIZED_SIZE: f64 = 100.0;
     pub const MAX_ROTATION_DEGREES: f64 = 3600.0;
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -98,7 +100,7 @@ impl Transform {
             || self.width > size_limit
             || self.height > size_limit
         {
-            return Err("transform width and height must be finite and between 0 and 10");
+            return Err("transform width and height must be finite and between 0 and 100");
         }
         if !self.rotation.is_finite() || self.rotation.abs() > Self::MAX_ROTATION_DEGREES {
             return Err("transform rotation must be finite and between -3600 and 3600 degrees");

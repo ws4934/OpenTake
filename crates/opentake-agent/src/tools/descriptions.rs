@@ -278,12 +278,12 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "opacity": {"type": "number", "minimum": 0, "maximum": 1, "description": "Opacity 0.0-1.0. Clears any existing opacity keyframes."},
                 "transform": {
                     "type": "object",
-                    "description": "Partial transform. Centers are finite normalized values from -10 to 10; width and height are finite values greater than 0 and at most 10. Omitted fields keep their current value.",
+                    "description": "Partial transform. Centers are finite normalized values from -10 to 10; width and height are finite values greater than 0 and at most 100. Omitted fields keep their current value.",
                     "properties": {
                         "centerX": {"type": "number", "minimum": -10, "maximum": 10},
                         "centerY": {"type": "number", "minimum": -10, "maximum": 10},
-                        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
-                        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
+                        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
+                        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
                         "flipHorizontal": {"type": "boolean", "description": "Mirror across the vertical axis."},
                         "flipVertical": {"type": "boolean", "description": "Mirror across the horizontal axis."}
                     }
@@ -341,12 +341,12 @@ pub fn input_schema(tool: ToolName) -> Value {
                             "content": {"type": "string", "description": "Text to display. Supports \\n for line breaks."},
                             "transform": {
                                 "type": "object",
-                                "description": "Optional normalized position/size. Centers are finite values from -10 to 10; width and height are greater than 0 and at most 10. Omit for center + auto-fit. Pass centerX+centerY only for a specific position with auto-fit size. Pass all four for full override.",
+                                "description": "Optional normalized position/size. Centers are finite values from -10 to 10; width and height are greater than 0 and at most 100. Omit for center + auto-fit. Pass centerX+centerY only for a specific position with auto-fit size. Pass all four for full override.",
                                 "properties": {
                                     "centerX": {"type": "number", "minimum": -10, "maximum": 10, "description": "Horizontal normalized center; 0-1 spans the canvas."},
                                     "centerY": {"type": "number", "minimum": -10, "maximum": 10, "description": "Vertical normalized center; 0-1 spans the canvas."},
-                                    "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Normalized width (optional; omit for auto-fit)."},
-                                    "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Normalized height (optional; omit for auto-fit)."},
+                                    "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "Normalized width (optional; omit for auto-fit)."},
+                                    "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "Normalized height (optional; omit for auto-fit)."},
                                     "flipHorizontal": {"type": "boolean", "description": "Mirror across the vertical axis."},
                                     "flipVertical": {"type": "boolean", "description": "Mirror across the horizontal axis."}
                                 }
