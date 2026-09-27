@@ -1641,7 +1641,7 @@ struct ExportOutputCleanup {
     file: Option<File>,
     final_name: Option<OsString>,
     partial_name: Option<OsString>,
-    target_identity: Option<FileIdentity>,
+    target_identity: Option<ExportTargetIdentity>,
 }
 
 impl ExportOutputCleanup {
@@ -2475,18 +2475,105 @@ fn open_media_directory_nofollow(path: &Path) -> Result<File, String> {
 
 /// Reject links and directories at the final name without opening it for
 /// writing. Preserve the original identity until the single rename commit.
-fn inspect_export_target(path: &Path) -> Result<Option<FileIdentity>, String> {
+fn inspect_export_target(path: &Path) -> Result<Option<ExportTargetIdentity>, String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_file() {
                 return Err("export output must be a real regular file".to_string());
             }
-            FileIdentity::from_path(path)
+            identify_export_target(path)
                 .map(Some)
                 .map_err(|error| format!("identify existing export target: {error}"))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("inspect existing export target: {error}")),
+    }
+}
+
+/// Identity of an existing export target, kept until the rename commit.
+///
+/// Unix keeps the target open: renaming over an open file is allowed, and the
+/// retained descriptor stops the inode number from being reused by a file
+/// written in its place. Windows must not keep a handle, because the classic
+/// replace (FAT, exFAT, network shares, older Windows) fails while any handle
+/// to the old file is open; NTFS file indexes carry a sequence number, so a
+/// file written in its place never repeats the key.
+#[cfg(not(windows))]
+type ExportTargetIdentity = FileIdentity;
+#[cfg(windows)]
+type ExportTargetIdentity = ExportFileKey;
+
+/// Identify `path` without following a final link and without blocking on a
+/// special file swapped in after the metadata check.
+fn identify_export_target(path: &Path) -> io::Result<ExportTargetIdentity> {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        // Attribute-only access with full sharing never conflicts with other
+        // openers of the target, and the handle is closed before returning.
+        options
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    options.read(true);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export target is not a regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        ExportFileKey::from_file(&file)
+    }
+    #[cfg(not(windows))]
+    {
+        FileIdentity::from_file(file)
+    }
+}
+
+/// Volume and file index of a file, read without retaining its handle.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportFileKey {
+    volume: u64,
+    index: u64,
+}
+
+#[cfg(windows)]
+impl ExportFileKey {
+    fn from_file(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
     }
 }
 
@@ -2529,13 +2616,61 @@ fn replace_export_file(
     final_name: &std::ffi::OsStr,
     _final_path: &Path,
 ) -> io::Result<()> {
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, FileRenameInformationEx, FILE_RENAME_POSIX_SEMANTICS,
+        FILE_RENAME_REPLACE_IF_EXISTS,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+        STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
+    };
+
+    // POSIX semantics replace a target that another process still holds open
+    // with delete sharing (a media player, the search indexer or an antivirus
+    // scan). Windows versions and file systems without the extended class
+    // fall back to the classic replace, which needs the old target closed.
+    let mut status = rename_retained_file(
+        directory,
+        file,
+        final_name,
+        FileRenameInformationEx,
+        FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+    )?;
+    if matches!(
+        status,
+        STATUS_INVALID_INFO_CLASS
+            | STATUS_INVALID_PARAMETER
+            | STATUS_NOT_IMPLEMENTED
+            | STATUS_NOT_SUPPORTED
+    ) {
+        // The classic class reads the same header; its first byte is the
+        // ReplaceIfExists BOOLEAN.
+        status = rename_retained_file(directory, file, final_name, FileRenameInformation, 1)?;
+    }
+    if status < 0 {
+        // SAFETY: converting an NTSTATUS reads no memory and consumes no handle.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(error as i32))
+    } else {
+        Ok(())
+    }
+}
+
+/// Rename the retained `file` to `final_name` inside the retained `directory`
+/// through `NtSetInformationFile`, returning the raw NTSTATUS.
+#[cfg(windows)]
+fn rename_retained_file(
+    directory: &File,
+    file: &File,
+    final_name: &std::ffi::OsStr,
+    class: windows_sys::Wdk::Storage::FileSystem::FILE_INFORMATION_CLASS,
+    flags: u32,
+) -> io::Result<windows_sys::Win32::Foundation::NTSTATUS> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
-        FILE_RENAME_INFORMATION_0,
+        NtSetInformationFile, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
     };
-    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let wide = final_name.encode_wide().collect::<Vec<_>>();
@@ -2553,14 +2688,17 @@ fn replace_export_file(
     let size = std::mem::size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(name_bytes as usize)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer too large"))?;
+    let size_u32 = u32::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer too large"))?;
     const _: () =
         assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFORMATION>());
     let mut storage = vec![0_usize; size.div_ceil(std::mem::size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `storage` is pointer-aligned and holds the header plus every
+    // UTF-16 unit of the name. Both handles stay open for this synchronous call
+    // (neither is opened for overlapped I/O), so `io_status` outlives it.
     let status = unsafe {
-        (*info).Anonymous = FILE_RENAME_INFORMATION_0 {
-            ReplaceIfExists: true,
-        };
+        (*info).Anonymous = FILE_RENAME_INFORMATION_0 { Flags: flags };
         (*info).RootDirectory = directory.as_raw_handle();
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -2573,16 +2711,11 @@ fn replace_export_file(
             file.as_raw_handle(),
             &mut io_status,
             info.cast(),
-            size as u32,
-            FileRenameInformation,
+            size_u32,
+            class,
         )
     };
-    if status < 0 {
-        let error = unsafe { RtlNtStatusToDosError(status) };
-        Err(io::Error::from_raw_os_error(error as i32))
-    } else {
-        Ok(())
-    }
+    Ok(status)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -4210,7 +4343,7 @@ mod tests {
         let project = tempfile::tempdir().expect("project");
         let output = project.path().join("partial.mp4");
         fs::write(&output, b"previous complete export").unwrap();
-        let previous_identity = FileIdentity::from_path(&output).unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).expect("create cleanup");
         let mut output_file = cleanup
             .open_output_file()
@@ -4227,7 +4360,7 @@ mod tests {
         drop(encoder_file);
         assert!(!partial_path.exists());
         assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
-        assert_eq!(FileIdentity::from_path(&output).unwrap(), previous_identity);
+        assert_eq!(identify_export_target(&output).unwrap(), previous_identity);
     }
 
     #[test]
@@ -4235,7 +4368,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let output = project.path().join("final.mp4");
         fs::write(&output, b"previous complete export").unwrap();
-        let previous_identity = FileIdentity::from_path(&output).unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
         let file = cleanup.open_output_file().unwrap();
         let partial = cleanup.partial_path().unwrap();
@@ -4255,7 +4388,7 @@ mod tests {
         encoder.abort();
         drop(cleanup);
         assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
-        assert_eq!(FileIdentity::from_path(&output).unwrap(), previous_identity);
+        assert_eq!(identify_export_target(&output).unwrap(), previous_identity);
         assert!(!partial.exists());
     }
 
@@ -4264,7 +4397,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let output = project.path().join("final.mp4");
         fs::write(&output, b"previous complete export").unwrap();
-        let previous_identity = FileIdentity::from_path(&output).unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
         let file = cleanup.open_output_file().unwrap();
         let partial = cleanup.partial_path().unwrap();
@@ -4287,7 +4420,7 @@ mod tests {
         assert!(probe.has_video);
         cleanup.publish().unwrap();
         drop(cleanup);
-        assert_ne!(FileIdentity::from_path(&output).unwrap(), previous_identity);
+        assert_ne!(identify_export_target(&output).unwrap(), previous_identity);
         assert!(!partial.exists());
         assert!(opentake_media::probe::probe(&output).unwrap().has_video);
     }
@@ -4348,7 +4481,7 @@ mod tests {
         let project = tempfile::tempdir().expect("project");
         let successful = project.path().join("successful.mp4");
         fs::write(&successful, b"old complete export").expect("previous output");
-        let old_identity = FileIdentity::from_path(&successful).unwrap();
+        let old_identity = identify_export_target(&successful).unwrap();
         let mut keep = ExportOutputCleanup::new(successful.clone(), true).expect("create cleanup");
         let mut file = keep.open_output_file().unwrap();
         file.write_all(b"new complete export").unwrap();
@@ -4359,7 +4492,7 @@ mod tests {
         keep.publish().expect("publish verified export");
         drop(keep);
         assert_eq!(fs::read(&successful).unwrap(), b"new complete export");
-        assert_ne!(FileIdentity::from_path(&successful).unwrap(), old_identity);
+        assert_ne!(identify_export_target(&successful).unwrap(), old_identity);
         assert!(!partial_path.exists());
 
         let reserved = project.path().join("reserved.mp4");
@@ -4374,6 +4507,30 @@ mod tests {
         reserved_cleanup.attach_output(reserved_file);
         drop(reserved_cleanup);
         assert!(reserved.exists());
+    }
+
+    #[test]
+    fn publish_replaces_a_target_that_a_reader_still_holds_open() {
+        use std::io::Read as _;
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous export").unwrap();
+        // A media player keeps the previous movie open. Rust's default Windows
+        // sharing includes FILE_SHARE_DELETE, like most players and scanners.
+        let mut reader = fs::File::open(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let mut file = cleanup.open_output_file().unwrap();
+        file.write_all(b"new export").unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        cleanup.attach_output(file);
+
+        cleanup.publish().unwrap();
+        drop(cleanup);
+        assert_eq!(fs::read(&output).unwrap(), b"new export");
+        assert!(!partial.exists());
+        let mut previous = Vec::new();
+        reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, b"previous export");
     }
 
     #[test]

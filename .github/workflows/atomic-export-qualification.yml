@@ -68,6 +68,7 @@ jobs:
             'export::tests::completed_native_encoder_replaces_previous_movie',
             'export::tests::export_output_cleanup_keeps_successful_output_and_reserved_output',
             'export::tests::export_does_not_publish_over_a_target_replaced_during_encoding',
+            'export::tests::publish_replaces_a_target_that_a_reader_still_holds_open',
             'export::tests::export_output_probe_reads_the_retained_file_before_cleanup'
           )
           if ($env:RUNNER_OS -eq 'Linux') {
