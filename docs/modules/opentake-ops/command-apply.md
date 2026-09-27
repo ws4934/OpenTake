@@ -31,6 +31,8 @@
 
 ### apply() —— 事务执行壳
 
+历史栈由 `editor_state/history.rs` 管理，最多 200 步，共享栈元数据与不可变条目。Undo/Redo 保留先校验候选再替换的原子策略，但不再复制整个历史，也不为 changed 判定额外克隆 before/after 文档。注册/替换/冻结素材的临时候选不带历史。core 检查点只复制当前文档和共享历史句柄，失败时可恢复已被批次淘汰的旧历史与清空的 redo。提供商音色和带外素材保留规则、Agent 的 transaction_version 归属判定不变。
+
 `apply(state: &mut EditorState, command: EditCommand, ids: &dyn IdGen) -> Result<EditResult, EditError>`：把命令分派到各实现函数。普通编辑实现走 `transact()`；`Undo`/`Redo` 与带 refusal 结果的 ripple 路径执行等价的 snapshot/restore/commit 流程：
 
 ```

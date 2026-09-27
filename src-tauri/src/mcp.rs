@@ -1902,8 +1902,7 @@ impl TauriMediaBridge {
         if meta.is_dir() {
             // Recursive directory import (剪注-style folder mirroring). Reuse the
             // media panel's `mirror_dir`; count what actually landed.
-            let before_entries = self.core.media().entries.len();
-            let before_folders = self.core.media().folders.len();
+            let (before_entries, before_folders) = self.core.media_counts();
             let mut skipped = Vec::new();
             let parent = folder_id.map(|s| s.to_string());
             before_commit();
@@ -1916,9 +1915,9 @@ impl TauriMediaBridge {
                 cancel,
             )
             .map_err(|error| BridgeError::new(error.to_string()))?;
-            let after = self.core.media();
-            let asset_count = after.entries.len().saturating_sub(before_entries);
-            let folder_count = after.folders.len().saturating_sub(before_folders);
+            let (after_entries, after_folders) = self.core.media_counts();
+            let asset_count = after_entries.saturating_sub(before_entries);
+            let folder_count = after_folders.saturating_sub(before_folders);
             if asset_count == 0 {
                 return Err(BridgeError::new(format!(
                     "No supported media found in folder: {path}"

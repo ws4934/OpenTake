@@ -60,6 +60,10 @@ pub fn apply(&mut self, command: EditCommand, ids: &dyn IdGen) -> Result<EditRes
 
 ## 媒体导入 / 重链（同步，在撤销事务之外）
 
+`checkpoint_editor_state()` 保存当前文档、版本及 ops 的共享不可变历史栈，不再深拷贝整条撤销链。写入失败时 `restore_editor_state()` 原样恢复检查点，即使失败批次已清空 redo 或触及 200 步上限淘汰旧记录也不会丢失历史。检查点只在持有会话锁的 core 事务中使用；它不是另一个编辑入口，也不把带外素材写入加入普通撤销历史。
+
+只需要数量时使用 `media_count()`，需要同一观察点的素材/文件夹数量时使用 `media_counts()`；二者不克隆 manifest。`AppCore` 提供对应的加锁入口，目录导入统计一次获取两项计数。需要完整媒体面板镜像时仍使用 `media()`。
+
 这是 core 内**已实现**的同步媒体路径，与 [`CoreDeps::media`](deps-di.md) 的异步能力后端是两回事：调用方（`src-tauri`，持媒体引擎）先探测文件，把纯值 `ProbedMedia` 传入，使本逻辑**单测无需调 ffprobe**。
 
 ### `ProbedMedia`

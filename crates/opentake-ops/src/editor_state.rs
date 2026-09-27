@@ -15,6 +15,8 @@ use opentake_domain::{ClipLocation, MediaManifest, Timeline};
 
 mod manifest_delta;
 use manifest_delta::ManifestDelta;
+mod history;
+use history::HistoryStack;
 
 /// Immutable snapshot of everything an [`crate::command::EditCommand`] can touch.
 #[derive(Clone, PartialEq, Debug)]
@@ -31,13 +33,15 @@ struct HistoryEntry {
     transaction_version: u64,
 }
 
-/// The editable document + undo/redo history + version.
+/// The editable document + bounded undo/redo history + version. Cloning copies
+/// only the current document: immutable historical entries and stack metadata
+/// are shared, with copy-on-write isolation for speculative edits/checkpoints.
 #[derive(Clone, Debug)]
 pub struct EditorState {
     pub timeline: Timeline,
     pub manifest: MediaManifest,
-    undo_stack: Vec<HistoryEntry>,
-    redo_stack: Vec<HistoryEntry>,
+    undo_stack: HistoryStack,
+    redo_stack: HistoryStack,
     version: u64,
 }
 
@@ -48,13 +52,17 @@ impl Default for EditorState {
 }
 
 impl EditorState {
+    /// Maximum number of recent undoable transactions. The oldest transaction
+    /// is discarded on overflow; undo/redo/checkpoints retain exact ordering.
+    pub const HISTORY_LIMIT: usize = history::LIMIT;
+
     /// New state wrapping `timeline` + `manifest` with empty history at version 0.
     pub fn new(timeline: Timeline, manifest: MediaManifest) -> Self {
         EditorState {
             timeline,
             manifest,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            undo_stack: HistoryStack::default(),
+            redo_stack: HistoryStack::default(),
             version: 0,
         }
     }
