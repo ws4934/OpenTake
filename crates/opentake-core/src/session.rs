@@ -49,6 +49,8 @@ use same_file::Handle;
 
 use crate::error::{CoreError, Result};
 
+mod import;
+
 /// The subset of probed media facts the session needs to materialize an asset.
 ///
 /// `opentake-core` deliberately does not depend on `opentake-media` (the
@@ -538,73 +540,22 @@ impl EditorSession {
                     provenance.source_asset_id
                 ))
             })?;
-        if !matches!(source.kind, ClipType::Audio | ClipType::Video)
-            || !source.has_audio.unwrap_or(source.kind == ClipType::Audio)
-        {
-            return Err(CoreError::Media(
-                "stem source asset has no audio".to_string(),
-            ));
-        }
-        if !valid_sha256(&provenance.source_sha256)
-            || provenance
-                .model_sha256
-                .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
-        {
-            return Err(CoreError::Media(
-                "stem provenance checksum is invalid".to_string(),
-            ));
-        }
-        let (provider, model) = provenance.execution.split_once(':').ok_or_else(|| {
-            CoreError::Media("stem execution must be '<provider>:<model>'".to_string())
-        })?;
-        if !safe_provider_prefix(provider) || model.trim().is_empty() {
-            return Err(CoreError::Media(
-                "stem execution provider or model is invalid".to_string(),
-            ));
-        }
-        let output_index = match provenance.stem.as_str() {
-            "vocals" => 0,
-            "accompaniment" => 1,
-            _ => {
-                return Err(CoreError::Media(
-                    "stem kind must be vocals or accompaniment".to_string(),
-                ))
-            }
-        };
-
-        let before = self.state.manifest.clone();
-        let result = (|| {
-            let entry = self.import_media_file(path, id, name, probe)?;
-            let target = self
-                .state
-                .manifest
-                .entries
-                .iter_mut()
-                .find(|candidate| candidate.id == entry.id)
-                .ok_or_else(|| CoreError::Media("imported stem disappeared".to_string()))?;
-            target.generation_input = Some(GenerationInput {
-                prompt: format!("stem:{}", provenance.stem),
-                model: model.to_string(),
-                duration: probe.duration_secs.max(0.0).round() as i32,
-                aspect_ratio: "audio".to_string(),
-                quality: provenance
-                    .model_sha256
-                    .map(|digest| format!("model-sha256:{digest}")),
-                reference_audio_urls: Some(vec![format!("sha256:{}", provenance.source_sha256)]),
-                provider: Some(provider.to_string()),
-                status: Some(GenerationJobStatus::Ready),
-                progress: Some(1.0),
-                output_index: Some(output_index),
-                source_asset_id: Some(provenance.source_asset_id),
-                ..GenerationInput::default()
+        let generation_input = import::stem_generation_input(source, provenance, probe)?;
+        let entry = self.prepare_media_file_entry(path, id, name, probe)?;
+        let position = self
+            .state
+            .manifest
+            .entries
+            .iter()
+            .position(|existing| existing.source == entry.source)
+            .unwrap_or_else(|| {
+                let position = self.state.manifest.entries.len();
+                self.state.manifest.entries.push(entry);
+                position
             });
-            Ok(target.clone())
-        })();
-        if result.is_err() {
-            self.state.manifest = before;
-        }
-        result
+        let target = &mut self.state.manifest.entries[position];
+        target.generation_input = Some(generation_input);
+        Ok(target.clone())
     }
 
     /// Import one file and roll the manifest back if `postcondition` fails.
@@ -620,7 +571,9 @@ impl EditorSession {
         postcondition: impl FnOnce() -> Result<()>,
     ) -> Result<MediaManifestEntry> {
         self.ensure_mutable()?;
-        let manifest_before = self.state.manifest.clone();
+        // Admission only appends or reuses an unchanged entry. A failed final
+        // identity check can therefore roll back by truncation, not O(n) clone.
+        let entries_before = self.state.manifest.entries.len();
         let path = path.as_ref();
         let entry = self.prepare_media_file_entry(path, id, name, probe)?;
         // Dedup (#91 "素材重复出现"): importing a file that is already in the
@@ -641,7 +594,7 @@ impl EditorSession {
             entry
         };
         if let Err(error) = postcondition() {
-            self.state.manifest = manifest_before;
+            self.state.manifest.entries.truncate(entries_before);
             return Err(error);
         }
         Ok(entry)

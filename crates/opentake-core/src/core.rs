@@ -26,7 +26,6 @@
 //! persistence logic — those live in `opentake-ops` / `opentake-project` and are
 //! reached through the session.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -323,21 +322,6 @@ fn ensure_project_identity(
         Err(crate::CoreError::Media(
             "project changed during global library workflow".to_string(),
         ))
-    }
-}
-
-fn resolve_prepared_folder(
-    planned: &BTreeMap<u64, String>,
-    folder: Option<PreparedMediaFolderRef>,
-) -> Result<Option<String>> {
-    match folder {
-        None => Ok(None),
-        Some(PreparedMediaFolderRef::Existing(id)) => Ok(Some(id)),
-        Some(PreparedMediaFolderRef::Planned(key)) => planned
-            .get(&key)
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| CoreError::Media(format!("prepared folder key not found: {key}"))),
     }
 }
 
@@ -1621,91 +1605,22 @@ impl AppCore {
         P: FnOnce() -> Result<()>,
         F: FnOnce(&mut EditorSession) -> Result<PathBuf>,
     {
-        let (imports, count, initial_version, final_version, written) = {
+        let (imports, count, written) = {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             session.editor.ensure_mutable()?;
             precondition()?;
             let before = session.editor.checkpoint_editor_state();
-            let initial_version = session.editor.version();
             let result = (|| {
-                let mut folder_ids = BTreeMap::<u64, String>::new();
-                let mut imports = Vec::new();
-
-                for operation in plan {
-                    match operation {
-                        PreparedMediaImportOp::CreateFolder { key, name, parent } => {
-                            if folder_ids.contains_key(&key) {
-                                return Err(CoreError::Media(format!(
-                                    "duplicate prepared folder key: {key}"
-                                )));
-                            }
-                            let parent_folder_id = resolve_prepared_folder(&folder_ids, parent)?;
-                            let result = session.editor.apply(
-                                EditCommand::CreateFolder {
-                                    name,
-                                    parent_folder_id,
-                                },
-                                self.ids.as_ref(),
-                            )?;
-                            let folder_id =
-                                result.affected_clip_ids.into_iter().next().ok_or_else(|| {
-                                    CoreError::Media(
-                                        "folder creation returned no id during batch import"
-                                            .to_string(),
-                                    )
-                                })?;
-                            folder_ids.insert(key, folder_id);
-                        }
-                        PreparedMediaImportOp::ImportFile {
-                            path,
-                            name,
-                            probe,
-                            folder,
-                        } => {
-                            let folder_id = resolve_prepared_folder(&folder_ids, folder)?;
-                            let id = self.ids.next_id();
-                            let mut entry =
-                                session.editor.import_media_file(&path, id, name, &probe)?;
-                            if let Some(folder_id) = folder_id {
-                                session.editor.apply(
-                                    EditCommand::MoveToFolder {
-                                        asset_ids: vec![entry.id.clone()],
-                                        folder_id: Some(folder_id.clone()),
-                                    },
-                                    self.ids.as_ref(),
-                                )?;
-                                entry.folder_id = Some(folder_id);
-                            }
-                            imports.push(CommittedMediaImport { path, entry });
-                        }
-                        PreparedMediaImportOp::ImportDerivedStem {
-                            path,
-                            name,
-                            probe,
-                            provenance,
-                        } => {
-                            let id = self.ids.next_id();
-                            let entry = session
-                                .editor
-                                .import_derived_stem_file(&path, id, name, &probe, provenance)?;
-                            imports.push(CommittedMediaImport { path, entry });
-                        }
-                    }
-                }
-
+                let imports = session
+                    .editor
+                    .import_prepared_media(plan, self.ids.as_ref())?;
                 let written = persist(&mut session.editor)?;
                 Ok((imports, written))
             })();
 
             match result {
-                Ok((imports, written)) => (
-                    imports,
-                    session.editor.media_count(),
-                    initial_version,
-                    session.editor.version(),
-                    written,
-                ),
+                Ok((imports, written)) => (imports, session.editor.media_count(), written),
                 Err(error) => {
                     session.editor.restore_editor_state(before);
                     return Err(error);
@@ -1713,12 +1628,6 @@ impl AppCore {
             }
         };
 
-        if final_version != initial_version {
-            self.events.emit(&CoreEvent::TimelineChanged {
-                project_epoch: expected_project_epoch,
-                version: final_version,
-            });
-        }
         self.events.emit(&CoreEvent::MediaChanged {
             project_epoch: expected_project_epoch,
             count,
@@ -2308,6 +2217,9 @@ impl AppCore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
+
+#[cfg(test)]
+mod import_tests;
 
 #[cfg(test)]
 mod tests {

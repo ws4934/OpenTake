@@ -41,7 +41,7 @@ pub enum GenerationJobStatus {
 /// Where a media file lives. Encoded externally-tagged to match Swift's
 /// synthesized `Codable` for an enum with associated values:
 /// `{"external":{"absolutePath":"..."}}` / `{"project":{"relativePath":"..."}}`.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MediaSource {
     #[serde(rename_all = "camelCase")]
