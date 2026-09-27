@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

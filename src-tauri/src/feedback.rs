@@ -6,6 +6,7 @@
 //! allow-listed feedback fields.
 
 use std::fmt;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::Duration;
 
