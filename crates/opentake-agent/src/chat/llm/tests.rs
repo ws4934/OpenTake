@@ -399,3 +399,107 @@ async fn next_chunk_or_cancel_interrupts_pending_stream() {
     let err = wait.await.unwrap_err().to_string();
     assert!(err.contains("cancelled"));
 }
+
+#[test]
+fn anthropic_default_model_is_current_and_retired_ids_are_replaced() {
+    let default = LlmProvider::Anthropic.default_model();
+    assert_eq!(default, "claude-haiku-4-5-20251001");
+    assert!(!RETIRED_MODELS.contains(&default));
+    assert!(!RETIRED_MODELS.contains(&LlmProvider::OpenAi.default_model()));
+    for retired in RETIRED_MODELS {
+        assert_eq!(
+            resolve_session_model(LlmProvider::Anthropic, Some("anthropic"), Some(retired)),
+            default
+        );
+    }
+}
+
+#[test]
+fn session_model_survives_same_provider_and_resets_on_switch() {
+    let anthropic = LlmProvider::Anthropic;
+    assert_eq!(
+        resolve_session_model(anthropic, Some("anthropic"), Some("claude-sonnet-4-6")),
+        "claude-sonnet-4-6"
+    );
+    assert_eq!(
+        resolve_session_model(anthropic, None, None),
+        anthropic.default_model()
+    );
+    assert_eq!(
+        resolve_session_model(anthropic, Some("openai"), Some("gpt-4o-mini")),
+        anthropic.default_model()
+    );
+}
+
+/// Serve one chunked SSE response: each `(delay, bytes)` pair is written after
+/// sleeping `delay`.
+async fn serve_chunked_once(chunks: Vec<(Duration, &'static [u8])>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        for (delay, bytes) in chunks {
+            tokio::time::sleep(delay).await;
+            let frame = [format!("{:x}\r\n", bytes.len()).as_bytes(), bytes, b"\r\n"].concat();
+            if socket.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn streaming_body_longer_than_read_timeout_completes_while_data_flows() {
+    let read_timeout = Duration::from_millis(200);
+    let chunks = (0..8)
+        .map(|_| (Duration::from_millis(100), &b"data: {}\n\n"[..]))
+        .collect();
+    let url = serve_chunked_once(chunks).await;
+    let started = std::time::Instant::now();
+    let resp = http_client_with_read_timeout(read_timeout)
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap();
+    let mut stream = resp.bytes_stream();
+    let mut received = 0;
+    while let Some(chunk) = stream.next().await {
+        received += chunk.expect("an active stream must not time out").len();
+    }
+    assert_eq!(received, 8 * b"data: {}\n\n".len());
+    assert!(started.elapsed() > read_timeout * 3);
+}
+
+#[tokio::test]
+async fn streaming_body_that_stalls_past_read_timeout_fails() {
+    let chunks = vec![
+        (Duration::ZERO, &b"data: {}\n\n"[..]),
+        (Duration::from_secs(2), &b"data: {}\n\n"[..]),
+    ];
+    let url = serve_chunked_once(chunks).await;
+    let resp = http_client_with_read_timeout(Duration::from_millis(200))
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap();
+    let mut stream = resp.bytes_stream();
+    let mut failed = false;
+    while let Some(chunk) = stream.next().await {
+        if chunk.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "a stalled stream must fail via read_timeout");
+}

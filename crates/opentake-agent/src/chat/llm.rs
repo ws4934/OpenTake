@@ -52,11 +52,36 @@ impl LlmProvider {
     }
 
     /// Default model id per provider (P1; a model picker is a follow-up).
+    /// Shared by chat and caption translation so the two cannot drift.
     pub fn default_model(self) -> &'static str {
         match self {
             LlmProvider::OpenAi => "gpt-4o-mini",
-            LlmProvider::Anthropic => "claude-3-5-haiku-latest",
+            LlmProvider::Anthropic => "claude-haiku-4-5-20251001",
         }
+    }
+}
+
+/// Model ids the providers have retired. Sessions persisted with one of these
+/// resolve to the provider default instead of failing every turn.
+const RETIRED_MODELS: &[&str] = &["claude-3-5-haiku-latest", "claude-3-5-haiku-20241022"];
+
+/// Pick the model for a turn: a session's stored model survives while the
+/// provider stays the same and the id is not retired; otherwise the provider
+/// default applies.
+pub fn resolve_session_model(
+    provider: LlmProvider,
+    previous_provider: Option<&str>,
+    stored_model: Option<&str>,
+) -> String {
+    match stored_model {
+        Some(model)
+            if previous_provider == Some(provider.as_str())
+                && !model.trim().is_empty()
+                && !RETIRED_MODELS.contains(&model) =>
+        {
+            model.to_string()
+        }
+        _ => provider.default_model().to_string(),
     }
 }
 
@@ -149,14 +174,19 @@ impl From<reqwest::Error> for LlmError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn http_client() -> Result<reqwest::Client, LlmError> {
+    http_client_with_read_timeout(READ_TIMEOUT)
+}
+
+/// No total request timeout: it would also cover the streamed body and cut
+/// long replies mid-stream. A stalled stream fails via `read_timeout` and the
+/// user can cancel at any time.
+fn http_client_with_read_timeout(read_timeout: Duration) -> Result<reqwest::Client, LlmError> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .read_timeout(read_timeout)
         .build()
         .map_err(|e| LlmError::Network(e.to_string()))
 }
