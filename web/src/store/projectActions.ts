@@ -380,19 +380,21 @@ export async function openProjectViaDialog(): Promise<void> {
   }
 }
 
-/** Materialize and open a remote sample without adding its cache path to the
- * recent-project registry. Tutorial routing is explicit so the Home card can
+/** Materialize and open an independent, durable sample project and record it
+ * in the recent-project registry. Tutorial routing is explicit so the Home card can
  * request the guided variant only after the project has opened successfully. */
 export async function openSampleProject(slug: string, startTutorial: boolean): Promise<void> {
   try {
     await saveCurrentProjectBeforeBoundary();
     const path = await api.sampleProjectMaterialize(slug);
     await flushMotionStudioBeforeProjectBoundary();
+    await saveCurrentProjectBeforeBoundary();
     await stopNativePlaybackForProjectBoundary();
     const snapshot = await api.projectOpen(path);
     useProjectStore.getState().replaceProjectSnapshot(snapshot);
     resetProjectMediaState();
     useProjectStore.getState().markSaved();
+    useRecentStore.getState().add(path);
     await refreshMedia();
     useEditorUiStore.getState().resetProjectRuntimeState();
     useEditorUiStore.getState().setView("editor");
