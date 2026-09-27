@@ -25,7 +25,7 @@ use opentake_core::OwnedUndoResult;
 use opentake_domain::{AnimPair, Crop, Interpolation, Keyframe, KeyframeTrack};
 use opentake_domain::{
     ChromaKey, ColorGrade, Effect, GenerationJobStatus, LiftGammaGain, Mask, MaskShape,
-    MediaManifest, Point2, Rgb, Rgba, TextStyle, Timeline, Transform, VideoType,
+    MediaManifest, Point2, Rgb, Rgba, TextStyle, Timeline, Transform, VideoType, VolumeScale,
 };
 use opentake_media::analysis::{
     detect_beats, detect_silences, BeatDetectionConfig, SilenceDetectionConfig,
@@ -4385,6 +4385,15 @@ fn build_keyframe_payload(
                 let value = *vals
                     .first()
                     .ok_or_else(|| ToolError::new(format!("keyframes[{i}]: missing value")))?;
+                // The volume track is stored in dB (as the Inspector writes it);
+                // the tool contract takes linear 0–1 amplitude.
+                let value = match property {
+                    KeyframeProperty::Volume => {
+                        VolumeScale::db_from_linear(unit_interval(value, i, "volume")?)
+                    }
+                    KeyframeProperty::Opacity => unit_interval(value, i, "opacity")?,
+                    _ => value,
+                };
                 kfs.push(make_keyframe(frame, value, interp));
             }
             KeyframePayload::Scalar(KeyframeTrack::from_keyframes(kfs))
@@ -4413,21 +4422,36 @@ fn build_keyframe_payload(
                 let (frame, vals, interp) = parse_kf_row(row, &format!("keyframes[{i}]"))?;
                 if vals.len() < 4 {
                     return Err(ToolError::new(format!(
-                        "keyframes[{i}]: crop needs [frame, left, top, right, bottom]"
+                        "keyframes[{i}]: crop needs [frame, top, right, bottom, left]"
                     )));
                 }
                 let crop = Crop {
-                    left: vals[0],
-                    top: vals[1],
-                    right: vals[2],
-                    bottom: vals[3],
+                    top: unit_interval(vals[0], i, "crop top")?,
+                    right: unit_interval(vals[1], i, "crop right")?,
+                    bottom: unit_interval(vals[2], i, "crop bottom")?,
+                    left: unit_interval(vals[3], i, "crop left")?,
                 };
+                if crop.left + crop.right >= 1.0 || crop.top + crop.bottom >= 1.0 {
+                    return Err(ToolError::new(format!(
+                        "keyframes[{i}]: crop left+right and top+bottom must each be below 1.0"
+                    )));
+                }
                 kfs.push(make_keyframe(frame, crop, interp));
             }
             KeyframePayload::Crop(KeyframeTrack::from_keyframes(kfs))
         }
     };
     Ok((property, payload))
+}
+
+fn unit_interval(value: f64, row: usize, what: &str) -> Result<f64, ToolError> {
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ToolError::new(format!(
+            "keyframes[{row}]: {what} must be between 0.0 and 1.0, got {value}"
+        )))
+    }
 }
 
 fn make_keyframe<V>(frame: i32, value: V, interp: Option<Interpolation>) -> Keyframe<V> {
@@ -9041,5 +9065,107 @@ mod tests {
         undo_with_empty_stack_errors();
         import_media_bytes_rejects_oversized_base64_before_bridge();
         import_media_rejects_unknown_nested_source_key();
+    }
+
+    /// Video clip `clip-v` on track 0 and audio clip `clip-a` on track 1, both
+    /// at frame 0 for 60 frames.
+    fn keyframe_dispatcher() -> Dispatcher {
+        let mut tl = Timeline::new();
+        tl.fps = 30;
+        let mut video_track = Track::new("track-v", ClipType::Video);
+        video_track.clips.push(Clip::new("clip-v", "vid", 0, 60));
+        let mut audio_track = Track::new("track-a", ClipType::Audio);
+        let mut audio = Clip::new("clip-a", "aud", 0, 60);
+        audio.media_type = ClipType::Audio;
+        audio_track.clips.push(audio);
+        tl.tracks.push(video_track);
+        tl.tracks.push(audio_track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(entry("vid", "Camera"));
+        manifest.entries.push(audio_entry("aud", "Voice"));
+        dispatcher_with(Arc::new(StateHandle::new(tl, manifest)))
+    }
+
+    fn keyframe_clip(d: &Dispatcher, id: &str) -> Clip {
+        d.timeline()
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == id)
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn set_keyframes_volume_takes_linear_amplitude() {
+        let d = keyframe_dispatcher();
+        let r = d.dispatch(
+            "set_keyframes",
+            serde_json::json!({
+                "clipId": "clip-a",
+                "property": "volume",
+                "keyframes": [[0, 0.0, "linear"], [30, 1.0, "linear"]],
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = keyframe_clip(&d, "clip-a");
+        assert!(clip.volume_at(0).abs() < 1e-6);
+        assert!((clip.volume_at(30) - 1.0).abs() < 1e-6);
+
+        let r = d.dispatch(
+            "set_keyframes",
+            serde_json::json!({"clipId": "clip-a", "property": "volume", "keyframes": [[0, 0.5]]}),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = keyframe_clip(&d, "clip-a");
+        assert!((clip.volume_at(0) - 0.5).abs() < 1e-6);
+        assert!((clip.volume_at(45) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_keyframes_crop_rows_are_top_right_bottom_left() {
+        let d = keyframe_dispatcher();
+        let r = d.dispatch(
+            "set_keyframes",
+            serde_json::json!({
+                "clipId": "clip-v",
+                "property": "crop",
+                "keyframes": [[0, 0.1, 0.2, 0.3, 0.4]],
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let crop = keyframe_clip(&d, "clip-v").crop_track.unwrap().keyframes[0].value;
+        assert_eq!(
+            crop,
+            Crop {
+                top: 0.1,
+                right: 0.2,
+                bottom: 0.3,
+                left: 0.4,
+            }
+        );
+    }
+
+    #[test]
+    fn set_keyframes_rejects_out_of_range_values_without_editing() {
+        let d = keyframe_dispatcher();
+        let before = d.timeline();
+        for (clip_id, property, row) in [
+            ("clip-a", "volume", serde_json::json!([0, -0.1])),
+            ("clip-a", "volume", serde_json::json!([0, 1.5])),
+            ("clip-v", "opacity", serde_json::json!([0, 2.0])),
+            ("clip-v", "crop", serde_json::json!([0, -0.1, 0, 0, 0])),
+            ("clip-v", "crop", serde_json::json!([0, 0, 0.6, 0, 0.5])),
+            ("clip-v", "crop", serde_json::json!([0, 0.5, 0, 0.5, 0])),
+        ] {
+            let args = serde_json::json!({
+                "clipId": clip_id,
+                "property": property,
+                "keyframes": [row],
+            });
+            let r = d.dispatch("set_keyframes", args);
+            assert!(r.is_error, "{property} {row} must be rejected");
+            assert_eq!(d.timeline(), before);
+        }
     }
 }
