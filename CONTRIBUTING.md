@@ -1,31 +1,38 @@
 # Contributing to OpenTake
 
-> Status: canonical · Stage: implementation-backed · Updated: 2026-09-06
+Contributions are welcome. Discuss large changes in an issue before implementing them.
 
-Contributions are welcome at [appergb/OpenTake](https://github.com/appergb/OpenTake). Discuss large changes in an issue before implementation. In this multi-worktree workspace, use `OpenTake-generation/`; a fresh clone may use its chosen directory name.
+Humans and AI agents follow the same conventions, which are maintained in one place:
 
-Start with [AGENTS.md](AGENTS.md), then read the relevant [module overview and index](docs/modules/INDEX.md). Development rules, upstream references, frame/serialization contracts and build commands have one source: [development conventions](docs/project/conventions.md).
+- [AGENTS.md](AGENTS.md) — entry point and hard rules
+- [.agent/message-conventions.md](.agent/message-conventions.md) — commits, branches, issues, pull requests and reviews
+- [.agent/workflow.md](.agent/workflow.md) — from issue to merge, and what to verify locally
+- [.agent/engineering.md](.agent/engineering.md) — architecture invariants and coding rules
+
+In short:
+
+- PR titles, PR descriptions and commit messages are written in English. Issues are preferably English; Chinese is accepted.
+- Commit subjects and PR titles use `<type>(<scope>): <summary>`, for example `fix(export): keep the old movie until the new export succeeds (#28)`.
+- Issue titles use `[P0-P3][<area>] <summary>`; use the templates under `.github/ISSUE_TEMPLATE/`.
+- PR descriptions start from `.github/pull_request_template.md`; delete the sections that do not apply rather than writing `None` or `N/A`. The `PR message` check enforces the title and description format.
+- No tool attribution lines or agent session links in PRs, issues or commits.
+- Enable the local commit message check once per clone with `git config core.hooksPath .githooks`.
 
 ## Validation
 
-Run checks appropriate to the changed behavior from the repository root:
+PR CI builds only the lightweight crates and the web frontend. Run the checks that match your change from the repository root and record the commands you actually ran in the PR:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy
-cargo test
-pnpm --dir web install --frozen-lockfile
-pnpm --dir web test
-pnpm --dir web build
-python3 scripts/check_docs.py
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --locked -p <crate> -- --test-threads=1
+pnpm -C web install --frozen-lockfile
+pnpm -C web build
+pnpm -C web test
 ```
 
-The frontend currently has no `lint` script; its build includes TypeScript checking. Record commands actually run. Native playback, GPU, audio, providers and installer changes need environment-specific evidence; a browser fallback does not validate a desktop package. Keep user edits and retained audit assets intact.
-
-## Documentation and releases
-
-Update the relevant module documentation with code changes. Keep historical dates and release versions. Current work follows the [public Beta plan](docs/plans/active/2026-09-06-public-beta.md); [Beta 6](docs/releases/1.0.0-beta.6.md) is a candidate pending validation and publication. Release/tag/signing operations belong to the release owner.
+Native playback, GPU, audio, provider and installer changes need evidence from the relevant platform; a browser fallback run does not validate the desktop app.
 
 ## License
 
-Contributions use the repository's GPL-3.0-or-later license; retain upstream attribution and third-party notices.
+Contributions are licensed under the repository's GPL-3.0-or-later license. Keep upstream attribution and third-party notices intact.
