@@ -31,6 +31,26 @@ def digest(data: bytes) -> str:
 
 
 class ProvisionFfmpegSidecarsTests(unittest.TestCase):
+    def test_cli_target_precedence_is_explicit_then_tauri_then_host(self) -> None:
+        cases = [
+            (["--target", "aarch64-apple-darwin"], "x86_64-unknown-linux-gnu", "aarch64-apple-darwin"),
+            ([], "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            ([], "", "x86_64-pc-windows-msvc"),
+        ]
+        for arguments, hook_target, expected in cases:
+            with self.subTest(arguments=arguments, hook_target=hook_target):
+                with (
+                    tempfile.TemporaryDirectory() as directory,
+                    mock.patch.object(provisioner, "BIN_DIR", Path(directory)),
+                    mock.patch.object(provisioner.sys, "argv", ["provisioner", *arguments]),
+                    mock.patch.dict(os.environ, {"TAURI_ENV_TARGET_TRIPLE": hook_target}),
+                    mock.patch.object(provisioner, "host_target", return_value="x86_64-pc-windows-msvc") as host,
+                    mock.patch.object(provisioner, "provision") as install,
+                ):
+                    self.assertEqual(provisioner.main(), 0)
+                self.assertEqual([call.args[2] for call in install.call_args_list], [expected, expected])
+                self.assertEqual(host.call_count, int(not arguments and not hook_target))
+
     def test_repository_root_can_be_bound_when_tooling_runs_outside_checkout(
         self,
     ) -> None:

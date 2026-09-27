@@ -200,9 +200,11 @@ def provision(tool: str, record: dict[str, object], target: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", default=host_target())
+    parser.add_argument("--target")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+    if args.target is None:
+        args.target = os.environ.get("TAURI_ENV_TARGET_TRIPLE") or host_target()
 
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     try:

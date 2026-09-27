@@ -29,6 +29,7 @@ mod library;
 mod lut;
 mod mcp;
 mod media;
+mod media_tools;
 pub mod motion;
 mod motion_documents;
 // Public for the same reason as `export`: integration acceptance drives the
@@ -93,8 +94,8 @@ pub fn run() {
     // explicit packaged/environment DSN this creates no SDK client or network.
     let _telemetry = telemetry::init_telemetry();
 
-    // Pin ffmpeg/ffprobe before anything decodes (see `resolve_media_tools`).
-    resolve_media_tools();
+    // Pin the bundled tools before starting any media workers.
+    media_tools::pin().expect("failed to resolve bundled FFmpeg paths");
 
     let safe_asset_protocol = safe_asset_protocol::SafeAssetProtocol::default();
     let legacy_asset_protocol = safe_asset_protocol.clone();
@@ -540,60 +541,6 @@ pub fn run() {
 #[doc(hidden)]
 pub fn run_safe_asset_helper_if_requested() -> bool {
     safe_asset_protocol::run_helper_if_requested()
-}
-
-/// Pin `OPENTAKE_FFMPEG` / `OPENTAKE_FFPROBE` before any media initialization.
-///
-/// A packaged application must use the two regular sidecars beside its own
-/// executable. Release builds deliberately pin the expected sibling paths even
-/// when a file is missing, so a corrupt package fails closed instead of silently
-/// invoking an attacker-controlled or developer-installed binary from PATH.
-/// Debug builds retain explicit overrides and host discovery for development.
-fn resolve_media_tools() {
-    let packaged = ["ffmpeg", "ffprobe"].map(opentake_media::ffmpeg_status::packaged_sidecar_path);
-    if let [Some(ffmpeg), Some(ffprobe)] = packaged {
-        std::env::set_var("OPENTAKE_FFMPEG", ffmpeg);
-        std::env::set_var("OPENTAKE_FFPROBE", ffprobe);
-        return;
-    }
-
-    if !cfg!(debug_assertions) {
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(parent) = executable.parent() {
-                let extension = if cfg!(windows) { ".exe" } else { "" };
-                std::env::set_var("OPENTAKE_FFMPEG", parent.join(format!("ffmpeg{extension}")));
-                std::env::set_var(
-                    "OPENTAKE_FFPROBE",
-                    parent.join(format!("ffprobe{extension}")),
-                );
-            }
-        }
-        return;
-    }
-
-    for (key, bin) in [
-        ("OPENTAKE_FFMPEG", "ffmpeg"),
-        ("OPENTAKE_FFPROBE", "ffprobe"),
-    ] {
-        if std::env::var_os(key).is_some() {
-            continue; // an explicit override always wins
-        }
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(path) = std::env::var_os("PATH") {
-            dirs.extend(std::env::split_paths(&path));
-        }
-        for p in [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/opt/local/bin",
-            "/usr/bin",
-        ] {
-            dirs.push(std::path::PathBuf::from(p));
-        }
-        if let Some(found) = dirs.into_iter().map(|d| d.join(bin)).find(|c| c.is_file()) {
-            std::env::set_var(key, found);
-        }
-    }
 }
 
 /// Map a [`CoreEvent`] onto a front-end Tauri event. The event name matches the
