@@ -6796,7 +6796,8 @@ fn swap_media(
         for id in &targets {
             let location = state.find_clip(id).expect("validated linked clip exists");
             let clip = &state.timeline.tracks[location.track_index].clips[location.clip_index];
-            let required = i64::from(clip.trim_start_frame) + i64::from(clip.source_frames_consumed());
+            let required =
+                i64::from(clip.trim_start_frame) + i64::from(clip.source_frames_consumed());
             if clip.trim_start_frame < 0 || required as f64 > available_frames + 0.001 {
                 return Err(EditError::Refused(format!(
                     "replacement media is too short for clip {id}"
