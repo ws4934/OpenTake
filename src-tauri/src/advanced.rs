@@ -2183,11 +2183,12 @@ impl TauriAdvancedWorkflowBridge {
             ));
         }
         let provider = args.provider.as_deref().unwrap_or("openai");
-        let model = args.model.as_deref().unwrap_or(match provider {
-            "openai" => "gpt-4o-mini",
-            "anthropic" => "claude-3-5-haiku-latest",
-            _ => "",
-        });
+        let model = args.model.as_deref().unwrap_or(
+            match opentake_agent::chat::provider_from_choice(provider) {
+                Ok(provider) => provider.default_model(),
+                Err(_) => "",
+            },
+        );
         if model.trim().is_empty() || model.len() > 128 {
             return Err(advanced_invalid("model must be a valid model identifier"));
         }
@@ -5178,6 +5179,65 @@ mod tests {
             .translate_captions(translation_args(ids, true), &MediaCancelToken::new())
             .is_err());
         assert_eq!(core.runtime_snapshot().timeline, before.timeline);
+    }
+
+    #[derive(Default)]
+    struct ModelRecordingCaptionTranslator {
+        models: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CaptionTranslationProvider for ModelRecordingCaptionTranslator {
+        fn translate(
+            &self,
+            provider: &str,
+            model: &str,
+            _source_locale: &str,
+            _target_locale: &str,
+            _captions: &[CaptionTranslationDraft],
+            _cancel: &MediaCancelToken,
+        ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
+            self.models
+                .lock()
+                .unwrap()
+                .push((provider.into(), model.into()));
+            Err(advanced_execution("recorded"))
+        }
+    }
+
+    #[test]
+    fn caption_translation_default_model_matches_chat_default() {
+        let root = tempfile::tempdir().unwrap();
+        let (core, ids) = caption_translation_fixture();
+        let translator = Arc::new(ModelRecordingCaptionTranslator::default());
+        let bridge = TauriAdvancedWorkflowBridge::with_caption_translator(
+            core,
+            root.path().join("cache"),
+            root.path().join("models"),
+            translator.clone(),
+        );
+        for provider in ["anthropic", "openai"] {
+            let mut args = translation_args(ids.clone(), false);
+            args.provider = Some(provider.into());
+            args.model = None;
+            let _ = bridge.translate_captions(args, &MediaCancelToken::new());
+        }
+        assert_eq!(
+            *translator.models.lock().unwrap(),
+            vec![
+                (
+                    "anthropic".to_string(),
+                    opentake_agent::chat::LlmProvider::Anthropic
+                        .default_model()
+                        .to_string()
+                ),
+                (
+                    "openai".to_string(),
+                    opentake_agent::chat::LlmProvider::OpenAi
+                        .default_model()
+                        .to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

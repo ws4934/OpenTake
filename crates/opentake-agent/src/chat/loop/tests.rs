@@ -1,4 +1,5 @@
 use super::*;
+use crate::chat::llm::LlmProvider;
 use crate::mcp::core_handle::CoreHandle;
 use opentake_domain::{Clip, ClipType, MediaManifest, Timeline, Track};
 use opentake_gen::MemoryKeyStore;
@@ -508,4 +509,45 @@ async fn unsupported_provider_fails_before_streaming() {
         .to_string();
     assert!(err.contains("does not support provider"));
     assert!(session.messages.is_empty());
+}
+
+async fn run_no_key_turn(loop_: &ChatLoop, session: &mut ChatSession, provider: &str) {
+    let emitter = CollectEmitter {
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    loop_
+        .run_turn(
+            session,
+            provider.into(),
+            "hello".into(),
+            &emitter,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn persisted_retired_model_is_replaced_and_chosen_model_is_kept() {
+    let loop_ = build_loop(talking_head_timeline(), Arc::new(MemoryKeyStore::new()));
+    let mut session = ChatSession::new("s1");
+    session.provider = Some("anthropic".into());
+    session.model = Some("claude-3-5-haiku-latest".into());
+    run_no_key_turn(&loop_, &mut session, "anthropic").await;
+    assert_eq!(
+        session.model.as_deref(),
+        Some(LlmProvider::Anthropic.default_model())
+    );
+
+    session.model = Some("claude-sonnet-4-6".into());
+    run_no_key_turn(&loop_, &mut session, "anthropic").await;
+    run_no_key_turn(&loop_, &mut session, "anthropic").await;
+    assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-6"));
+
+    run_no_key_turn(&loop_, &mut session, "openai").await;
+    assert_eq!(session.provider.as_deref(), Some("openai"));
+    assert_eq!(
+        session.model.as_deref(),
+        Some(LlmProvider::OpenAi.default_model())
+    );
 }

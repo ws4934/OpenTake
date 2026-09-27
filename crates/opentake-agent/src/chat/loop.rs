@@ -20,7 +20,8 @@ use opentake_domain::Timeline;
 use opentake_gen::KeyStore;
 
 use crate::chat::llm::{
-    no_key_guide, provider_from_choice, stream_chat, ChatRequest, LlmError, StreamEvent, ToolSchema,
+    no_key_guide, provider_from_choice, resolve_session_model, stream_chat, ChatRequest, LlmError,
+    StreamEvent, ToolSchema,
 };
 use crate::chat::session::{
     next_message_id, AgentContentBlock, ChatMessage, ChatSession, ToolCall,
@@ -491,8 +492,12 @@ impl ChatLoop {
         } = turn;
         let provider = provider_from_choice(&provider_choice)
             .map_err(|error| LoopError::llm(error, &first_message_id, 0))?;
-        session.provider = Some(provider_choice);
-        session.model = Some(provider.default_model().to_string());
+        let previous_provider = session.provider.replace(provider_choice);
+        session.model = Some(resolve_session_model(
+            provider,
+            previous_provider.as_deref(),
+            session.model.as_deref(),
+        ));
         if !has_trailing_user_message(session, &user_text) {
             session.messages.push(ChatMessage::user(user_text));
         }
