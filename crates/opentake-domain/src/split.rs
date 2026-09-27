@@ -55,11 +55,18 @@ pub fn split_clip(clip: &Clip, at_frame: i32, right_id: impl Into<String>) -> Op
         left.trim_end_frame = clip.trim_end_frame.checked_add(right_source)?;
     }
     left.fade_out_frames = 0;
+    left.transition_out = None;
     left.loudness_normalization = None;
     left.clamp_fades_to_duration();
 
     let mut right = clip.clone();
     right.id = right_id.into();
+    right.transition_out = right.transition_out.filter(|transition| {
+        transition.from_clip_id.is_empty() || transition.from_clip_id == clip.id
+    });
+    if let Some(transition) = &mut right.transition_out {
+        transition.from_clip_id = right.id.clone();
+    }
     right.start_frame = at_frame;
     right.duration_frames = right_duration;
     if clip.reversed {
@@ -235,6 +242,29 @@ mod tests {
         let (left, right) = split_clip(&c, 115, "right-uuid").unwrap();
         assert_eq!(left.id, "orig");
         assert_eq!(right.id, "right-uuid");
+    }
+
+    #[test]
+    fn outgoing_transition_moves_to_the_tail_without_rebinding_a_stale_owner() {
+        for owner in ["orig", "", "different-clip"] {
+            let mut clip = base_clip();
+            clip.transition_out = Some(crate::transition::Transition {
+                from_clip_id: owner.into(),
+                to_clip_id: "next".into(),
+                kind: crate::transition::TransitionKind::CrossDissolve,
+                duration_frames: 5,
+            });
+            let (left, right) = split_clip(&clip, 115, "right").unwrap();
+            assert!(left.transition_out.is_none());
+            if owner == "different-clip" {
+                assert!(right.transition_out.is_none());
+            } else {
+                let transition = right.transition_out.unwrap();
+                assert_eq!(transition.from_clip_id, "right");
+                assert_eq!(transition.to_clip_id, "next");
+                assert_eq!(transition.duration_frames, 5);
+            }
+        }
     }
 
     // --- Keyframe continuity across the cut ---
