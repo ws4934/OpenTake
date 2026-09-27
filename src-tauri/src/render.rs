@@ -3,8 +3,8 @@
 //! Wires the ready-made wgpu compositor (`opentake-render`) to the live editing
 //! session: build a `RenderPlan` from the current `Timeline`, evaluate one frame
 //! into an ordered draw list, resolve each layer's pixels through ffmpeg decode
-//! (`opentake-media`), composite on the GPU, read back, and return the frame as a
-//! base64 PNG data URL the WebView paints onto a `<canvas>` (replacing the black
+//! (`opentake-media`), composite on the GPU, read back, and return a binary JPEG
+//! the WebView paints onto a `<canvas>` (replacing the black
 //! placeholder shown on the Timeline tab).
 //!
 //! Scope: **video + image + text + Lottie** layers. Text clips rasterize through
@@ -28,8 +28,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tauri::{Manager, State};
 
@@ -55,7 +54,7 @@ use opentake_render::{
 };
 
 /// Cap (longest canvas side, px) for a composite when the caller passes no
-/// `max_size`. Keeps the PNG payload small for interactive scrubbing while still
+/// `max_size`. Keeps the JPEG payload small for interactive scrubbing while still
 /// looking crisp in the preview pane.
 const DEFAULT_PREVIEW_CAP: u32 = 1280;
 
@@ -113,17 +112,8 @@ pub(crate) struct TimelineResultPng {
 const TEXTURE_CACHE_CAP: usize = 64;
 const LUT_CACHE_CAP: usize = 16;
 
-/// The composited frame handed back to the WebView.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CompositeFrameDto {
-    /// Composite width in pixels (after preview downscale).
-    pub width: u32,
-    /// Composite height in pixels.
-    pub height: u32,
-    /// `data:image/png;base64,...` — assignable directly to an `<img>`/canvas.
-    pub data_url: String,
-}
+/// Binary preview envelope: `OTF1`, little-endian width and height, JPEG bytes.
+const STILL_FRAME_MAGIC: &[u8; 4] = b"OTF1";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1211,8 +1201,7 @@ pub(crate) fn authoritative_visible_clip_count(
     Ok(clip_count + text_count)
 }
 
-/// Encode an RGBA composite as PNG bytes. Shared by the preview data-URL path
-/// and the capture-to-media on-disk path.
+/// Encode an RGBA composite as PNG bytes for capture-to-media on disk.
 fn encode_png_bytes(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
     let mut bytes: Vec<u8> = Vec::new();
@@ -1227,11 +1216,27 @@ fn encode_png_bytes(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Encode an RGBA composite as a base64 PNG `data:` URL.
-fn encode_png_data_url(frame: &DecodedFrame) -> Result<String, String> {
-    let bytes = encode_png_bytes(frame)?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
+/// Pack a preview frame into a binary IPC response. The preview and playback
+/// stages both paint onto an opaque canvas, so JPEG follows the same RGB path
+/// used by the live playback transport.
+fn encode_still_frame(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
+    let mut rgb = Vec::with_capacity(frame.rgba.len() / 4 * 3);
+    for pixel in frame.rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&pixel[..3]);
+    }
+    let mut response = Vec::with_capacity(12);
+    response.extend_from_slice(STILL_FRAME_MAGIC);
+    response.extend_from_slice(&frame.width.to_le_bytes());
+    response.extend_from_slice(&frame.height.to_le_bytes());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut response, 75)
+        .encode(
+            &rgb,
+            frame.width,
+            frame.height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| format!("still jpeg encode: {error}"))?;
+    Ok(response)
 }
 
 fn timeline_timecode(frame: i32, fps: i32) -> String {
@@ -1749,7 +1754,7 @@ pub async fn composite_frame(
     render: State<'_, RenderState>,
     request: CompositeFrameRequest,
     max_size: Option<u32>,
-) -> Result<CompositeFrameDto, String> {
+) -> Result<tauri::ipc::Response, String> {
     let revision = ProjectRevision {
         project_epoch: request.project_epoch,
         version: request.timeline_version,
@@ -1769,7 +1774,9 @@ pub async fn composite_frame(
         composite_frame_blocking(&core, &render, request, max_size, revision, &cancel)
     });
     tokio::select! {
-        result = &mut work => result.map_err(|error| format!("preview composite worker failed: {error}"))?,
+        result = &mut work => result
+            .map_err(|error| format!("preview composite worker failed: {error}"))?
+            .map(tauri::ipc::Response::new),
         _ = cancelled.changed() => Err("preview composite was superseded".to_string()),
     }
 }
@@ -1781,7 +1788,7 @@ fn composite_frame_blocking(
     max_size: Option<u32>,
     revision: ProjectRevision,
     cancel: &MediaCancelToken,
-) -> Result<CompositeFrameDto, String> {
+) -> Result<Vec<u8>, String> {
     if cancel.is_cancelled() || core.project_revision() != revision {
         return Err("preview composite was superseded".to_string());
     }
@@ -1808,7 +1815,7 @@ fn composite_frame_blocking(
     {
         return Err("preview composite was superseded".to_string());
     }
-    let data_url = encode_png_data_url(&composite)?;
+    let encoded = encode_still_frame(&composite)?;
     if cancel.is_cancelled()
         || core.project_revision() != revision
         || !render.preview.is_current(
@@ -1823,11 +1830,7 @@ fn composite_frame_blocking(
     if request.source_media_id.is_none() && request.sequence_id.is_none() {
         record_root_timeline_playhead(request.project_epoch, request.frame);
     }
-    Ok(CompositeFrameDto {
-        width: composite.width,
-        height: composite.height,
-        data_url,
-    })
+    Ok(encoded)
 }
 
 #[tauri::command]
@@ -2530,18 +2533,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_png_data_url_has_png_prefix() {
+    fn encoded_still_frame_has_dimensions_and_jpeg_body() {
         let frame = DecodedFrame::new(1, 1, vec![10, 20, 30, 255], false);
-        let url = encode_png_data_url(&frame).expect("encode");
-        assert!(url.starts_with("data:image/png;base64,"));
-        // Round-trips to a non-empty payload.
-        let b64 = url.strip_prefix("data:image/png;base64,").unwrap();
-        assert!(!b64.is_empty());
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .expect("valid base64");
-        // PNG magic number.
-        assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
+        let bytes = encode_still_frame(&frame).expect("encode");
+        assert_eq!(&bytes[..4], STILL_FRAME_MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(&bytes[12..14], &[0xff, 0xd8]);
     }
 
     #[test]

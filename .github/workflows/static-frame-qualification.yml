@@ -76,3 +76,4 @@ jobs:
           Assert-Case 'render::tests::preview_cancellation_returns_while_blocking_work_is_occupied'
           Assert-Case 'render::tests::preview_composite_rejects_missing_image_instead_of_returning_a_black_frame'
           Assert-Case 'render::tests::repeated_still_frames_reuse_managed_lut_without_rereading_it'
+          Assert-Case 'render::tests::encoded_still_frame_has_dimensions_and_jpeg_body'
