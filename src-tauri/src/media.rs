@@ -6504,6 +6504,101 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_audio_clip_cancel_mid_render_leaves_no_output_or_manifest_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+
+        use opentake_domain::{Clip, Track};
+
+        if !opentake_media::ffmpeg_status::ffprobe_available() {
+            eprintln!(
+                "SKIP: ffmpeg sidecars are required for the 300-frame audio cancellation test"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("CancelAudio.opentake");
+        let source = tmp.path().join("speech.wav");
+        crate::export::write_wav_s16le(&vec![0.2; 48_000 * 10], 48_000, &source).unwrap();
+        let mut project = opentake_project::Project::new(&bundle);
+        project.timeline.fps = 30;
+        let mut track = Track::new("audio", ClipType::Audio);
+        track.clips.push(Clip::new("audio-clip", "speech", 0, 300));
+        project.timeline.tracks.push(track);
+        project.manifest.entries.push(MediaManifestEntry {
+            id: "speech".into(),
+            name: "speech".into(),
+            kind: ClipType::Audio,
+            source: MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        project.save().unwrap();
+        let core = AppCore::new();
+        core.open_project(bundle.clone()).unwrap();
+        let snapshot = core.runtime_snapshot();
+        let before = core.media();
+        let before_disk = fs::read(bundle.join("media.json")).unwrap();
+
+        let control = crate::export::ExportControl::default();
+        let guard = control.try_begin("save-as:audio-cancel").unwrap();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let signalled = AtomicBool::new(false);
+        let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
+            if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
+                progress_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        });
+        let worker_core = core.clone();
+        let worker_control = control.clone();
+        let temp_root = tmp.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let engine = engine_for(&temp_root);
+            let scheduler = prewarm::PrewarmScheduler::new(snapshot.project_epoch);
+            save_clip_as_media_workflow_from_snapshot(
+                &worker_core,
+                &worker_control,
+                &engine,
+                &scheduler,
+                snapshot,
+                "audio-clip",
+                "save-as:audio-cancel",
+                on_progress,
+                Some(guard),
+            )
+        });
+        let reached_progress = progress_rx.recv_timeout(Duration::from_secs(20));
+        let cancelled = control.request_cancel("save-as:audio-cancel");
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap();
+        reached_progress.expect("the 300-frame FFmpeg audio worker must reach partial progress");
+        assert!(cancelled, "cancellation must reach the active worker");
+        assert_eq!(result.unwrap_err(), crate::export::CANCELLED_SENTINEL);
+        assert_eq!(core.media(), before);
+        assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+        assert!(
+            !bundle.join("media").exists()
+                || fs::read_dir(bundle.join("media")).unwrap().next().is_none(),
+            "partial WAV output must be removed"
+        );
+    }
+
+    #[test]
     fn project_switch_before_saved_media_transaction_leaves_replacement_unchanged() {
         let tmp = tempfile::tempdir().expect("temp root");
         let project_a = tmp.path().join("A.opentake");
