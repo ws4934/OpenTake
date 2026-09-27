@@ -2264,6 +2264,50 @@ impl AppCore {
         Ok(entry)
     }
 
+    /// Publish a finished proxy only if its source and previous proxy still
+    /// match the job's initial snapshot. Other media edits may continue while
+    /// the expensive transcode is running, without losing a newer proxy.
+    pub fn set_media_proxy_if_source_unchanged_for_project(
+        &self,
+        expected_project_epoch: u64,
+        expected_project_dir: &Path,
+        expected_entry: &MediaManifestEntry,
+        proxy: Option<MediaProxy>,
+    ) -> Result<Option<MediaManifestEntry>> {
+        let (entry, count, written) = {
+            let mut session = self.lock();
+            ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
+            let Some(current) = session.editor.media_entry(&expected_entry.id) else {
+                return Ok(None);
+            };
+            if current.source != expected_entry.source
+                || current.kind != expected_entry.kind
+                || current.proxy != expected_entry.proxy
+            {
+                return Ok(None);
+            }
+            let before = session.editor.media();
+            let entry = session.editor.set_media_proxy(&expected_entry.id, proxy)?;
+            let count = session.editor.media_count();
+            match session.editor.save_media_manifest() {
+                Ok(written) => (entry, count, written),
+                Err(error) => {
+                    session.editor.restore_media(before);
+                    return Err(error);
+                }
+            }
+        };
+        self.events.emit(&CoreEvent::MediaChanged {
+            project_epoch: expected_project_epoch,
+            count,
+        });
+        self.events.emit(&CoreEvent::ProjectSaved {
+            path: written.to_string_lossy().into_owned(),
+            project_epoch: expected_project_epoch,
+        });
+        Ok(Some(entry))
+    }
+
     /// Reconcile a proxy after a background source hash. A newer proxy or a
     /// project switch must never be overwritten by an older playback task.
     pub fn reconcile_media_proxy_for_project(
@@ -3963,6 +4007,75 @@ mod tests {
             .reconcile_media_proxy_for_project(epoch, &bundle, &entry.id, &current, None)
             .unwrap());
         assert!(core.media().entries[0].proxy.is_none());
+    }
+
+    #[test]
+    fn proxy_job_commit_allows_save_but_rejects_newer_proxy_and_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ProxyJob.opentake");
+        let core = Arc::new(AppCore::new());
+        core.save_project(Some(bundle.clone())).unwrap();
+        let source = temp.path().join("source.mp4");
+        std::fs::write(&source, b"source").unwrap();
+        let expected_entry = core
+            .import_media_file(&source, "source", &ProbedMedia::default())
+            .unwrap();
+        let epoch = core.runtime_snapshot().project_epoch;
+        let candidate = MediaProxy {
+            relative_path: "media/proxies/first.mp4".into(),
+            source_sha256: "a".repeat(64),
+            source_stamp: None,
+            width: 640,
+            height: 360,
+        };
+        // Simulate a long transcode after the initial identity lease is gone.
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_core = Arc::clone(&core);
+        let worker_bundle = bundle.clone();
+        let worker_entry = expected_entry.clone();
+        let worker_candidate = candidate.clone();
+        let worker = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            worker_core.set_media_proxy_if_source_unchanged_for_project(
+                epoch,
+                &worker_bundle,
+                &worker_entry,
+                Some(worker_candidate),
+            )
+        });
+        let start = std::time::Instant::now();
+        core.save_project(None).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap().is_some());
+        assert_eq!(core.media().entries[0].proxy, Some(candidate.clone()));
+
+        let newer = MediaProxy {
+            relative_path: "media/proxies/newer.mp4".into(),
+            ..candidate.clone()
+        };
+        core.set_media_proxy_for_project(epoch, &bundle, &expected_entry.id, Some(newer.clone()))
+            .unwrap();
+        assert!(core
+            .set_media_proxy_if_source_unchanged_for_project(
+                epoch,
+                &bundle,
+                &expected_entry,
+                Some(candidate.clone()),
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(core.media().entries[0].proxy, Some(newer));
+        core.new_project();
+        assert!(matches!(
+            core.set_media_proxy_if_source_unchanged_for_project(
+                epoch,
+                &bundle,
+                &expected_entry,
+                Some(candidate),
+            ),
+            Err(CoreError::Media(_))
+        ));
     }
 
     #[test]

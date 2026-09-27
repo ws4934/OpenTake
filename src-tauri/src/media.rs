@@ -4937,40 +4937,52 @@ fn create_media_proxy_blocking(
     cancel: opentake_media::MediaCancelToken,
 ) -> Result<MediaProxyDto, String> {
     let core = app.state::<AppCore>();
-    let _identity = core.lock_project_identity_workflow();
-    core.ensure_project_mutable()
+    // Take only the initial identity snapshot under the shared lease. A save
+    // must never wait for the source hash or FFmpeg to finish (#64).
+    let (project_epoch, project_dir, entry, source) = {
+        let _identity = core.lock_project_identity_workflow();
+        core.ensure_project_mutable()
+            .map_err(|error| error.to_string())?;
+        let snapshot = core.runtime_snapshot();
+        let project_dir = snapshot
+            .project_dir
+            .ok_or_else(|| "media_proxy_project_must_be_saved".to_string())?;
+        let entry = snapshot
+            .media
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == asset_id)
+            .ok_or_else(|| format!("media_proxy_source_not_found:{asset_id}"))?;
+        if entry.kind != ClipType::Video {
+            return Err("media_proxy_video_required".to_string());
+        }
+        let source = source_path_for_entry(&entry, Some(&project_dir))?;
+        if !source.is_file() {
+            return Err("media_proxy_source_unreadable".to_string());
+        }
+        let root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
+        core.ensure_project_root_identity_for_project(
+            snapshot.project_epoch,
+            &project_dir,
+            root.identity(),
+        )
         .map_err(|error| error.to_string())?;
-    let snapshot = core.runtime_snapshot();
-    let project_dir = snapshot
-        .project_dir
-        .clone()
-        .ok_or_else(|| "media_proxy_project_must_be_saved".to_string())?;
-    let entry = snapshot
-        .media
-        .entries
-        .iter()
-        .find(|entry| entry.id == asset_id)
-        .cloned()
-        .ok_or_else(|| format!("media_proxy_source_not_found:{asset_id}"))?;
-    if entry.kind != ClipType::Video {
-        return Err("media_proxy_video_required".to_string());
-    }
-    let source = source_path_for_entry(&entry, Some(&project_dir))?;
-    if !source.is_file() {
-        return Err("media_proxy_source_unreadable".to_string());
-    }
+        (snapshot.project_epoch, project_dir, entry, source)
+    };
 
-    let project_root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
-    core.ensure_project_root_identity_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        project_root.identity(),
-    )
-    .map_err(|error| error.to_string())?;
-    let proxy_dir = project_proxy_directory(&project_dir, true)?;
+    // The private stage is a sibling of the bundle: it shares its filesystem
+    // for an atomic publication, but no save can accidentally copy partial
+    // transcode bytes into the project while the worker runs.
+    let stage_parent = project_dir
+        .parent()
+        .ok_or_else(|| "media_proxy_project_parent_missing".to_string())?;
+    let stage = tempfile::Builder::new()
+        .prefix(".opentake-proxy-job-")
+        .tempdir_in(stage_parent)
+        .map_err(|error| format!("media_proxy_stage_failed:{error}"))?;
+    let stage_output = stage.path().join("proxy.mp4");
     let leaf = format!("{}.mp4", uuid::Uuid::new_v4());
     let relative_path = format!("media/proxies/{leaf}");
-    let output = proxy_dir.join(leaf);
     let progress_app = app.clone();
     let progress_asset_id = asset_id.clone();
     let progress: ProxyProgressCallback = Arc::new(move |done, total| {
@@ -4986,7 +4998,7 @@ fn create_media_proxy_blocking(
     let created = match create_proxy(
         ProxyRequest {
             source: &source,
-            output: &output,
+            output: &stage_output,
             max_size: (max_width.unwrap_or(1280), max_height.unwrap_or(720)),
         },
         &cancel,
@@ -4996,6 +5008,27 @@ fn create_media_proxy_blocking(
         Err(MediaError::Cancelled) => return Err("media_proxy_cancelled".to_string()),
         Err(error) => return Err(format!("media_proxy_failed:{error}")),
     };
+    // Project replacement/Save As cancels the worker. Check once more under a
+    // short identity lease before exposing the file and its manifest entry.
+    let _identity = core.lock_project_identity_workflow();
+    if cancel.checkpoint() {
+        return Err("media_proxy_cancelled".to_string());
+    }
+    let current_root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
+    core.ensure_project_root_identity_for_project(
+        project_epoch,
+        &project_dir,
+        current_root.identity(),
+    )
+    .map_err(|error| error.to_string())?;
+    core.ensure_project_mutable()
+        .map_err(|error| error.to_string())?;
+    let proxy_dir = project_proxy_directory(&project_dir, true)?;
+    let output = proxy_dir.join(leaf);
+    // Hard-linking from the private sibling stage is atomic, same-volume, and
+    // refuses to clobber a destination that unexpectedly already exists.
+    std::fs::hard_link(&stage_output, &output)
+        .map_err(|error| format!("media_proxy_publish_failed:{error}"))?;
     let proxy = MediaProxy {
         relative_path: relative_path.clone(),
         source_sha256: created.source_sha256.clone(),
@@ -5003,37 +5036,30 @@ fn create_media_proxy_blocking(
         width: created.width,
         height: created.height,
     };
-    if let Err(error) = core.ensure_project_root_identity_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        project_root.identity(),
-    ) {
-        let _ = std::fs::remove_file(&output);
-        return Err(error.to_string());
-    }
-    if let Err(error) = core.set_media_proxy_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        &asset_id,
-        Some(proxy),
-    ) {
-        let _ = std::fs::remove_file(&output);
-        return Err(format!("media_proxy_persist_failed:{error}"));
-    }
+    // Grant access before writing the manifest, so failure cannot leave a
+    // persisted proxy whose asset URL is unusable.
     if let Err(error) = grant_proxy_asset_file(&app, &output) {
-        let rollback = core.set_media_proxy_for_project(
-            snapshot.project_epoch,
-            &project_dir,
-            &asset_id,
-            entry.proxy.clone(),
-        );
         let _ = std::fs::remove_file(&output);
-        return match rollback {
-            Ok(_) => Err(error),
-            Err(rollback_error) => Err(format!(
-                "{error};media_proxy_scope_rollback_failed:{rollback_error}"
-            )),
-        };
+        return Err(error);
+    }
+    let committed = if cancel.checkpoint() {
+        Err("media_proxy_cancelled".to_string())
+    } else {
+        match core.set_media_proxy_if_source_unchanged_for_project(
+            project_epoch,
+            &project_dir,
+            &entry,
+            Some(proxy),
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("media_proxy_source_changed".to_string()),
+            Err(error) => Err(format!("media_proxy_persist_failed:{error}")),
+        }
+    };
+    if let Err(error) = committed {
+        revoke_proxy_asset_file(&app, &output);
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
     }
     if let Some(old) = entry
         .proxy
