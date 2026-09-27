@@ -81,6 +81,7 @@ export async function newProjectAndEnter(): Promise<void> {
     const save = await saveDialog();
     if (!save) {
       await flushMotionStudioBeforeProjectBoundary();
+      await saveCurrentProjectBeforeBoundary();
       await stopNativePlaybackForProjectBoundary();
       const snapshot = await api.projectNew(null);
       useProjectStore.getState().replaceProjectSnapshot(snapshot);
@@ -103,6 +104,7 @@ export async function newProjectAndEnter(): Promise<void> {
 
     const requestedPath = withExt(chosen);
     await flushMotionStudioBeforeProjectBoundary();
+    await saveCurrentProjectBeforeBoundary();
     await stopNativePlaybackForProjectBoundary();
     // The desktop command persists a separate fresh session first and only
     // replaces the live project after that bundle can be reopened. A failed
@@ -165,6 +167,17 @@ function sameProject(snapshot: SaveSnapshot): boolean {
 function currentProjectNeedsSave(): boolean {
   const current = useProjectStore.getState();
   return Boolean(current.projectPath) && current.timelineVersion !== current.lastSavedVersion;
+}
+
+/** Persist the open project before another session replaces it. The core only
+ *  swaps sessions, and autosave's debounce (or an earlier failed save it never
+ *  retries) would otherwise drop the latest edits silently. The coordinator
+ *  reports failures without rejecting, so the dirty state is re-checked: if the
+ *  save did not land, the boundary is refused and the current project stays. */
+async function saveCurrentProjectBeforeBoundary(): Promise<void> {
+  if (!currentProjectNeedsSave()) return;
+  await saveCurrentProject();
+  if (currentProjectNeedsSave()) throw new Error(t("project.unsavedBlocksSwitch"));
 }
 
 async function runSaveCoordinator(): Promise<void> {
@@ -322,6 +335,7 @@ export async function openProjectPath(path: string): Promise<void> {
   let snap: Awaited<ReturnType<typeof api.projectOpen>>;
   try {
     await flushMotionStudioBeforeProjectBoundary();
+    await saveCurrentProjectBeforeBoundary();
     await stopNativePlaybackForProjectBoundary();
     snap = await api.projectOpen(path);
   } catch (error) {
@@ -371,6 +385,7 @@ export async function openProjectViaDialog(): Promise<void> {
  * request the guided variant only after the project has opened successfully. */
 export async function openSampleProject(slug: string, startTutorial: boolean): Promise<void> {
   try {
+    await saveCurrentProjectBeforeBoundary();
     const path = await api.sampleProjectMaterialize(slug);
     await flushMotionStudioBeforeProjectBoundary();
     await stopNativePlaybackForProjectBoundary();
