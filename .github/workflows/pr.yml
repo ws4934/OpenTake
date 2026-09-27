@@ -63,13 +63,13 @@ jobs:
       - name: cargo clippy
         run: >-
           cargo clippy --locked
-          -p opentake-domain -p opentake-ops -p opentake-project -p opentake-process-tree
+          -p opentake-domain -p opentake-ops -p opentake-project -p opentake-process-tree -p opentake-core
           --all-targets -- -D warnings
 
       - name: cargo test
         run: >-
           cargo test --locked
-          -p opentake-domain -p opentake-ops -p opentake-project -p opentake-process-tree
+          -p opentake-domain -p opentake-ops -p opentake-project -p opentake-process-tree -p opentake-core
           -- --test-threads=1
 
   web:

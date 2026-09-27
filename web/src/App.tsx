@@ -193,8 +193,8 @@ export default function App() {
 
     launchWithRetry("时间线同步失败 / Timeline sync failed", startSync);
     launchWithRetry("媒体同步失败 / Media sync failed", startMediaSync);
-    // Window closed → app stays resident; return to the launcher (so a
-    // Dock-reopen shows Home), mirroring upstream "close window → Home".
+    // macOS closes to Home after saving, so Dock reopen shows the launcher.
+    // Windows/Linux close exits the process after the same save barrier.
     launchWithRetry(
       "窗口监听失败 / Window listener failed",
       () =>

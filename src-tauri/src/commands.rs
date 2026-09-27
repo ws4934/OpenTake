@@ -728,22 +728,41 @@ pub(crate) async fn save_project_with_composite_cover<R: tauri::Runtime>(
     .await
 }
 
-/// CloseRequested parity entry point. It snapshots the current identity once
-/// and delegates to exactly the same bounded authoritative-cover save helper as
-/// the explicit Save command.
-pub(crate) async fn save_current_project_with_composite_cover<R: tauri::Runtime>(
+/// Close/Quit prioritize document persistence over cover generation. Reuse the
+/// save timeout's commit gate: cancellation can refuse publication, but a save
+/// that has already begun committing must finish before the app exits.
+pub(crate) async fn save_current_project_before_exit<R: tauri::Runtime>(
     app: AppHandle<R>,
-) -> Result<String, CmdError> {
-    let snapshot = app.state::<AppCore>().runtime_snapshot();
-    save_project_with_composite_cover(
-        app,
-        None,
-        snapshot.project_epoch,
-        snapshot
-            .project_dir
-            .map(|path| path.to_string_lossy().into_owned()),
+) -> Result<(), CmdError> {
+    let cancel = opentake_media::MediaCancelToken::new();
+    let gate = std::sync::Arc::new(ProjectCoverCommitGate::default());
+    let worker_gate = gate.clone();
+    let deadline = std::time::Instant::now() + PROJECT_COVER_SAVE_TIMEOUT;
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let admission = app.state::<crate::updater::InstallAdmissionGate>();
+        let _activity =
+            crate::updater::begin_mutating_activity(&admission).map_err(validation_error)?;
+        if !worker_gate.enter_precommit() {
+            return Err(internal_error(
+                "lifecycle save was cancelled before precommit",
+            ));
+        }
+        app.state::<AppCore>()
+            .save_project_before_exit_if(|| {
+                std::time::Instant::now() < deadline && worker_gate.begin_commit()
+            })
+            .map(|path| path.map_or_else(String::new, |path| path.to_string_lossy().into_owned()))
+            .map_err(CmdError::from)
+    });
+    await_project_cover_save_worker(
+        "lifecycle save",
+        PROJECT_COVER_SAVE_TIMEOUT,
+        cancel,
+        gate,
+        task,
     )
     .await
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -903,6 +903,34 @@ impl AppCore {
         self.save_project_with_thumbnail(path, None)
     }
 
+    /// Final lifecycle save without rendering a cover. Always flush a writable
+    /// bundle: manifest-only imports need persistence even when the timeline
+    /// version has not advanced. A missing or compatibility-read-only session
+    /// needs no write; identity drift or a failed checkpoint refuses shutdown.
+    pub fn save_project_before_exit_if(
+        &self,
+        can_commit: impl FnOnce() -> bool,
+    ) -> Result<Option<PathBuf>> {
+        let (epoch, path) = {
+            let session = self.lock();
+            if session.editor.compatibility().is_read_only() {
+                return Ok(None);
+            }
+            let Some(path) = session.editor.project_dir() else {
+                return Ok(None);
+            };
+            (session.project_epoch, path.to_path_buf())
+        };
+        self.save_project_with_thumbnail_update_for_project_if(
+            epoch,
+            Some(&path),
+            None,
+            ThumbnailUpdate::Preserve,
+            can_commit,
+        )
+        .map(Some)
+    }
+
     /// Like [`Self::save_project`] but also writes a cover `thumbnail.jpg` from
     /// the supplied JPEG bytes (`None` leaves any existing cover in place). The
     /// caller — which owns the media engine / GPU — captures the representative

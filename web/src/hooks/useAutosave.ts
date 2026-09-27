@@ -2,7 +2,8 @@
  * Debounced autosave (issue #38). Whenever the document version advances past
  * the last persisted version, schedule a save-back to the open bundle
  * (`project_save(None)`). This is the safety net; Cmd/Ctrl+S forces an immediate
- * save and the window-close handler flushes a final write in Rust.
+ * save. Native window close and Quit share a final document save barrier; a
+ * failed save keeps the project visible, and this barrier preserves the cover.
  *
  * No-op outside Tauri (no bundle on disk) or when no project is open (Home).
  */
