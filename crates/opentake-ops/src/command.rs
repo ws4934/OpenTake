@@ -232,6 +232,118 @@ mod motion_media_transaction_tests {
         );
         assert!(state.timeline.tracks[0].clips[0].masks.is_empty());
     }
+
+    fn trimmed_replacement_state(
+        has_audio: bool,
+        audio_start: i32,
+        audio_duration: i32,
+    ) -> EditorState {
+        let mut video = Clip::new("video", "source", 0, 20);
+        video.trim_start_frame = 10;
+        video.trim_end_frame = 30;
+        video.link_group_id = Some("linked".into());
+        let mut audio = Clip::new("audio", "source", 0, audio_duration);
+        audio.media_type = ClipType::Audio;
+        audio.source_clip_type = ClipType::Audio;
+        audio.trim_start_frame = audio_start;
+        audio.link_group_id = Some("linked".into());
+        let mut video_track = Track::new("v", ClipType::Video);
+        video_track.clips.push(video);
+        let mut audio_track = Track::new("a", ClipType::Audio);
+        audio_track.clips.push(audio);
+        let mut state = EditorState::default();
+        state.timeline.tracks = vec![video_track, audio_track];
+        let mut source = media("source");
+        source.duration = 2.0;
+        source.has_audio = Some(has_audio);
+        state.manifest.entries.push(source);
+        state
+    }
+
+    #[test]
+    fn generated_replacement_resets_trim_and_restores_it_with_one_undo() {
+        let mut state = trimmed_replacement_state(false, 10, 20);
+        let ids = SeqIdGen::default();
+        let mut derivative = media("derivative");
+        derivative.duration = 20.0 / 30.0;
+        let result = apply(
+            &mut state,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: derivative,
+                clip_id: "video".into(),
+            },
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(result.affected_clip_ids, vec!["video"]);
+        assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "derivative");
+        assert_eq!(state.timeline.tracks[0].clips[0].duration_frames, 20);
+        assert_eq!(state.timeline.tracks[0].clips[0].trim_start_frame, 0);
+        assert_eq!(state.timeline.tracks[0].clips[0].trim_end_frame, 0);
+        assert_eq!(state.timeline.tracks[1].clips[0].media_ref, "source");
+        apply(&mut state, EditCommand::Undo, &ids).unwrap();
+        assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "source");
+        assert_eq!(state.timeline.tracks[0].clips[0].trim_start_frame, 10);
+        assert_eq!(state.timeline.tracks[0].clips[0].trim_end_frame, 30);
+        assert_eq!(state.manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn generated_replacement_rebases_contained_audio_but_preserves_j_cut() {
+        let ids = SeqIdGen::default();
+        let mut contained = trimmed_replacement_state(true, 12, 16);
+        let mut derivative = media("derivative");
+        derivative.duration = 20.0 / 30.0;
+        derivative.has_audio = Some(true);
+        let result = apply(
+            &mut contained,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: derivative.clone(),
+                clip_id: "video".into(),
+            },
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(result.affected_clip_ids.len(), 2);
+        let audio = &contained.timeline.tracks[1].clips[0];
+        assert_eq!(audio.media_ref, "derivative");
+        assert_eq!(audio.trim_start_frame, 2);
+        assert_eq!(audio.trim_end_frame, 2);
+
+        let mut j_cut = trimmed_replacement_state(true, 5, 25);
+        apply(
+            &mut j_cut,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: derivative,
+                clip_id: "video".into(),
+            },
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(j_cut.timeline.tracks[1].clips[0].media_ref, "source");
+        assert_eq!(j_cut.timeline.tracks[1].clips[0].trim_start_frame, 5);
+    }
+
+    #[test]
+    fn generated_replacement_rejects_short_output_without_mutation() {
+        let mut state = trimmed_replacement_state(true, 10, 20);
+        let before = state.clone();
+        let mut derivative = media("short");
+        derivative.duration = 19.0 / 30.0;
+        let error = apply(
+            &mut state,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: derivative,
+                clip_id: "video".into(),
+            },
+            &SeqIdGen::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shorter than the visible clip"));
+        assert_eq!(state.timeline, before.timeline);
+        assert_eq!(state.manifest, before.manifest);
+        assert_eq!(state.version(), before.version());
+    }
 }
 
 #[cfg(test)]
@@ -1162,9 +1274,8 @@ pub enum EditCommand {
     ///   pair pointing at the same file stays in sync.
     /// * **No-op on identical ref**: swapping to the same `media_ref` returns
     ///   `changed = false` (no undo entry, no version bump).
-    /// * **No trim/duration rewrites**: trim / speed / start / duration are
-    ///   kept verbatim. The render layer is responsible for any overshoot
-    ///   sampling when the new media is shorter.
+    /// * **No trim/duration rewrites**: the source range must fit the candidate
+    ///   media; if it does, trim / speed / start / duration are kept verbatim.
     SwapMedia { clip_id: String, media_ref: String },
     /// Reset the transform section back to defaults. 1:1 port of upstream's
     /// Inspector "Reset transform" button (`InspectorView.transformHeader`):
@@ -2972,7 +3083,10 @@ fn register_media_and_swap_clip(
     let media_ref = media.id.clone();
     candidate.manifest.entries.push(media);
     let seed_clip_id = clip_id.clone();
-    let replacement = swap_media(&mut candidate, clip_id, media_ref)?;
+    // Renderers write the visible interval into a new file starting at frame 0.
+    // The inspector's SwapMedia preserves source trims; using it here would
+    // apply the original trim a second time and read beyond the new file.
+    let replacement = swap_generated_visible_media(&mut candidate, &clip_id, &media_ref)?;
     if clear_masks {
         let clip = candidate
             .timeline
@@ -6599,9 +6713,8 @@ fn delete_folder(
 ///    same `media_ref`. Each one is updated to the new ref in the same
 ///    transaction, so a linked audio/video pair pointing at the same file
 ///    stays in sync (and `Undo` restores every old ref atomically).
-/// 3. **No** trim / duration / start rewrites — `resetTrim: false`. The render
-///    layer is responsible for any overshoot sampling when the new media is
-///    shorter.
+/// 3. **No** trim / duration / start rewrites — `resetTrim: false`; reject a
+///    candidate too short for any linked clip's current source interval.
 /// 4. Same `media_ref` is a no-op (`changed = false`, no undo entry, no
 ///    version bump).
 fn swap_media(
@@ -6673,6 +6786,26 @@ fn swap_media(
         targets.push(clip_id.clone());
     }
 
+    if matches!(new_asset.kind, ClipType::Video | ClipType::Audio) {
+        let available_frames = new_asset.duration * f64::from(state.timeline.fps);
+        if state.timeline.fps <= 0 || !available_frames.is_finite() {
+            return Err(EditError::Refused(
+                "replacement media has no valid duration".into(),
+            ));
+        }
+        for id in &targets {
+            let location = state.find_clip(id).expect("validated linked clip exists");
+            let clip = &state.timeline.tracks[location.track_index].clips[location.clip_index];
+            let required =
+                i64::from(clip.trim_start_frame) + i64::from(clip.source_frames_consumed());
+            if clip.trim_start_frame < 0 || required as f64 > available_frames + 0.001 {
+                return Err(EditError::Refused(format!(
+                    "replacement media is too short for clip {id}"
+                )));
+            }
+        }
+    }
+
     let summary_old = seed_old_ref;
     let summary_new = media_ref.clone();
     let target_count = targets.len();
@@ -6699,6 +6832,96 @@ fn swap_media(
                         .loudness_normalization = None;
                     affected.push(tid.clone());
                 }
+            }
+            Ok(affected)
+        },
+    )
+}
+
+/// Replace a clip with a derivative of its visible source interval. Linked
+/// audio is replaced only when the new file contains audio and the member's
+/// entire source interval lies inside the rendered interval. A J/L cut keeps
+/// its original source rather than reading beyond the derivative.
+fn swap_generated_visible_media(
+    state: &mut EditorState,
+    clip_id: &str,
+    media_ref: &str,
+) -> Result<EditResult, EditError> {
+    let seed_loc = state
+        .find_clip(clip_id)
+        .ok_or_else(|| EditError::Invalid(format!("Clip not found: {clip_id}")))?;
+    let seed = state.timeline.tracks[seed_loc.track_index].clips[seed_loc.clip_index].clone();
+    let media = state
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.id == media_ref)
+        .ok_or_else(|| EditError::Invalid(format!("Media not found: {media_ref}")))?;
+    if seed.media_type != media.kind {
+        return Err(EditError::Refused(
+            "generated replacement media type does not match clip".into(),
+        ));
+    }
+    let fps = state.timeline.fps;
+    let media_frames = (media.duration * f64::from(fps)).round();
+    if fps <= 0
+        || !media_frames.is_finite()
+        || media_frames < f64::from(seed.source_frames_consumed())
+    {
+        return Err(EditError::Refused(
+            "generated replacement is shorter than the visible clip".into(),
+        ));
+    }
+    let interval_start = i64::from(seed.trim_start_frame);
+    let interval_end = interval_start + i64::from(seed.source_frames_consumed());
+    let linked = ops::expand_to_link_group(&state.timeline, &HashSet::from([clip_id.to_string()]));
+    let mut replacements = vec![(clip_id.to_string(), 0_i32, 0_i32)];
+    if media.has_audio == Some(true) && seed.media_type == ClipType::Video {
+        for member_id in linked {
+            if member_id == clip_id {
+                continue;
+            }
+            let Some(location) = state.find_clip(&member_id) else {
+                continue;
+            };
+            let member = &state.timeline.tracks[location.track_index].clips[location.clip_index];
+            let member_start = i64::from(member.trim_start_frame);
+            let member_end = member_start + i64::from(member.source_frames_consumed());
+            if member.media_type != ClipType::Audio
+                || member.media_ref != seed.media_ref
+                || member_start < interval_start
+                || member_end > interval_end
+            {
+                continue;
+            }
+            let relative_start = member_start - interval_start;
+            let relative_end = member_end - interval_start;
+            if relative_end as f64 > media_frames {
+                continue;
+            }
+            replacements.push((
+                member_id,
+                relative_start as i32,
+                (media_frames as i64 - relative_end) as i32,
+            ));
+        }
+    }
+    let affected = replacements.iter().map(|(id, _, _)| id.clone()).collect();
+    transact(
+        state,
+        "Swap Generated Media",
+        |_| format!("Replaced visible media for {clip_id}"),
+        move |current| {
+            for (id, trim_start, trim_end) in &replacements {
+                let location = current
+                    .find_clip(id)
+                    .expect("validated replacement clip exists");
+                let clip =
+                    &mut current.timeline.tracks[location.track_index].clips[location.clip_index];
+                clip.media_ref = media_ref.to_string();
+                clip.trim_start_frame = *trim_start;
+                clip.trim_end_frame = *trim_end;
+                clip.loudness_normalization = None;
             }
             Ok(affected)
         },
