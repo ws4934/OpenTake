@@ -1,0 +1,138 @@
+name: PR checks
+
+# Lightweight gate for pull requests: Linux Rust fmt/clippy/test and the web
+# build/test. The Windows product/bundle, Windows security and safe-filesystem
+# matrices live in ci.yml and run for release tags or manual dispatch only.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # The playback engine (#53) is now a DEFAULT feature, so the workspace
+      # fmt/clippy/test steps below compile it (cpal + axum/tokio + the wgpu
+      # render path). Reclaim runner disk up front — these deps are heavy and the
+      # hosted runner's default free space is tight.
+      - name: Free disk space (playback-engine deps are heavy)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Rust toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Install system deps (ffmpeg + Tauri/GTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libglib2.0-dev \
+            libsoup-3.0-dev \
+            patchelf \
+            pkg-config \
+            fonts-dejavu-core
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Validate Windows product gate contract
+        run: |
+          python3 -B scripts/check_windows_product_ci.py
+          python3 -B -m unittest discover -s scripts -p 'test_check_windows_product_ci.py'
+
+      - name: Validate release workflow contract
+        run: |
+          python3 -B scripts/check_release_workflow.py
+          python3 -B -m unittest discover -s scripts -p 'test_check_release_workflow.py'
+
+      - name: Validate C1B CI and evidence contracts
+        run: |
+          ruby scripts/tests/validate-c1b-ci-test.rb
+          ruby scripts/tests/validate-c1b-evidence-test.rb
+
+      - name: Provisioner unit tests (scripts/tests)
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # `--workspace` compiles the default features, which now include
+      # opentake-tauri's `playback-engine` — so these two steps also lint and test
+      # the streaming engine (its unit tests: drain/clock/projection/transport).
+      # The GPU+ffmpeg integration tests in src-tauri/tests/ compile here too and
+      # auto-skip on the GPU-less / ffmpeg-less runner.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        env:
+          OPENTAKE_MOTION_TRACE: '1'
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: live playback transport integration (fail closed)
+        run: |
+          set -euo pipefail
+          cargo test -p opentake-tauri \
+            --features playback-engine \
+            --test playback_transport_integration \
+            -- --test-threads=1
+
+      # Prove the minimal build still compiles WITHOUT the engine (the
+      # `--no-default-features` escape hatch: drops cpal/axum/tokio + the
+      # `playback_*` commands; the front end then falls back to the legacy path).
+      - name: cargo clippy (minimal, no default features)
+        run: cargo clippy -p opentake-tauri --no-default-features --all-targets -- -D warnings
+
+  web:
+    name: Web (install / build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm -C web install --frozen-lockfile
+
+      - name: Validate Web dependency licenses
+        run: |
+          python3 -B -m unittest discover -s scripts -p 'test_check_license_inventory.py'
+          python3 -B scripts/check_license_inventory.py
+
+      - name: pnpm build
+        run: pnpm -C web build
+
+      - name: pnpm test
+        run: pnpm -C web test
