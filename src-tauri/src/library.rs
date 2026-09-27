@@ -1874,13 +1874,17 @@ mod tests {
         let (saved_tx, saved_rx) = mpsc::channel();
 
         std::thread::scope(|scope| {
-            let importing = scope.spawn(|| {
+            let core_ref = &core;
+            let media_ref = &media;
+            let library_ref = &library;
+            let entry_id = &entry.id;
+            let importing = scope.spawn(move || {
                 let mut events = DeferredCoreEvents::default();
                 library_import_to_project_with_hook(
-                    &core,
-                    &media,
-                    &library,
-                    &entry.id,
+                    core_ref,
+                    media_ref,
+                    library_ref,
+                    entry_id,
                     &mut events,
                     |phase, path| {
                         if phase == ImportHookPhase::BeforeProbe {
@@ -1892,9 +1896,10 @@ mod tests {
             });
             let staging_path = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(staging_path.exists());
-            let saving = scope.spawn(|| {
+            let save_destination = destination.clone();
+            let saving = scope.spawn(move || {
                 saved_tx
-                    .send(core.save_project(Some(destination.clone())).is_ok())
+                    .send(core_ref.save_project(Some(save_destination)).is_ok())
                     .unwrap();
             });
             let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));

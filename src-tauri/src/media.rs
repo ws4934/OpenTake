@@ -5453,32 +5453,38 @@ mod tests {
         let (saved_tx, saved_rx) = mpsc::channel();
 
         std::thread::scope(|scope| {
-            let favorite = scope.spawn(|| {
+            let core_ref = &core;
+            let store_ref = &store;
+            let asset_id_ref = &asset_id;
+            let project_dir = &current_dir;
+            let root = tmp.path();
+            let epoch = current.project_epoch;
+            let favorite = scope.spawn(move || {
                 let mut events = DeferredCoreEvents::default();
                 toggle_favorite_impl_with(
-                    &core,
-                    tmp.path(),
-                    &store,
-                    &asset_id,
+                    core_ref,
+                    root,
+                    store_ref,
+                    asset_id_ref,
                     true,
                     ExpectedFavoriteProject {
-                        epoch: current.project_epoch,
-                        dir: &current_dir,
+                        epoch,
+                        dir: project_dir,
                     },
                     &mut events,
                     |request| {
                         entered_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
-                        store
+                        store_ref
                             .prepare_favorite(request)
                             .map_err(|error| error.to_string())
                     },
                 )
             });
             entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            let save = scope.spawn(|| {
+            let save = scope.spawn(move || {
                 saved_tx
-                    .send(core.save_project(Some(destination)).is_ok())
+                    .send(core_ref.save_project(Some(destination)).is_ok())
                     .unwrap();
             });
             // A held identity lease would make this time out until copy resumes.
