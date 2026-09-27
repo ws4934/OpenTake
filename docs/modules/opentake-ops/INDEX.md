@@ -5,7 +5,7 @@
 
 > 上级：[模块文档树](../INDEX.md) · [docs 总目录](../../INDEX.md)
 >
-> `opentake-ops` = 纯编辑引擎 + 唯一编辑入口 `EditCommand` + `apply()` 事务 + 整树快照撤销/重做栈。依赖只向下：仅依赖 `opentake-domain`，被 `opentake-core` 调用。
+> `opentake-ops` = 纯编辑引擎 + 唯一编辑入口 `EditCommand` + `apply()` 事务 + 有界共享历史（时间线快照/素材增量）。依赖只向下：仅依赖 `opentake-domain`，被 `opentake-core` 调用。
 
 ---
 
@@ -40,6 +40,7 @@ crates/opentake-ops/src/
 ├── command.rs        EditCommand 枚举 + apply 事务 + 各命令实现
 ├── editor_state.rs   EditorState + DocSnapshot + 撤销/重做栈
 ├── editor_state/
+│   ├── history.rs         200 步有界共享历史，检查点写时复制
 │   └── manifest_delta.rs  素材/文件夹事务增量，保留带外写入
 ├── intent.rs         高层编辑意图预检与归一（EditPlan）
 ├── id.rs             IdGen trait + SeqIdGen（注入式 id 生成）

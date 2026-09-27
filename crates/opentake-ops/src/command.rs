@@ -1199,16 +1199,18 @@ pub fn apply(
     validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
     match command {
         EditCommand::Undo => {
-            let before = state.snapshot();
+            // History is immutable/shared, so this candidate clones only the
+            // current document. Failure leaves even skipped history untouched.
             let mut candidate = state.clone();
             let changed = candidate.undo();
             validate_timeline_frame_arithmetic(&candidate.timeline, "undo timeline")?;
+            let timeline_changed = changed && state.timeline != candidate.timeline;
+            let manifest_changed = changed && state.manifest != candidate.manifest;
             *state = candidate;
-            let after = state.snapshot();
             Ok(result(
                 state,
-                changed && before.timeline != after.timeline,
-                changed && before.manifest != after.manifest,
+                timeline_changed,
+                manifest_changed,
                 "Undo",
                 Vec::new(),
                 if changed {
@@ -1219,16 +1221,16 @@ pub fn apply(
             ))
         }
         EditCommand::Redo => {
-            let before = state.snapshot();
             let mut candidate = state.clone();
             let changed = candidate.redo();
             validate_timeline_frame_arithmetic(&candidate.timeline, "redo timeline")?;
+            let timeline_changed = changed && state.timeline != candidate.timeline;
+            let manifest_changed = changed && state.manifest != candidate.manifest;
             *state = candidate;
-            let after = state.snapshot();
             Ok(result(
                 state,
-                changed && before.timeline != after.timeline,
-                changed && before.manifest != after.manifest,
+                timeline_changed,
+                manifest_changed,
                 "Redo",
                 Vec::new(),
                 if changed {
@@ -2931,7 +2933,7 @@ fn register_media_and_add_clip(
     // its overlap, track, duration, and manifest validation remains the single
     // source of truth. Only its resulting document is copied into the one outer
     // transaction; its temporary undo/version bookkeeping is discarded.
-    let mut candidate = state.clone();
+    let mut candidate = EditorState::new(state.timeline.clone(), state.manifest.clone());
     candidate.manifest.entries.push(media);
     let placement = if auto_track {
         add_clips_auto_track(&mut candidate, vec![entry], ids)?
@@ -2962,7 +2964,7 @@ fn register_media_and_swap_clip(
     ids: &dyn IdGen,
 ) -> Result<EditResult, EditError> {
     validate_registered_media(state, &media)?;
-    let mut candidate = state.clone();
+    let mut candidate = EditorState::new(state.timeline.clone(), state.manifest.clone());
     let media_ref = media.id.clone();
     candidate.manifest.entries.push(media);
     let seed_clip_id = clip_id.clone();
@@ -3024,7 +3026,7 @@ fn register_media_and_freeze_frame(
     // Validate and build the complete timeline+manifest result on a disposable
     // state. Only those two documents enter the outer transaction, so the
     // nested command's temporary version/history bookkeeping cannot leak.
-    let mut candidate = state.clone();
+    let mut candidate = EditorState::new(state.timeline.clone(), state.manifest.clone());
     let media_ref = media.id.clone();
     candidate.manifest.entries.push(media);
     let frozen = freeze_frame(

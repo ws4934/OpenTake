@@ -69,6 +69,10 @@ UI 手势 / Agent / MCP 工具
 
 ### 原子性与不变量（贯穿全模块）
 
+历史最多保留最近 **200** 个事务（`EditorState::HISTORY_LIMIT`）；超出时只移除最旧一步，打开工程仍从空历史开始。历史栈与条目以 `Arc` 共享不可变值，栈发生修改时最多复制 200 个引用，不深拷贝其他历史文档。`EditorState::clone` 只克隆当前文档并保存两份共享栈句柄，因此 Undo/Redo 候选和 core 回滚检查点的成本不再乘以历史深度。候选仍先完整校验再替换；失败连跳过的无效/无变化历史、redo、事务归属版本都不改变。注册素材的临时候选使用无历史的新状态。历史上限按步数而非字节数计算，单个超大文档仍可能占用较多内存。
+
+可重现 release 基准：`cargo test --release -p opentake-ops --test history_limits -- --ignored --nocapture`（1000 片段，1/150 步历史）和 `cargo test --release -p opentake-core release_checkpoint_latency -- --ignored --nocapture`（1000 片段 + 1000 素材，400 次编辑、保留 200 步）。基准有独立 `ignore` 标记，须显式运行，不能把 debug 默认跳过视为通过；输出本机七次采样中位数，目标分别为 Undo/Redo <10ms、检查点 <20ms。
+
 - **原子性**：校验失败（`EditError::Invalid`）或波纹拒绝（`EditError::Refused`）时，`apply` 直接返回 `Err`，事务不提交，**文档保持原样**。
 - **视频轨在音频轨之上的分区不变量**：可视轨（video/image/text/lottie）恒占 `[0, first_audio_index)`，音频轨占 `[first_audio_index, count)`；建轨索引被钳进各自分区（`tracks.rs` 的 `partitioned_insertion_index`）。
 - **链接音视频组同步**：共享 `link_group_id` 的片段在移动 / 修剪 / 分割 / 删除时作为一个整体联动（`linking.rs`）。

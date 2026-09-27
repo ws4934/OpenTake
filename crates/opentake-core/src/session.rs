@@ -806,6 +806,16 @@ impl EditorSession {
         self.state.manifest.clone()
     }
 
+    /// Count catalog entries without cloning the catalog under the session lock.
+    pub fn media_count(&self) -> usize {
+        self.state.manifest.entries.len()
+    }
+
+    /// Entry and folder counts from the same document observation.
+    pub fn media_counts(&self) -> (usize, usize) {
+        (self.media_count(), self.state.manifest.folders.len())
+    }
+
     /// Restore a previously captured manifest after an application-layer
     /// transaction fails. Kept crate-private so ordinary callers cannot bypass
     /// the command/session invariants.
@@ -813,8 +823,10 @@ impl EditorSession {
         self.state.manifest = manifest;
     }
 
-    /// Capture the complete undoable document state before an application-layer
-    /// batch transaction. The matching restore is intentionally crate-private:
+    /// Capture the document/version and shared immutable history handles before
+    /// a batch transaction. No historical documents are cloned; copy-on-write
+    /// stacks keep rollback exact even when a batch evicts entries at the cap.
+    /// The matching restore is intentionally crate-private:
     /// only [`crate::AppCore`] may use it while holding the authoritative
     /// session lock.
     pub(crate) fn checkpoint_editor_state(&self) -> EditorState {
@@ -1366,6 +1378,131 @@ mod tests {
         let mut tl = Timeline::new();
         tl.tracks.push(Track::new("t1", ClipType::Video));
         tl
+    }
+
+    fn history_session(size: usize, edits: usize) -> EditorSession {
+        let mut session = EditorSession::new_project();
+        let mut timeline = one_video_track();
+        for index in 0..size {
+            timeline.tracks[0].clips.push(opentake_domain::Clip::new(
+                format!("clip-{index}"),
+                format!("asset-{index}"),
+                index as i32 * 1000,
+                30,
+            ));
+        }
+        session.seed_from_timeline(timeline);
+        session.state.manifest.entries = (0..size)
+            .map(|index| {
+                MediaAsset::new(
+                    format!("asset-{index}"),
+                    "/fixture.mov",
+                    ClipType::Video,
+                    "Video",
+                    1.0,
+                )
+                .to_manifest_entry(None, 0.0)
+            })
+            .collect();
+        let ids = SeqIdGen::new("history-");
+        for index in 0..edits {
+            session
+                .apply(
+                    EditCommand::SetClipProperties {
+                        clip_ids: vec!["clip-0".into()],
+                        properties: Box::new(opentake_ops::ClipProperties {
+                            opacity: Some(if index % 2 == 0 { 0.25 } else { 0.75 }),
+                            ..Default::default()
+                        }),
+                    },
+                    &ids,
+                )
+                .unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn checkpoint_restores_evicted_history_and_cleared_redo_exactly() {
+        let mut session = history_session(1, 210);
+        let ids = SeqIdGen::new("history-");
+        session.apply(EditCommand::Undo, &ids).unwrap();
+        session.apply(EditCommand::Undo, &ids).unwrap();
+        let saved = session.checkpoint_editor_state();
+        let mut expected = saved.clone();
+        let counts = session.media_counts();
+        // A failed batch can both clear redo and evict the oldest undo entries.
+        // Restoring only an undo length cannot recover either of those changes.
+        for index in 0..10 {
+            session
+                .apply(
+                    EditCommand::CreateFolder {
+                        name: format!("attempt-{index}"),
+                        parent_folder_id: None,
+                    },
+                    &ids,
+                )
+                .unwrap();
+        }
+        assert!(!session.can_redo());
+        assert_eq!(session.state.undo_depth(), EditorState::HISTORY_LIMIT);
+        session.restore_editor_state(saved);
+        assert_eq!(session.media_counts(), counts);
+        assert_eq!(session.version(), expected.version());
+        assert_eq!(session.state.undo_depth(), expected.undo_depth());
+        for command in [EditCommand::Redo, EditCommand::Redo] {
+            session.apply(command.clone(), &ids).unwrap();
+            opentake_ops::apply(&mut expected, command, &ids).unwrap();
+            assert_eq!(session.state.timeline, expected.timeline);
+            assert_eq!(session.state.manifest, expected.manifest);
+            assert_eq!(session.version(), expected.version());
+            assert_eq!(
+                session.state.undo_transaction_version(),
+                expected.undo_transaction_version()
+            );
+        }
+        for _ in 0..EditorState::HISTORY_LIMIT {
+            session.apply(EditCommand::Undo, &ids).unwrap();
+            opentake_ops::apply(&mut expected, EditCommand::Undo, &ids).unwrap();
+            assert_eq!(session.state.timeline, expected.timeline);
+            assert_eq!(session.state.manifest, expected.manifest);
+            assert_eq!(session.version(), expected.version());
+            assert_eq!(session.state.undo_depth(), expected.undo_depth());
+            assert_eq!(
+                session.state.undo_transaction_version(),
+                expected.undo_transaction_version()
+            );
+        }
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    #[ignore = "controlled release benchmark: cargo test --release -p opentake-core release_checkpoint_latency -- --ignored --nocapture"]
+    #[allow(clippy::assertions_on_constants)]
+    fn release_checkpoint_latency_is_document_sized_after_400_edits() {
+        // This ignored test must compile in debug, but refuse accidental debug
+        // execution. A const assertion would reject the whole debug test build.
+        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+        let session = history_session(1000, 400);
+        assert_eq!(session.media_count(), 1000);
+        assert_eq!(session.state.undo_depth(), EditorState::HISTORY_LIMIT);
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            let saved = std::hint::black_box(session.checkpoint_editor_state());
+            samples.push(start.elapsed());
+            drop(saved);
+        }
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        println!(
+            "core checkpoint: 1000 clips + 1000 media, 400 edits, retained={} median={median:?}",
+            session.state.undo_depth()
+        );
+        assert!(
+            median < std::time::Duration::from_millis(20),
+            "checkpoint: {median:?}"
+        );
     }
 
     fn add_one_clip_cmd() -> EditCommand {

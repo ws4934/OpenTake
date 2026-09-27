@@ -662,9 +662,7 @@ impl AppCore {
                 });
             }
             let edit = session.editor.apply(EditCommand::Undo, self.ids.as_ref())?;
-            let media_count = edit
-                .manifest_changed
-                .then(|| session.editor.media().entries.len());
+            let media_count = edit.manifest_changed.then(|| session.editor.media_count());
             (edit, session.project_epoch, media_count)
         };
         let (edit, project_epoch, media_count) = outcome;
@@ -765,7 +763,7 @@ impl AppCore {
                 let result = session.editor.apply(command, self.ids.as_ref())?;
                 let media_count = result
                     .manifest_changed
-                    .then(|| session.editor.media().entries.len());
+                    .then(|| session.editor.media_count());
                 let written = session.editor.save_project(None)?;
                 Ok((result, media_count, written))
             })();
@@ -816,7 +814,7 @@ impl AppCore {
             let result = session.editor.apply(command, self.ids.as_ref())?;
             let media_count = result
                 .manifest_changed
-                .then(|| session.editor.media().entries.len());
+                .then(|| session.editor.media_count());
             (result, session.project_epoch, media_count)
         };
         if result.changed {
@@ -1044,6 +1042,17 @@ impl AppCore {
         self.lock().editor.media()
     }
 
+    /// Catalog size without allocating or cloning media metadata.
+    pub fn media_count(&self) -> usize {
+        self.lock().editor.media_count()
+    }
+
+    /// Observe entry/folder counts together under one session lock, without a
+    /// complete manifest clone (for example, directory-import summaries).
+    pub fn media_counts(&self) -> (usize, usize) {
+        self.lock().editor.media_counts()
+    }
+
     /// A snapshot of the current AI generation log. Cloned out from under the
     /// session lock so a caller (the `.opentake` bundle exporter) can write it
     /// into a self-contained bundle alongside the timeline + manifest, exactly as
@@ -1182,7 +1191,7 @@ impl AppCore {
                 Ok((value, written))
             })();
             match result {
-                Ok((value, written)) => (value, session.editor.media().entries.len(), written),
+                Ok((value, written)) => (value, session.editor.media_count(), written),
                 Err(error) => {
                     session.editor.restore_generation_state(checkpoint);
                     return Err(error);
@@ -1229,7 +1238,7 @@ impl AppCore {
         let (entry, count, project_epoch) = {
             let mut session = self.lock();
             let entry = session.editor.import_media_file(path, id, name, probe)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             (entry, count, session.project_epoch)
         };
         self.events.emit(&CoreEvent::MediaChanged {
@@ -1306,7 +1315,7 @@ impl AppCore {
                 session
                     .editor
                     .import_media_file_checked(path, id, name, probe, postcondition)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             (entry, count)
         };
         self.events.emit(&CoreEvent::MediaChanged {
@@ -1537,7 +1546,7 @@ impl AppCore {
 
             match result {
                 Ok((commit, written)) => {
-                    let count = session.editor.media().entries.len();
+                    let count = session.editor.media_count();
                     (commit, count, written)
                 }
                 Err(error) => {
@@ -1692,7 +1701,7 @@ impl AppCore {
             match result {
                 Ok((imports, written)) => (
                     imports,
-                    session.editor.media().entries.len(),
+                    session.editor.media_count(),
                     initial_version,
                     session.editor.version(),
                     written,
@@ -1773,7 +1782,7 @@ impl AppCore {
             })();
             match result {
                 Ok(entry) => {
-                    let count = session.editor.media().entries.len();
+                    let count = session.editor.media_count();
                     (entry, count)
                 }
                 Err(error) => {
@@ -1844,7 +1853,7 @@ impl AppCore {
                 Ok((entry, warning))
             })();
             match result {
-                Ok((entry, warning)) => (entry, warning, session.editor.media().entries.len()),
+                Ok((entry, warning)) => (entry, warning, session.editor.media_count()),
                 Err(error) => {
                     session.editor.restore_media(before);
                     return Err(error);
@@ -1923,7 +1932,7 @@ impl AppCore {
                 Ok((entry, None))
             })();
             match result {
-                Ok((entry, warning)) => (entry, warning, session.editor.media().entries.len()),
+                Ok((entry, warning)) => (entry, warning, session.editor.media_count()),
                 Err(error) => {
                     session.editor.restore_media(before);
                     return Err(error);
@@ -1950,7 +1959,7 @@ impl AppCore {
         let (changed, count, project_epoch) = {
             let mut session = self.lock();
             let changed = session.editor.set_media_favorite(asset_ids, favorite)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             (changed, count, session.project_epoch)
         };
         if changed > 0 {
@@ -1993,7 +2002,7 @@ impl AppCore {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let changed = session.editor.set_media_favorite(asset_ids, favorite)?;
-            (changed, session.editor.media().entries.len())
+            (changed, session.editor.media_count())
         };
         if changed > 0 {
             events.push(CoreEvent::MediaChanged {
@@ -2019,7 +2028,7 @@ impl AppCore {
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let before = session.editor.media();
             let entry = session.editor.set_media_proxy(asset_id, proxy)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             match session.editor.save_media_manifest() {
                 Ok(written) => (entry, count, written),
                 Err(error) => {
@@ -2051,7 +2060,7 @@ impl AppCore {
             let changed = session
                 .editor
                 .set_media_global_favorite(asset_id, library_id)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             (changed, count, session.project_epoch)
         };
         if changed {
@@ -2098,7 +2107,7 @@ impl AppCore {
             let changed = session
                 .editor
                 .set_media_global_favorite(asset_id, library_id)?;
-            (changed, session.editor.media().entries.len())
+            (changed, session.editor.media_count())
         };
         if changed {
             events.push(CoreEvent::MediaChanged {
@@ -2114,7 +2123,7 @@ impl AppCore {
         let (changed, count, project_epoch) = {
             let mut session = self.lock();
             let changed = session.editor.clear_media_global_favorite_id(library_id)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             (changed, count, session.project_epoch)
         };
         if changed > 0 {
@@ -2154,7 +2163,7 @@ impl AppCore {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let changed = session.editor.clear_media_global_favorite_id(library_id)?;
-            (changed, session.editor.media().entries.len())
+            (changed, session.editor.media_count())
         };
         if changed > 0 {
             events.push(CoreEvent::MediaChanged {
@@ -2260,7 +2269,7 @@ impl AppCore {
             let mut session = self.lock();
             let before = session.editor.media();
             let entry = session.editor.relink_media_file(asset_id, path, probe)?;
-            let count = session.editor.media().entries.len();
+            let count = session.editor.media_count();
             let saved = if session.editor.project_dir().is_some() {
                 match session.editor.save_media_manifest() {
                     Ok(path) => Some(path),
@@ -2363,16 +2372,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(committed.edit.action_name, "Add Motion Graphic");
-        assert_eq!(core.media().entries.len(), 2);
+        assert_eq!(core.media_count(), 2);
         assert_eq!(core.get_timeline().timeline.tracks[0].clips.len(), 1);
 
         let reopened = AppCore::new();
         reopened.open_project(&bundle).unwrap();
-        assert_eq!(reopened.media().entries.len(), 2);
+        assert_eq!(reopened.media_count(), 2);
         assert_eq!(reopened.get_timeline().timeline.tracks[0].clips.len(), 1);
 
         core.undo().unwrap();
-        assert_eq!(core.media().entries.len(), 1);
+        assert_eq!(core.media_count(), 1);
         assert!(core.get_timeline().timeline.tracks[0].clips.is_empty());
         let _ = std::fs::remove_dir_all(bundle);
     }
@@ -3366,7 +3375,7 @@ mod tests {
 
         // Id came from the core generator (default "id-" prefix).
         assert_eq!(entry.id, "id-1");
-        assert_eq!(core.media().entries.len(), 1);
+        assert_eq!(core.media_count(), 1);
         // Importing does not move the timeline version.
         assert_eq!(core.version(), 0);
         assert_eq!(
@@ -3588,13 +3597,10 @@ mod tests {
 
     #[test]
     fn prepared_media_batch_writer_failure_restores_full_editor_state() {
-        let sequence = CoreIdGen::default().next_id();
-        let root = std::env::temp_dir().join(format!(
-            "opentake-core-media-batch-rollback-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let project = root.join("Rollback.opentake");
+        // Also invoked by the aggregate acceptance test in parallel. A fresh
+        // CoreIdGen starts at id-1 each time, so it cannot identify this fixture.
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("Rollback.opentake");
         let core = AppCore::new();
         core.save_project(Some(project.clone())).unwrap();
         core.apply(EditCommand::CreateFolder {
@@ -3649,7 +3655,74 @@ mod tests {
         let reopened = AppCore::new();
         reopened.open_project(project).unwrap();
         assert_eq!(reopened.media(), before_media);
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_import_at_history_limit_restores_every_retained_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("History.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(project.clone())).unwrap();
+        for index in 0..210 {
+            core.apply(EditCommand::CreateFolder {
+                name: format!("kept-{index}"),
+                parent_folder_id: None,
+            })
+            .unwrap();
+        }
+        core.undo().unwrap();
+        core.undo().unwrap();
+        let mut expected = core.lock().editor.checkpoint_editor_state();
+        let before = core.runtime_snapshot();
+        let before_media = core.media();
+        let mut plan: Vec<_> = (0..10)
+            .map(|key| PreparedMediaImportOp::CreateFolder {
+                key,
+                name: format!("attempt-{key}"),
+                parent: None,
+            })
+            .collect();
+        plan.push(PreparedMediaImportOp::ImportFile {
+            path: PathBuf::from("/abs/candidate.mp4"),
+            name: "candidate".into(),
+            probe: ProbedMedia::default(),
+            folder: Some(PreparedMediaFolderRef::Planned(0)),
+        });
+        let error = core
+            .import_media_batch_for_project_with_writer(
+                before.project_epoch,
+                &project,
+                plan,
+                || Ok(()),
+                |_| {
+                    Err(CoreError::Media(
+                        "injected persistence failure at history cap".into(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "injected persistence failure at history cap"
+        );
+        assert_eq!(core.media(), before_media);
+        assert_eq!(core.runtime_snapshot().timeline, before.timeline);
+        assert_eq!(core.version(), expected.version());
+        let ids = CoreIdGen::default();
+        for command in [EditCommand::Redo, EditCommand::Redo] {
+            core.apply(command.clone()).unwrap();
+            opentake_ops::apply(&mut expected, command, &ids).unwrap();
+            assert_eq!(core.media(), expected.manifest);
+            assert_eq!(core.version(), expected.version());
+        }
+        for _ in 0..opentake_ops::EditorState::HISTORY_LIMIT {
+            core.undo().unwrap();
+            opentake_ops::apply(&mut expected, EditCommand::Undo, &ids).unwrap();
+            assert_eq!(core.media(), expected.manifest);
+            assert_eq!(core.version(), expected.version());
+        }
+        assert!(!core.can_undo());
+        assert_eq!(core.media_counts(), (0, 10));
     }
 
     #[test]
