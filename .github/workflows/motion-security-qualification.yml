@@ -1,0 +1,89 @@
+name: Motion Chromium lifecycle qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - 'Cargo.lock'
+      - 'crates/opentake-motion/Cargo.toml'
+      - 'crates/opentake-motion/src/renderer.rs'
+      - 'src-tauri/src/lib.rs'
+      - '.github/workflows/motion-security-qualification.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unix-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PR_BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install Clippy
+        run: rustup component add clippy
+      - name: Require linked issue and check private profile
+        shell: bash
+        run: |
+          if ! printf '%s\n' "$PR_BODY" | grep -Eiq '^[[:space:]]*(Closes|Fixes|Resolves|Refs)[[:space:]]+#109\b'; then
+            echo 'Link issue #109 in the pull request description' >&2
+            exit 1
+          fi
+          cargo clippy --locked -p opentake-motion --features chromium --lib -- -D warnings
+          assert_case() {
+            local output
+            if ! output=$(cargo test --locked -p opentake-motion --features chromium --lib "$1" \
+              -- --exact --nocapture --test-threads=1 2>&1); then
+              printf '%s\n' "$output"
+              exit 1
+            fi
+            printf '%s\n' "$output"
+            if ! grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' <<< "$output" || grep -Fq 'SKIP:' <<< "$output"; then
+              echo "Motion Chromium regression was skipped: $1" >&2
+              exit 1
+            fi
+          }
+          assert_case renderer::chromium_backend::tests::chromium_profile_directory_is_private
+          assert_case renderer::chromium_backend::tests::shutdown_blocks_future_browser_acquisition
+
+  windows-browser:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: motion-windows-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: motion-windows-${{ runner.arch }}-
+      - name: Render a frame then terminate the retained browser and profile
+        run: |
+          cargo clippy --locked -p opentake-motion --features chromium --lib -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Motion Chromium lint failed' }
+          $case = 'renderer::chromium_backend::tests::shutdown_pool_terminates_browser_and_removes_profile'
+          $output = cargo test --locked -p opentake-motion --features chromium --lib $case -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $lines = @($output | ForEach-Object { "$_" })
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0) { throw "Motion Chromium regression failed: $case" }
+          $log = $lines -join "`n"
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -or $log -match 'SKIP:') {
+            throw "Motion Chromium regression was skipped or did not run: $case"
+          }
