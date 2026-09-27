@@ -37,8 +37,8 @@ use opentake_core::{AppCore, EditCommand, ProjectRevision};
 use opentake_domain::{ClipType, LutReference, MediaSource, TextStyle, Timeline};
 use opentake_media::{
     decode_frame_at_cancellable, decode_frame_file_at_cancellable, interpolate_frame_pair,
-    ContentHashCache, FileStamp, FrameInterpolationFallback, FrameInterpolationMode, FrameRequest,
-    MediaCancelToken,
+    source_frame_pair, ContentHashCache, FileStamp, FrameInterpolationFallback,
+    FrameInterpolationMode, FrameRequest, MediaCancelToken,
 };
 use opentake_ops::command::RenameEntry;
 use opentake_project::ProjectRoot;
@@ -904,11 +904,8 @@ impl MediaResolver<'_> {
             return self
                 .fail_materialization(format!("video source {media_ref} has invalid frame rate"));
         }
-        let timestamp = source_frame.max(0) as f64 / interpolation.target_fps;
-        let source_position = timestamp * source_fps;
-        let first_index = source_position.floor().max(0.0) as i64;
-        let next_index = source_position.ceil().max(0.0) as i64;
-        let alpha = source_position - first_index as f64;
+        let (first_index, next_index, alpha) =
+            source_frame_pair(source_frame, interpolation.target_fps, source_fps);
         let decode = |index: i64| {
             let request = FrameRequest {
                 time_secs: index as f64 / source_fps,
@@ -1508,6 +1505,21 @@ pub(crate) fn composite_timeline_frame_authorized(
     )
 }
 
+/// Rate-conversion contract shared by paused preview, captures and export.
+/// Nearest shows the source frame displayed at each project frame, the frame
+/// the playback engine streams; optical flow is never applied implicitly.
+pub(crate) fn timeline_interpolation_config(
+    timeline_fps: i32,
+) -> Result<TextureInterpolationConfig, String> {
+    TextureInterpolationConfig::new(
+        timeline_fps as f64,
+        timeline_fps as f64,
+        TextureInterpolationMode::Nearest,
+        TextureInterpolationFallback::Nearest,
+    )
+    .map_err(str::to_string)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn composite_timeline_frame_with_authority(
     timeline: &Timeline,
@@ -1639,13 +1651,7 @@ fn composite_timeline_frame_with_authority(
             materialization_error: None,
             strict_materialization,
         };
-        let interpolation = TextureInterpolationConfig::new(
-            plan.fps as f64,
-            plan.fps as f64,
-            TextureInterpolationMode::OpticalFlow,
-            TextureInterpolationFallback::Blend,
-        )
-        .map_err(str::to_string)?;
+        let interpolation = timeline_interpolation_config(plan.fps)?;
         let composite = ctx
             .compositor
             .render_to_rgba_with_interpolation(
@@ -2113,6 +2119,23 @@ mod tests {
         .expect("source still request decodes");
 
         assert_eq!(request.source_media_id.as_deref(), Some("main10"));
+    }
+
+    #[test]
+    fn preview_and_export_share_the_nearest_frame_interpolation_contract() {
+        let config = timeline_interpolation_config(30).unwrap();
+        assert_eq!(config.mode, TextureInterpolationMode::Nearest);
+        assert_eq!(config.fallback, TextureInterpolationFallback::Nearest);
+        assert_eq!((config.source_fps, config.target_fps), (30.0, 30.0));
+        assert!(timeline_interpolation_config(0).is_err());
+
+        // Neither composite path may build its own contract.
+        let constructor = concat!("TextureInterpolationConfig", "::new(");
+        let constructions = |source: &str| source.matches(constructor).count();
+        assert_eq!(constructions(include_str!("render.rs")), 1);
+        assert_eq!(constructions(include_str!("export.rs")), 0);
+        assert!(include_str!("export.rs")
+            .contains("crate::render::timeline_interpolation_config(plan.fps)?"));
     }
 
     #[test]

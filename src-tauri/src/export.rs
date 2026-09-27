@@ -58,7 +58,7 @@ use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
     decode_frame_at, extract_pcm, extract_pcm_cancellable_with_progress, interpolate_frame_pair,
-    ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
+    source_frame_pair, ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
     FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer,
     PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
 };
@@ -574,11 +574,8 @@ impl MediaResolver<'_> {
         if !source_fps.is_finite() || source_fps <= 0.0 {
             return None;
         }
-        let timestamp = source_frame.max(0) as f64 / interpolation.target_fps;
-        let source_position = timestamp * source_fps;
-        let first_index = source_position.floor().max(0.0) as i64;
-        let next_index = source_position.ceil().max(0.0) as i64;
-        let alpha = source_position - first_index as f64;
+        let (first_index, next_index, alpha) =
+            source_frame_pair(source_frame, interpolation.target_fps, source_fps);
         let decode = |index: i64| {
             decode_frame_at(
                 &info.path,
@@ -1738,13 +1735,7 @@ pub(crate) fn run_export_with_control(
             lut_cache: &mut lut_cache,
             materialization_error: None,
         };
-        let interpolation = TextureInterpolationConfig::new(
-            plan.fps as f64,
-            plan.fps as f64,
-            TextureInterpolationMode::OpticalFlow,
-            TextureInterpolationFallback::Blend,
-        )
-        .map_err(str::to_string)?;
+        let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
         let composite = compositor
             .render_to_rgba_with_interpolation(
                 &dev.device,

@@ -27,6 +27,7 @@ tracing = "0.1"
 unicode-normalization = "0.1"
 tempfile = "3"
 rustfft = "6"
+rayon = "1"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 # Media IO. We drive the system ffmpeg/ffprobe over the CLI rather than linking

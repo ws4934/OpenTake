@@ -10,7 +10,7 @@ pub use audio_stream::{decode_pcm_interleaved, decode_pcm_interleaved_cancellabl
 pub use frame::{
     convert_frame_rate, decode_frame_at, decode_frame_at_cancellable,
     decode_frame_file_at_cancellable, decode_frames_at, decode_frames_at_cancellable, fit_within,
-    interpolate_frame_pair, FrameInterpolationFallback, FrameInterpolationMode,
+    interpolate_frame_pair, source_frame_pair, FrameInterpolationFallback, FrameInterpolationMode,
     FrameInterpolationResult, FrameRateSample, FrameRequest,
 };
 pub use pcm::{
