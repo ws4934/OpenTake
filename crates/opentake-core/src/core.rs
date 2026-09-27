@@ -43,11 +43,19 @@ use crate::deps::CoreDeps;
 use crate::error::{CoreError, Result};
 use crate::events::{CoreEvent, EventBus, SubscriptionId};
 use crate::session::{
-    DerivedStemProvenance, EditorSession, GenerationJobCommit, GenerationStateUpdate,
-    PreparedGenerationJob, PreparedGenerationOutput, ProbedMedia,
+    DerivedStemProvenance, EditorSession, GenerationChange, GenerationJobCommit,
+    GenerationStateUpdate, PreparedGenerationJob, PreparedGenerationOutput, ProbedMedia,
 };
 
 type ProjectIdentityTransitionListener = Arc<dyn Fn(bool) + Send + Sync + 'static>;
+
+/// A generation mutation committed under the session lock, with the events
+/// still owed to observers once every lock is released.
+struct GenerationCommit<T> {
+    value: T,
+    media_count: Option<usize>,
+    written: Option<PathBuf>,
+}
 
 /// Thread-safe id generator used as the core's default.
 ///
@@ -1062,6 +1070,10 @@ impl AppCore {
         )
     }
 
+    /// Apply one provider lifecycle update. A repeated poll with identical
+    /// state is a no-op, a progress-only poll updates memory and observers
+    /// without writing, and only lifecycle changes append log rows and are
+    /// persisted. Returns the number of outputs the job owns.
     pub fn update_generation_job_for_project(
         &self,
         expected_project_epoch: u64,
@@ -1069,11 +1081,16 @@ impl AppCore {
         job_id: &str,
         update: GenerationStateUpdate,
     ) -> Result<usize> {
-        self.persist_generation_mutation(
+        let bundle_publication = self.lock_project_bundle_publication();
+        let committed = self.commit_generation_mutation(
+            &bundle_publication,
             expected_project_epoch,
             expected_project_dir,
             |editor, ids| editor.update_generation_job(job_id, update, ids),
-        )
+            |editor| editor.save_generation_state(),
+        );
+        drop(bundle_publication);
+        self.emit_generation_commit(expected_project_epoch, committed)
     }
 
     pub fn finalize_generation_output_for_project(
@@ -1089,8 +1106,12 @@ impl AppCore {
         )
     }
 
-    /// Finalize a generated output and stream its media bytes into the same
-    /// complete-bundle publication as the manifest and generation log.
+    /// Finalize a generated output and stream its media bytes into the bundle.
+    ///
+    /// The bytes are staged under `media/` while only the bundle publication
+    /// gate is held, so a large download never blocks session readers. The
+    /// session lock then covers just the manifest mutation, the leaf rename,
+    /// and the small component writes whose failure rolls both back.
     pub fn finalize_generation_output_with_media_for_project(
         &self,
         expected_project_epoch: u64,
@@ -1106,12 +1127,27 @@ impl AppCore {
                 "generation output path does not match its media leaf".to_string(),
             ));
         }
-        self.persist_generation_mutation_using(
+        let bundle_publication = self.lock_project_bundle_publication();
+        let root = {
+            let session = self.lock();
+            ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
+            session.editor.project_root_clone()?
+        };
+        let staged = root.stage_media_leaf(media_leaf, media_byte_size, media)?;
+        drop(root);
+        let committed = self.commit_generation_mutation(
+            &bundle_publication,
             expected_project_epoch,
             expected_project_dir,
-            |editor, ids| editor.finalize_generation_output(output, ids),
-            |editor| editor.save_generation_state_with_media(media_leaf, media_byte_size, media),
-        )
+            |editor, ids| {
+                editor
+                    .finalize_generation_output(output, ids)
+                    .map(|()| ((), GenerationChange::Durable))
+            },
+            |editor| editor.save_generation_state_with_media(staged),
+        );
+        drop(bundle_publication);
+        self.emit_generation_commit(expected_project_epoch, committed)
     }
 
     pub fn fail_generation_output_for_project(
@@ -1165,35 +1201,75 @@ impl AppCore {
         persist: impl FnOnce(&mut EditorSession) -> Result<PathBuf>,
     ) -> Result<T> {
         let bundle_publication = self.lock_project_bundle_publication();
-        let (value, count, written) = {
-            let mut session = self.lock();
-            ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
-            let checkpoint = session.editor.checkpoint_generation_state();
-            let result = (|| {
-                let value = mutate(&mut session.editor, self.ids.as_ref())?;
-                let written = persist(&mut session.editor)?;
-                Ok((value, written))
-            })();
-            match result {
-                Ok((value, written)) => (value, session.editor.media_count(), written),
-                Err(error) => {
-                    session.editor.restore_generation_state(checkpoint);
-                    return Err(error);
-                }
-            }
-        };
-        // Event subscribers may synchronously re-enter project component
-        // stores, so publication locks must be released before broadcasting.
+        let committed = self.commit_generation_mutation(
+            &bundle_publication,
+            expected_project_epoch,
+            expected_project_dir,
+            |editor, ids| mutate(editor, ids).map(|value| (value, GenerationChange::Durable)),
+            persist,
+        );
         drop(bundle_publication);
-        self.events.emit(&CoreEvent::MediaChanged {
-            project_epoch: expected_project_epoch,
-            count,
-        });
-        self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
-            project_epoch: expected_project_epoch,
-        });
-        Ok(value)
+        self.emit_generation_commit(expected_project_epoch, committed)
+    }
+
+    /// Run one generation mutation under the session lock and persist it only
+    /// when it is a durable lifecycle change. Any mutation or persistence
+    /// failure restores the exact pre-call manifest and log.
+    fn commit_generation_mutation<T>(
+        &self,
+        _publication: &MutexGuard<'_, ()>,
+        expected_project_epoch: u64,
+        expected_project_dir: &Path,
+        mutate: impl FnOnce(&mut EditorSession, &dyn IdGen) -> Result<(T, GenerationChange)>,
+        persist: impl FnOnce(&mut EditorSession) -> Result<PathBuf>,
+    ) -> Result<GenerationCommit<T>> {
+        let mut session = self.lock();
+        ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
+        let checkpoint = session.editor.checkpoint_generation_state();
+        let result = (|| {
+            let (value, change) = mutate(&mut session.editor, self.ids.as_ref())?;
+            let written = match change {
+                GenerationChange::Durable => Some(persist(&mut session.editor)?),
+                GenerationChange::Progress | GenerationChange::Unchanged => None,
+            };
+            Ok((value, change, written))
+        })();
+        match result {
+            Ok((value, change, written)) => Ok(GenerationCommit {
+                value,
+                media_count: (change != GenerationChange::Unchanged)
+                    .then(|| session.editor.media_count()),
+                written,
+            }),
+            Err(error) => {
+                session.editor.restore_generation_state(checkpoint);
+                Err(error)
+            }
+        }
+    }
+
+    /// Broadcast a committed generation mutation. Event subscribers may
+    /// synchronously re-enter project component stores, so callers release
+    /// the publication gate before calling this.
+    fn emit_generation_commit<T>(
+        &self,
+        project_epoch: u64,
+        committed: Result<GenerationCommit<T>>,
+    ) -> Result<T> {
+        let committed = committed?;
+        if let Some(count) = committed.media_count {
+            self.events.emit(&CoreEvent::MediaChanged {
+                project_epoch,
+                count,
+            });
+        }
+        if let Some(written) = committed.written {
+            self.events.emit(&CoreEvent::ProjectSaved {
+                path: written.to_string_lossy().into_owned(),
+                project_epoch,
+            });
+        }
+        Ok(committed.value)
     }
 
     /// The open project's `.opentake` bundle directory, or `None` for an unsaved

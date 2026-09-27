@@ -338,6 +338,27 @@ impl Project {
         root.write_atomic(layout::MANIFEST_FILE, &manifest)
     }
 
+    /// Persist `generation-log.json` (when held) and then `media.json` in
+    /// place through a retained bundle root.
+    ///
+    /// Generation state lives in exactly these two components. Each is replaced
+    /// atomically and the root directory keeps its identity, so no other
+    /// component or `media/` byte is copied. `media.json` is written last and
+    /// is the commit point: a failure or crash between the two writes leaves
+    /// the previous manifest with at most extra trailing log rows describing a
+    /// transition the manifest does not yet show. Job state is always taken
+    /// from the manifest and the log is an append-only audit trail, so the
+    /// worst outcome is that a resumed job records that transition twice.
+    pub fn save_manifest_and_generation_log_to_root(&self, root: &ProjectRoot) -> Result<()> {
+        self.compatibility.ensure_writable()?;
+        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        if let Some(log) = &self.generation_log {
+            let log = encode_component(layout::GENERATION_LOG_FILE, log)?;
+            root.write_atomic(layout::GENERATION_LOG_FILE, &log)?;
+        }
+        root.write_atomic(layout::MANIFEST_FILE, &manifest)
+    }
+
     /// Like [`Self::save`] but targets an explicit `bundle` directory (used by
     /// the archiver to stage a self-contained copy). Does not mutate `self`.
     pub fn save_to(&self, bundle: impl AsRef<Path>) -> Result<()> {
@@ -401,65 +422,6 @@ impl Project {
                 source.copy_thumbnail_to(publisher.stage())?;
             }
         }
-        publisher.publish()
-    }
-
-    /// Replace the same bundle represented by an owned retained root.
-    ///
-    /// Windows refuses to rename a directory while a process still owns an
-    /// open directory handle to it. Complete same-target transactions therefore
-    /// stage and copy through the retained authority first, explicitly close
-    /// that authority, and only then enter the existing journaled publication
-    /// commit. Save-As keeps using [`Self::publish_complete_to`] because its
-    /// source and destination are distinct.
-    pub fn publish_complete_replacing_root(
-        &self,
-        bundle: impl AsRef<Path>,
-        media_source: ProjectRoot,
-    ) -> Result<ProjectRoot> {
-        let preserve_thumbnail = self.thumbnail.is_none();
-        let encoded = EncodedProject::prepare(self)?;
-        let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
-        media_source.copy_media_to(publisher.stage())?;
-        media_source.copy_chat_sessions_to(publisher.stage())?;
-        media_source.copy_motion_documents_to(publisher.stage())?;
-        if preserve_thumbnail {
-            media_source.copy_thumbnail_to(publisher.stage())?;
-        }
-        drop(media_source);
-        publisher.publish()
-    }
-
-    /// Replace the owned source bundle while adding one generated media leaf
-    /// directly to the unpublished sibling stage.
-    ///
-    /// This keeps the media bytes, `media.json`, and `generation-log.json` in
-    /// one directory-publication transaction. In particular, callers do not
-    /// need to retain an open handle inside the live target across its Windows
-    /// rename commit point.
-    pub fn publish_complete_replacing_root_with_media(
-        &self,
-        bundle: impl AsRef<Path>,
-        media_source: ProjectRoot,
-        media_leaf: &str,
-        media_byte_size: u64,
-        media: &mut dyn std::io::Read,
-    ) -> Result<ProjectRoot> {
-        let preserve_thumbnail = self.thumbnail.is_none();
-        let encoded = EncodedProject::prepare(self)?;
-        let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
-        media_source.copy_media_to(publisher.stage())?;
-        publisher
-            .stage()
-            .write_new_media_leaf(media_leaf, media_byte_size, media)?;
-        media_source.copy_chat_sessions_to(publisher.stage())?;
-        media_source.copy_motion_documents_to(publisher.stage())?;
-        if preserve_thumbnail {
-            media_source.copy_thumbnail_to(publisher.stage())?;
-        }
-        drop(media_source);
         publisher.publish()
     }
 }
@@ -922,8 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_publish_replaces_the_owned_source_root() {
-        let tmp = TmpDir::new("complete-same-target");
+    fn generation_components_are_written_in_place_without_touching_other_components() {
+        let tmp = TmpDir::new("generation-components");
         let target = tmp.path().join("Project.opentake");
         let mut project = Project::new(&target);
         project.timeline.fps = 24;
@@ -931,19 +893,35 @@ mod tests {
         fs::create_dir_all(target.join("media")).unwrap();
         fs::write(target.join("media/clip.bin"), b"media").unwrap();
         fs::write(target.join("thumbnail.jpg"), b"cover").unwrap();
-        let source_root = ProjectRoot::open(&target).unwrap();
+        let timeline_before = fs::read(target.join(layout::TIMELINE_FILE)).unwrap();
+        let root = ProjectRoot::open(&target).unwrap();
+        let identity = root.stable_identity();
 
         project.timeline.fps = 48;
-        let published = project
-            .publish_complete_replacing_root(&target, source_root)
-            .expect("same-target publication must release the old root before rename");
+        project.manifest.favorites.push("generated".into());
+        project.generation_log = Some(GenerationLog {
+            version: 1,
+            entries: vec![GenerationLogEntry::new("row-1", "fal:model", None, None)],
+        });
+        project
+            .save_manifest_and_generation_log_to_root(&root)
+            .unwrap();
 
         assert_eq!(
-            Project::open_from_root(&published).unwrap().timeline.fps,
-            48
+            ProjectRoot::open(&target).unwrap().stable_identity(),
+            identity
+        );
+        assert!(root.is_current_namespace().unwrap());
+        assert_eq!(
+            fs::read(target.join(layout::TIMELINE_FILE)).unwrap(),
+            timeline_before
         );
         assert_eq!(fs::read(target.join("media/clip.bin")).unwrap(), b"media");
         assert_eq!(fs::read(target.join("thumbnail.jpg")).unwrap(), b"cover");
+        let reopened = Project::open_from_root(&root).unwrap();
+        assert_eq!(reopened.timeline.fps, 24);
+        assert_eq!(reopened.manifest.favorites, ["generated"]);
+        assert_eq!(reopened.generation_log.unwrap().entries.len(), 1);
     }
 
     #[test]
@@ -967,26 +945,21 @@ mod tests {
     }
 
     #[test]
-    fn complete_publish_streams_generated_media_into_the_new_bundle() {
-        let tmp = TmpDir::new("complete-generated-media");
+    fn staged_generated_media_is_invisible_until_published_and_committed() {
+        let tmp = TmpDir::new("staged-generated-media");
         let target = tmp.path().join("Project.opentake");
-        let mut project = Project::new(&target);
-        project.timeline.fps = 24;
-        project.save().unwrap();
+        Project::new(&target).save().unwrap();
         fs::create_dir_all(target.join("media")).unwrap();
         fs::write(target.join("media/source.bin"), b"source").unwrap();
-        let source_root = ProjectRoot::open(&target).unwrap();
-        let mut generated = std::io::Cursor::new(b"generated");
+        let root = ProjectRoot::open(&target).unwrap();
+        let identity = root.stable_identity();
 
-        project
-            .publish_complete_replacing_root_with_media(
-                &target,
-                source_root,
-                "output.bin",
-                9,
-                &mut generated,
-            )
-            .expect("generated media must share the bundle publication commit");
+        let staged = root
+            .stage_media_leaf("output.bin", 9, &mut std::io::Cursor::new(b"generated"))
+            .expect("generated media stages under the live media directory");
+        assert_eq!(staged.root_identity(), identity);
+        assert!(!target.join("media/output.bin").exists());
+        staged.publish().unwrap().commit();
 
         assert_eq!(
             fs::read(target.join("media/source.bin")).unwrap(),
@@ -995,6 +968,44 @@ mod tests {
         assert_eq!(
             fs::read(target.join("media/output.bin")).unwrap(),
             b"generated"
+        );
+        assert_eq!(fs::read_dir(target.join("media")).unwrap().count(), 2);
+        assert_eq!(
+            ProjectRoot::open(&target).unwrap().stable_identity(),
+            identity
+        );
+    }
+
+    #[test]
+    fn uncommitted_published_media_rolls_back_unless_it_replaced_a_leftover() {
+        let tmp = TmpDir::new("published-generated-media-rollback");
+        let target = tmp.path().join("Project.opentake");
+        Project::new(&target).save().unwrap();
+        let root = ProjectRoot::open(&target).unwrap();
+        let before = tree_receipt(&target);
+
+        let fresh = root
+            .stage_media_leaf("output.bin", 5, &mut std::io::Cursor::new(b"fresh"))
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert!(target.join("media/output.bin").is_file());
+        drop(fresh);
+        assert!(!target.join("media/output.bin").exists());
+        fs::remove_dir(target.join("media")).unwrap();
+        assert_eq!(tree_receipt(&target), before);
+
+        fs::create_dir_all(target.join("media")).unwrap();
+        fs::write(target.join("media/output.bin"), b"leftover").unwrap();
+        let replacement = root
+            .stage_media_leaf("output.bin", 11, &mut std::io::Cursor::new(b"replacement"))
+            .unwrap()
+            .publish()
+            .unwrap();
+        drop(replacement);
+        assert_eq!(
+            fs::read(target.join("media/output.bin")).unwrap(),
+            b"replacement"
         );
     }
 
@@ -1014,25 +1025,19 @@ mod tests {
             }
         }
 
-        let tmp = TmpDir::new("complete-generated-media-failure");
+        let tmp = TmpDir::new("staged-generated-media-failure");
         let target = tmp.path().join("Project.opentake");
         let project = Project::new(&target);
         project.save().unwrap();
         fs::create_dir_all(target.join("media")).unwrap();
         fs::write(target.join("media/source.bin"), b"source").unwrap();
         let before = tree_receipt(&target);
-        let source_root = ProjectRoot::open(&target).unwrap();
-        let mut generated = FailingReader(false);
+        let root = ProjectRoot::open(&target).unwrap();
 
-        project
-            .publish_complete_replacing_root_with_media(
-                &target,
-                source_root,
-                "output.bin",
-                14,
-                &mut generated,
-            )
-            .expect_err("a failed generated media stream must abort publication");
+        root.stage_media_leaf("output.bin", 14, &mut FailingReader(false))
+            .expect_err("a failed generated media stream must abort staging");
+        root.stage_media_leaf("output.bin", 14, &mut std::io::Cursor::new(b"short"))
+            .expect_err("a truncated generated media stream must abort staging");
 
         assert_eq!(tree_receipt(&target), before);
         assert!(!target.join("media/output.bin").exists());

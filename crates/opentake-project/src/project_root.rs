@@ -316,23 +316,51 @@ impl ProjectRoot {
         self.copy_directory_component_to(destination, crate::layout::MEDIA_DIR, "media-copy")
     }
 
-    /// Write one fresh media leaf into this retained bundle.
+    /// Retain a second authority for the same concrete bundle directory.
     ///
-    /// Complete generation publication uses this only on an unpublished stage,
-    /// after the existing media tree has been copied. The final leaf is created
-    /// with `create_new`, streamed without an ambient destination path, checked
-    /// against the downloader's exact byte count, synced, and kept only after
-    /// every write succeeds.
-    pub(crate) fn write_new_media_leaf(
+    /// Both handles are duplicated from the already-open no-follow roots, so
+    /// the clone never re-resolves the ambient bundle path.
+    pub fn try_clone(&self) -> Result<Self> {
+        let parent = self
+            .parent
+            .try_clone()
+            .map_err(|error| ProjectError::io(&self.path, error))?;
+        let dir = self
+            .dir
+            .try_clone()
+            .map_err(|error| ProjectError::io(&self.path, error))?;
+        let identity = Handle::from_file(
+            dir.try_clone()
+                .map_err(|error| ProjectError::io(&self.path, error))?
+                .into_std_file(),
+        )
+        .map_err(|error| ProjectError::io(&self.path, error))?;
+        Ok(Self {
+            path: self.path.clone(),
+            parent,
+            name: self.name.clone(),
+            dir,
+            identity,
+            stable_identity: self.stable_identity,
+        })
+    }
+
+    /// Stream one generated media leaf into this bundle's live `media/`
+    /// directory under a private temporary name.
+    ///
+    /// The bytes are checked against the downloader's exact byte count and
+    /// synced, but stay invisible at `media/<name>` until
+    /// [`StagedMediaLeaf::publish`]. Dropping the stage removes the temporary
+    /// leaf, so a failed or abandoned stream never changes the live bundle.
+    /// Staging touches neither the bundle root nor any other media file.
+    pub fn stage_media_leaf(
         &self,
         name: &str,
         expected_bytes: u64,
         source: &mut dyn Read,
-    ) -> Result<()> {
-        validate_leaf(name).map_err(|error| {
-            ProjectError::io(self.path.join(crate::layout::MEDIA_DIR).join(name), error)
-        })?;
+    ) -> Result<StagedMediaLeaf> {
         let media_path = self.path.join(crate::layout::MEDIA_DIR);
+        validate_leaf(name).map_err(|error| ProjectError::io(media_path.join(name), error))?;
         match self.dir.create_dir(crate::layout::MEDIA_DIR) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -342,8 +370,9 @@ impl ProjectRoot {
             .dir
             .open_dir_nofollow(crate::layout::MEDIA_DIR)
             .map_err(|error| ProjectError::io(&media_path, error))?;
-        let mut leaf = TransactionLeaf::create(&media, name)
-            .map_err(|error| ProjectError::io(media_path.join(name), error))?;
+        let tmp_name = unique_temp_name(name);
+        let mut leaf = TransactionLeaf::create(&media, &tmp_name)
+            .map_err(|error| ProjectError::io(media_path.join(&tmp_name), error))?;
         let copied = std::io::copy(
             &mut source.take(expected_bytes.saturating_add(1)),
             leaf.handle.as_file_mut(),
@@ -363,8 +392,13 @@ impl ProjectRoot {
             .flush()
             .and_then(|()| leaf.handle.as_file().sync_all())
             .map_err(|error| ProjectError::io(media_path.join(name), error))?;
-        leaf.cleanup_on_drop = false;
-        Ok(())
+        Ok(StagedMediaLeaf {
+            root_identity: self.stable_identity,
+            media,
+            media_path,
+            name: name.to_string(),
+            leaf,
+        })
     }
 
     /// Copy project-local Agent conversations during complete-bundle
@@ -846,6 +880,66 @@ impl ProjectRoot {
             .open_dir_nofollow(crate::layout::LUTS_DIR)
             .map(Some)
             .map_err(|error| ProjectError::io(luts_path, error))
+    }
+}
+
+/// Synced generated media bytes held at a private temporary name inside a
+/// bundle's live `media/` directory. See [`ProjectRoot::stage_media_leaf`].
+pub struct StagedMediaLeaf {
+    root_identity: ProjectRootIdentity,
+    media: Dir,
+    media_path: PathBuf,
+    name: String,
+    leaf: TransactionLeaf,
+}
+
+impl std::fmt::Debug for StagedMediaLeaf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedMediaLeaf")
+            .field("media_path", &self.media_path)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedMediaLeaf {
+    /// Identity of the bundle root whose `media/` holds the staged bytes.
+    pub fn root_identity(&self) -> ProjectRootIdentity {
+        self.root_identity
+    }
+
+    /// Make the staged bytes visible at `media/<name>` with one rename.
+    ///
+    /// A leftover leaf at that name (from an attempt that crashed before its
+    /// manifest commit) is replaced. The returned guard removes the published
+    /// leaf again when dropped before [`PublishedMediaLeaf::commit`], unless
+    /// it replaced an existing file: those old bytes are already gone, so the
+    /// replacement is kept rather than deleting a leaf a manifest might name.
+    pub fn publish(mut self) -> Result<PublishedMediaLeaf> {
+        let replaced_existing = match self.media.symlink_metadata(&self.name) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(ProjectError::io(self.media_path.join(&self.name), error)),
+        };
+        self.leaf
+            .replace(&self.media, Path::new(&self.name))
+            .map_err(|error| ProjectError::io(self.media_path.join(&self.name), error))?;
+        self.leaf.cleanup_on_drop = !replaced_existing;
+        Ok(PublishedMediaLeaf { leaf: self.leaf })
+    }
+}
+
+/// A generated media leaf visible under `media/` whose manifest commit has
+/// not yet succeeded. Dropping it rolls the leaf back.
+pub struct PublishedMediaLeaf {
+    leaf: TransactionLeaf,
+}
+
+impl PublishedMediaLeaf {
+    /// Keep the published leaf once the manifest that references it is durable.
+    pub fn commit(mut self) {
+        self.leaf.cleanup_on_drop = false;
     }
 }
 

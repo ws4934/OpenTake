@@ -43,7 +43,7 @@ use opentake_ops::command::{self, EditCommand, EditResult};
 use opentake_ops::{EditorState, IdGen};
 use opentake_project::{
     GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectRoot,
-    ProjectRootIdentity, ThumbnailUpdate,
+    ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate,
 };
 use same_file::Handle;
 
@@ -135,6 +135,17 @@ pub(crate) struct GenerationStateCheckpoint {
     manifest: MediaManifest,
     log: GenerationLog,
     component_present: bool,
+}
+
+/// How far one generation mutation must propagate beyond the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GenerationChange {
+    /// Nothing changed: no event, no log row, no write.
+    Unchanged,
+    /// Only in-memory progress moved: notify observers, but write nothing.
+    Progress,
+    /// A lifecycle fact changed: append audit rows and persist durably.
+    Durable,
 }
 
 /// File extensions the importer accepts, grouped by the [`ClipType`] they map to.
@@ -1002,9 +1013,53 @@ impl EditorSession {
         job_id: &str,
         update: GenerationStateUpdate,
         ids: &dyn IdGen,
-    ) -> Result<usize> {
+    ) -> Result<(usize, GenerationChange)> {
         self.ensure_mutable()?;
         validate_generation_update(&update)?;
+        // Validate every output before mutating any, so a rejected update
+        // leaves the manifest untouched, and classify how far it must reach.
+        // Only a new status, provider identity, failure code, or billed cost
+        // is an audit event worth a log row and a durable write; a repeated
+        // provider poll that only moves progress stays in memory.
+        let mut outputs = 0;
+        let mut change = if update.cost_credits.is_some() {
+            GenerationChange::Durable
+        } else {
+            GenerationChange::Unchanged
+        };
+        for input in self
+            .state
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| entry.generation_input.as_ref())
+            .filter(|input| input.job_id.as_deref() == Some(job_id))
+        {
+            if !valid_generation_transition(input.status, update.status) {
+                return Err(CoreError::Media(format!(
+                    "invalid generation transition from {:?} to {:?}",
+                    input.status, update.status
+                )));
+            }
+            outputs += 1;
+            if input.status != Some(update.status)
+                || input.error_code != update.error_code
+                || (update.provider_job_id.is_some()
+                    && input.provider_job_id != update.provider_job_id)
+            {
+                change = GenerationChange::Durable;
+            } else if input.progress != update.progress && change == GenerationChange::Unchanged {
+                change = GenerationChange::Progress;
+            }
+        }
+        if outputs == 0 {
+            return Err(CoreError::Media(format!(
+                "generation job does not exist: {job_id}"
+            )));
+        }
+        if change == GenerationChange::Unchanged {
+            return Ok((outputs, change));
+        }
         let mut events = Vec::new();
         for entry in &mut self.state.manifest.entries {
             let Some(input) = entry.generation_input.as_mut() else {
@@ -1012,12 +1067,6 @@ impl EditorSession {
             };
             if input.job_id.as_deref() != Some(job_id) {
                 continue;
-            }
-            if !valid_generation_transition(input.status, update.status) {
-                return Err(CoreError::Media(format!(
-                    "invalid generation transition from {:?} to {:?}",
-                    input.status, update.status
-                )));
             }
             input.status = Some(update.status);
             input.progress = update.progress;
@@ -1027,24 +1076,21 @@ impl EditorSession {
             }
             events.push((entry.id.clone(), input.clone()));
         }
-        if events.is_empty() {
-            return Err(CoreError::Media(format!(
-                "generation job does not exist: {job_id}"
-            )));
+        if change == GenerationChange::Durable {
+            for (event_index, (asset_id, input)) in events.iter().enumerate() {
+                self.append_generation_event(
+                    ids,
+                    asset_id,
+                    input,
+                    update.status,
+                    update.progress,
+                    update.error_code.clone(),
+                    (event_index == 0).then_some(update.cost_credits).flatten(),
+                    update.created_at,
+                );
+            }
         }
-        for (event_index, (asset_id, input)) in events.iter().enumerate() {
-            self.append_generation_event(
-                ids,
-                asset_id,
-                input,
-                update.status,
-                update.progress,
-                update.error_code.clone(),
-                (event_index == 0).then_some(update.cost_credits).flatten(),
-                update.created_at,
-            );
-        }
-        Ok(events.len())
+        Ok((outputs, change))
     }
 
     pub(crate) fn finalize_generation_output(
@@ -1192,64 +1238,57 @@ impl EditorSession {
         Ok(())
     }
 
+    /// Persist generation state as in-place component writes through the
+    /// retained root. Generation mutates only the manifest and the log, so
+    /// neither `project.json` nor any `media/` byte is rewritten and the root
+    /// keeps its identity for every other holder (chat, Motion, asset reads).
     pub(crate) fn save_generation_state(&mut self) -> Result<PathBuf> {
         self.ensure_mutable()?;
         let target = self.project_dir.clone().ok_or(CoreError::NoProjectOpen)?;
-        let mut project =
-            Project::new_with_compatibility(target.clone(), self.compatibility.clone());
-        project.timeline = self.state.timeline.clone();
-        project.manifest = self.state.manifest.clone();
-        project.generation_log = Some(self.generation_log.clone());
-        // Generation spans media.json + generation-log.json. Publish a complete
-        // sibling bundle so both become visible at one rename commit point.
-        // The source root carries media/chat/thumbnail into the fresh stage.
-        let source_root = self.project_root.take().ok_or(CoreError::NoProjectOpen)?;
-        let new_root = match project.publish_complete_replacing_root(&target, source_root) {
-            Ok(root) => root,
-            Err(error) => {
-                // A pre-commit failure restores the original target; recover
-                // retained authority when possible while preserving the exact
-                // publication error for the caller. Post-commit ambiguity stays
-                // fail-closed if the target cannot be reopened.
-                self.project_root = ProjectRoot::open(&target).ok();
-                return Err(error.into());
-            }
-        };
-        self.project_root = Some(new_root);
+        let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
+        self.generation_state_project(&target)
+            .save_manifest_and_generation_log_to_root(root)?;
         self.generation_log_component_present = true;
         Ok(target)
     }
 
+    /// Publish a staged generated media leaf and then commit the manifest
+    /// that references it. The leaf is rolled back if the manifest commit
+    /// fails, so no durable entry can name missing bytes.
     pub(crate) fn save_generation_state_with_media(
         &mut self,
-        media_leaf: &str,
-        media_byte_size: u64,
-        media: &mut dyn std::io::Read,
+        media: StagedMediaLeaf,
     ) -> Result<PathBuf> {
         self.ensure_mutable()?;
         let target = self.project_dir.clone().ok_or(CoreError::NoProjectOpen)?;
-        let mut project =
-            Project::new_with_compatibility(target.clone(), self.compatibility.clone());
-        project.timeline = self.state.timeline.clone();
-        project.manifest = self.state.manifest.clone();
-        project.generation_log = Some(self.generation_log.clone());
-        let source_root = self.project_root.take().ok_or(CoreError::NoProjectOpen)?;
-        let new_root = match project.publish_complete_replacing_root_with_media(
-            &target,
-            source_root,
-            media_leaf,
-            media_byte_size,
-            media,
-        ) {
-            Ok(root) => root,
-            Err(error) => {
-                self.project_root = ProjectRoot::open(&target).ok();
-                return Err(error.into());
-            }
-        };
-        self.project_root = Some(new_root);
+        let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
+        if root.stable_identity() != media.root_identity() {
+            return Err(CoreError::Media(
+                "project bundle changed while generated media was staged".to_string(),
+            ));
+        }
+        let project = self.generation_state_project(&target);
+        let published = media.publish()?;
+        project.save_manifest_and_generation_log_to_root(root)?;
+        published.commit();
         self.generation_log_component_present = true;
         Ok(target)
+    }
+
+    fn generation_state_project(&self, target: &Path) -> Project {
+        let mut project =
+            Project::new_with_compatibility(target.to_path_buf(), self.compatibility.clone());
+        project.manifest = self.state.manifest.clone();
+        project.generation_log = Some(self.generation_log.clone());
+        project
+    }
+
+    /// A second retained authority for the open bundle, so callers can stage
+    /// large generated media without holding the session lock.
+    pub(crate) fn project_root_clone(&self) -> Result<ProjectRoot> {
+        self.ensure_mutable()?;
+        let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
+        Ok(root.try_clone()?)
     }
 
     pub(crate) fn checkpoint_generation_state(&self) -> GenerationStateCheckpoint {

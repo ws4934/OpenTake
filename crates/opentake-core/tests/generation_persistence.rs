@@ -1,13 +1,14 @@
 use std::fs;
 
 use opentake_core::{
-    AppCore, GenerationStateUpdate, PreparedGenerationJob, PreparedGenerationOutput, ProbedMedia,
+    AppCore, CoreEvent, GenerationStateUpdate, PreparedGenerationJob, PreparedGenerationOutput,
+    ProbedMedia,
 };
 use opentake_domain::{
     ClipType, GenerationInput, GenerationJobStatus, MediaManifestEntry, MediaSource,
 };
 use opentake_ops::{ClipEntry, EditCommand};
-use opentake_project::Project;
+use opentake_project::{Project, ProjectRoot};
 
 fn saved_project() -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
@@ -511,4 +512,306 @@ fn cancelling_a_partially_finalized_job_preserves_ready_outputs() {
         MediaSource::Project { ref relative_path } if relative_path.ends_with(".pending")
     ));
     assert!(!bundle.join(format!("media/{cancelled_id}.png")).exists());
+}
+
+fn running_poll() -> GenerationStateUpdate {
+    let mut running = update(GenerationJobStatus::Generating, Some(0.5));
+    running.provider_job_id = Some("fal::fixture-job".to_string());
+    running
+}
+
+/// Sibling names the bundle publisher uses while replacing the bundle (stage,
+/// backup, journal, lock). Component writes must not add any of them.
+fn publication_artifacts(bundle: &std::path::Path) -> Vec<String> {
+    let prefix = format!(".{}", bundle.file_name().unwrap().to_string_lossy());
+    fs::read_dir(bundle.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
+#[test]
+fn repeated_running_polls_neither_log_nor_write_nor_rotate_the_bundle_root() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    let mut submitted = update(GenerationJobStatus::Generating, Some(0.15));
+    submitted.provider_job_id = Some("fal::fixture-job".to_string());
+    core.update_generation_job_for_project(epoch, &bundle, &job.job_id, submitted)
+        .unwrap();
+
+    let rows = core.generation_log().entries.len();
+    let artifacts = publication_artifacts(&bundle);
+    let authority = core.project_asset_authority().unwrap();
+    let identity = ProjectRoot::open(&bundle).unwrap().stable_identity();
+    let manifest_bytes = fs::read(bundle.join("media.json")).unwrap();
+    let log_bytes = fs::read(bundle.join("generation-log.json")).unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    core.subscribe(move |event| recorded.lock().unwrap().push(event.clone()));
+
+    for _ in 0..10 {
+        assert_eq!(
+            core.update_generation_job_for_project(epoch, &bundle, &job.job_id, running_poll())
+                .unwrap(),
+            1
+        );
+    }
+
+    assert_eq!(core.generation_log().entries.len(), rows);
+    assert_eq!(core.project_asset_authority().unwrap(), authority);
+    assert_eq!(
+        ProjectRoot::open(&bundle).unwrap().stable_identity(),
+        identity
+    );
+    assert_eq!(fs::read(bundle.join("media.json")).unwrap(), manifest_bytes);
+    assert_eq!(
+        fs::read(bundle.join("generation-log.json")).unwrap(),
+        log_bytes
+    );
+    assert_eq!(publication_artifacts(&bundle), artifacts);
+    let placeholder = core
+        .media()
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == job.placeholder_asset_ids[0])
+        .unwrap();
+    assert_eq!(placeholder.generation_input.unwrap().progress, Some(0.5));
+    // Only the first poll moved progress; it is announced but never saved.
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(events[0], CoreEvent::MediaChanged { .. }));
+}
+
+#[test]
+fn identical_updates_append_no_rows_while_each_transition_appends_one() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let mut plan = upscale_plan();
+    plan.output_count = 2;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, plan)
+        .unwrap();
+    assert_eq!(core.generation_log().entries.len(), 2);
+
+    for _ in 0..50 {
+        core.update_generation_job_for_project(epoch, &bundle, &job.job_id, running_poll())
+            .unwrap();
+    }
+    assert_eq!(core.generation_log().entries.len(), 4);
+
+    let mut downloading = update(GenerationJobStatus::Downloading, Some(0.8));
+    downloading.cost_credits = Some(7);
+    core.update_generation_job_for_project(epoch, &bundle, &job.job_id, downloading)
+        .unwrap();
+    for _ in 0..5 {
+        core.update_generation_job_for_project(
+            epoch,
+            &bundle,
+            &job.job_id,
+            update(GenerationJobStatus::Downloading, Some(0.8)),
+        )
+        .unwrap();
+    }
+    let log = Project::open(&bundle).unwrap().generation_log.unwrap();
+    assert_eq!(log.entries.len(), 6);
+    assert_eq!(log.total_credits(), 7);
+    assert_eq!(log, core.generation_log());
+}
+
+#[test]
+fn retained_root_identity_survives_polls_transitions_and_media_finalization() {
+    let (_temp, bundle) = saved_project();
+    let held = ProjectRoot::open(&bundle).unwrap();
+    let artifacts = publication_artifacts(&bundle);
+    #[cfg(unix)]
+    let source_inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(bundle.join("media/source.png")).unwrap().ino()
+    };
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let still_bound = || {
+        core.ensure_project_root_identity_for_project(epoch, &bundle, held.identity())
+            .expect("a retained root must stay bound to the open session")
+    };
+
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    still_bound();
+    for _ in 0..5 {
+        core.update_generation_job_for_project(epoch, &bundle, &job.job_id, running_poll())
+            .unwrap();
+        still_bound();
+    }
+    core.update_generation_job_for_project(
+        epoch,
+        &bundle,
+        &job.job_id,
+        update(GenerationJobStatus::Downloading, Some(0.8)),
+    )
+    .unwrap();
+    still_bound();
+
+    let asset_id = &job.placeholder_asset_ids[0];
+    let leaf = format!("{asset_id}.png");
+    core.finalize_generation_output_with_media_for_project(
+        epoch,
+        &bundle,
+        PreparedGenerationOutput {
+            asset_id: asset_id.clone(),
+            relative_path: format!("media/{leaf}"),
+            probe: history_image_probe(),
+            created_at: Some(800_000_002.0),
+        },
+        &leaf,
+        6,
+        &mut std::io::Cursor::new(b"result"),
+    )
+    .unwrap();
+    still_bound();
+
+    assert_eq!(publication_artifacts(&bundle), artifacts);
+    assert_eq!(
+        fs::read(bundle.join("media").join(&leaf)).unwrap(),
+        b"result"
+    );
+    assert_eq!(fs::read(bundle.join("thumbnail.jpg")).unwrap(), b"cover");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(bundle.join("media/source.png")).unwrap().ino(),
+            source_inode,
+            "existing media must not be copied"
+        );
+    }
+    let reopened = Project::open(&bundle).unwrap();
+    let output = reopened
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(
+        output.generation_input.as_ref().unwrap().status,
+        Some(GenerationJobStatus::Ready)
+    );
+    assert_eq!(reopened.generation_log.unwrap().entries.len(), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_manifest_commit_rolls_back_the_published_media_leaf() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    for status in [
+        GenerationJobStatus::Generating,
+        GenerationJobStatus::Downloading,
+    ] {
+        core.update_generation_job_for_project(epoch, &bundle, &job.job_id, update(status, None))
+            .unwrap();
+    }
+    let before = core.media();
+    let rows = core.generation_log().entries.len();
+    // A non-empty directory at `media.json` makes its atomic replace fail.
+    fs::remove_file(bundle.join("media.json")).unwrap();
+    fs::create_dir_all(bundle.join("media.json/blocker")).unwrap();
+
+    let asset_id = &job.placeholder_asset_ids[0];
+    let leaf = format!("{asset_id}.png");
+    core.finalize_generation_output_with_media_for_project(
+        epoch,
+        &bundle,
+        PreparedGenerationOutput {
+            asset_id: asset_id.clone(),
+            relative_path: format!("media/{leaf}"),
+            probe: history_image_probe(),
+            created_at: None,
+        },
+        &leaf,
+        6,
+        &mut std::io::Cursor::new(b"result"),
+    )
+    .expect_err("the manifest commit point failed");
+
+    assert!(!bundle.join("media").join(&leaf).exists());
+    assert_eq!(
+        fs::read_dir(bundle.join("media")).unwrap().count(),
+        1,
+        "only the pre-existing source remains"
+    );
+    assert_eq!(core.media(), before);
+    assert_eq!(core.generation_log().entries.len(), rows);
+}
+
+/// Acceptance timing for issue #76: with 256 MiB under `media/`, one durable
+/// transition and every concurrent session read stay under 50 ms because no
+/// media byte is copied. Ignored by default because fsync latency on shared
+/// CI disks is not a stable timing source; run it explicitly with
+/// `cargo test -p opentake-core --test generation_persistence -- --ignored`.
+#[test]
+#[ignore]
+fn durable_transition_with_large_media_stays_fast_and_does_not_block_readers() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let (_temp, bundle) = saved_project();
+    let mut large = fs::File::create(bundle.join("media/large.bin")).unwrap();
+    let chunk = vec![0x5a_u8; 1024 * 1024];
+    for _ in 0..256 {
+        large.write_all(&chunk).unwrap();
+    }
+    large.sync_all().unwrap();
+    drop(large);
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+
+    let running = std::sync::Arc::new(AtomicBool::new(true));
+    let reader_core = core.clone();
+    let reader_running = running.clone();
+    let reader = std::thread::spawn(move || {
+        let mut worst = Duration::ZERO;
+        while reader_running.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            let _ = reader_core.get_timeline();
+            worst = worst.max(started.elapsed());
+        }
+        worst
+    });
+    let mut slowest = Duration::ZERO;
+    for status in [
+        GenerationJobStatus::Generating,
+        GenerationJobStatus::Downloading,
+        GenerationJobStatus::Finalizing,
+    ] {
+        let started = Instant::now();
+        core.update_generation_job_for_project(epoch, &bundle, &job.job_id, update(status, None))
+            .unwrap();
+        slowest = slowest.max(started.elapsed());
+    }
+    running.store(false, Ordering::Relaxed);
+    let worst_read = reader.join().unwrap();
+    eprintln!("slowest durable transition {slowest:?}, slowest concurrent read {worst_read:?}");
+    assert!(slowest < Duration::from_millis(50), "{slowest:?}");
+    assert!(worst_read < Duration::from_millis(50), "{worst_read:?}");
 }
