@@ -949,6 +949,7 @@ impl TauriMotionBridge {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_and_encode(
         &self,
         stored_source: &StoredMotionSource,
