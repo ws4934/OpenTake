@@ -515,6 +515,10 @@ pub fn run() {
         .run(|_app, _event| {
             if matches!(&_event, RunEvent::Exit) {
                 external_mcp::shutdown_on_exit(_app);
+                if let Some(motion) = _app.try_state::<motion::MotionCommandState>() {
+                    motion.cancel_active();
+                }
+                opentake_motion::HeadlessChromiumRenderer::shutdown_all_pools();
             }
             // Programmatic exits (including updater restart and a successful
             // save barrier) bypass this handler to avoid recursive saves.

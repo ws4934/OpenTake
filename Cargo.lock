@@ -3810,6 +3810,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "image",
+ "libc",
  "opentake-domain",
  "opentake-process-tree",
  "opentake-render",
