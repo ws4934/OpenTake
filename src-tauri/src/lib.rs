@@ -306,6 +306,7 @@ pub fn run() {
                 engine,
                 install_admission.clone(),
             ));
+            app.manage(captions::CaptionGenerationState::default());
             app.manage(media::StabilizationAnalysisState::new(
                 install_admission.clone(),
             ));
@@ -481,6 +482,7 @@ pub fn run() {
             transcribe::transcribe_media,
             transcribe::transcript_get,
             captions::generate_captions,
+            captions::cancel_caption_generation,
             search::search_model_status,
             search::download_search_model,
             search::search_index_status,
