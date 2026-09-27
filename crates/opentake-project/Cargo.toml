@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = ".opentake project bundle read/write (serde) + media manifest/archive."
 
+[features]
+test-hooks = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

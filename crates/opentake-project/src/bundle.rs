@@ -22,7 +22,7 @@
 //! `chat-sessions/`, or `motion-documents/`, which their owning layers manage
 //! out-of-band.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use opentake_domain::{MediaManifest, Timeline};
@@ -35,6 +35,21 @@ use crate::error::{ProjectError, Result};
 use crate::gen_log::{GenerationLog, GenerationLogEntry};
 use crate::layout;
 use crate::{is_safe_project_asset_relative_path, ProjectRoot};
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static FAIL_FINAL_MANIFEST_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks {
+    pub fn fail_next_final_manifest_write() {
+        super::FAIL_FINAL_MANIFEST_WRITE.with(|fail| {
+            assert!(!fail.replace(true), "previous test left the failure armed");
+        });
+    }
+}
 
 /// Persisted schema details this build cannot safely write back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -305,7 +320,9 @@ impl Project {
     /// Creates the bundle directory if needed. Always (re)writes `project.json`
     /// and `media.json`; writes `generation-log.json` when a log is held and
     /// `thumbnail.jpg` when [`Self::thumbnail`] is set. Each file is written
-    /// atomically (temp file + rename). Existing `media/` and `chat-sessions/`
+    /// atomically (temp file + rename), ordering the timeline and manifest by
+    /// asset additions/removals so a published timeline never references a
+    /// missing manifest entry. Existing `media/` and `chat-sessions/`
     /// directories are left untouched.
     pub fn save(&self) -> Result<()> {
         let encoded = EncodedProject::prepare(self)?;
@@ -478,8 +495,66 @@ impl EncodedProject {
     }
 
     fn write_to(&self, root: &ProjectRoot) -> Result<()> {
-        root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
+        let current_manifest = match root.read_optional(layout::MANIFEST_FILE)? {
+            Some(bytes) => decode_component::<MediaManifest>(&bytes, layout::MANIFEST_FILE)?.0,
+            None => MediaManifest::default(),
+        };
+        let next_manifest =
+            decode_component::<MediaManifest>(&self.manifest, layout::MANIFEST_FILE)?.0;
+        let current_ids: HashSet<&str> = current_manifest
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let next_ids: HashSet<&str> = next_manifest
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let adds_assets = next_ids.iter().any(|id| !current_ids.contains(id));
+        let removes_assets = current_ids.iter().any(|id| !next_ids.contains(id));
+
+        if removes_assets && !adds_assets {
+            self.write_non_manifest_components(root)?;
+            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
+            return write_final_manifest(root, &self.manifest)
+                .map_err(ProjectError::partial_commit);
+        }
+
+        if adds_assets && removes_assets {
+            let mut transition_manifest = next_manifest.clone();
+            for entry in &current_manifest.entries {
+                if !next_ids.contains(entry.id.as_str()) {
+                    transition_manifest.entries.push(entry.clone());
+                }
+            }
+            let transition_folder_ids: HashSet<String> = transition_manifest
+                .folders
+                .iter()
+                .map(|folder| folder.id.clone())
+                .collect();
+            for folder in &current_manifest.folders {
+                if !transition_folder_ids.contains(&folder.id) {
+                    transition_manifest.folders.push(folder.clone());
+                }
+            }
+            validate_manifest_paths(&transition_manifest)?;
+            let transition_bytes = encode_component(layout::MANIFEST_FILE, &transition_manifest)?;
+            root.write_atomic(layout::MANIFEST_FILE, &transition_bytes)?;
+            self.write_non_manifest_components(root)?;
+            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
+            return write_final_manifest(root, &self.manifest)
+                .map_err(ProjectError::partial_commit);
+        }
+
         root.write_atomic(layout::MANIFEST_FILE, &self.manifest)?;
+        self.write_non_manifest_components(root)?;
+        // New clip references become visible only after their manifest entries.
+        // A failed timeline replacement can leave extra, unreferenced entries.
+        root.write_atomic(layout::TIMELINE_FILE, &self.timeline)
+    }
+
+    fn write_non_manifest_components(&self, root: &ProjectRoot) -> Result<()> {
         if let Some(log) = &self.generation_log {
             root.write_atomic(layout::GENERATION_LOG_FILE, log)?;
         }
@@ -492,6 +567,17 @@ impl EncodedProject {
         }
         Ok(())
     }
+}
+
+fn write_final_manifest(root: &ProjectRoot, manifest: &[u8]) -> Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if FAIL_FINAL_MANIFEST_WRITE.with(|fail| fail.replace(false)) {
+        return Err(ProjectError::io(
+            root.path().join(layout::MANIFEST_FILE),
+            std::io::Error::other("injected final manifest failure"),
+        ));
+    }
+    root.write_atomic(layout::MANIFEST_FILE, manifest)
 }
 
 fn encode_component<T: Serialize>(file_name: &str, value: &T) -> Result<Vec<u8>> {
@@ -582,6 +668,7 @@ pub fn copy_media_dir(source_bundle: &Path, dest_bundle: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentake_domain::{Clip, ClipType, MediaManifestEntry, MediaSource, Track};
     use std::fs;
 
     /// A per-call-unique scratch dir under the system temp dir, removed on drop.
@@ -605,6 +692,59 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn failed_manifest_cleanup_keeps_the_committed_timeline_and_reports_partial_commit() {
+        let tmp = TmpDir::new("partial-delete-commit");
+        let bundle = tmp.path().join("Delete.opentake");
+        let mut project = Project::new(&bundle);
+        project
+            .timeline
+            .tracks
+            .push(Track::new("V1", ClipType::Video));
+        project.timeline.tracks[0]
+            .clips
+            .push(Clip::new("clip-1", "asset-1", 0, 30));
+        project.manifest.entries.push(MediaManifestEntry {
+            id: "asset-1".into(),
+            name: "source.mp4".into(),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: "media/source.mp4".into(),
+            },
+            duration: 1.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        project.save().unwrap();
+
+        let mut deleted = Project::open(&bundle).unwrap();
+        deleted.timeline.tracks[0].clips.clear();
+        deleted.manifest.entries.clear();
+        FAIL_FINAL_MANIFEST_WRITE.with(|fail| {
+            assert!(!fail.replace(true), "previous test left the failure armed");
+        });
+
+        let error = deleted.save().expect_err("manifest cleanup must fail");
+        assert!(error.is_partial_commit());
+        assert!(error.to_string().contains("timeline was committed"));
+
+        let reopened = Project::open(&bundle).unwrap();
+        assert!(reopened.timeline.tracks[0].clips.is_empty());
+        assert!(reopened
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.id == "asset-1"));
     }
 
     fn tree_receipt(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {

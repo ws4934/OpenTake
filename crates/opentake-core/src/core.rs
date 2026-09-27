@@ -853,32 +853,44 @@ impl AppCore {
     }
 
     /// Persist a paid provider's registration against the same project even
-    /// after unrelated timeline edits; rollback remains exact on save failure.
+    /// after unrelated timeline edits. Uncommitted save failures roll back;
+    /// post-commit cleanup failures keep the committed edit live.
     pub fn apply_for_project_persisted(
         &self,
         expected_project_epoch: u64,
         expected_project_dir: &Path,
         command: EditCommand,
     ) -> Result<EditResult> {
-        let (result, count, written) = {
+        let (result, count, written, partial_error) = {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let before = session.editor.checkpoint_editor_state();
-            let outcome = (|| {
-                let result = session.editor.apply(command, self.ids.as_ref())?;
-                let count = result
-                    .manifest_changed
-                    .then(|| session.editor.media_count());
-                let written = session.editor.save_project(None)?;
-                Ok((result, count, written))
-            })();
-            match outcome {
-                Ok(value) => value,
+            let result = match session.editor.apply(command, self.ids.as_ref()) {
+                Ok(result) => result,
                 Err(error) => {
                     session.editor.restore_editor_state(before);
                     return Err(error);
                 }
-            }
+            };
+            let count = result
+                .manifest_changed
+                .then(|| session.editor.media_count());
+            let (written, partial_error) = match session.editor.save_project(None) {
+                Ok(written) => (Some(written), None),
+                Err(error)
+                    if matches!(
+                        &error,
+                        CoreError::Project(project) if project.is_partial_commit()
+                    ) =>
+                {
+                    (None, Some(error))
+                }
+                Err(error) => {
+                    session.editor.restore_editor_state(before);
+                    return Err(error);
+                }
+            };
+            (result, count, written, partial_error)
         };
         if result.changed {
             self.events.emit(&CoreEvent::TimelineChanged {
@@ -892,22 +904,28 @@ impl AppCore {
                 count,
             });
         }
-        self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
-            project_epoch: expected_project_epoch,
-        });
+        if let Some(written) = written {
+            self.events.emit(&CoreEvent::ProjectSaved {
+                path: written.to_string_lossy().into_owned(),
+                project_epoch: expected_project_epoch,
+            });
+        }
+        if let Some(error) = partial_error {
+            return Err(error);
+        }
         Ok(result)
     }
 
     /// Apply one revision-bound edit and durably save the project under the
-    /// same session lock. Persistence failure restores document, history, and
-    /// version exactly before returning.
+    /// same session lock. A failure before the timeline commit restores the
+    /// document, history, and version; a later manifest-cleanup failure keeps
+    /// the committed state live and reports the partial save.
     pub fn apply_at_revision_persisted(
         &self,
         expected: ProjectRevision,
         command: EditCommand,
     ) -> Result<EditResult> {
-        let (result, project_epoch, media_count, written) = {
+        let (result, project_epoch, media_count, written, partial_error) = {
             let mut session = self.lock();
             if session.project_epoch != expected.project_epoch
                 || session.editor.version() != expected.version
@@ -915,23 +933,38 @@ impl AppCore {
                 return Err(CoreError::StaleProject);
             }
             let before = session.editor.checkpoint_editor_state();
-            let outcome = (|| {
-                let result = session.editor.apply(command, self.ids.as_ref())?;
-                let media_count = result
-                    .manifest_changed
-                    .then(|| session.editor.media_count());
-                let written = session.editor.save_project(None)?;
-                Ok((result, media_count, written))
-            })();
-            match outcome {
-                Ok((result, media_count, written)) => {
-                    (result, session.project_epoch, media_count, written)
+            let result = match session.editor.apply(command, self.ids.as_ref()) {
+                Ok(result) => result,
+                Err(error) => {
+                    session.editor.restore_editor_state(before);
+                    return Err(error);
+                }
+            };
+            let media_count = result
+                .manifest_changed
+                .then(|| session.editor.media_count());
+            let (written, partial_error) = match session.editor.save_project(None) {
+                Ok(written) => (Some(written), None),
+                Err(error)
+                    if matches!(
+                        &error,
+                        CoreError::Project(project) if project.is_partial_commit()
+                    ) =>
+                {
+                    (None, Some(error))
                 }
                 Err(error) => {
                     session.editor.restore_editor_state(before);
                     return Err(error);
                 }
-            }
+            };
+            (
+                result,
+                session.project_epoch,
+                media_count,
+                written,
+                partial_error,
+            )
         };
         if result.changed {
             self.events.emit(&CoreEvent::TimelineChanged {
@@ -945,10 +978,15 @@ impl AppCore {
                 count,
             });
         }
-        self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
-            project_epoch,
-        });
+        if let Some(written) = written {
+            self.events.emit(&CoreEvent::ProjectSaved {
+                path: written.to_string_lossy().into_owned(),
+                project_epoch,
+            });
+        }
+        if let Some(error) = partial_error {
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -2531,7 +2569,10 @@ mod import_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentake_domain::{Clip, ClipType, MediaColorMetadata, MediaProxy, Timeline, Track};
+    use opentake_domain::{
+        Clip, ClipType, MediaColorMetadata, MediaManifestEntry, MediaProxy, MediaSource, Timeline,
+        Track,
+    };
     use opentake_ops::command::{ClipEntry, ClipProperties};
     use std::sync::Mutex;
 
@@ -2792,6 +2833,257 @@ mod tests {
         reopened.open_project(&bundle).unwrap();
         assert_eq!(reopened.get_timeline().timeline.fps, 24);
         let _ = std::fs::remove_dir_all(bundle);
+    }
+
+    #[test]
+    fn failed_persisted_edit_keeps_the_old_timeline_as_the_disk_commit_point() {
+        let bundle = project_bundle("persisted-edit-commit-point");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let before = core.runtime_snapshot();
+
+        let manifest_path = bundle.join(opentake_project::layout::MANIFEST_FILE);
+        let mut noncanonical_manifest = b" \n".to_vec();
+        noncanonical_manifest.extend(std::fs::read(&manifest_path).unwrap());
+        std::fs::write(&manifest_path, &noncanonical_manifest).unwrap();
+        let blocked_timeline = block_project_json(&bundle);
+
+        let result = core.apply_at_revision_persisted(core.project_revision(), add_one_clip());
+        restore_project_json(&bundle, &blocked_timeline);
+
+        assert!(
+            result.is_err(),
+            "the blocked timeline replacement must fail"
+        );
+        let after = core.runtime_snapshot();
+        assert_eq!(after.timeline, before.timeline);
+        assert_eq!(after.media, before.media);
+        assert_eq!(after.version, before.version);
+        assert_ne!(
+            std::fs::read(&manifest_path).unwrap(),
+            noncanonical_manifest,
+            "the manifest write must happen before the final timeline commit"
+        );
+
+        let reopened = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(reopened.timeline, before.timeline);
+        drop(reopened);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn failed_register_and_add_never_publishes_a_clip_without_its_manifest_entry() {
+        let bundle = project_bundle("register-add-commit-point");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let before = core.runtime_snapshot();
+        let media = MediaManifestEntry {
+            id: "registered-media".into(),
+            name: "registered.mp4".into(),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: "media/registered.mp4".into(),
+            },
+            duration: 1.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        };
+        let entry = ClipEntry {
+            media_ref: media.id.clone(),
+            media_type: ClipType::Video,
+            source_clip_type: ClipType::Video,
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 30,
+            trim_start_frame: None,
+            trim_end_frame: None,
+            has_audio: false,
+            add_linked_audio: false,
+            transform: None,
+        };
+        let blocked_timeline = block_project_json(&bundle);
+
+        let result = core.apply_at_revision_persisted(
+            core.project_revision(),
+            EditCommand::RegisterMediaAndAddClip {
+                media,
+                entry,
+                auto_track: false,
+            },
+        );
+        restore_project_json(&bundle, &blocked_timeline);
+
+        assert!(
+            result.is_err(),
+            "the blocked timeline replacement must fail"
+        );
+        let after = core.runtime_snapshot();
+        assert_eq!(after.timeline, before.timeline);
+        assert_eq!(after.media, before.media);
+
+        let reopened = opentake_project::Project::open(&bundle).unwrap();
+        assert!(reopened
+            .manifest
+            .entries
+            .iter()
+            .any(|asset| asset.id == "registered-media"));
+        assert!(reopened
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .all(|clip| reopened
+                .manifest
+                .entries
+                .iter()
+                .any(|asset| asset.id == clip.media_ref)));
+        drop(reopened);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn failed_delete_does_not_remove_manifest_entries_before_the_timeline_commit() {
+        let bundle = project_bundle("delete-media-before-timeline");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let asset_id = core
+            .media()
+            .entries
+            .first()
+            .expect("project fixture has an imported asset")
+            .id
+            .clone();
+        core.apply(EditCommand::AddClips {
+            entries: vec![ClipEntry {
+                media_ref: asset_id.clone(),
+                media_type: ClipType::Video,
+                source_clip_type: ClipType::Video,
+                track_index: 0,
+                start_frame: 0,
+                duration_frames: 30,
+                trim_start_frame: None,
+                trim_end_frame: None,
+                has_audio: false,
+                add_linked_audio: false,
+                transform: None,
+            }],
+        })
+        .unwrap();
+        core.save_project(None).unwrap();
+        let before = core.runtime_snapshot();
+        let manifest_path = bundle.join(opentake_project::layout::MANIFEST_FILE);
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let blocked_timeline = block_project_json(&bundle);
+
+        let result = core.apply_at_revision_persisted(
+            core.project_revision(),
+            EditCommand::DeleteMedia {
+                asset_ids: vec![asset_id.clone()],
+            },
+        );
+        restore_project_json(&bundle, &blocked_timeline);
+
+        assert!(
+            result.is_err(),
+            "the blocked timeline replacement must fail"
+        );
+        assert_eq!(core.runtime_snapshot().timeline, before.timeline);
+        assert_eq!(core.runtime_snapshot().media, before.media);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+
+        let reopened = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(reopened.timeline, before.timeline);
+        assert!(reopened
+            .manifest
+            .entries
+            .iter()
+            .any(|asset| asset.id == asset_id));
+        drop(reopened);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn partial_delete_commit_keeps_live_state_and_retry_finishes_manifest_cleanup() {
+        let bundle = project_bundle("partial-delete-commit-retry");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let asset_id = core
+            .media()
+            .entries
+            .first()
+            .expect("project fixture has an imported asset")
+            .id
+            .clone();
+        core.apply(EditCommand::AddClips {
+            entries: vec![ClipEntry {
+                media_ref: asset_id.clone(),
+                media_type: ClipType::Video,
+                source_clip_type: ClipType::Video,
+                track_index: 0,
+                start_frame: 0,
+                duration_frames: 30,
+                trim_start_frame: None,
+                trim_end_frame: None,
+                has_audio: false,
+                add_linked_audio: false,
+                transform: None,
+            }],
+        })
+        .unwrap();
+        core.save_project(None).unwrap();
+        let before = core.runtime_snapshot();
+
+        opentake_project::bundle::test_hooks::fail_next_final_manifest_write();
+        let error = core
+            .apply_at_revision_persisted(
+                core.project_revision(),
+                EditCommand::DeleteMedia {
+                    asset_ids: vec![asset_id.clone()],
+                },
+            )
+            .expect_err("manifest cleanup must report the partial commit");
+
+        assert!(matches!(
+            &error,
+            CoreError::Project(project) if project.is_partial_commit()
+        ));
+        let after = core.runtime_snapshot();
+        assert!(after.version > before.version);
+        assert!(after
+            .timeline
+            .tracks
+            .iter()
+            .all(|track| track.clips.is_empty()));
+        assert!(after.media.entries.iter().all(|entry| entry.id != asset_id));
+
+        let partially_saved = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(partially_saved.timeline, after.timeline);
+        assert!(partially_saved
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.id == asset_id));
+        drop(partially_saved);
+
+        core.save_project(None).unwrap();
+        let recovered = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(recovered.timeline, core.runtime_snapshot().timeline);
+        assert!(recovered.manifest.entries.is_empty());
+
+        drop(recovered);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
     }
 
     #[test]
@@ -3292,6 +3584,21 @@ mod tests {
         .unwrap();
         core.save_project(Some(dir.clone())).unwrap();
         dir
+    }
+
+    fn block_project_json(bundle: &Path) -> Vec<u8> {
+        let path = bundle.join(opentake_project::layout::TIMELINE_FILE);
+        let previous = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("blocker"), b"block atomic replacement").unwrap();
+        previous
+    }
+
+    fn restore_project_json(bundle: &Path, previous: &[u8]) {
+        let path = bundle.join(opentake_project::layout::TIMELINE_FILE);
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(path, previous).unwrap();
     }
 
     fn assert_runtime_snapshot_matches_project(

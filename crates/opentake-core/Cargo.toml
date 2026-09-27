@@ -17,3 +17,4 @@ same-file = "1.0.6"
 
 [dev-dependencies]
 tempfile = "3"
+opentake-project = { workspace = true, features = ["test-hooks"] }
