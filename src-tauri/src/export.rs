@@ -3147,6 +3147,32 @@ mod tests {
     }
 
     #[test]
+    fn cancel_export_command_returns_while_save_worker_owns_lease() {
+        let app = tauri::test::mock_app();
+        app.manage(ExportControl::default());
+        let guard = app
+            .state::<ExportControl>()
+            .try_begin("save-as-worker")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            guard.checkpoint()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let started = Instant::now();
+        let cancelled = cancel_export(app.state::<ExportControl>(), "save-as-worker".into());
+        let elapsed = started.elapsed();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(CANCELLED_SENTINEL.to_string()));
+        assert_eq!(cancelled, Ok(true));
+        assert!(elapsed < Duration::from_millis(100));
+    }
+
+    #[test]
     fn pre_cancelled_export_leaves_existing_output_untouched() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("existing.mp4");

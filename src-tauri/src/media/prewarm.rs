@@ -112,6 +112,7 @@ struct ReservationGuard {
 }
 
 impl PrewarmScheduler {
+    #[cfg(test)]
     pub fn new(active_epoch: u64) -> Self {
         Self::new_with_admission(
             active_epoch,
