@@ -322,6 +322,43 @@ describe("native keyboard-control ownership", () => {
   });
 });
 
+describe("frame stepping during WebKit playback", () => {
+  it("rounds the active frame before applying the arrow-key step", async () => {
+    const endFrame = vi.spyOn(edit, "currentTimelineEndFrame").mockReturnValue(30);
+    useEditorUiStore.setState({
+      view: "editor",
+      focusedPanel: "timeline",
+      previewMediaId: null,
+      activeFrame: 10.4,
+      currentFrame: 10,
+      settingsOpen: false,
+      exportDialogOpen: false,
+      saveAsProgress: null,
+      projectSettingsPrompt: null,
+      pendingSwapClipId: null,
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const Harness = () => {
+      useKeyboardShortcuts();
+      return null;
+    };
+    try {
+      await act(async () => root.render(createElement(Harness)));
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", {
+        code: "ArrowRight", key: "ArrowRight", bubbles: true, cancelable: true,
+      })));
+      expect(useEditorUiStore.getState().currentFrame).toBe(11);
+      expect(Number.isInteger(useEditorUiStore.getState().currentFrame)).toBe(true);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      endFrame.mockRestore();
+    }
+  });
+});
+
 describe("project save shortcut", () => {
   it("prevents the native shortcut but ignores repeated KeyS events", () => {
     let saves = 0;
