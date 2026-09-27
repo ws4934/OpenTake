@@ -19,6 +19,8 @@ interface Props {
   sensitivity: number;
   /** Format the numeric value into display text (without suffix handled here). */
   format: (v: number) => string;
+  /** Inverse of `format` for typed text (suffix already stripped). Defaults to `Number`. */
+  parse?: (text: string) => number | null;
   suffix?: string;
   width?: number;
   onChange?: (v: number) => void; // during drag (optional live)
@@ -162,8 +164,8 @@ export function ScrubbableNumberField(p: Props) {
 
   const commitEdit = useCallback((restoreFocus: boolean) => {
     const cleaned = draft.replace(p.suffix ?? "", "").replace(",", ".").trim();
-    const parsed = Number(cleaned);
-    if (!p.disabled && Number.isFinite(parsed)) p.onCommit(clamp(parsed));
+    const parsed = p.parse ? p.parse(cleaned) : Number(cleaned);
+    if (!p.disabled && parsed !== null && Number.isFinite(parsed)) p.onCommit(clamp(parsed));
     finishEditing(restoreFocus);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft, p, finishEditing]);

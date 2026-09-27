@@ -27,6 +27,7 @@ import { PanelHeaderBar } from "../ui/PanelShell";
 import { Icon } from "../ui/Icon";
 import { HoverButton } from "../ui/HoverButton";
 import { ScrubbableNumberField } from "./ScrubbableNumberField";
+import { decibelUnits, percentUnits } from "./inspectorUnits";
 import { TextTab } from "./TextTab";
 import { AiEditTab } from "./AiEditTab";
 import { MattingSection } from "./MattingSection";
@@ -537,7 +538,8 @@ function ClipInspector({
                 min={0}
                 max={4}
                 sensitivity={0.01}
-                format={(v) => (20 * Math.log10(Math.max(1e-6, v))).toFixed(1)}
+                format={decibelUnits.format}
+                parse={decibelUnits.parse}
                 suffix=" dB"
                 width={56}
                 displayTextOverride={(v) => (v <= 0 ? "-∞ dB" : null)}
@@ -576,7 +578,8 @@ function ClipInspector({
                   min={0.01}
                   max={10}
                   sensitivity={0.005}
-                  format={(v) => Math.round(v * 100).toString()}
+                  format={percentUnits.format}
+                  parse={percentUnits.parse}
                   suffix="%"
                   width={56}
                   onCommit={(v) =>
@@ -623,7 +626,8 @@ function ClipInspector({
                   min={0}
                   max={1}
                   sensitivity={0.005}
-                  format={(v) => Math.round(v * 100).toString()}
+                  format={percentUnits.format}
+                  parse={percentUnits.parse}
                   suffix="%"
                   width={56}
                   onCommit={(v) =>
@@ -2303,7 +2307,7 @@ function MaskTransformFields({
       <MaskNumberRow label={t("inspector.mask.offsetY")} value={transform.offset.y} onChange={(v) => pointField("offset", "y", v, false)} onCommit={(v) => pointField("offset", "y", v, true)} />
       <MaskNumberRow label={t("inspector.mask.scaleX")} value={transform.scale.x} min={0.05} max={4} onChange={(v) => pointField("scale", "x", v, false)} onCommit={(v) => pointField("scale", "x", v, true)} />
       <MaskNumberRow label={t("inspector.mask.scaleY")} value={transform.scale.y} min={0.05} max={4} onChange={(v) => pointField("scale", "y", v, false)} onCommit={(v) => pointField("scale", "y", v, true)} />
-      <EffectNumberRow label={t("inspector.mask.rotation")} value={transform.rotationDegrees} min={-180} max={180} sensitivity={0.5} format={(v) => `${v.toFixed(1)}°`} onChange={(v) => update({ ...transform, rotationDegrees: v }, false)} onCommit={(v) => update({ ...transform, rotationDegrees: v }, true)} />
+      <EffectNumberRow label={t("inspector.mask.rotation")} value={transform.rotationDegrees} min={-180} max={180} sensitivity={0.5} format={(v) => v.toFixed(1)} suffix="°" onChange={(v) => update({ ...transform, rotationDegrees: v }, false)} onCommit={(v) => update({ ...transform, rotationDegrees: v }, true)} />
     </>
   );
 }
@@ -2315,6 +2319,7 @@ function EffectNumberRow({
   max,
   sensitivity,
   format,
+  suffix,
   width = EFFECT_VALUE_WIDTH,
   onChange,
   onCommit,
@@ -2325,6 +2330,7 @@ function EffectNumberRow({
   max: number;
   sensitivity: number;
   format: (v: number) => string;
+  suffix?: string;
   width?: number;
   onChange: (v: number) => void;
   onCommit: (v: number) => void;
@@ -2338,6 +2344,7 @@ function EffectNumberRow({
         max={max}
         sensitivity={sensitivity}
         format={format}
+        suffix={suffix}
         width={width}
         onChange={onChange}
         onCommit={onCommit}
