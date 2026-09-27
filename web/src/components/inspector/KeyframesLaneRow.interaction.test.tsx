@@ -118,6 +118,9 @@ it("control-75a9964d0b81961a keyframe lane seek", async () => {
     lane?.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: 200 }));
   });
   expect(useEditorUiStore.getState().activeFrame).toBe(110);
+  // A lane click is a seek: the parked playhead follows, so a later timeline
+  // refresh cannot pull the playhead back to the old frame.
+  expect(useEditorUiStore.getState().currentFrame).toBe(110);
 
   const child = lane?.firstElementChild;
   await act(async () => {
@@ -136,6 +139,7 @@ it("control-75a9964d0b81961a keyframe lane seek", async () => {
   });
   expect(document.activeElement).toBe(lane);
   expect(useEditorUiStore.getState().activeFrame).toBe(111);
+  expect(useEditorUiStore.getState().currentFrame).toBe(111);
   expect(lane?.getAttribute("aria-valuenow")).toBe("111");
 });
 

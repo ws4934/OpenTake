@@ -64,7 +64,10 @@ function reportSyncFailure(label: string, error: unknown): void {
 /** Keep the UI playhead inside the authoritative timeline after an edit or
  * undo/redo changes its duration. The scrubber intentionally permits the
  * duration boundary (not only the last drawable frame), so a parked end frame
- * remains representable while stale positions are never sent to preview. */
+ * remains representable while stale positions are never sent to preview.
+ * Each playhead value is only clamped on its own: `activeFrame` legitimately
+ * runs ahead of `currentFrame` during playback and after keyframe navigation,
+ * so a refresh must never pull it back to the parked frame. */
 function reconcilePlayheadToTimeline(): void {
   const ui = useEditorUiStore.getState();
   const project = useProjectStore.getState();
@@ -73,12 +76,14 @@ function reconcilePlayheadToTimeline(): void {
       (sequence) => sequence.id === ui.activeNestedSequenceId,
     )?.timeline ?? project.timeline;
   const maxFrame = Math.max(0, totalFrames(timeline));
-  const frame = Math.max(
-    0,
-    Math.min(maxFrame, Math.round(Number.isFinite(ui.currentFrame) ? ui.currentFrame : 0)),
+  const clamp = (frame: number) => Math.max(0, Math.min(maxFrame, frame));
+  const currentFrame = clamp(
+    Math.round(Number.isFinite(ui.currentFrame) ? ui.currentFrame : 0),
   );
-  if (ui.currentFrame !== frame || ui.activeFrame !== frame) {
-    ui.setCurrentFrame(frame);
+  // Fractional during playback: clamp without rounding.
+  const activeFrame = clamp(Number.isFinite(ui.activeFrame) ? ui.activeFrame : 0);
+  if (ui.currentFrame !== currentFrame || ui.activeFrame !== activeFrame) {
+    useEditorUiStore.setState({ currentFrame, activeFrame });
   }
 }
 

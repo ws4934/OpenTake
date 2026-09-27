@@ -97,7 +97,7 @@ export function KeyframesLaneRow({
 }) {
   const activeFrame = useEditorUiStore((s) => s.activeFrame);
   const editFrame = Math.round(activeFrame);
-  const setActiveFrame = useEditorUiStore((s) => s.setActiveFrame);
+  const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
   const pushToast = useEditorUiStore((s) => s.pushToast);
   const track = getTrack(clip, property);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -164,7 +164,7 @@ export function KeyframesLaneRow({
   const handleTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.target !== e.currentTarget) return;
     const rel = xToFrame(e.clientX);
-    setActiveFrame(startFrame + rel);
+    setCurrentFrame(startFrame + rel);
   };
 
   const handleTrackKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -177,7 +177,7 @@ export function KeyframesLaneRow({
     if (e.key === "End") nextFrame = endFrame;
     if (nextFrame === null) return;
     e.preventDefault();
-    setActiveFrame(Math.max(startFrame, Math.min(endFrame, nextFrame)));
+    setCurrentFrame(Math.max(startFrame, Math.min(endFrame, nextFrame)));
   };
 
   const commitKeyframeMove = useCallback(

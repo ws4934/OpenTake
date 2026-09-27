@@ -294,7 +294,7 @@ function KeyframeRowControls({
   activeFrame: number;
   t: TFunction;
 }) {
-  const setActiveFrame = useEditorUiStore((s) => s.setActiveFrame);
+  const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
   const editFrame = Math.round(activeFrame);
   const inRange = clipContainsFrame(clip, editFrame);
   const onKeyframe = hasKeyframeAt(clip, property, editFrame);
@@ -323,7 +323,7 @@ function KeyframeRowControls({
       <HoverButton
         title={t("inspector.keyframe.prev")}
         disabled={prev === null}
-        onClick={() => prev !== null && setActiveFrame(prev)}
+        onClick={() => prev !== null && setCurrentFrame(prev)}
         size={24}
       >
         <Icon icon={ChevronLeft} size={12} />
@@ -344,7 +344,7 @@ function KeyframeRowControls({
       <HoverButton
         title={t("inspector.keyframe.next")}
         disabled={next === null}
-        onClick={() => next !== null && setActiveFrame(next)}
+        onClick={() => next !== null && setCurrentFrame(next)}
         size={24}
       >
         <Icon icon={ChevronRight} size={12} />
