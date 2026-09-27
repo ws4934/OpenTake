@@ -15,7 +15,6 @@ use crate::source::SourceMetrics;
 /// orientation, no alpha. Lottie frame count configurable per ref.
 struct TestMetrics {
     nat: (u32, u32),
-    premultiply: bool,
     pt: [f64; 6],
     lottie_frames: Option<i64>,
 }
@@ -24,7 +23,6 @@ impl Default for TestMetrics {
     fn default() -> Self {
         TestMetrics {
             nat: (1920, 1080),
-            premultiply: false,
             pt: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             lottie_frames: None,
         }
@@ -37,9 +35,6 @@ impl SourceMetrics for TestMetrics {
     }
     fn preferred_transform(&self, _r: &str) -> [f64; 6] {
         self.pt
-    }
-    fn needs_premultiply(&self, _r: &str) -> bool {
-        self.premultiply
     }
     fn lottie_frame_count(&self, _r: &str) -> Option<i64> {
         self.lottie_frames
@@ -652,35 +647,4 @@ fn preferred_transform_box_normalization_rotates_nat_size() {
     let cp = &plan.clip_plans[0];
     approx(cp.nat_size.0, 1080.0);
     approx(cp.nat_size.1, 1920.0);
-}
-
-// --- needs_premultiply flows from metrics for video, false for image ---
-
-#[test]
-fn premultiply_flag_from_metrics() {
-    let tl = single_video_timeline(video_clip("c0", 0, 30));
-    let m = TestMetrics {
-        premultiply: true,
-        ..Default::default()
-    };
-    let plan = build_render_plan(&tl, RS, &m);
-    assert!(plan.clip_plans[0].needs_premultiply);
-    assert!(plan.frame(&tl, 0).draws[0].needs_premultiply);
-}
-
-#[test]
-fn image_never_premultiplied_even_if_metrics_say_so() {
-    let mut clip = Clip::new("img", "asset", 0, 30);
-    clip.media_type = ClipType::Image;
-    let mut tl = Timeline::new();
-    let mut track = Track::new("t0", ClipType::Video);
-    track.clips.push(clip);
-    tl.tracks.push(track);
-    let m = TestMetrics {
-        premultiply: true,
-        ..Default::default()
-    };
-    let plan = build_render_plan(&tl, RS, &m);
-    // Image is authored premultiplied -> flag stays false (SPEC §4.1).
-    assert!(!plan.clip_plans[0].needs_premultiply);
 }

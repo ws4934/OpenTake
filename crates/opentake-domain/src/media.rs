@@ -253,8 +253,9 @@ pub struct MediaManifestEntry {
 
 impl MediaManifestEntry {
     /// Generated local matting derivatives contain straight RGBA from FFmpeg's
-    /// ProRes 4444 decoder. The render adapters use this non-secret provenance
-    /// to request one premultiplication before blending.
+    /// ProRes 4444 decoder (premultiplied once at texture upload, like every
+    /// straight-alpha source). Motion re-renders use this provenance to keep a
+    /// transparent clip transparent.
     pub fn carries_straight_alpha(&self) -> bool {
         self.generation_input.as_ref().is_some_and(|input| {
             input.transparent == Some(true)

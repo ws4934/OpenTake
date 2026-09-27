@@ -14,7 +14,7 @@
 //! master clock, the MJPEG sink, and the Tauri event emitter without touching the
 //! loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -340,15 +340,7 @@ impl RenderLoop {
     ) -> Result<Self, String> {
         let dev = RenderDevice::try_new().map_err(|e| format!("no GPU device: {e}"))?;
         let compositor = Compositor::new(&dev.device);
-        let straight_alpha = media
-            .iter()
-            .filter(|(_, info)| info.straight_alpha)
-            .map(|(id, _)| id.clone())
-            .collect::<HashSet<_>>();
-        let metrics = ManifestMetrics {
-            sizes,
-            straight_alpha,
-        };
+        let metrics = ManifestMetrics { sizes };
         let plan = try_build_render_plan(&timeline, render_size, &metrics)
             .map_err(|error| format!("invalid timeline graph: {error}"))?;
         let project_root = project_dir
@@ -1108,7 +1100,6 @@ mod tests {
                 nat_size: (1.0, 1.0),
                 crop_uv: (0.0, 0.0, 1.0, 1.0),
                 opacity: 1.0,
-                needs_premultiply: false,
                 clip_id: "clip-1",
                 color_grade: None,
                 lut: None,
@@ -1138,7 +1129,6 @@ mod tests {
                 nat_size: (1.0, 1.0),
                 crop_uv: (0.0, 0.0, 1.0, 1.0),
                 opacity: 1.0,
-                needs_premultiply: false,
                 clip_id: "clip-1",
                 color_grade: None,
                 lut: None,

@@ -19,7 +19,7 @@
 //! (one frame at a time, no GPU contention). The continuous playback engine
 //! (#53) will move this onto a dedicated render thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
@@ -355,20 +355,15 @@ fn text_style_is_finite(style: &TextStyle) -> bool {
 }
 
 /// `SourceMetrics` backed by the media manifest: only intrinsic size is known
-/// here (orientation/alpha use the documented identity/false defaults; ffmpeg
-/// auto-rotates on decode in this first cut).
+/// here (orientation uses the documented identity default; ffmpeg auto-rotates
+/// on decode in this first cut).
 struct ManifestMetrics {
     sizes: HashMap<String, (u32, u32)>,
-    straight_alpha: HashSet<String>,
 }
 
 impl SourceMetrics for ManifestMetrics {
     fn natural_size(&self, media_ref: &str) -> Option<(u32, u32)> {
         self.sizes.get(media_ref).copied()
-    }
-
-    fn needs_premultiply(&self, media_ref: &str) -> bool {
-        self.straight_alpha.contains(media_ref)
     }
 }
 
@@ -805,9 +800,8 @@ impl MediaResolver<'_> {
 
     /// Rasterize a text clip's box to a premultiplied-RGBA texture (composited
     /// last, like upstream's `CATextLayer`). The box texture is uploaded with
-    /// `srgb = false` so it blends in the same encoded space as video/image, and
-    /// the plan marks text `needs_premultiply = false` so the shader treats it as
-    /// already premultiplied (which it is).
+    /// `srgb = false` so it blends in the same encoded space as video/image; the
+    /// raster is already premultiplied, so the upload leaves it untouched.
     fn resolve_text(&mut self, clip_id: &str) -> Option<Rc<GpuTexture>> {
         let key = format!("t:{clip_id}");
         if let Some(tex) = self.cache.get(&key) {
@@ -1020,9 +1014,7 @@ impl TextureResolver for MediaResolver<'_> {
         let Ok((_actual, frame)) = decoded else {
             return self.fail_materialization(format!("media source {media_ref} decode failed"));
         };
-        // ffmpeg emits straight RGBA; the plan's `needs_premultiply` flag (false
-        // for image/video here) drives the shader, so the `premultiplied` marker
-        // on the upload is informational only.
+        // ffmpeg emits straight RGBA; `upload_rgba` premultiplies it.
         let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
         let tex = upload_rgba(
             self.device,
@@ -1108,11 +1100,7 @@ fn authoritative_render_plan(
     max_size: u32,
 ) -> Result<RenderPlan, String> {
     let mut sizes = HashMap::new();
-    let mut straight_alpha = HashSet::new();
     for entry in &manifest.entries {
-        if entry.carries_straight_alpha() {
-            straight_alpha.insert(entry.id.clone());
-        }
         if let (Some(width), Some(height)) = (entry.source_width, entry.source_height) {
             if width > 0 && height > 0 {
                 sizes.insert(entry.id.clone(), (width as u32, height as u32));
@@ -1120,15 +1108,8 @@ fn authoritative_render_plan(
         }
     }
     let render_size = preview_render_size(timeline.width, timeline.height, max_size);
-    let plan = try_build_render_plan(
-        timeline,
-        render_size,
-        &ManifestMetrics {
-            sizes,
-            straight_alpha,
-        },
-    )
-    .map_err(|error| format!("invalid timeline graph: {error}"))?;
+    let plan = try_build_render_plan(timeline, render_size, &ManifestMetrics { sizes })
+        .map_err(|error| format!("invalid timeline graph: {error}"))?;
     Ok(plan)
 }
 
@@ -1345,7 +1326,6 @@ fn composite_empty_timeline_canvas(
             nat_size: (size.width as f64, size.height as f64),
             crop_uv: (0.0, 0.0, 1.0, 1.0),
             opacity: 1.0,
-            needs_premultiply: false,
             clip_id: "agent-empty-timeline",
             color_grade: None,
             lut: None,
@@ -1529,12 +1509,8 @@ fn composite_timeline_frame_with_authority(
 
     // Project the manifest into render-side lookups.
     let mut sizes: HashMap<String, (u32, u32)> = HashMap::new();
-    let mut straight_alpha = HashSet::new();
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
     for entry in &manifest.entries {
-        if entry.carries_straight_alpha() {
-            straight_alpha.insert(entry.id.clone());
-        }
         let path = match &entry.source {
             MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
             MediaSource::Project { relative_path } => match &project_dir {
@@ -1563,10 +1539,7 @@ fn composite_timeline_frame_with_authority(
 
     let render_size = preview_render_size(timeline.width, timeline.height, max_size);
 
-    let metrics = ManifestMetrics {
-        sizes,
-        straight_alpha,
-    };
+    let metrics = ManifestMetrics { sizes };
     let plan = try_build_render_plan(timeline, render_size, &metrics)
         .map_err(|error| format!("invalid timeline graph: {error}"))?;
     let frame_plan = plan.frame(timeline, frame);

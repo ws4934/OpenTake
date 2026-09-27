@@ -17,7 +17,7 @@
 //! built from the same cache/models dirs the UI uses, so imports produce the exact
 //! same posters / manifest entries / `MediaChanged` events as the media panel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -2626,7 +2626,6 @@ fn inspect_lottie_frames(
             nat_size: (render_size.width as f64, render_size.height as f64),
             crop_uv: (0.0, 0.0, 1.0, 1.0),
             opacity: 1.0,
-            needs_premultiply: false,
             clip_id: "inspect-media-lottie",
             color_grade: None,
             lut: None,
@@ -2849,16 +2848,7 @@ fn composite_frames_jpeg(
 
     let text = project_text(timeline);
     let (sizes, media) = project_media(manifest, project_dir);
-    let straight_alpha = manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.carries_straight_alpha())
-        .map(|entry| entry.id.clone())
-        .collect();
-    let metrics = ManifestMetrics {
-        sizes,
-        straight_alpha,
-    };
+    let metrics = ManifestMetrics { sizes };
     let plan = try_build_render_plan(timeline, render_size, &metrics)
         .map_err(|error| BridgeError::new(format!("invalid timeline graph: {error}")))?;
 
@@ -2973,16 +2963,11 @@ struct TextInfo {
 /// `SourceMetrics` backed by the media manifest (intrinsic size only).
 struct ManifestMetrics {
     sizes: HashMap<String, (u32, u32)>,
-    straight_alpha: HashSet<String>,
 }
 
 impl SourceMetrics for ManifestMetrics {
     fn natural_size(&self, media_ref: &str) -> Option<(u32, u32)> {
         self.sizes.get(media_ref).copied()
-    }
-
-    fn needs_premultiply(&self, media_ref: &str) -> bool {
-        self.straight_alpha.contains(media_ref)
     }
 }
 

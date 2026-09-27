@@ -146,8 +146,6 @@ pub struct ClipPlan {
     /// 源轨道朝向修正(上游 preferredTransform,已平移到 box.minX/minY 归零,L172)。
     /// 行优先 [a, b, c, d, tx, ty]。无朝向 = 单位阵 [1,0,0,1,0,0]。
     pub preferred_transform: [f64; 6],
-    /// 是否需要 premultiply(直通 alpha 源,见 §4.1)。图片/文字已是预乘。
-    pub needs_premultiply: bool,
     /// 速度(用于源帧索引换算,见 §2.5)。
     pub speed: f64,
     pub trim_start_frame: i32,
@@ -178,7 +176,6 @@ pub struct LayerDraw<'a> {
     pub crop_uv: (f64, f64, f64, f64),
     /// premultiplied alpha 全局乘子 = clip.opacity_at(f) ∈ [0,1]。
     pub opacity: f64,
-    pub needs_premultiply: bool,
     pub clip_id: &'a str,
 }
 
@@ -211,7 +208,6 @@ pub fn build_render_plan(
 4. 每个入选 clip 构造 `ClipPlan`:
    - `source` 按 `media_type` 选 `TextureSource`(video/audio→Decoded,image→Image,lottie→Lottie)。audio clip 无视频纹理:**audio track 整轨不产生 ClipPlan**(本 crate 视频侧;音频混合在播放/导出后端另行处理,见 §3.8)。
    - `nat_size` / `preferred_transform`:见 §4.1(视频从 ffmpeg display matrix + naturalSize;图片从解码尺寸;lottie 从 manifest;text 从 §4.2 排版尺寸)。复刻上游 L166-172 的 box 归一化:`nat_size = |bbox(natSize0, preferredTransform)|`,`preferred_transform` 末尾平移 `(-box.minX, -box.minY)`。
-   - `needs_premultiply`:视频且源为直通 alpha → true(§4.1);图片/文字/lottie 已预乘 → false。
    - `speed / trim_start_frame / media_type` 原样拷。
 5. 收集所有 `ClipPlan` 到 `clip_plans`,**最终排序键 `(track_index, start_frame)`**(保证混合顺序 = 轨道顺序;同轨已无重叠)。
 6. 返回 `RenderPlan { fps, render_size, total_frames, clip_plans }`。
@@ -233,7 +229,7 @@ impl RenderPlan {
 4. `transform = clip.transform_at(f)`(domain);`affine = compose(preferred_transform, affine_transform(transform, nat_size, render_size))`(§1.3 公式,纯几何,在 render 层实现 `affine_transform` + `compose`,见 §2.6)。
 5. `crop = clip.crop_at(f)`(domain);`crop_uv = crop_to_uv(crop)`(§3.4)。
 6. `source_frame = source_frame_index(clip_plan, f)`(§2.5)。
-7. push `LayerDraw { source, source_frame, affine, crop_uv, opacity, needs_premultiply, clip_id }`。
+7. push `LayerDraw { source, source_frame, affine, crop_uv, opacity, clip_id }`。
 返回 `FramePlan { clear_rgba: [0,0,0,1], draws }`。
 
 ### 2.5 源帧索引换算 `source_frame_index`(对拍 insertClip L301-343 的 trim+speed+scaleTimeRange)
@@ -351,13 +347,13 @@ struct U {
 
 ### 3.6 混合:premultiplied alpha,顺序 alpha-over
 
-- 所有纹理在采样后转成 **premultiplied**(若 `needs_premultiply`,在片元里 `rgb *= a`;图片/文字已预乘则跳过)。再乘全局 `opacity`:`rgb *= opacity; a *= opacity`(预乘下 opacity 同时缩放 rgb 和 a)。
+- 所有纹理**上传期即为 premultiplied**:`upload_rgba` 对 `DecodedFrame.premultiplied == false` 的直通帧(ffmpeg `rgba` 输出的图片/视频/透明 Motion)在 CPU 端 `c = round(c*a/255)`(全不透明帧原样上传);文字/Lottie 已预乘则跳过。预乘纹理保证双线性采样不把全透明像素的 RGB 混进边缘(#88)。片元统一先反预乘做效果链,末尾再预乘一次,再乘全局 `opacity`:`rgb *= opacity; a *= opacity`(预乘下 opacity 同时缩放 rgb 和 a)。
 - wgpu blend state(预乘 over):
   ```
   color: src_factor=ONE, dst_factor=ONE_MINUS_SRC_ALPHA, op=ADD
   alpha: src_factor=ONE, dst_factor=ONE_MINUS_SRC_ALPHA, op=ADD
   ```
-- 与上游一致性:AVFoundation layer 合成用 premultiplied(故上游才需 `AlphaVideoNormalizer` 把直通 alpha 预乘,§4.1)。OpenTake 把"预乘"放进片元(直通源)或上传期(图片),结果等价。
+- 与上游一致性:AVFoundation layer 合成用 premultiplied(故上游才需 `AlphaVideoNormalizer` 把直通 alpha 预乘,§4.1)。OpenTake 把"预乘"放在上传期(所有直通源),结果等价。
 
 ### 3.7 色彩空间管线(对拍 §1.6)
 
@@ -389,7 +385,7 @@ PoC 用 sRGB 非线性直接混合以最小化与 AVFoundation 的差异(§6 容
 ### 4.1 视频源(Decoded)+ preferredTransform + premultiply
 
 - **natSize / preferredTransform**:上游从 `AVAssetTrack.naturalSize` + `preferredTransform`(CompositionBuilder L166-172)取。OpenTake 从 ffmpeg:`naturalSize` = 解码帧尺寸;`preferredTransform` = 容器 **display matrix**(`AV_PKT_DATA_DISPLAYMATRIX` / `AVStream` side data,旋转 90/180/270 + flip)。转成 6 元组,按上游 L170-172 做 box 归一化(`nat_size = |bbox|`,平移归零)。无 side data ⇒ 单位阵、`nat_size = 解码尺寸`。
-- **premultiply**:上游 `AlphaVideoNormalizer`(L9)检测**编解码器 alpha 标志**(`kCMFormatDescriptionExtension_ContainsAlphaChannel` L37),仅对**直通 alpha 且 preferredTransform 为单位**(L16)的源预乘。OpenTake:解码出带 alpha 的像素格式(如 yuva/ rgba)⇒ `needs_premultiply = true`,在片元 `rgb*=a`。**无需烧中间 ProRes4444**;旋转源不再是障碍(我们的几何在顶点处理,与 premultiply 解耦,可放宽上游"仅单位阵才预乘"的限制——但 PoC 阶段保持一致以便对拍)。
+- **premultiply**:上游 `AlphaVideoNormalizer`(L9)检测**编解码器 alpha 标志**(`kCMFormatDescriptionExtension_ContainsAlphaChannel` L37),仅对**直通 alpha 且 preferredTransform 为单位**(L16)的源预乘。OpenTake:ffmpeg 解码输出直通 `rgba`,上传期统一预乘(§3.6),无需按源标记。**无需烧中间 ProRes4444**;旋转源不再是障碍(我们的几何在顶点处理,与 premultiply 解耦,可放宽上游"仅单位阵才预乘"的限制——但 PoC 阶段保持一致以便对拍)。
 - 解码接口见 §5.3。
 
 ### 4.2 文字源(Text)——上游 CATextLayer → cosmic-text + tiny-skia/Vello 光栅纹理
@@ -411,7 +407,7 @@ PoC 用 sRGB 非线性直接混合以最小化与 AVFoundation 的差异(§6 容
 上游 `LottieVideoGenerator` 把 Lottie 烧成视频再当普通 video clip。OpenTake **按需把 Lottie 的"内部帧"光栅化成纹理**(rlottie FFI 优先,velato 备选;ARCHITECTURE §6/§10)。
 - `nat_size` / 帧数 / framerate:从 manifest(`source_width/height/fps`,MediaAsset.loadMetadata 对应字段)或 rlottie inspect。
 - `source_frame`(§2.5):`(trim + round(rel*speed)) % lottie_total_frames`(或钳末帧,与物化一致;Lottie 通常循环,取模更贴近"长视频"语义)。
-- 已带 alpha 且预乘 ⇒ `needs_premultiply = false`(rlottie 输出预乘 BGRA/RGBA)。
+- 已带 alpha 且预乘 ⇒ `DecodedFrame.premultiplied = true`,上传期不再预乘(rlottie 输出预乘 BGRA/RGBA)。
 - 缓存:每"内部帧"一张纹理,content-hash(文件 hash + 帧号 + 尺寸)缓存(避免重复光栅)。
 
 ### 4.4 纹理缓存与生命周期(`gpu/texture.rs`)
@@ -451,8 +447,6 @@ pub trait SourceMetrics {
     fn natural_size(&self, media_ref: &str) -> Option<(u32, u32)>;
     /// 视频容器 display matrix → 6 元组(无则单位)。对拍 preferredTransform L169。
     fn preferred_transform(&self, media_ref: &str) -> [f64; 6];
-    /// 源是否带 alpha 且需预乘(对拍 trackContainsAlpha L34)。
-    fn needs_premultiply(&self, media_ref: &str) -> bool;
     /// lottie 内部总帧数(取模用,§4.3)。
     fn lottie_frame_count(&self, media_ref: &str) -> Option<i64>;
 }

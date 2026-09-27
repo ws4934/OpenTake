@@ -136,12 +136,6 @@ fn make_clip_plan(
         normalize_box(nat0, pt)
     };
 
-    let needs_premultiply = match clip.media_type {
-        ClipType::Video => sources.needs_premultiply(&clip.media_ref),
-        // Image / Text / Lottie are authored premultiplied.
-        _ => false,
-    };
-
     let lottie_frame_count = if clip.media_type == ClipType::Lottie {
         sources.lottie_frame_count(&clip.media_ref)
     } else {
@@ -160,7 +154,6 @@ fn make_clip_plan(
         end_frame: visible_end,
         nat_size,
         preferred_transform,
-        needs_premultiply,
         speed: clip.speed,
         reversed: clip.reversed,
         trim_start_frame: effective_trim_start,
@@ -600,7 +593,6 @@ fn eval_layer<'a>(
         nat_size: plan.nat_size,
         crop_uv,
         opacity,
-        needs_premultiply: plan.needs_premultiply,
         clip_id: &plan.clip_id,
         color_grade: plan.color_grade.as_ref(),
         lut: plan.lut.as_ref(),
@@ -647,7 +639,6 @@ fn eval_transition_incoming<'a>(
         nat_size: plan.nat_size,
         crop_uv: crop_to_uv(clip.crop_at(sample_frame)),
         opacity,
-        needs_premultiply: plan.needs_premultiply,
         clip_id: &plan.clip_id,
         color_grade: plan.color_grade.as_ref(),
         lut: plan.lut.as_ref(),

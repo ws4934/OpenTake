@@ -114,12 +114,6 @@ impl SourceMetrics for MotionClipSource<'_> {
     fn natural_size(&self, _media_ref: &str) -> Option<(u32, u32)> {
         Some((self.clip.width, self.clip.height))
     }
-
-    /// Motion frames carry straight alpha when the clip is transparent, so the
-    /// compositor must premultiply before blending (same contract as alpha video).
-    fn needs_premultiply(&self, _media_ref: &str) -> bool {
-        self.clip.transparent
-    }
 }
 
 impl FrameProvider for MotionClipSource<'_> {
@@ -171,17 +165,6 @@ mod tests {
         let (clip, _tmp) = render_clip(true);
         let src = MotionClipSource::new(clip, image_decoder);
         assert_eq!(src.natural_size("ref"), Some((6, 4)));
-    }
-
-    #[test]
-    fn needs_premultiply_tracks_transparency() {
-        let (t_clip, _t) = render_clip(true);
-        let t_src = MotionClipSource::new(t_clip, image_decoder);
-        assert!(t_src.needs_premultiply("ref"));
-
-        let (o_clip, _o) = render_clip(false);
-        let o_src = MotionClipSource::new(o_clip, image_decoder);
-        assert!(!o_src.needs_premultiply("ref"));
     }
 
     #[test]

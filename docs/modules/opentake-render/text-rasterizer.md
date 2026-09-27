@@ -34,7 +34,7 @@
 - **画布相对缩放基准 = 1080**：字号、投影 offset/blur 一律乘 `canvas.h / 1080`，与上游一致，否则文字框尺寸/位置漂移（MODULE-PORT-MAP 文字度量条目）。
 - **文字层 `nat_size` = 框像素尺寸、`preferred_transform` = 单位阵**（由 plan 侧 `make_clip_plan` 文字分支保证），使框纹理经标准 affine 1:1 落位。
 - **文字不做同轨去重**：每个可见文字 clip 各自一张纹理、各自一个 `LayerDraw`，且整体叠在所有视频之上（plan 的 `text_plans`，对齐上游 CoreAnimationTool 文字在视频合成之上）。
-- **输出预乘**：`DecodedFrame.premultiplied = true`，合成器对其 `needs_premultiply=false`。
+- **输出预乘**：`DecodedFrame.premultiplied = true`，`upload_rgba` 原样上传、不再预乘。
 - **无字体不崩**：headless 无字体时仍产出框尺寸帧（背景/边框照画），仅 glyph 像素缺失。
 - **结构而非字体边缘锁定**：固定矩阵以 1080 高度、每侧 12px 阴影余量、2px 边框为上游基准，覆盖中英混排、缺失字体族回退、左右/居中、窄框换行与多分辨率缩放；CoreText/cosmic-text 的抗锯齿边缘差异不作为几何失败。
 

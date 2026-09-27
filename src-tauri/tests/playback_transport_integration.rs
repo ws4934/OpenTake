@@ -1,7 +1,7 @@
 //! Fail-closed live HTTP transport integration for native playback.
 #![cfg(feature = "playback-engine")]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -103,16 +103,8 @@ fn build_plan(
     manifest: &MediaManifest,
     render_size: RenderSize,
 ) -> opentake_render::RenderPlan {
-    let (sizes, media) = project_media(manifest, &None);
-    let straight_alpha = media
-        .iter()
-        .filter(|(_, info)| info.straight_alpha)
-        .map(|(id, _)| id.clone())
-        .collect::<HashSet<_>>();
-    let metrics = ManifestMetrics {
-        sizes,
-        straight_alpha,
-    };
+    let (sizes, _) = project_media(manifest, &None);
+    let metrics = ManifestMetrics { sizes };
     build_render_plan(timeline, render_size, &metrics)
 }
 

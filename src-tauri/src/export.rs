@@ -508,16 +508,11 @@ struct TextInfo {
 /// auto-rotates on decode in this cut).
 struct ManifestMetrics {
     sizes: HashMap<String, (u32, u32)>,
-    straight_alpha: HashSet<String>,
 }
 
 impl SourceMetrics for ManifestMetrics {
     fn natural_size(&self, media_ref: &str) -> Option<(u32, u32)> {
         self.sizes.get(media_ref).copied()
-    }
-
-    fn needs_premultiply(&self, media_ref: &str) -> bool {
-        self.straight_alpha.contains(media_ref)
     }
 }
 
@@ -1651,22 +1646,13 @@ pub(crate) fn run_export_with_control(
 
     let text = project_text(timeline);
     let (sizes, media) = project_media(manifest, project_dir);
-    let straight_alpha = manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.carries_straight_alpha())
-        .map(|entry| entry.id.clone())
-        .collect();
 
     let render_size = export_render_size(
         (timeline.width, timeline.height),
         req.quality.render_resolution(),
     );
 
-    let metrics = ManifestMetrics {
-        sizes,
-        straight_alpha,
-    };
+    let metrics = ManifestMetrics { sizes };
     let plan = try_build_render_plan(timeline, render_size, &metrics)
         .map_err(|error| format!("invalid timeline graph: {error}"))?;
     let project_root = project_dir

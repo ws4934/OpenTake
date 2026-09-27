@@ -1658,20 +1658,8 @@ mod tests {
             audio_clip("c2", "m2", 900, 900),
         ]);
         let media = HashMap::from([
-            (
-                "m1".to_string(),
-                MediaInfo {
-                    path: first,
-                    straight_alpha: false,
-                },
-            ),
-            (
-                "m2".to_string(),
-                MediaInfo {
-                    path: second,
-                    straight_alpha: false,
-                },
-            ),
+            ("m1".to_string(), MediaInfo { path: first }),
+            ("m2".to_string(), MediaInfo { path: second }),
         ]);
         let cancel = MediaCancelToken::new();
         let worker_cancel = cancel.clone();
@@ -1861,7 +1849,6 @@ mod tests {
             "missing".to_string(),
             MediaInfo {
                 path: PathBuf::from("/definitely/missing/audio.wav"),
-                straight_alpha: false,
             },
         )]);
 
@@ -1881,7 +1868,6 @@ mod tests {
             "missing".to_string(),
             MediaInfo {
                 path: PathBuf::from("/definitely/missing/try-build-clock.wav"),
-                straight_alpha: false,
             },
         )]);
 

@@ -50,7 +50,7 @@ pub type FrameDecoder<'a> = dyn Fn(&Path) -> Option<DecodedFrame> + 'a;
 
 ### `impl SourceMetrics`
 - `natural_size(_)` = clip 的 `(width, height)`（渲染画布）。
-- `needs_premultiply(_)` = `clip.transparent`——透明动效帧带**直 alpha**，合成器混合前须预乘（与 alpha 视频同契约）。
+- 透明动效帧带**直 alpha**，解码器产出 `premultiplied = false`，由 `upload_rgba` 上传期预乘（与 alpha 视频同契约）。
 
 ### `impl FrameProvider`
 - `decoded_frame(_, source_frame)` → `frame(source_frame)`：motion clip 是帧序列，`source_frame` 直接索引渲染帧（时间线帧→源帧的映射在上游 plan builder；1:1 overlay 时二者重合）。
@@ -64,19 +64,19 @@ pub type FrameDecoder<'a> = dyn Fn(&Path) -> Option<DecodedFrame> + 'a;
 ```text
 RenderedClip (磁盘 PNG 帧)
   └─ MotionClipSource::new(clip, decode)
-       ├─ SourceMetrics  → natural_size / needs_premultiply
+       ├─ SourceMetrics  → natural_size
        └─ FrameProvider  → decoded_frame(source_frame) → (decode)(frame_path)
             └─ opentake-render 合成器纹理层（未来接入）
 ```
 
-测试覆盖：`natural_size` = 渲染画布、`needs_premultiply` 跟透明、`decoded_frame` 返回正确形状 RGBA、过末端钳位仍解码、解码器失败返回 `None`、负 `source_frame` 映射到首帧；feature-gated live 验收还把真实 Chromium PNG 通过注入的 decoder 送入 `MotionClipSource`，验证尺寸与 RGBA 长度。
+测试覆盖：`natural_size` = 渲染画布、`decoded_frame` 返回正确形状 RGBA、过末端钳位仍解码、解码器失败返回 `None`、负 `source_frame` 映射到首帧；feature-gated live 验收还把真实 Chromium PNG 通过注入的 decoder 送入 `MotionClipSource`，验证尺寸与 RGBA 长度。
 
 ---
 
 ## 移植铁律落地
 
 - **末帧定格 / 负索引归零**：`frame()` 钳位，对齐 `RenderedClip` 与上游 Lottie/图片定格。
-- **透明 = 预乘契约**：`needs_premultiply` 跟随 `transparent`，与 alpha 视频一致。
+- **透明 = 预乘契约**：直 alpha 帧在上传期预乘，与 alpha 视频一致。
 - **零特殊处理**：实现 render 既有 source 契约，使 motion clip 对合成器是普通纹理。
 - **默认依赖面不绑解码器**：解码器注入，本 crate 不引 PNG/ffmpeg 运行时依赖（仅 dev-dep 测试）。
 

@@ -114,9 +114,6 @@ pub struct ClipPlan {
     /// translated so its bounding box origin is at (0,0), L172). Row-major
     /// `[a, b, c, d, tx, ty]`. Identity = `[1, 0, 0, 1, 0, 0]`.
     pub preferred_transform: [f64; 6],
-    /// Whether a straight-alpha source needs premultiplying (SPEC §4.1). Image /
-    /// text / Lottie are already premultiplied.
-    pub needs_premultiply: bool,
     /// Playback speed (source-frame index conversion; SPEC §2.5).
     pub speed: f64,
     pub reversed: bool,
@@ -190,7 +187,6 @@ pub struct LayerDraw<'a> {
     pub crop_uv: (f64, f64, f64, f64),
     /// Premultiplied-alpha global multiplier = `clip.opacity_at(f)` in `[0, 1]`.
     pub opacity: f64,
-    pub needs_premultiply: bool,
     pub clip_id: &'a str,
     /// Color grade applied in-shader (linear-light chain), borrowed from the
     /// [`ClipPlan`]. `None` = no grade.

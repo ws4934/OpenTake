@@ -15,9 +15,9 @@
 ### 数据结构（`plan/types.rs`）
 - `RenderSize { width, height }`：画布像素尺寸（已偶数化）。
 - `TextureSource`：`Decoded{media_ref}` / `Image{media_ref}` / `Lottie{media_ref}` / `Text{clip_id}`——纹理来源标签（物化策略见各执行侧）。
-- `ClipPlan`：单 clip 的静态描述。除几何字段（`start/end_frame`、`nat_size`、`preferred_transform`、`needs_premultiply`、`speed`、`trim_start_frame`）外，还携带 `clip_index`（省去 `frame()` 里按 id 查找）与**进阶像素效果输入** `color_grade` / `chroma_key` / `masks` / `effects`（本轮帧无关，建 plan 时从 `Clip` 原样拷，恒等 grade 会被 `filter` 掉）。
+- `ClipPlan`：单 clip 的静态描述。除几何字段（`start/end_frame`、`nat_size`、`preferred_transform`、`speed`、`trim_start_frame`）外，还携带 `clip_index`（省去 `frame()` 里按 id 查找）与**进阶像素效果输入** `color_grade` / `chroma_key` / `masks` / `effects`（本轮帧无关，建 plan 时从 `Clip` 原样拷，恒等 grade 会被 `filter` 掉）。
 - `RenderPlan`：`clip_plans`（视频层，已去重 + 排序）+ `text_plans`（文字层，恒叠在视频之上、**不去重**）。
-- `LayerDraw<'a>`：单帧单层一次 draw——`affine[6]` + `nat_size` + `crop_uv` + `opacity` + `needs_premultiply` + 借用的 `color_grade/chroma_key/masks/effects`。`nat_size` **必须**是构建 affine 时所用的源自然尺寸（非解码纹理分辨率，见不变量）。
+- `LayerDraw<'a>`：单帧单层一次 draw——`affine[6]` + `nat_size` + `crop_uv` + `opacity` + 借用的 `color_grade/chroma_key/masks/effects`。`nat_size` **必须**是构建 affine 时所用的源自然尺寸（非解码纹理分辨率，见不变量）。
 - `FramePlan<'a>`：`clear_rgba`（恒 `[0,0,0,1]`）+ 已按混合序排好的 `draws`。
 
 ### `build_render_plan`（`plan/build.rs`）
@@ -64,7 +64,7 @@
 
 ## 关系
 - 输入来自 [opentake-domain](../opentake-domain/INDEX.md) 的 `Timeline/Clip/Transform/Crop/ColorGrade/ChromaKey/Mask` 与全部 `*_at` 采样。
-- `nat_size` / `preferred_transform` / `needs_premultiply` / `lottie_frame_count` 经 `SourceMetrics` 查询（见 [source-size.md](source-size.md)）。
+- `nat_size` / `preferred_transform` / `lottie_frame_count` 经 `SourceMetrics` 查询（见 [source-size.md](source-size.md)）。
 - 输出的 `FramePlan` 喂给 [gpu-compositor.md](gpu-compositor.md) 的 `render_to_rgba`；其中进阶效果字段在片元着色器消费。
 
 ---

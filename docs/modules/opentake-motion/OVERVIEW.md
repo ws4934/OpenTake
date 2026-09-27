@@ -88,8 +88,8 @@ MotionSource (Code 内联文档 | Template id + params)
 网络/CSP 的执行落在真实 CDP 后端（`chromium` feature 后）；策略类型与其纯检查（`check_url` / `check_document_size`）在本 crate，无需引擎即可单测。注意：连 `StubRenderer` 也会执行文档大小检查，确保安全契约被测试覆盖到。
 
 ### 与 render 的集成桥
-`opentake-render` **定义** `SourceMetrics`（`natural_size` / `needs_premultiply`）/ `FrameProvider`（`decoded_frame` / `image_pixels` / `lottie_frame`）/ `DecodedFrame`；本模块 `MotionClipSource` **实现**它们：
-- `natural_size` = 渲染画布尺寸；`needs_premultiply` = 是否透明（透明帧带直 alpha，合成前需预乘，与 alpha 视频同契约）。
+`opentake-render` **定义** `SourceMetrics`（`natural_size`）/ `FrameProvider`（`decoded_frame` / `image_pixels` / `lottie_frame`）/ `DecodedFrame`；本模块 `MotionClipSource` **实现**它们：
+- `natural_size` = 渲染画布尺寸；透明帧带直 alpha，由 `upload_rgba` 上传期预乘（与 alpha 视频同契约）。
 - 帧文件→RGBA 的解码**不硬接** PNG 库，而是接收调用层注入的 `FrameDecoder`（`Fn(&Path) -> Option<DecodedFrame>`），因为帧可能来自 stub（自制 PNG）、未来 headless-Chromium（标准 PNG）、Motion Canvas 图片序列、或未来裸 RGBA 快路径。测试注入基于 `image` dev-dep 的解码器；app 注入自己的 image/ffmpeg 栈。
 - 过界帧索引钳到最后一帧（freeze-frame 定格，与 `RenderedClip::frame_path` 一致，也对齐上游 Lottie/图片的"末帧定格"行为）。
 
