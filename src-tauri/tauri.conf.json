@@ -8,11 +8,11 @@
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": {
       "cwd": "..",
-      "script": "pnpm -C web dev"
+      "script": "python3 scripts/provision_ffmpeg_sidecars.py && pnpm -C web dev"
     },
     "beforeBuildCommand": {
       "cwd": "..",
-      "script": "pnpm -C web build"
+      "script": "python3 scripts/provision_ffmpeg_sidecars.py && pnpm -C web build"
     }
   },
   "app": {

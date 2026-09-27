@@ -20,12 +20,6 @@ WORKFLOW_PATH = Path(
         REPOSITORY_ROOT / ".github" / "workflows" / "release.yml",
     )
 ).resolve()
-RELEASE_NOTES_PATH = Path(
-    os.environ.get(
-        "OPENTAKE_RELEASE_NOTES_PATH",
-        REPOSITORY_ROOT / "docs" / "releases" / "1.0.0-beta.6.md",
-    )
-).resolve()
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8") if WORKFLOW_PATH.is_file() else ""
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 BETA4_FAILED_RUN_ID = 31412976593
@@ -2166,48 +2160,27 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assert_rejected(mutated, "verified prerelease publication")
 
-    def test_repository_metadata_is_beta6_and_release_notes_exist(self) -> None:
+    def test_repository_metadata_is_beta6_without_historical_notes(self) -> None:
         self.assertEqual(
             [],
             contract.validate_repository_metadata(
-                REPOSITORY_ROOT, expected_version=contract.CURRENT_RELEASE_VERSION
+                REPOSITORY_ROOT,
+                expected_version=contract.CURRENT_RELEASE_VERSION,
+                require_release_notes=False,
             ),
         )
 
-    def test_release_notes_document_normal_push_and_dual_sha_recovery(self) -> None:
-        self.assertTrue(RELEASE_NOTES_PATH.is_file())
-        self.assertEqual(
-            [], contract.validate_release_notes_contract(RELEASE_NOTES_PATH)
-        )
+    def test_workflow_only_mode_does_not_require_historical_notes(self) -> None:
+        with mock.patch("builtins.print"):
+            contract.main(["--workflow-only"])
+
+    def test_release_mode_still_requires_missing_notes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            notes = Path(directory) / "notes.md"
-            notes.write_text(
-                "tag must always equal current main\n", encoding="utf-8"
-            )
-            self.assertEqual(
-                ["Beta 6 release notes document dual-SHA recovery provenance"],
-                contract.validate_release_notes_contract(notes),
-            )
-        canonical = RELEASE_NOTES_PATH.read_text(encoding="utf-8")
-        for marker in (
-            "`failed_run_id=31412976593`",
-            "`failed_recovery_run_id=31441693191`",
-            "`2c4efdff9d2587c90cbcac0919f9d1d333d67d6a`",
-            "`924bc1102a9343e14c3beea2a3622b5d92ebff13`",
-        ):
-            with self.subTest(marker=marker):
-                with tempfile.TemporaryDirectory() as directory:
-                    notes = Path(directory) / "notes.md"
-                    notes.write_text(
-                        canonical.replace(marker, "`redacted`"),
-                        encoding="utf-8",
-                    )
-                    self.assertEqual(
-                        [
-                            "Beta 6 release notes document dual-SHA recovery provenance"
-                        ],
-                        contract.validate_release_notes_contract(notes),
-                    )
+            with mock.patch.object(
+                contract, "RELEASE_NOTES_PATH", Path(directory) / "missing.md"
+            ):
+                with self.assertRaisesRegex(SystemExit, "release notes"):
+                    contract.main([])
 
 
 class ReleaseRepositoryMetadataTests(unittest.TestCase):

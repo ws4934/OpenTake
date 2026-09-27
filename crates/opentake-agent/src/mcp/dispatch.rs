@@ -2114,7 +2114,7 @@ impl Dispatcher {
         config.min_silence_frames = a.min_silence_frames.unwrap_or(12).max(1) as u64;
         let padding = a.padding_frames.unwrap_or(3).max(0);
 
-        let mut by_track: BTreeMap<usize, Vec<(i32, i32)>> = BTreeMap::new();
+        let mut by_track: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
         let mut clip_payloads = Vec::new();
         let mut warnings = Vec::new();
         for target in targets {
@@ -2162,7 +2162,7 @@ impl Dispatcher {
                 by_track
                     .entry(target.track_index)
                     .or_default()
-                    .push((start, end));
+                    .push((start.into(), end.into()));
                 clip_ranges.push(serde_json::json!([start, end]));
             }
             clip_payloads.push(serde_json::json!({
@@ -2176,29 +2176,14 @@ impl Dispatcher {
             ranges.sort_unstable();
             ranges.dedup();
         }
-        let commands = by_track
-            .iter()
-            .filter(|(_, ranges)| !ranges.is_empty())
-            .map(|(track_index, ranges)| {
-                serde_json::json!({
-                    "tool": "ripple_delete_ranges",
-                    "args": {
-                        "trackIndex": track_index,
-                        "units": "frames",
-                        "ranges": ranges.iter().map(|(start, end)| {
-                            serde_json::json!([start, end])
-                        }).collect::<Vec<_>>(),
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let commands = ordered_ripple_commands(&by_track);
 
         let payload = serde_json::json!({
             "applied": false,
             "clips": clip_payloads,
             "commands": commands,
             "warnings": warnings,
-            "note": "Preview only. Run each returned ripple_delete_ranges command to apply.",
+            "note": "Preview only. Run the returned ripple_delete_ranges commands in the listed order to apply; do not reorder them.",
         });
         Ok(ToolResult::ok(round_floats_3dp(payload).to_string()))
     }
@@ -2306,7 +2291,10 @@ impl Dispatcher {
         });
         let padding = a.padding_frames.unwrap_or(1).max(0) as i64;
         let mut cuts = Vec::new();
-        let mut ranges_by_track: BTreeMap<u64, Vec<[i64; 2]>> = BTreeMap::new();
+        let mut ranges_by_track: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        // A ripple cut on one link-group member also cuts its partners, so every
+        // member's cuts go to the first member's track as one set of ranges.
+        let mut link_group_tracks: BTreeMap<&str, usize> = BTreeMap::new();
 
         for clip in clips {
             let Some(clip_id) = clip["clipId"].as_str() else {
@@ -2315,6 +2303,13 @@ impl Dispatcher {
             let Some(track_index) = clip["trackIndex"].as_u64() else {
                 continue;
             };
+            let command_track =
+                match find_clip(before, clip_id).and_then(|clip| clip.link_group_id.as_deref()) {
+                    Some(group) => *link_group_tracks
+                        .entry(group)
+                        .or_insert(track_index as usize),
+                    None => track_index as usize,
+                };
             if selected_ids
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(clip_id))
@@ -2360,9 +2355,9 @@ impl Dispatcher {
                         "accepted": true,
                     }));
                     ranges_by_track
-                        .entry(track_index)
+                        .entry(command_track)
                         .or_default()
-                        .push([start, end]);
+                        .push((start, end));
                 }
                 word_index += phrase.len();
             }
@@ -2378,25 +2373,13 @@ impl Dispatcher {
                 cut["range"][0].as_i64().unwrap_or(0),
             )
         });
-        let commands = ranges_by_track
-            .into_iter()
-            .map(|(track_index, ranges)| {
-                serde_json::json!({
-                    "tool": "ripple_delete_ranges",
-                    "args": {
-                        "trackIndex": track_index,
-                        "units": "frames",
-                        "ranges": ranges,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let commands = ordered_ripple_commands(&ranges_by_track);
         Ok(ToolResult::ok(
             serde_json::json!({
                 "applied": false,
                 "cuts": cuts,
                 "commands": commands,
-                "note": "Review cuts and remove rejected ranges before calling each returned ripple_delete_ranges command. Each command applies as one undoable edit.",
+                "note": "Review cuts and remove rejected ranges, then call the returned ripple_delete_ranges commands in the listed order; do not reorder them. Each command applies as one undoable edit.",
             })
             .to_string(),
         ))
@@ -3930,7 +3913,7 @@ fn silence_targets<'a>(
                     out.push(SilenceTarget { track_index, clip });
                 }
             }
-            Ok(out)
+            Ok(one_target_per_link_group(out))
         }
         (None, Some(track_index)) => {
             let track = timeline.tracks.get(track_index).ok_or_else(|| {
@@ -3960,6 +3943,69 @@ fn silence_targets<'a>(
                 ToolError::new("tighten_silences: missing clipIds/trackIndex and no audio track")
             }),
     }
+}
+
+/// A ripple cut on one link-group member also cuts its partners, so analyzing
+/// and cutting several members would remove the same span repeatedly. Keep one
+/// member per group, preferring audio.
+fn one_target_per_link_group(targets: Vec<SilenceTarget<'_>>) -> Vec<SilenceTarget<'_>> {
+    let mut kept: Vec<SilenceTarget<'_>> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let Some(group) = target.clip.link_group_id.as_deref() else {
+            kept.push(target);
+            continue;
+        };
+        match kept
+            .iter_mut()
+            .find(|kept| kept.clip.link_group_id.as_deref() == Some(group))
+        {
+            Some(existing) => {
+                if existing.clip.media_type != opentake_domain::ClipType::Audio
+                    && target.clip.media_type == opentake_domain::ClipType::Audio
+                {
+                    *existing = target;
+                }
+            }
+            None => kept.push(target),
+        }
+    }
+    kept
+}
+
+/// Turn per-track cut ranges measured on the pre-edit timeline into
+/// `ripple_delete_ranges` preview commands. Commands run latest-first and never
+/// mix tracks, so each one only shifts frames after every range still to run:
+/// executed in the listed order, the pre-edit coordinates stay valid and the
+/// result equals cutting every range at once. A single track yields one command.
+fn ordered_ripple_commands(ranges: &BTreeMap<usize, Vec<(i64, i64)>>) -> Vec<Value> {
+    let mut all: Vec<(usize, i64, i64)> = ranges
+        .iter()
+        .flat_map(|(track, ranges)| ranges.iter().map(|&(start, end)| (*track, start, end)))
+        .collect();
+    all.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+    let mut groups: Vec<(usize, Vec<(i64, i64)>)> = Vec::new();
+    for (track, start, end) in all {
+        match groups.last_mut() {
+            Some((last, group)) if *last == track => group.push((start, end)),
+            _ => groups.push((track, vec![(start, end)])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(track_index, mut ranges)| {
+            ranges.sort_unstable();
+            serde_json::json!({
+                "tool": "ripple_delete_ranges",
+                "args": {
+                    "trackIndex": track_index,
+                    "units": "frames",
+                    "ranges": ranges.iter().map(|(start, end)| {
+                        serde_json::json!([start, end])
+                    }).collect::<Vec<_>>(),
+                }
+            })
+        })
+        .collect()
 }
 
 fn find_clip_with_track<'a>(
@@ -9502,5 +9548,222 @@ mod tests {
             clips(&d)["textStyle"],
             serde_json::json!({"fontName": "Georgia", "color": "#00FF0080", "alignment": "left"})
         );
+    }
+
+    /// A handle whose every analysis source is 1 s of PCM with a silence at
+    /// 0.3–0.7 s, so each 10-frame clip at 10 fps has one silence near 3..7.
+    fn silence_handle(timeline: Timeline) -> Arc<WritableAnalysisHandle> {
+        let mut samples = vec![0.5f32; 300];
+        samples.extend(std::iter::repeat_n(0.0f32, 400));
+        samples.extend(std::iter::repeat_n(0.5f32, 300));
+        let mut manifest = MediaManifest::new();
+        for id in ["src", "voice-1", "voice-2"] {
+            manifest.entries.push(audio_entry(id, id));
+        }
+        Arc::new(WritableAnalysisHandle {
+            state: Mutex::new(EditorState::new(timeline, manifest)),
+            pcm: pcm(samples, 1_000),
+            commands: Mutex::new(Vec::new()),
+            cancel_after_extract: Mutex::new(None),
+        })
+    }
+
+    fn audio_clip(id: &str, media_ref: &str, start: i32, duration: i32) -> Clip {
+        let mut clip = Clip::new(id, media_ref, start, duration);
+        clip.media_type = ClipType::Audio;
+        clip.source_clip_type = ClipType::Audio;
+        clip
+    }
+
+    /// Execute preview commands in the listed order, as the tool note says,
+    /// with one id stream across commands.
+    fn run_ripple_commands(timeline: &Timeline, commands: &Value) -> Timeline {
+        let mut state = EditorState::new(timeline.clone(), MediaManifest::new());
+        let ids = SeqIdGen::new("cut-");
+        for command in commands.as_array().unwrap() {
+            assert_eq!(command["tool"], "ripple_delete_ranges");
+            let args = &command["args"];
+            assert_eq!(args["units"], "frames");
+            let ranges = args["ranges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|range| {
+                    FrameRange::new(
+                        range[0].as_i64().unwrap() as i32,
+                        range[1].as_i64().unwrap() as i32,
+                    )
+                })
+                .collect();
+            ops_apply(
+                &mut state,
+                EditCommand::RippleDeleteRanges {
+                    track_index: args["trackIndex"].as_u64().unwrap() as usize,
+                    ranges,
+                },
+                &ids,
+            )
+            .unwrap();
+        }
+        state.timeline
+    }
+
+    /// `(startFrame, durationFrames, trimStartFrame)` per clip on a track.
+    fn track_layout(timeline: &Timeline, track_index: usize) -> Vec<(i32, i32, i32)> {
+        timeline.tracks[track_index]
+            .clips
+            .iter()
+            .map(|clip| {
+                (
+                    clip.start_frame,
+                    clip.duration_frames,
+                    clip.trim_start_frame,
+                )
+            })
+            .collect()
+    }
+
+    fn first_range(value: &Value) -> (i32, i32) {
+        (
+            value[0].as_i64().unwrap() as i32,
+            value[1].as_i64().unwrap() as i32,
+        )
+    }
+
+    fn tighten_args(clip_ids: &[&str]) -> Value {
+        serde_json::json!({
+            "clipIds": clip_ids,
+            "thresholdDb": -40.0,
+            "minSilenceFrames": 2,
+            "paddingFrames": 0
+        })
+    }
+
+    #[test]
+    fn tighten_silences_cuts_a_linked_pair_once() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 10;
+        let mut video_track = Track::new("track-v", ClipType::Video);
+        let mut video = Clip::new("clip-v", "src", 0, 10);
+        video.link_group_id = Some("av".into());
+        video_track.clips.push(video);
+        let mut audio_track = Track::new("track-a", ClipType::Audio);
+        let mut audio = audio_clip("clip-a", "src", 0, 10);
+        audio.link_group_id = Some("av".into());
+        audio_track.clips.push(audio);
+        timeline.tracks = vec![video_track, audio_track];
+        let d = dispatcher_with(silence_handle(timeline.clone()));
+
+        let result = d.dispatch("tighten_silences", tighten_args(&["clip-v", "clip-a"]));
+        assert!(!result.is_error, "{}", result.text_joined());
+        let json = first_json(&result);
+        let commands = json["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1, "{json}");
+        assert_eq!(commands[0]["args"]["trackIndex"], 1);
+        let (start, end) = first_range(&commands[0]["args"]["ranges"][0]);
+
+        let after = run_ripple_commands(&timeline, &json["commands"]);
+        let expected = vec![(0, start, 0), (start, 10 - end, end)];
+        assert_eq!(track_layout(&after, 0), expected);
+        assert_eq!(track_layout(&after, 1), expected);
+    }
+
+    #[test]
+    fn tighten_silences_orders_independent_sync_locked_tracks_latest_first() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 10;
+        let mut first = Track::new("track-1", ClipType::Audio);
+        first.clips.push(audio_clip("a1", "voice-1", 0, 10));
+        let mut second = Track::new("track-2", ClipType::Audio);
+        second.clips.push(audio_clip("a2", "voice-2", 10, 10));
+        timeline.tracks = vec![first, second];
+        assert!(timeline.tracks.iter().all(|track| track.sync_locked));
+        let d = dispatcher_with(silence_handle(timeline.clone()));
+
+        let result = d.dispatch("tighten_silences", tighten_args(&["a1", "a2"]));
+        assert!(!result.is_error, "{}", result.text_joined());
+        let json = first_json(&result);
+        let commands = json["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 2, "{json}");
+        assert_eq!(commands[0]["args"]["trackIndex"], 1);
+        assert_eq!(commands[1]["args"]["trackIndex"], 0);
+        let (start, end) = first_range(&commands[1]["args"]["ranges"][0]);
+        assert_eq!(
+            first_range(&commands[0]["args"]["ranges"][0]),
+            (start + 10, end + 10)
+        );
+
+        // Reference: both silences removed from the pre-edit timeline at once;
+        // the sync-locked second track also closes the first track's gap.
+        let removed = end - start;
+        let after = run_ripple_commands(&timeline, &json["commands"]);
+        assert_eq!(
+            track_layout(&after, 0),
+            vec![(0, start, 0), (start, 10 - end, end)]
+        );
+        assert_eq!(
+            track_layout(&after, 1),
+            vec![
+                (10 - removed, start, 0),
+                (10 - removed + start, 10 - end, end)
+            ]
+        );
+
+        let mut reversed = json["commands"].as_array().unwrap().clone();
+        reversed.reverse();
+        assert_ne!(
+            run_ripple_commands(&timeline, &Value::Array(reversed)),
+            after,
+            "the listed order is load-bearing"
+        );
+    }
+
+    #[test]
+    fn remove_filler_words_cuts_a_linked_audio_pair_once() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 30;
+        let mut tracks = Vec::new();
+        for (track_id, clip_id) in [("track-l", "clip-l"), ("track-r", "clip-r")] {
+            let mut track = Track::new(track_id, ClipType::Audio);
+            let mut clip = audio_clip(clip_id, "aud", 0, 60);
+            clip.link_group_id = Some("dual-mono".into());
+            track.clips.push(clip);
+            tracks.push(track);
+        }
+        timeline.tracks = tracks;
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("aud", "Voice"));
+        let bridge = Arc::new(FakeBridge::default().with_transcript(
+            "aud",
+            transcript(vec![
+                word("Well", 0.0, 0.2),
+                word("um", 0.2, 0.4),
+                word("go", 0.5, 0.7),
+            ]),
+        ));
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline.clone(), manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge as Arc<dyn MediaBridge>),
+        );
+
+        let result = d.dispatch(
+            "remove_filler_words",
+            serde_json::json!({"fillerWords": ["um"], "paddingFrames": 0}),
+        );
+        assert!(!result.is_error, "{}", result.text_joined());
+        let json = first_json(&result);
+        assert_eq!(
+            json["commands"],
+            serde_json::json!([{
+                "tool": "ripple_delete_ranges",
+                "args": {"trackIndex": 0, "units": "frames", "ranges": [[6, 12]]}
+            }])
+        );
+
+        let after = run_ripple_commands(&timeline, &json["commands"]);
+        let expected = vec![(0, 6, 0), (6, 48, 12)];
+        assert_eq!(track_layout(&after, 0), expected);
+        assert_eq!(track_layout(&after, 1), expected);
     }
 }

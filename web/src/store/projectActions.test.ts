@@ -463,7 +463,7 @@ describe("openProjectPath", () => {
       timelineVersion: 12,
       timeline: oldTimeline,
       projectPath: "/tmp/current.opentake",
-      lastSavedVersion: 11,
+      lastSavedVersion: 12,
     });
     useMediaStore.setState({ items: srv.media.items, folders: [], error: "old media state" });
     const failure = { code: "engine", message: "project create timed out after 15s" };
@@ -896,4 +896,85 @@ describe("saveCurrentProjectAs", () => {
     expect(srv.projectSave).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projectPath).toBe("/tmp/current.opentake");
   });
+});
+
+describe("project boundaries save the current project first", () => {
+  const openers = {
+    openProjectPath: () => openProjectPath("/tmp/other.opentake"),
+    newProjectAndEnter: () => newProjectAndEnter(),
+    openSampleProject: () => openSampleProject("quick-tutorial", false),
+  } as const;
+  const replacement = {
+    openProjectPath: srv.projectOpen,
+    newProjectAndEnter: srv.projectNew,
+    openSampleProject: srv.projectOpen,
+  } as const;
+
+  beforeEach(() => {
+    srv.projectOpen.mockClear();
+    srv.projectNew.mockClear();
+    srv.sampleProjectMaterialize.mockClear();
+    srv.projectSave.mockReset();
+    srv.projectSave.mockImplementation(async (path: string | null) => path ?? "/tmp/current.opentake");
+    useProjectStore.setState({
+      snapshotMutationRevision: 0,
+      projectEpoch: 1,
+      projectPath: "/tmp/current.opentake",
+      timelineVersion: 7,
+      lastSavedVersion: 5,
+    });
+    useEditorUiStore.setState({ view: "editor", toast: null });
+    useI18nStore.setState({ locale: "zh-CN" });
+  });
+
+  afterEach(() => {
+    useProjectStore.setState({ projectEpoch: 0, projectPath: null, timelineVersion: 0, lastSavedVersion: 0 });
+  });
+
+  it.each(Object.keys(openers) as Array<keyof typeof openers>)(
+    "%s saves unsaved edits before replacing the session",
+    async (name) => {
+      await openers[name]();
+
+      expect(srv.projectSave).toHaveBeenCalledWith(null, 1, "/tmp/current.opentake");
+      expect(srv.projectSave.mock.invocationCallOrder[0]).toBeLessThan(
+        replacement[name].mock.invocationCallOrder[0],
+      );
+    },
+  );
+
+  it("saves before materializing a sample project", async () => {
+    await openSampleProject("quick-tutorial", false);
+
+    expect(srv.projectSave.mock.invocationCallOrder[0]).toBeLessThan(
+      srv.sampleProjectMaterialize.mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each(Object.keys(openers) as Array<keyof typeof openers>)(
+    "%s keeps the current project when its save fails",
+    async (name) => {
+      srv.projectSave.mockRejectedValueOnce(new Error("disk full"));
+
+      await expect(openers[name]()).rejects.toThrow("当前工程的修改未能保存");
+
+      expect(replacement[name]).not.toHaveBeenCalled();
+      expect(srv.sampleProjectMaterialize).not.toHaveBeenCalled();
+      expect(useProjectStore.getState().projectPath).toBe("/tmp/current.opentake");
+      expect(useProjectStore.getState().lastSavedVersion).toBe(5);
+      expect(useEditorUiStore.getState().toast?.message).toContain("当前工程的修改未能保存");
+    },
+  );
+
+  it.each(Object.keys(openers) as Array<keyof typeof openers>)(
+    "%s does not save a clean project",
+    async (name) => {
+      useProjectStore.setState({ lastSavedVersion: 7 });
+
+      await openers[name]();
+
+      expect(srv.projectSave).not.toHaveBeenCalled();
+      expect(replacement[name]).toHaveBeenCalled();
+    },
+  );
 });

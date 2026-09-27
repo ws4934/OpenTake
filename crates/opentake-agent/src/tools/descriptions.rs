@@ -59,9 +59,9 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::SmartReframe => "Plans subject-aware reframing for target aspect ratios such as 9:16 or 1:1. The typed surface is present, but MCP frame sampling / vision analysis is not wired yet; calls return a deterministic needs-vision-backend error and do not mutate the timeline.",
 
-        ToolName::TightenSilences => "Plans silence tightening by finding low-energy PCM spans and converting them into ripple_delete_ranges candidate commands. Returns a preview only; it does not mutate the timeline.",
+        ToolName::TightenSilences => "Plans silence tightening by finding low-energy PCM spans and converting them into ripple_delete_ranges candidate commands. Returns a preview only; it does not mutate the timeline. Run the returned commands in the listed order. Linked clips in clipIds are analyzed once (the audio member) because a ripple cut also cuts linked partners.",
 
-        ToolName::RemoveFillerWords => "Transcribes the current spoken timeline and returns reviewable filler-word cuts aligned to word timestamps. Supports an exact configurable lexicon including multi-word phrases. It does not mutate the timeline: remove rejected cuts, then call each returned ripple_delete_ranges command to apply the accepted ranges as one undoable edit per track.",
+        ToolName::RemoveFillerWords => "Transcribes the current spoken timeline and returns reviewable filler-word cuts aligned to word timestamps. Supports an exact configurable lexicon including multi-word phrases. It does not mutate the timeline: remove rejected cuts, then call the returned ripple_delete_ranges commands in the listed order (each is one undoable edit) to apply the accepted ranges. Linked clips share one command because a ripple cut also cuts linked partners.",
 
         ToolName::GenerateVideo => "Starts an async AI video generation. Returns a placeholder asset ID immediately; generation runs in the background and the asset becomes usable in add_clips once ready. Costs real money and is not undoable.",
 
