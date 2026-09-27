@@ -66,7 +66,7 @@ use opentake_media::{
     },
     waveform::store::CACHE_SUBDIR,
     FrameRequest, MediaEngine, MediaError, PcmFormat, PcmSpec, ProxyProgressCallback, ProxyRequest,
-    RgbaFrame,
+    ProxyResult, RgbaFrame,
 };
 use opentake_ops::{ClipEntry, EditCommand};
 use opentake_project::ProjectRoot;
@@ -4936,6 +4936,22 @@ fn create_media_proxy_blocking(
     max_height: Option<u32>,
     cancel: opentake_media::MediaCancelToken,
 ) -> Result<MediaProxyDto, String> {
+    create_media_proxy_blocking_with(app, asset_id, max_width, max_height, cancel, create_proxy)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_media_proxy_blocking_with(
+    app: AppHandle,
+    asset_id: String,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    cancel: opentake_media::MediaCancelToken,
+    transcode: impl for<'a> FnOnce(
+        ProxyRequest<'a>,
+        &opentake_media::MediaCancelToken,
+        Option<ProxyProgressCallback>,
+    ) -> Result<ProxyResult, MediaError>,
+) -> Result<MediaProxyDto, String> {
     let core = app.state::<AppCore>();
     // Take only the initial identity snapshot under the shared lease. A save
     // must never wait for the source hash or FFmpeg to finish (#64).
@@ -4995,7 +5011,7 @@ fn create_media_proxy_blocking(
             },
         );
     });
-    let created = match create_proxy(
+    let created = match transcode(
         ProxyRequest {
             source: &source,
             output: &stage_output,
@@ -8396,6 +8412,138 @@ mod tests {
         symlink(&outside, bundle.join("media/proxies")).unwrap();
 
         assert!(trusted_project_proxy_path(&bundle, "media/proxies/proxy.mp4").is_none());
+    }
+
+    #[test]
+    fn proxy_transcode_allows_save_and_readers_and_cleans_stale_stage() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let other_source = temp.path().join("second.mp4");
+        fs::write(&other_source, b"second source").unwrap();
+        core.import_media_file(&other_source, "second", &ProbedMedia::default())
+            .unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_app = app.handle().clone();
+        let worker = std::thread::spawn(move || {
+            create_media_proxy_blocking_with(
+                worker_app,
+                asset_id,
+                None,
+                None,
+                MediaCancelToken::new(),
+                move |request, _, _| {
+                    stage_tx.send(request.output.to_path_buf()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    fs::write(request.output, b"completed proxy").unwrap();
+                    Ok(ProxyResult {
+                        path: request.output.to_path_buf(),
+                        source_sha256: opentake_media::file_sha256(request.source).unwrap(),
+                        source_stamp: Some(
+                            opentake_media::source_file_stamp(request.source).unwrap(),
+                        ),
+                        width: 320,
+                        height: 180,
+                    })
+                },
+            )
+        });
+        let stage_output = stage_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy reached its transcode stage");
+        assert!(!stage_output.starts_with(&bundle));
+
+        let (save_tx, save_rx) = mpsc::channel();
+        let save_core = core.clone();
+        let saver = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = save_core.save_project(None);
+            save_tx.send((started.elapsed(), result)).unwrap();
+        });
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_core = core.clone();
+        let reader = std::thread::spawn(move || {
+            let started = Instant::now();
+            let lease = read_core.lock_project_identity_workflow();
+            drop(lease);
+            read_tx.send(started.elapsed()).unwrap();
+        });
+
+        let saved = save_rx.recv_timeout(Duration::from_secs(1));
+        let read = read_rx.recv_timeout(Duration::from_secs(1));
+        let (transition_tx, transition_rx) = mpsc::channel();
+        let transition_core = core.clone();
+        let transition = std::thread::spawn(move || {
+            transition_core.new_project();
+            transition_tx.send(()).unwrap();
+        });
+        let transitioned = transition_rx.recv_timeout(Duration::from_secs(1));
+        // Unblock the worker before asserting any deadline, so a regression
+        // holding the read lease cannot deadlock the test itself.
+        release_tx.send(()).unwrap();
+        let worker_result = worker.join().unwrap();
+        saver.join().unwrap();
+        reader.join().unwrap();
+        transition.join().unwrap();
+        let (save_time, save_result) = saved.expect("in-place save must finish during transcode");
+        save_result.expect("save must succeed");
+        assert!(save_time < Duration::from_secs(1));
+        assert!(read.expect("reader must finish during transcode") < Duration::from_millis(100));
+        transitioned.expect("project transition must finish during transcode");
+        let error = worker_result.unwrap_err();
+        assert!(error.contains("project changed"), "{error}");
+        assert!(!stage_output.exists(), "stale transcode stage must be removed");
+        let reopened = AppCore::new();
+        reopened.open_project(bundle.clone()).unwrap();
+        assert_eq!(reopened.media().entries.len(), 2, "latest save was persisted");
+        assert!(reopened.media().entries.iter().all(|entry| entry.proxy.is_none()));
+        assert!(!bundle.join("media/proxies").exists());
+        assert!(core.media().entries.is_empty(), "replacement project was untouched");
+    }
+
+    #[test]
+    fn proxy_transcode_cancellation_cleans_private_stage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let token = MediaCancelToken::new();
+        let worker_token = token.clone();
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_app = app.handle().clone();
+        let worker = std::thread::spawn(move || {
+            create_media_proxy_blocking_with(
+                worker_app,
+                asset_id,
+                None,
+                None,
+                worker_token,
+                move |request, cancel, _| {
+                    fs::write(request.output, b"incomplete proxy").unwrap();
+                    stage_tx.send(request.output.to_path_buf()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(cancel.checkpoint());
+                    Err(MediaError::Cancelled)
+                },
+            )
+        });
+        let stage_output = stage_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap_err(), "media_proxy_cancelled");
+        assert!(!stage_output.exists());
+        assert!(core.media().entries[0].proxy.is_none());
+        assert!(!bundle.join("media/proxies").exists());
     }
 
     #[test]
