@@ -2204,8 +2204,8 @@ mod tests {
         assert!(request.apply_rotation);
     }
 
-    #[test]
-    fn preview_composite_cancel_floor_kills_old_work_but_not_its_successor() {
+    #[tokio::test]
+    async fn preview_composite_cancel_floor_kills_old_work_but_not_its_successor() {
         let coordinator = PreviewCompositeCoordinator::default();
         let revision = opentake_core::ProjectRevision {
             project_epoch: 3,
@@ -2217,7 +2217,13 @@ mod tests {
 
         coordinator.cancel_before(revision, "idle-session", 1, 1);
         assert!(old.is_cancelled());
-        assert!(old_cancelled.has_changed().unwrap());
+        // Cancelling drops the superseded entry and its sender. `changed()`,
+        // which `composite_frame` awaits, still reports the unseen `true`
+        // (`has_changed()` would report the closed channel instead).
+        tokio::time::timeout(std::time::Duration::from_secs(1), old_cancelled.changed())
+            .await
+            .expect("superseded preview wakes")
+            .expect("cancellation was published before the sender closed");
         assert!(*old_cancelled.borrow_and_update());
 
         let (current, current_cancelled) = coordinator
