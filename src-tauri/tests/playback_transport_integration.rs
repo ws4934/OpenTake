@@ -129,7 +129,6 @@ fn decode_exact_source_frame(
     let request = FrameRequest {
         time_secs: source_frame as f64 / fps as f64,
         max_size: (width, height),
-        tolerance_secs: 0.0,
         apply_rotation: true,
     };
     let (_, frame) = decode_frame_at(path, &request)

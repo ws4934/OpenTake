@@ -205,7 +205,6 @@ fn cold_bootstrap_uses_exact_trimmed_source_frame() {
     let exact_request = |frame: i32| FrameRequest {
         time_secs: frame as f64 / fps as f64,
         max_size: (w, h),
-        tolerance_secs: 0.0,
         apply_rotation: true,
     };
     let (_, predecessor) = decode_frame_at(&src, &exact_request(source_frame - 1))

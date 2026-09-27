@@ -119,7 +119,6 @@ fn all_services_are_reachable_only_through_facade_and_dependencies_stay_acyclic(
             &FrameRequest {
                 time_secs: 0.25,
                 max_size: (32, 18),
-                tolerance_secs: 0.25,
                 apply_rotation: true,
             },
         )

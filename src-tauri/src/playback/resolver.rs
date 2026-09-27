@@ -148,7 +148,6 @@ fn bootstrap_frame_request(
     FrameRequest {
         time_secs: source_frame.max(0) as f64 / timeline_fps.max(1) as f64,
         max_size: render_box,
-        tolerance_secs: 0.0,
         apply_rotation: true,
     }
 }
@@ -453,7 +452,6 @@ impl<'d, 's> StreamingResolver<'d, 's> {
         let req = FrameRequest {
             time_secs: 0.0,
             max_size: self.state.render_box,
-            tolerance_secs: 0.0,
             apply_rotation: true,
         };
         let (_actual, frame) =
@@ -994,11 +992,10 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_request_has_zero_tolerance_at_exact_source_frame() {
+    fn bootstrap_request_targets_exact_source_frame() {
         let request = bootstrap_frame_request(17, 25, (640, 360));
 
         assert_eq!(request.time_secs, 17.0 / 25.0);
-        assert_eq!(request.tolerance_secs, 0.0);
         assert_eq!(request.max_size, (640, 360));
         assert!(request.apply_rotation);
     }

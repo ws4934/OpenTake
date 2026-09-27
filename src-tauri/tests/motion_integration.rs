@@ -26,7 +26,6 @@ fn decode(path: &std::path::Path, time_secs: f64) -> Vec<u8> {
         &opentake_media::FrameRequest {
             time_secs,
             max_size: (96, 54),
-            tolerance_secs: 0.0,
             apply_rotation: true,
         },
     )

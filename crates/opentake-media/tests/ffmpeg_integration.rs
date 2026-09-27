@@ -13,9 +13,9 @@ use std::process::Command;
 use opentake_media::decode::spawn_video_stream;
 use opentake_media::ffmpeg_status::{ffmpeg_available, ffmpeg_path, ffprobe_available};
 use opentake_media::{
-    decode_frame_at, encode, extract_pcm, probe, video_thumbnails, waveform, ExportPreset,
-    ExportResolution, FrameRequest, PcmFormat, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
-    VideoStreamRequest,
+    decode_frame_at, decode_frame_file_at_cancellable, decode_frames_at, encode, extract_pcm,
+    probe, video_thumbnails, waveform, ExportPreset, ExportResolution, FrameRequest, PcmFormat,
+    PcmSpec, RgbaFrame, VideoCodec, VideoEncoder, VideoStreamRequest,
 };
 
 /// Generate a 2 s 320x240@10fps test video with a 440 Hz sine audio track.
@@ -102,7 +102,6 @@ fn decode_frame_returns_rgba_of_expected_size() {
     let req = FrameRequest {
         time_secs: 1.0,
         max_size: (0, 0),
-        tolerance_secs: 1.0,
         apply_rotation: true,
     };
     let (_actual, frame) = decode_frame_at(&av, &req).unwrap();
@@ -124,7 +123,6 @@ fn decode_frame_scales_within_box() {
     let req = FrameRequest {
         time_secs: 0.5,
         max_size: (120, 68),
-        tolerance_secs: 1.0,
         apply_rotation: true,
     };
     let (_t, frame) = decode_frame_at(&av, &req).unwrap();
@@ -508,7 +506,6 @@ fn prores_4444_roundtrip_preserves_alpha_plane() {
         &output,
         &FrameRequest {
             max_size: (2, 2),
-            tolerance_secs: 0.0,
             ..FrameRequest::default()
         },
     )
@@ -560,6 +557,192 @@ fn continuous_decode_scales_real_main10_frames_without_corruption() {
             "frame {} contains {neon_green} neon-green pixels",
             decoded.source_frame
         );
+    }
+}
+
+/// Lossless frame-numbered clip: the luma of source frame `N` is `N + 16`, so
+/// the decoded red channel names the source frame. `vf` retimes the frames.
+fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=black:s=16x16:r={fps},format=gray,geq=lum='N+16'"),
+        "-frames:v",
+        &frames.to_string(),
+    ]);
+    if let Some(vf) = vf {
+        command.args(["-vf", vf, "-fps_mode", "vfr"]);
+    }
+    command
+        .args(["-c:v", "libx264", "-crf", "0", "-g", "15", "-y"])
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn source_index(frame: &RgbaFrame) -> i64 {
+    i64::from(frame.rgba[0]) - 16
+}
+
+fn frame_at(path: &Path, time_secs: f64) -> (f64, i64) {
+    let (actual, frame) = decode_frame_at(
+        path,
+        &FrameRequest {
+            time_secs,
+            ..FrameRequest::default()
+        },
+    )
+    .unwrap();
+    (actual, source_index(&frame))
+}
+
+/// `(timeline frame, source frame)` for every frame the stream emits.
+fn streamed(path: &Path, fps: i32, start: i64, end: i64) -> Vec<(i64, i64)> {
+    let mut request = VideoStreamRequest::new(path, fps);
+    request.start_frame = start;
+    request.end_frame = Some(end);
+    let stream = spawn_video_stream(request).unwrap();
+    let mut out = Vec::new();
+    while let Ok(result) = stream
+        .receiver()
+        .recv_timeout(std::time::Duration::from_secs(10))
+    {
+        let decoded = result.expect("continuous decode frame");
+        out.push((decoded.source_frame, source_index(&decoded.frame)));
+    }
+    out
+}
+
+#[test]
+fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("numbered30.mp4");
+    if !make_numbered(&clip, 30, 150, None) {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+
+    let (actual, index) = frame_at(&clip, 3.0);
+    assert_eq!(index, 90);
+    assert!((actual - 3.0).abs() < 1e-5, "{actual}");
+    // Between frames the one still on screen is returned with its own pts.
+    let (actual, index) = frame_at(&clip, 3.02);
+    assert_eq!(index, 90);
+    assert!((actual - 3.0).abs() < 1e-5, "{actual}");
+
+    // Thumbnail-style batch: t=0 and t=1 are different frames; a request that
+    // lands on an already-emitted frame is de-duplicated by its real pts.
+    let batch = decode_frames_at(&clip, &[0.0, 1.0, 1.01], &FrameRequest::default())
+        .into_iter()
+        .map(|result| {
+            let (actual, frame) = result.unwrap();
+            (actual, source_index(&frame))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(batch.len(), 2, "{batch:?}");
+    assert_eq!((batch[0].1, batch[1].1), (0, 30));
+    assert!((batch[1].0 - 1.0).abs() < 1e-5);
+
+    // The retained-handle path pipes the file and cannot seek; it must select
+    // the same frame.
+    let file = std::fs::File::open(&clip).unwrap();
+    let (actual, frame) = decode_frame_file_at_cancellable(
+        &file,
+        &FrameRequest {
+            time_secs: 3.02,
+            ..FrameRequest::default()
+        },
+        &opentake_media::MediaCancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(source_index(&frame), 90);
+    assert!((actual - 3.0).abs() < 1e-5, "{actual}");
+}
+
+#[test]
+fn vfr_gap_single_and_streamed_frames_hold_the_last_displayed_frame() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("vfr.mp4");
+    // Source frames 0-29 at 0-0.967s, frame 30 onward shifted to 2.0s.
+    if !make_numbered(&clip, 30, 60, Some("setpts='if(gte(N,30),PTS+1/TB,PTS)'")) {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+
+    let (actual, index) = frame_at(&clip, 1.2);
+    assert_eq!(index, 29);
+    assert!((actual - 29.0 / 30.0).abs() < 1e-5, "{actual}");
+
+    let frames = streamed(&clip, 30, 36, 64);
+    let expected = (36..64)
+        .map(|timeline| (timeline, if timeline < 60 { 29 } else { timeline - 30 }))
+        .collect::<Vec<_>>();
+    assert_eq!(frames, expected);
+}
+
+#[test]
+fn mismatched_fps_single_and_streamed_frames_follow_floor_rule() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("numbered24.mp4");
+    if !make_numbered(&clip, 24, 60, None) {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+    let expected = |timeline: i64| timeline * 24 / 30;
+
+    let from_start = streamed(&clip, 30, 0, 60);
+    assert_eq!(
+        from_start,
+        (0..60).map(|f| (f, expected(f))).collect::<Vec<_>>()
+    );
+    // Starting mid-clip keeps the same grid instead of re-anchoring at the
+    // first decoded frame.
+    let mid = streamed(&clip, 30, 37, 60);
+    assert_eq!(mid, (37..60).map(|f| (f, expected(f))).collect::<Vec<_>>());
+    for timeline in 0..60 {
+        let (_, index) = frame_at(&clip, timeline as f64 / 30.0);
+        assert_eq!(index, expected(timeline), "timeline frame {timeline}");
+    }
+}
+
+#[test]
+fn same_fps_single_and_streamed_frames_are_identity() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("numbered30.mp4");
+    if !make_numbered(&clip, 30, 90, None) {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+
+    for start in [0, 1, 44] {
+        let frames = streamed(&clip, 30, start, 90);
+        assert_eq!(frames, (start..90).map(|f| (f, f)).collect::<Vec<_>>());
+    }
+    for timeline in [0, 1, 14, 15, 16, 59, 89] {
+        let (actual, index) = frame_at(&clip, timeline as f64 / 30.0);
+        assert_eq!(index, timeline);
+        assert!((actual - timeline as f64 / 30.0).abs() < 1e-5);
     }
 }
 
