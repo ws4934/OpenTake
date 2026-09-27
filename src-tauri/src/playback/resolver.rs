@@ -26,7 +26,7 @@
 //! to a table lookup for video, the static cache for image / text, and the
 //! content-hash + internal-frame LRU for Lottie.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 
@@ -54,36 +54,62 @@ use super::project::{MediaInfo, TextInfo};
 /// frame. Bounds VRAM for the static layers.
 const STATIC_CACHE_CAP: usize = 64;
 
+/// Source frames decoded per reverse-playback window. A reversed clip's source
+/// frame descends every tick, which a forward decoder cannot follow, so it is
+/// served from short forward-decoded windows instead: one decode process per
+/// window rather than one per frame.
+const REVERSE_WINDOW_FRAMES: i64 = 16;
+/// Request the next (earlier) window once fewer than this many requested
+/// frames remain below the current target.
+const REVERSE_PREFETCH_FRAMES: i64 = 8;
+
 /// One active video clip's continuous-decode state. Created when a clip first
 /// appears in a frame plan, dropped (after a cooperative stop) when it leaves.
 struct ClipStream {
-    /// The forward ffmpeg decode worker for this clip's source.
-    stream: VideoStream,
-    /// A frame pulled off the queue that is *ahead* of the current target, held
-    /// for a future tick instead of being discarded (slow-motion / dup frames).
-    pending: Option<StreamVideoFrame>,
+    decoder: ClipDecoder,
     /// Most recently uploaded texture, reused when decode falls behind the
     /// target ("drop video, keep the clock moving").
     cached_tex: Rc<GpuTexture>,
     /// Source-frame identity of `cached_tex`. This may trail the requested
-    /// target while the forward decoder catches up.
+    /// target while the decoder catches up.
     cached_source_frame: i64,
 }
 
+enum ClipDecoder {
+    /// The forward ffmpeg decode worker for this clip's source, plus a frame
+    /// pulled off the queue that is *ahead* of the current target, held for a
+    /// future tick instead of being discarded (slow-motion / dup frames).
+    Forward {
+        stream: VideoStream,
+        pending: Option<StreamVideoFrame>,
+    },
+    /// A reversed clip: descending source frames from bounded windows.
+    Reverse {
+        windows: ReverseWindows<VideoStream>,
+        request: VideoStreamRequest,
+    },
+}
+
 impl ClipStream {
-    fn new(stream: VideoStream, cached_tex: Rc<GpuTexture>, cached_source_frame: i64) -> Self {
+    fn new(decoder: ClipDecoder, cached_tex: Rc<GpuTexture>, cached_source_frame: i64) -> Self {
         ClipStream {
-            stream,
-            pending: None,
+            decoder,
             cached_tex,
             cached_source_frame,
         }
     }
 
-    /// Advance this clip's single decoder stream to `target`, uploading and
-    /// caching the matched frame. Cold bootstrap is completed synchronously
-    /// before construction; subsequent calls are non-blocking and retain
-    /// `cached_tex` when decode falls behind.
+    fn request_stop(&self) {
+        match &self.decoder {
+            ClipDecoder::Forward { stream, .. } => stream.request_stop(),
+            ClipDecoder::Reverse { windows, .. } => windows.request_stop(),
+        }
+    }
+
+    /// Advance this clip's decoder to `target`, uploading and caching the
+    /// matched frame. Cold bootstrap is completed synchronously before
+    /// construction; subsequent calls are non-blocking and retain `cached_tex`
+    /// when decode falls behind.
     fn advance(
         &mut self,
         target: i64,
@@ -91,13 +117,20 @@ impl ClipStream {
         queue: &wgpu::Queue,
     ) -> Result<(), String> {
         let cached_source_frame = self.cached_source_frame;
-        let next = {
-            let rx = self.stream.receiver();
-            drain_to_target(
-                &mut self.pending,
-                || classify_stream_pull(rx.try_recv(), cached_source_frame, target),
-                target,
-            )?
+        let next = match &mut self.decoder {
+            ClipDecoder::Forward { stream, pending } => {
+                let rx = stream.receiver();
+                drain_to_target(
+                    pending,
+                    || classify_stream_pull(rx.try_recv(), cached_source_frame, target),
+                    target,
+                )?
+            }
+            ClipDecoder::Reverse { windows, request } => {
+                windows.advance(target, cached_source_frame, |start, end| {
+                    spawn_reverse_window(request, start, end)
+                })?
+            }
         };
         if let Some(vf) = next {
             self.cached_source_frame = vf.source_frame;
@@ -106,6 +139,128 @@ impl ClipStream {
             self.cached_tex = Rc::new(tex);
         }
         Ok(())
+    }
+}
+
+/// Non-blocking frame supply of one decode worker.
+trait FrameSupply {
+    fn try_pull(&self) -> Result<Result<StreamVideoFrame, MediaError>, TryRecvError>;
+    fn request_stop(&self);
+}
+
+impl FrameSupply for VideoStream {
+    fn try_pull(&self) -> Result<Result<StreamVideoFrame, MediaError>, TryRecvError> {
+        self.receiver().try_recv()
+    }
+
+    fn request_stop(&self) {
+        VideoStream::request_stop(self);
+    }
+}
+
+fn spawn_reverse_window(
+    template: &VideoStreamRequest,
+    start: i64,
+    end: i64,
+) -> Result<VideoStream, String> {
+    let mut req = template.clone();
+    req.start_frame = start;
+    req.end_frame = Some(end);
+    req.queue_capacity = REVERSE_WINDOW_FRAMES as usize;
+    spawn_video_stream(req).map_err(|error| {
+        format!("playback reverse window [{start}, {end}) failed to start: {error}")
+    })
+}
+
+/// Serves a reversed clip's descending source frames. Each window decodes
+/// source frames `[start, end)` forward in the background; the render thread
+/// only drains finished frames and hands them out in descending order, and
+/// requests the next earlier window before the buffered ones run out. At most
+/// one window decodes at a time, so decode processes scale with the number of
+/// windows played, never with the number of frames.
+struct ReverseWindows<S> {
+    /// Decoded frames at or below the current target.
+    frames: BTreeMap<i64, StreamVideoFrame>,
+    inflight: Option<S>,
+    /// Source frames `[low, high)` shown or requested by the current chain.
+    coverage: (i64, i64),
+}
+
+impl<S: FrameSupply> ReverseWindows<S> {
+    /// Start a chain at the synchronously bootstrapped `source_frame`.
+    fn new(source_frame: i64) -> Self {
+        ReverseWindows {
+            frames: BTreeMap::new(),
+            inflight: None,
+            coverage: (source_frame, source_frame + 1),
+        }
+    }
+
+    fn request_stop(&self) {
+        if let Some(supply) = &self.inflight {
+            supply.request_stop();
+        }
+    }
+
+    fn restart(&mut self) {
+        if let Some(supply) = self.inflight.take() {
+            supply.request_stop();
+        }
+        self.frames.clear();
+    }
+
+    /// Return the decoded frame at `target` when it is ready (`None` reuses the
+    /// displayed `cached_source_frame`), spawning windows through `spawn`.
+    fn advance(
+        &mut self,
+        target: i64,
+        cached_source_frame: i64,
+        mut spawn: impl FnMut(i64, i64) -> Result<S, String>,
+    ) -> Result<Option<StreamVideoFrame>, String> {
+        if let Some(supply) = &self.inflight {
+            loop {
+                match supply.try_pull() {
+                    Ok(Ok(frame)) => {
+                        self.frames.insert(frame.source_frame, frame);
+                    }
+                    Ok(Err(error)) => {
+                        return Err(format!(
+                            "playback reverse decode failed before source frame {target}: {error}"
+                        ));
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.inflight = None;
+                        break;
+                    }
+                }
+            }
+        }
+        // Reverse playback only descends: frames above the target were shown.
+        drop(self.frames.split_off(&(target + 1)));
+        let hit = self.frames.remove(&target);
+        let (low, high) = self.coverage;
+        if !(low..high).contains(&target) {
+            // Outside the requested chain (decode fell a whole window behind,
+            // or the target moved up): restart the chain at the target.
+            self.restart();
+            if cached_source_frame == target {
+                self.coverage = (target, target + 1);
+            } else {
+                let start = (target + 1 - REVERSE_WINDOW_FRAMES).max(0);
+                self.inflight = Some(spawn(start, target + 1)?);
+                self.coverage = (start, target + 1);
+                return Ok(None);
+            }
+        }
+        self.coverage.1 = target + 1;
+        let low = self.coverage.0;
+        if self.inflight.is_none() && low > 0 && target - low < REVERSE_PREFETCH_FRAMES {
+            let start = (low - REVERSE_WINDOW_FRAMES).max(0);
+            self.inflight = Some(spawn(start, low)?);
+            self.coverage.0 = start;
+        }
+        Ok(hit)
     }
 }
 
@@ -207,6 +362,8 @@ pub struct PlaybackResolverState {
     /// Active video streams, keyed by **clip id** (NOT media_ref): a split clip
     /// or a reused asset needs an independent decode position.
     streams: HashMap<String, ClipStream>,
+    /// Clip ids whose source frames play in reverse (decoded in windows).
+    reversed_clips: HashSet<String>,
     /// Image, text, and bounded Lottie-frame textures (persistent across frames).
     static_cache: TextureCache,
     lottie: LottieMaterializer,
@@ -245,6 +402,7 @@ impl PlaybackResolverState {
     ) -> Self {
         PlaybackResolverState {
             streams: HashMap::new(),
+            reversed_clips: HashSet::new(),
             static_cache: TextureCache::new(STATIC_CACHE_CAP),
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
@@ -266,8 +424,24 @@ impl PlaybackResolverState {
     /// on the render thread.
     pub fn clear_streams(&mut self) {
         for (_, cs) in self.streams.drain() {
-            cs.stream.request_stop();
+            cs.request_stop();
         }
+    }
+
+    /// Stop and drop only the given clips' streams (a source that moved
+    /// backwards restarts at its new position; other clips keep decoding).
+    pub fn reset_streams<'a>(&mut self, clip_ids: impl IntoIterator<Item = &'a str>) {
+        for clip_id in clip_ids {
+            if let Some(cs) = self.streams.remove(clip_id) {
+                cs.request_stop();
+            }
+        }
+    }
+
+    /// Mark the clips whose source frames descend during playback so they are
+    /// served by reverse windows instead of a forward stream.
+    pub fn set_reversed_clips(&mut self, clip_ids: HashSet<String>) {
+        self.reversed_clips = clip_ids;
     }
 
     /// Take the first materialization failure recorded during the current
@@ -340,7 +514,8 @@ impl<'d, 's> StreamingResolver<'d, 's> {
     ///
     /// 1. Stop streams whose clip is no longer on screen.
     /// 2. Decode each newly-visible clip's exact target synchronously, then
-    ///    spawn its forward stream from the following source frame.
+    ///    spawn its forward stream from the following source frame (reversed
+    ///    clips request earlier windows on demand instead).
     /// 3. Advance every active stream to its target and stash the resulting
     ///    texture in the per-frame lookup.
     pub fn sync_active(&mut self, plan: &FramePlan) -> Result<(), String> {
@@ -352,7 +527,7 @@ impl<'d, 's> StreamingResolver<'d, 's> {
             if active_ids.contains(id.as_str()) {
                 true
             } else {
-                cs.stream.request_stop();
+                cs.request_stop();
                 false
             }
         });
@@ -370,6 +545,7 @@ impl<'d, 's> StreamingResolver<'d, 's> {
                 .ok_or_else(|| format!("playback bootstrap media not found: {}", t.media_ref))?;
             let timeline_fps = self.state.timeline_fps;
             let render_box = self.state.render_box;
+            let reversed = self.state.reversed_clips.contains(&t.clip_id);
             ensure_stream_with(&mut self.state.streams, &t.clip_id, || {
                 let request = bootstrap_frame_request(t.source_frame, timeline_fps, render_box);
                 let (_, frame) =
@@ -390,16 +566,27 @@ impl<'d, 's> StreamingResolver<'d, 's> {
                 ));
 
                 let mut req = VideoStreamRequest::new(media_path, timeline_fps);
-                req.start_frame = t.source_frame.max(0).saturating_add(1);
                 req.timeline_fps = timeline_fps;
                 req.max_size = render_box;
-                let stream = spawn_video_stream(req).map_err(|error| {
-                    format!(
-                        "playback bootstrap stream failed for {} at source frame {}: {error}",
-                        t.media_ref, t.source_frame
-                    )
-                })?;
-                Ok::<_, String>(ClipStream::new(stream, texture, t.source_frame))
+                let decoder = if reversed {
+                    ClipDecoder::Reverse {
+                        windows: ReverseWindows::new(t.source_frame),
+                        request: req,
+                    }
+                } else {
+                    req.start_frame = t.source_frame.max(0).saturating_add(1);
+                    let stream = spawn_video_stream(req).map_err(|error| {
+                        format!(
+                            "playback bootstrap stream failed for {} at source frame {}: {error}",
+                            t.media_ref, t.source_frame
+                        )
+                    })?;
+                    ClipDecoder::Forward {
+                        stream,
+                        pending: None,
+                    }
+                };
+                Ok::<_, String>(ClipStream::new(decoder, texture, t.source_frame))
             })?;
             if let Some(cs) = self.state.streams.get_mut(&t.clip_id) {
                 cs.advance(t.source_frame, self.device, self.queue)?;
@@ -1117,6 +1304,134 @@ mod tests {
         .expect_err("continuous decoder failure must propagate");
 
         assert_eq!(error, "decoder failed");
+    }
+
+    struct FakeSupply {
+        rx: std::sync::mpsc::Receiver<Result<StreamVideoFrame, MediaError>>,
+        stopped: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl FrameSupply for FakeSupply {
+        fn try_pull(&self) -> Result<Result<StreamVideoFrame, MediaError>, TryRecvError> {
+            self.rx.try_recv()
+        }
+
+        fn request_stop(&self) {
+            self.stopped.set(self.stopped.get() + 1);
+        }
+    }
+
+    /// A window supply that already decoded `[start, end)` (instant decoder).
+    fn finished_window(start: i64, end: i64, stopped: &Rc<std::cell::Cell<usize>>) -> FakeSupply {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for frame in start..end {
+            tx.send(Ok(vf(frame))).expect("queue window frame");
+        }
+        FakeSupply {
+            rx,
+            stopped: stopped.clone(),
+        }
+    }
+
+    #[test]
+    fn reverse_windows_serve_sixty_descending_frames_with_bounded_spawns() {
+        let stopped = Rc::new(std::cell::Cell::new(0));
+        let mut spawned = Vec::new();
+        let mut windows = ReverseWindows::new(59);
+        let mut cached = 59;
+        for target in (0..60).rev() {
+            let hit = windows
+                .advance(target, cached, |start, end| {
+                    spawned.push((start, end));
+                    Ok(finished_window(start, end, &stopped))
+                })
+                .expect("advance reverse windows");
+            if target < 59 {
+                assert_eq!(
+                    hit.as_ref().map(|frame| frame.source_frame),
+                    Some(target),
+                    "prefetched window must hold source frame {target}"
+                );
+            }
+            if let Some(frame) = hit {
+                cached = frame.source_frame;
+            }
+        }
+
+        let windows_played = 60_usize.div_ceil(REVERSE_WINDOW_FRAMES as usize);
+        assert!(
+            spawned.len() <= windows_played + 2,
+            "60 reversed frames spawned {} windows: {spawned:?}",
+            spawned.len()
+        );
+        assert_eq!(spawned, vec![(43, 59), (27, 43), (11, 27), (0, 11)]);
+        assert_eq!(stopped.get(), 0, "no window is abandoned while in step");
+    }
+
+    #[test]
+    fn lagging_reverse_decode_restarts_once_per_window_not_per_frame() {
+        let stopped = Rc::new(std::cell::Cell::new(0));
+        let mut spawned = 0;
+        // Senders stay alive and never deliver: every window lags forever.
+        let mut senders = Vec::new();
+        let mut windows = ReverseWindows::new(59);
+        for target in (0..60).rev() {
+            let hit = windows
+                .advance(target, 59, |_, _| {
+                    spawned += 1;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    senders.push(tx);
+                    Ok(FakeSupply {
+                        rx,
+                        stopped: stopped.clone(),
+                    })
+                })
+                .expect("advance lagging reverse windows");
+            assert!(hit.is_none());
+        }
+
+        let windows_played = 60_usize.div_ceil(REVERSE_WINDOW_FRAMES as usize);
+        assert!(
+            spawned <= windows_played + 2,
+            "lagging decode spawned {spawned} windows over 60 frames"
+        );
+        assert_eq!(stopped.get(), spawned - 1, "each superseded window stops");
+    }
+
+    #[test]
+    fn reverse_windows_restart_at_a_target_above_the_chain() {
+        let stopped = Rc::new(std::cell::Cell::new(0));
+        let mut spawned = Vec::new();
+        let mut windows = ReverseWindows::new(20);
+        let mut spawn = |start, end| {
+            spawned.push((start, end));
+            Ok(finished_window(start, end, &stopped))
+        };
+        windows.advance(20, 20, &mut spawn).expect("bootstrap");
+        windows.advance(19, 20, &mut spawn).expect("descend");
+        let hit = windows.advance(40, 19, &mut spawn).expect("jump up");
+
+        assert!(hit.is_none());
+        assert_eq!(spawned.last(), Some(&(25, 41)));
+    }
+
+    #[test]
+    fn reverse_window_decode_failure_propagates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(MediaError::Decode("broken window".to_string())))
+            .expect("queue failure");
+        let mut supply = Some(FakeSupply {
+            rx,
+            stopped: Rc::new(std::cell::Cell::new(0)),
+        });
+        let mut windows = ReverseWindows::new(10);
+        windows
+            .advance(10, 10, |_, _| Ok(supply.take().expect("one window")))
+            .expect("first advance spawns the failing window");
+        let error = windows
+            .advance(9, 10, |_, _| panic!("no new window while one is in flight"))
+            .expect_err("reverse decode failure must propagate");
+        assert!(error.contains("broken window"), "{error}");
     }
 
     #[test]

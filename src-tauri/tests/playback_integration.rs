@@ -243,6 +243,69 @@ fn cold_bootstrap_uses_exact_trimmed_source_frame() {
 }
 
 #[test]
+fn reversed_clip_streams_descending_source_frames_matching_exact_decode() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let src = dir.path().join("distinct-cfr.mp4");
+    let (w, h, fps, frames) = (160u32, 90u32, 12u32, 36u32);
+    make_distinct_cfr_video(&src, w, h, fps, frames);
+
+    let mut timeline = Timeline::new();
+    timeline.fps = fps as i32;
+    let mut track = Track::new("t1", ClipType::Video);
+    let mut clip = Clip::new("clip-1", "asset-1", 0, frames as i32);
+    clip.reversed = true;
+    track.clips.push(clip);
+    timeline.tracks.push(track);
+    let mut manifest = MediaManifest::new();
+    manifest.entries.push(external_entry(
+        "asset-1", &src, w as i32, h as i32, fps as f64,
+    ));
+
+    let Some(mut render_loop) = try_render_loop(timeline, &manifest, RenderSize::new(w, h)) else {
+        return;
+    };
+    let mut previous: Option<Vec<u8>> = None;
+    for timeline_frame in 0..frames as i32 {
+        let source_frame = frames as i32 - 1 - timeline_frame;
+        let (_, expected) = decode_frame_at(
+            &src,
+            &FrameRequest {
+                time_secs: source_frame as f64 / fps as f64,
+                max_size: (w, h),
+                apply_rotation: true,
+            },
+        )
+        .expect("decode exact reversed source frame");
+        if let Some(previous) = &previous {
+            assert_ne!(
+                &expected.rgba, previous,
+                "CFR fixture must have distinct adjacent frame pixels"
+            );
+        }
+        let mut matched = false;
+        for _ in 0..WARMUP_TRIES {
+            let rendered = render_loop
+                .render_frame(timeline_frame)
+                .expect("render reversed frame");
+            if rendered.rgba == expected.rgba {
+                matched = true;
+                break;
+            }
+            sleep(WARMUP_SLEEP);
+        }
+        assert!(
+            matched,
+            "timeline frame {timeline_frame} must show exact source frame {source_frame}"
+        );
+        previous = Some(expected.rgba);
+    }
+}
+
+#[test]
 fn cold_bootstrap_decode_failure_is_reported_instead_of_publishing_black() {
     let dir = tempfile::tempdir().expect("fixture tempdir");
     let missing = dir.path().join("missing.mp4");
