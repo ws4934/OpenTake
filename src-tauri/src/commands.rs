@@ -3825,7 +3825,7 @@ mod edit_request_serde_tests {
             ),
         ];
 
-        assert_eq!(cases.len(), 56);
+        assert_eq!(cases.len(), 57);
         for (json, expected_route) in cases {
             let mut hostile = serde_json::from_str::<serde_json::Value>(json).unwrap();
             hostile
