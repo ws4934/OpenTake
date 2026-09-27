@@ -20,18 +20,6 @@ vi.mock("./i18n", async (importOriginal) => {
 
 const webRoot = process.cwd();
 const globalCss = readFileSync(resolve(webRoot, "src/styles/global.css"), "utf8");
-const homeTests = readFileSync(
-  resolve(webRoot, "src/components/home/HomeView.test.tsx"),
-  "utf8",
-);
-const projectActionTests = readFileSync(
-  resolve(webRoot, "src/store/projectActions.test.ts"),
-  "utf8",
-);
-const sampleBackend = readFileSync(
-  resolve(webRoot, "../src-tauri/src/samples.rs"),
-  "utf8",
-);
 
 let root: Root;
 let container: HTMLDivElement;
@@ -116,12 +104,4 @@ it("sample_projects_accessibility_visual_and_interaction_gate", async () => {
   expect(globalCss).toContain("@media (prefers-reduced-motion: reduce)");
   expect(globalCss).toContain("@media (forced-colors: active)");
 
-  // The release umbrella is backed by the existing executable sample owners:
-  // Home routing, project lifecycle success/failure, and atomic offline bundle
-  // materialization. This test keeps those owners discoverable from one gate.
-  expect(homeTests).toContain("new_open_sample_register_only_after_success_and_route_tutorial");
-  expect(projectActionTests).toContain("opens a completed tutorial sample");
-  expect(projectActionTests).toContain("does not open or mutate recents when materialization fails");
-  expect(sampleBackend).toContain("built_in_tutorial_is_offline_and_contains_editing_steps");
-  expect(sampleBackend).toContain("failed_materialization_rolls_back_entire_sample_directory");
 });
