@@ -23,6 +23,7 @@ These apply even if you have not opened the files above.
 5. No tool attribution ("Generated with …" lines) or agent session links in PRs, issues, review comments or commit messages; a standard `Co-authored-by:` commit trailer is fine.
 6. PR CI does not build `src-tauri`, `opentake-media`, `opentake-render`, `opentake-motion`, `opentake-agent` or `opentake-gen`. If you change them, run `cargo clippy --workspace --all-targets --locked -- -D warnings` and the affected tests locally, and record the actual commands and results in the PR.
 7. Open PRs as drafts until they are complete and verified. One PR per issue. Never push to `main`, never force-push someone else's branch, never skip or delete tests to get CI green.
+8. Squash-merge, then delete the head branch on GitHub and locally.
 
 ## Quick commands
 

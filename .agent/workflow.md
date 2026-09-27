@@ -51,4 +51,5 @@ Notes:
 
 - Address every review comment with a fix or a written reason (see [message-conventions.md](message-conventions.md) §6.4).
 - Merge with squash; the PR title becomes the commit subject.
+- Delete the head branch right after the merge, on GitHub and locally (`git fetch --prune`); see [message-conventions.md](message-conventions.md) §6.3.
 - After merging a partial fix, comment on the issue with what remains and keep it open. After a complete fix, check that `Closes #N` closed the issue.
