@@ -69,9 +69,10 @@ use opentake_render::gpu::compositor::{
 };
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::{
-    export_render_size, try_build_render_plan, AudioClipPlan, Compositor, CosmicTextRasterizer,
-    DecodedFrame, ExportResolution as RenderResolution, GpuLutTexture, GpuTexture, RenderDevice,
-    SourceMetrics, TextRasterRequest, TextRasterizer, TextureCache, TextureResolver, TextureSource,
+    export_render_size, source_frame_index, try_build_render_plan, AudioClipPlan, Compositor,
+    CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, GpuLutTexture,
+    GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest, TextRasterizer,
+    TextureCache, TextureResolver, TextureSource,
 };
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
@@ -538,12 +539,21 @@ struct MediaResolver<'d> {
 }
 
 impl MediaResolver<'_> {
+    fn fail_materialization<T>(&mut self, message: impl Into<String>) -> Option<T> {
+        if self.materialization_error.is_none() {
+            self.materialization_error = Some(message.into());
+        }
+        None
+    }
+
     fn resolve_text(&mut self, clip_id: &str) -> Option<Rc<GpuTexture>> {
         let key = format!("t:{clip_id}");
         if let Some(tex) = self.cache.get(&key) {
             return Some(tex);
         }
-        let info = self.text.get(clip_id)?;
+        let Some(info) = self.text.get(clip_id) else {
+            return self.fail_materialization(format!("text clip {clip_id} has no raster input"));
+        };
         let req = TextRasterRequest {
             clip_id,
             content: &info.content,
@@ -551,7 +561,19 @@ impl MediaResolver<'_> {
             box_norm: info.box_norm,
             canvas: self.render_box,
         };
-        let frame = self.text_rasterizer.rasterize(&req)?;
+        let frame = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.text_rasterizer.rasterize(&req)
+        })) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                return self
+                    .fail_materialization(format!("text clip {clip_id} rasterization failed"));
+            }
+            Err(_) => {
+                return self
+                    .fail_materialization(format!("text clip {clip_id} rasterization panicked"));
+            }
+        };
         let tex = upload_rgba(self.device, self.queue, &frame, false, Some("export-text"));
         Some(self.cache.insert(key, tex))
     }
@@ -569,10 +591,13 @@ impl MediaResolver<'_> {
         if let Some(tex) = self.cache.get(&key) {
             return Some(tex);
         }
-        let info = self.media.get(media_ref)?;
+        let Some(info) = self.media.get(media_ref) else {
+            return self.fail_materialization(format!("video source {media_ref} is unavailable"));
+        };
         let source_fps = info.source_fps.unwrap_or(interpolation.source_fps);
         if !source_fps.is_finite() || source_fps <= 0.0 {
-            return None;
+            return self
+                .fail_materialization(format!("video source {media_ref} has invalid frame rate"));
         }
         let (first_index, next_index, alpha) =
             source_frame_pair(source_frame, interpolation.target_fps, source_fps);
@@ -585,17 +610,35 @@ impl MediaResolver<'_> {
                     apply_rotation: true,
                 },
             )
-            .ok()
             .map(|(_, frame)| frame)
         };
-        let first = decode(first_index)?;
+        let first = match decode(first_index) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return self.fail_materialization(format!(
+                    "video source {media_ref} decode failed: {error}"
+                ));
+            }
+        };
         let last = if next_index == first_index {
             first.clone()
         } else {
             // A half-open media duration may not expose the mathematical next
             // frame at the tail. Hold the last decodable endpoint instead of
             // dropping the whole layer to black.
-            decode(next_index).unwrap_or_else(|| first.clone())
+            match decode(next_index) {
+                Ok(frame) => frame,
+                Err(opentake_media::MediaError::Decode(message))
+                    if message.starts_with("no frame at ") && info.path.is_file() =>
+                {
+                    first.clone()
+                }
+                Err(error) => {
+                    return self.fail_materialization(format!(
+                        "video source {media_ref} interpolation endpoint decode failed: {error}"
+                    ));
+                }
+            }
         };
         let requested = match interpolation.mode {
             TextureInterpolationMode::Nearest => FrameInterpolationMode::Nearest,
@@ -607,9 +650,14 @@ impl MediaResolver<'_> {
             TextureInterpolationFallback::Blend => FrameInterpolationFallback::Blend,
             TextureInterpolationFallback::Error => FrameInterpolationFallback::Error,
         };
-        let frame = interpolate_frame_pair(&first, &last, alpha, requested, fallback, true)
-            .ok()?
-            .frame;
+        let frame = match interpolate_frame_pair(&first, &last, alpha, requested, fallback, true) {
+            Ok(result) => result.frame,
+            Err(error) => {
+                return self.fail_materialization(format!(
+                    "video source {media_ref} interpolation failed: {error}"
+                ));
+            }
+        };
         let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
         let tex = upload_rgba(
             self.device,
@@ -629,7 +677,10 @@ impl TextureResolver for MediaResolver<'_> {
             TextureSource::Image { media_ref } => (media_ref, true),
             TextureSource::Text { clip_id } => return self.resolve_text(clip_id),
             TextureSource::Lottie { media_ref } => {
-                let info = self.media.get(media_ref)?;
+                let Some(info) = self.media.get(media_ref) else {
+                    return self
+                        .fail_materialization(format!("Lottie source {media_ref} is unavailable"));
+                };
                 return match self.lottie.resolve(
                     self.device,
                     self.queue,
@@ -642,16 +693,24 @@ impl TextureResolver for MediaResolver<'_> {
                     Ok(texture) => Some(texture),
                     Err(error) => {
                         eprintln!("[export] {error}");
-                        self.materialization_error = Some(error);
-                        None
+                        self.fail_materialization(error)
                     }
                 };
             }
         };
 
-        let info = self.media.get(media_ref)?;
+        let Some(info) = self.media.get(media_ref) else {
+            return self.fail_materialization(format!("media source {media_ref} is unavailable"));
+        };
         let key = if is_image {
-            let content_hash = self.content_hashes.sha256(&info.path).ok()?;
+            let content_hash = match self.content_hashes.sha256(&info.path) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    return self.fail_materialization(format!(
+                        "image source {media_ref} hashing failed: {error}"
+                    ));
+                }
+            };
             format!("i:{content_hash}")
         } else {
             format!("v:{media_ref}:{source_frame}")
@@ -672,7 +731,14 @@ impl TextureResolver for MediaResolver<'_> {
             max_size: self.render_box,
             apply_rotation: true,
         };
-        let (_actual, frame) = decode_frame_at(&info.path, &req).ok()?;
+        let (_actual, frame) = match decode_frame_at(&info.path, &req) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return self.fail_materialization(format!(
+                    "media source {media_ref} decode failed: {error}"
+                ));
+            }
+        };
         let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
         let tex = upload_rgba(self.device, self.queue, &decoded, false, Some("export-src"));
         Some(self.cache.insert(key, tex))
@@ -780,6 +846,99 @@ fn project_media(
         );
     }
     (sizes, media)
+}
+
+/// Check the sources that contribute to this range before opening an encoder
+/// or acquiring a GPU. A missing silent video must fail just as early as a
+/// missing video with an audio track. The resolver still reports failures that
+/// happen later (including a source removed during export).
+fn preflight_export_sources(
+    plan: &RenderPlan,
+    manifest: &opentake_domain::MediaManifest,
+    media: &HashMap<String, MediaInfo>,
+    start_frame: i32,
+    end_frame: i32,
+    control: Option<&ExportControl>,
+    external_cancel: Option<&MediaCancelToken>,
+) -> Result<(), String> {
+    let names: HashMap<&str, &str> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry.name.as_str()))
+        .collect();
+    let mut checked = HashSet::new();
+    let sources = plan
+        .clip_plans
+        .iter()
+        .chain(plan.text_plans.iter())
+        .filter(|clip| clip.start_frame < end_frame && clip.end_frame > start_frame)
+        .filter_map(|clip| match &clip.source {
+            TextureSource::Decoded { media_ref } => Some((
+                media_ref.as_str(),
+                ClipType::Video,
+                Some(source_frame_index(clip, clip.start_frame.max(start_frame))),
+            )),
+            TextureSource::Image { media_ref } => {
+                Some((media_ref.as_str(), ClipType::Image, Some(0)))
+            }
+            TextureSource::Lottie { media_ref } => {
+                Some((media_ref.as_str(), ClipType::Lottie, None))
+            }
+            TextureSource::Text { .. } => None,
+        })
+        .chain(
+            plan.audio_clips
+                .iter()
+                .filter(|audio| {
+                    audio.clip.start_frame < end_frame && audio.clip.end_frame() > start_frame
+                })
+                .map(|audio| (audio.clip.media_ref.as_str(), ClipType::Audio, None)),
+        );
+    for (media_ref, kind, first_frame) in sources {
+        if !checked.insert(media_ref) {
+            continue;
+        }
+        check_audio_cancel_with_external(control, external_cancel)?;
+        let label = match names.get(media_ref) {
+            Some(name) => format!("{name} ({media_ref})"),
+            None => media_ref.to_string(),
+        };
+        let info = media
+            .get(media_ref)
+            .ok_or_else(|| format!("export source {label} is unavailable in the media manifest"))?;
+        let file = File::open(&info.path)
+            .map_err(|error| format!("export source {label} cannot be opened: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("export source {label} cannot be inspected: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("export source {label} is not a regular file"));
+        }
+        if kind == ClipType::Lottie {
+            continue;
+        }
+        let probe = opentake_media::probe::probe(&info.path)
+            .map_err(|error| format!("export source {label} cannot be probed: {error}"))?;
+        if kind == ClipType::Audio {
+            if !probe.has_audio {
+                return Err(format!("export audio source {label} has no audio stream"));
+            }
+            continue;
+        }
+        if !probe.has_video {
+            return Err(format!("export source {label} has no visual stream"));
+        }
+        let request = FrameRequest {
+            time_secs: first_frame
+                .map(|frame| project_frame_time_secs(frame, plan.fps))
+                .unwrap_or(0.0),
+            max_size: (64, 64),
+            apply_rotation: true,
+        };
+        decode_frame_at(&info.path, &request)
+            .map_err(|error| format!("export source {label} cannot be decoded: {error}"))?;
+    }
+    Ok(())
 }
 
 /// PCM spec the export decodes every audio source window into: mono f32 at the
@@ -1648,6 +1807,23 @@ pub(crate) fn run_export_with_control(
     let metrics = ManifestMetrics { sizes };
     let plan = try_build_render_plan(timeline, render_size, &metrics)
         .map_err(|error| format!("invalid timeline graph: {error}"))?;
+    let (start_frame, end_frame) = match options.frame_range {
+        None => (0, plan.total_frames),
+        Some((lo, hi)) => {
+            let lo = lo.max(0).min(plan.total_frames);
+            let hi = hi.max(lo).min(plan.total_frames);
+            (lo, hi)
+        }
+    };
+    preflight_export_sources(
+        &plan,
+        manifest,
+        &media,
+        start_frame,
+        end_frame,
+        control,
+        external_cancel.as_ref(),
+    )?;
     let project_root = project_dir
         .as_ref()
         .map(ProjectRoot::open)
@@ -1688,14 +1864,6 @@ pub(crate) fn run_export_with_control(
     )
     .map_err(|e| format!("encoder init failed: {e}"))?;
 
-    let (start_frame, end_frame) = match options.frame_range {
-        None => (0, plan.total_frames),
-        Some((lo, hi)) => {
-            let lo = lo.max(0).min(plan.total_frames);
-            let hi = hi.max(lo).min(plan.total_frames);
-            (lo, hi)
-        }
-    };
     let range_total = end_frame - start_frame;
 
     let mut last_progress_emit = Instant::now();
