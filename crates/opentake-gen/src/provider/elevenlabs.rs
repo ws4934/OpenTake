@@ -55,11 +55,24 @@ impl ElevenLabsAdapter {
     }
 
     /// Resolve a voice id from params (falls back to a default voice).
-    fn voice_id(p: &AudioParams) -> String {
-        p.voice
-            .clone()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_VOICE_ID.to_string())
+    fn voice_id(p: &AudioParams) -> Result<String, GenError> {
+        let Some(voice) = p.voice.as_deref() else {
+            return Ok(DEFAULT_VOICE_ID.to_string());
+        };
+        if voice.eq_ignore_ascii_case("rachel") {
+            return Ok(DEFAULT_VOICE_ID.to_string());
+        }
+        if voice.is_empty()
+            || voice.len() > 128
+            || !voice
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(GenError::Other(anyhow::anyhow!(
+                "invalid ElevenLabs voice id"
+            )));
+        }
+        Ok(voice.to_string())
     }
 
     /// Whether this is a music request (vs TTS), inferred from the vendor model.
@@ -73,13 +86,17 @@ impl ElevenLabsAdapter {
         p: &AudioParams,
     ) -> Result<GenerationJob, GenError> {
         use serde_json::json;
-        let voice = Self::voice_id(p);
-        let url = format!("{}/text-to-speech/{}", self.api_base, voice);
+        let voice = Self::voice_id(p)?;
+        let mut url = url::Url::parse(&format!("{}/text-to-speech/", self.api_base))?;
+        url.path_segments_mut()
+            .map_err(|_| GenError::Transport("invalid ElevenLabs API base".into()))?
+            .pop_if_empty()
+            .push(&voice);
         let body = json!({ "text": p.prompt, "model_id": route.vendor_model });
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(HttpRequest::post(url).header(hk, hv).json(body))
+            .send(HttpRequest::post(url.to_string()).header(hk, hv).json(body))
             .await?;
         if !resp.is_success() {
             return Err(map_http_error(resp.status, &resp.body));
@@ -102,7 +119,7 @@ impl ElevenLabsAdapter {
             body["music_length_ms"] = json!(d as u64 * 1000);
         }
         if p.instrumental {
-            body["instrumental"] = json!(true);
+            body["force_instrumental"] = json!(true);
         }
         let (hk, hv) = self.auth_header();
         let resp = self
@@ -224,6 +241,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rachel_name_maps_to_voice_id_and_invalid_paths_never_send() {
+        // https://elevenlabs.io/docs/api-reference/text-to-speech/convert
+        let mock = MockTransport::new();
+        mock.on_raw(
+            Method::Post,
+            format!("https://mockel/v1/text-to-speech/{DEFAULT_VOICE_ID}"),
+            HttpResponse::new(200, b"X".to_vec()),
+        );
+        let a = adapter(&mock);
+        let mut route = ModelRoute::parse("elevenlabs:eleven-multilingual-v2").unwrap();
+        route.vendor_model = "eleven_multilingual_v2".into();
+        let mut params = AudioParams::new("hello", false);
+        params.voice = Some("rachel".into());
+        a.submit(&route, &GenerationParams::Audio(params.clone()))
+            .await
+            .unwrap();
+        match mock.last_call().unwrap().body {
+            Body::Json(body) => assert_eq!(body["model_id"], "eleven_multilingual_v2"),
+            _ => panic!("expected JSON"),
+        }
+        for invalid in ["../voices", "a/b", "x?y", "x#y", " ", ""] {
+            let before = mock.calls().len();
+            params.voice = Some(invalid.into());
+            assert!(a
+                .submit(&route, &GenerationParams::Audio(params.clone()))
+                .await
+                .is_err());
+            assert_eq!(
+                mock.calls().len(),
+                before,
+                "invalid {invalid:?} sent a request"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn music_route_hits_music_endpoint_with_length() {
         let mock = MockTransport::new();
         let resp = HttpResponse::new(200, b"MUS".to_vec());
@@ -237,7 +290,7 @@ mod tests {
             Body::Json(v) => {
                 assert_eq!(v["prompt"], "epic score");
                 assert_eq!(v["music_length_ms"], 30000);
-                assert_eq!(v["instrumental"], true);
+                assert_eq!(v["force_instrumental"], true);
             }
             _ => panic!("expected json"),
         }

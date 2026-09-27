@@ -242,8 +242,16 @@ impl GenClient {
         project_id: Option<&str>,
     ) -> Result<String, GenError> {
         match &self.inner.mode {
-            AuthMode::Byok { registry, .. } => {
-                let (adapter, route) = registry.route(model)?;
+            AuthMode::Byok { registry, catalog } => {
+                let (adapter, mut route) = registry.route(model)?;
+                if let Some(vendor_model) = catalog
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.id == model)
+                    .and_then(|entry| entry.vendor_model.as_deref())
+                {
+                    route.vendor_model = vendor_model.to_owned();
+                }
                 let job = adapter.submit(&route, &params).await?;
                 Ok(job.id)
             }
@@ -376,9 +384,9 @@ pub fn filter_by_kind(entries: &[CatalogEntry], kind: ModelKind) -> Vec<CatalogE
 mod tests {
     use super::*;
     use crate::job::JobStatus;
-    use crate::params::ImageParams;
-    use crate::provider::FalAdapter;
-    use crate::transport::MockTransport;
+    use crate::params::{AudioParams, ImageParams, UpscaleParams, VideoParams};
+    use crate::provider::{ElevenLabsAdapter, FalAdapter, ReplicateAdapter};
+    use crate::transport::{HttpResponse, MockTransport};
     use futures_util::StreamExt;
     use serde_json::json;
 
@@ -416,19 +424,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_replicate_models_use_official_endpoints() {
+        let mock = MockTransport::new();
+        let registry = ProviderRegistry::new().with(Arc::new(
+            ReplicateAdapter::new(Arc::new(mock.clone()), "token").with_base("https://mockrep/v1"),
+        ));
+        let client = GenClient::byok(registry, Catalog::builtin());
+        for (id, endpoint, params) in [
+            (
+                "replicate:seedance-1-pro",
+                "https://mockrep/v1/models/bytedance/seedance-1-pro/predictions",
+                GenerationParams::Video(VideoParams {
+                    prompt: "scene".into(),
+                    duration: 5,
+                    aspect_ratio: "16:9".into(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "replicate:topaz-upscale",
+                "https://mockrep/v1/models/topazlabs/video-upscale/predictions",
+                GenerationParams::Upscale(UpscaleParams {
+                    source_url: "https://x/video.mp4".into(),
+                    duration_seconds: 5,
+                }),
+            ),
+        ] {
+            mock.on(
+                Method::Post,
+                endpoint,
+                201,
+                json!({"id":"p","status":"starting"}),
+            );
+            client.submit_byok(id, params).await.unwrap();
+            let call = mock.last_call().unwrap();
+            assert_eq!(call.url, endpoint);
+            let crate::transport::Body::Json(body) = call.body else {
+                panic!("expected JSON");
+            };
+            assert!(body.get("version").is_none());
+            if id == "replicate:topaz-upscale" {
+                assert_eq!(body["input"], json!({"video":"https://x/video.mp4"}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_elevenlabs_uses_documented_tts_model_and_voice_id() {
+        let mock = MockTransport::new();
+        let voice = "21m00Tcm4TlvDq8ikWAM";
+        mock.on_raw(
+            Method::Post,
+            format!("https://mockel/v1/text-to-speech/{voice}"),
+            HttpResponse::new(200, b"speech".to_vec()),
+        );
+        let registry = ProviderRegistry::new().with(Arc::new(
+            ElevenLabsAdapter::new(Arc::new(mock.clone()), "key").with_base("https://mockel/v1"),
+        ));
+        let client = GenClient::byok(registry, Catalog::builtin());
+        let mut params = AudioParams::new("hello", false);
+        params.voice = Some("rachel".into());
+        client
+            .submit_byok(
+                "elevenlabs:eleven-multilingual-v2",
+                GenerationParams::Audio(params),
+            )
+            .await
+            .unwrap();
+        let call = mock.last_call().unwrap();
+        assert_eq!(
+            call.url,
+            format!("https://mockel/v1/text-to-speech/{voice}")
+        );
+        let crate::transport::Body::Json(body) = call.body else {
+            panic!("expected JSON");
+        };
+        assert_eq!(body["model_id"], "eleven_multilingual_v2");
+    }
+
+    #[tokio::test]
     async fn byok_submit_then_watch_to_succeeded() {
         let mock = MockTransport::new();
         // submit
         mock.on(
             Method::Post,
-            "https://mockfal/flux-pro",
+            "https://mockfal/fal-ai/flux-pro/v1.1",
             200,
             json!({"request_id": "req-7", "status": "IN_QUEUE"}),
         );
         // poll status: queued -> running -> completed
         mock.on_sequence(
             Method::Get,
-            "https://mockfal/flux-pro/requests/req-7/status",
+            "https://mockfal/fal-ai/flux-pro/requests/req-7/status",
             vec![
                 (200, json!({"status": "IN_QUEUE"})),
                 (200, json!({"status": "IN_PROGRESS"})),
@@ -438,7 +525,7 @@ mod tests {
         // terminal result fetch
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/req-7",
+            "https://mockfal/fal-ai/flux-pro/requests/req-7",
             200,
             json!({"images": [{"url": "https://out/final.png"}]}),
         );

@@ -15,6 +15,13 @@ use std::sync::Arc;
 const QUEUE_BASE: &str = "https://queue.fal.run";
 const STORAGE_UPLOAD: &str = "https://rest.alpha.fal.ai/storage/upload";
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FalJobRoutes {
+    request_id: String,
+    status_url: String,
+    response_url: String,
+}
+
 /// fal.ai provider adapter.
 pub struct FalAdapter {
     http: Arc<dyn HttpTransport>,
@@ -47,8 +54,40 @@ impl FalAdapter {
         ("Authorization".to_string(), format!("Key {}", self.api_key))
     }
 
+    fn queue_url(&self, value: &str) -> Result<String, GenError> {
+        let base = url::Url::parse(&self.queue_base)?;
+        let candidate = url::Url::parse(value)?;
+        if base.origin() != candidate.origin()
+            || candidate.username() != ""
+            || candidate.password().is_some()
+        {
+            return Err(GenError::Transport(
+                "fal returned a status URL outside its queue origin".into(),
+            ));
+        }
+        Ok(candidate.to_string())
+    }
+
+    fn endpoint(route: &ModelRoute, params: &GenerationParams) -> String {
+        match params {
+            GenerationParams::Video(p)
+                if route.vendor_model == "fal-ai/kling-video/v2.5-turbo/pro/text-to-video"
+                    && p.start_frame_url.is_some() =>
+            {
+                "fal-ai/kling-video/v2.5-turbo/pro/image-to-video".into()
+            }
+            GenerationParams::Image(p)
+                if route.vendor_model == "fal-ai/flux-pro/kontext/text-to-image"
+                    && !p.image_urls.is_empty() =>
+            {
+                "fal-ai/flux-pro/kontext".into()
+            }
+            _ => route.vendor_model.clone(),
+        }
+    }
+
     /// Map unified params into the fal request body (vendor field names).
-    fn map_body(params: &GenerationParams) -> serde_json::Value {
+    fn map_body(endpoint: &str, params: &GenerationParams) -> serde_json::Value {
         use serde_json::json;
         match params {
             GenerationParams::Image(p) => {
@@ -63,6 +102,24 @@ impl FalAdapter {
                 }
                 if p.num_images > 1 {
                     body["num_images"] = json!(p.num_images);
+                }
+                if endpoint == "fal-ai/flux-pro/v1.1" {
+                    body.as_object_mut().unwrap().remove("aspect_ratio");
+                    let image_size = p.resolution.as_deref().and_then(|size| {
+                        let (w, h) = size.split_once('x')?;
+                        Some(json!({ "width": w.parse::<u32>().ok()?, "height": h.parse::<u32>().ok()? }))
+                    });
+                    body["image_size"] = image_size.unwrap_or_else(|| {
+                        json!(match p.aspect_ratio.as_str() {
+                            "1:1" => "square_hd",
+                            "9:16" => "portrait_16_9",
+                            "3:4" => "portrait_4_3",
+                            "16:9" => "landscape_16_9",
+                            _ => "landscape_4_3",
+                        })
+                    });
+                } else if endpoint.starts_with("fal-ai/flux-pro/kontext") {
+                    body.as_object_mut().unwrap().remove("image_size");
                 }
                 body
             }
@@ -84,6 +141,16 @@ impl FalAdapter {
                 }
                 if !p.reference_image_urls.is_empty() {
                     body["reference_image_urls"] = json!(p.reference_image_urls);
+                }
+                if endpoint.starts_with("fal-ai/kling-video/") {
+                    let map = body.as_object_mut().unwrap();
+                    map.insert("duration".into(), json!(p.duration.to_string()));
+                    map.remove("enable_audio");
+                    map.remove("resolution");
+                    map.remove("reference_image_urls");
+                    if let Some(end) = map.remove("end_image_url") {
+                        map.insert("tail_image_url".into(), end);
+                    }
                 }
                 body
             }
@@ -142,8 +209,9 @@ impl ProviderAdapter for FalAdapter {
         route: &ModelRoute,
         params: &GenerationParams,
     ) -> Result<GenerationJob, GenError> {
-        let url = format!("{}/{}", self.queue_base, route.vendor_model);
-        let body = Self::map_body(params);
+        let endpoint = Self::endpoint(route, params);
+        let url = format!("{}/{}", self.queue_base, endpoint);
+        let body = Self::map_body(&endpoint, params);
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
@@ -158,7 +226,18 @@ impl ProviderAdapter for FalAdapter {
             .and_then(|x| x.as_str())
             .ok_or_else(|| GenError::Transport("fal: missing request_id".into()))?;
         // Encode the routing needed for polling into the job id.
-        let job_id = format!("{}|{}", route.vendor_model, request_id);
+        let job_id = if let (Some(status_url), Some(response_url)) = (
+            v.get("status_url").and_then(|value| value.as_str()),
+            v.get("response_url").and_then(|value| value.as_str()),
+        ) {
+            serde_json::to_string(&FalJobRoutes {
+                request_id: request_id.into(),
+                status_url: self.queue_url(status_url)?,
+                response_url: self.queue_url(response_url)?,
+            })?
+        } else {
+            format!("{endpoint}|{request_id}")
+        };
         let status = v
             .get("status")
             .and_then(|x| x.as_str())
@@ -168,13 +247,26 @@ impl ProviderAdapter for FalAdapter {
     }
 
     async fn poll(&self, job_id: &str) -> Result<GenerationJob, GenError> {
-        let (vendor_model, request_id) = job_id
-            .split_once('|')
-            .ok_or_else(|| GenError::Transport("fal: malformed job id".into()))?;
-        let status_url = format!(
-            "{}/{}/requests/{}/status",
-            self.queue_base, vendor_model, request_id
-        );
+        let (status_url, result_url) = if job_id.starts_with('{') {
+            let routes: FalJobRoutes = serde_json::from_str(job_id)?;
+            (
+                self.queue_url(&routes.status_url)?,
+                self.queue_url(&routes.response_url)?,
+            )
+        } else {
+            let (vendor_model, request_id) = job_id
+                .split_once('|')
+                .ok_or_else(|| GenError::Transport("fal: malformed job id".into()))?;
+            let app = vendor_model
+                .split('/')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("/");
+            (
+                format!("{}/{app}/requests/{request_id}/status", self.queue_base),
+                format!("{}/{app}/requests/{request_id}", self.queue_base),
+            )
+        };
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
@@ -192,10 +284,6 @@ impl ProviderAdapter for FalAdapter {
 
         match status {
             JobStatus::Succeeded => {
-                let result_url = format!(
-                    "{}/{}/requests/{}",
-                    self.queue_base, vendor_model, request_id
-                );
                 let rresp = self
                     .http
                     .send(HttpRequest::get(result_url).header(hk, hv))
@@ -323,6 +411,83 @@ mod tests {
             }
             _ => panic!("expected json"),
         }
+    }
+
+    #[tokio::test]
+    async fn builtin_flux_route_uses_vendor_path_and_valid_image_size() {
+        // https://fal.ai/models/fal-ai/flux-pro/v1.1/api
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockfal/fal-ai/flux-pro/v1.1",
+            200,
+            json!({"request_id": "r"}),
+        );
+        let a = adapter(&mock);
+        let mut route = ModelRoute::parse("fal:flux-pro").unwrap();
+        route.vendor_model = "fal-ai/flux-pro/v1.1".into();
+        let mut params = ImageParams::new("cat", "16:9", 1);
+        params.resolution = Some("1024x1536".into());
+        a.submit(&route, &GenerationParams::Image(params))
+            .await
+            .unwrap();
+        match mock.last_call().unwrap().body {
+            Body::Json(body) => {
+                assert_eq!(body["image_size"], json!({"width": 1024, "height": 1536}));
+                assert!(body.get("aspect_ratio").is_none());
+            }
+            _ => panic!("expected JSON"),
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_kling_uses_image_endpoint_and_returned_poll_urls() {
+        // https://fal.ai/models/fal-ai/kling-video/v2.5-turbo/pro/image-to-video/api
+        let mock = MockTransport::new();
+        let endpoint = "https://mockfal/fal-ai/kling-video/v2.5-turbo/pro/image-to-video";
+        let status = "https://mockfal/fal-ai/kling-video/requests/r/status";
+        let response = "https://mockfal/fal-ai/kling-video/requests/r";
+        mock.on(
+            Method::Post,
+            endpoint,
+            200,
+            json!({"request_id":"r", "status_url":status, "response_url":response}),
+        );
+        mock.on(Method::Get, status, 200, json!({"status":"COMPLETED"}));
+        mock.on(
+            Method::Get,
+            response,
+            200,
+            json!({"video":{"url":"https://out/video.mp4"}}),
+        );
+        let a = adapter(&mock);
+        let mut route = ModelRoute::parse("fal:kling-video").unwrap();
+        route.vendor_model = "fal-ai/kling-video/v2.5-turbo/pro/text-to-video".into();
+        let params = VideoParams {
+            prompt: "scene".into(),
+            duration: 5,
+            aspect_ratio: "16:9".into(),
+            start_frame_url: Some("https://x/start.png".into()),
+            end_frame_url: Some("https://x/end.png".into()),
+            ..Default::default()
+        };
+        let job = a
+            .submit(&route, &GenerationParams::Video(params))
+            .await
+            .unwrap();
+        let request = mock.last_call().unwrap();
+        match request.body {
+            Body::Json(body) => {
+                assert_eq!(body["image_url"], "https://x/start.png");
+                assert_eq!(body["tail_image_url"], "https://x/end.png");
+                assert_eq!(body["duration"], "5");
+                assert!(body.get("enable_audio").is_none());
+                assert!(body.get("resolution").is_none());
+            }
+            _ => panic!("expected JSON"),
+        }
+        let done = a.poll(&job.id).await.unwrap();
+        assert_eq!(done.result_urls, Some(vec!["https://out/video.mp4".into()]));
     }
 
     #[tokio::test]

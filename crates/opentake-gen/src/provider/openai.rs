@@ -81,12 +81,15 @@ impl OpenAiAdapter {
     ) -> Result<GenerationJob, GenError> {
         use serde_json::json;
         let url = format!("{}/images/generations", self.api_base);
-        let body = json!({
+        let mut body = json!({
             "model": route.vendor_model,
             "prompt": p.prompt,
             "size": Self::image_size(p),
             "n": p.num_images,
         });
+        if let Some(quality) = &p.quality {
+            body["quality"] = json!(quality);
+        }
         let (hk, hv) = self.auth_header();
         let resp = self
             .http

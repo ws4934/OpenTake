@@ -1,6 +1,7 @@
 [
   {
     "id": "fal:flux-pro",
+    "vendorModel": "fal-ai/flux-pro/v1.1",
     "kind": "image",
     "displayName": "FLUX.1 [pro]",
     "allowedEndpoints": [],
@@ -15,6 +16,7 @@
   },
   {
     "id": "fal:flux-kontext",
+    "vendorModel": "fal-ai/flux-pro/kontext/text-to-image",
     "kind": "image",
     "displayName": "FLUX.1 Kontext",
     "allowedEndpoints": [],
@@ -29,20 +31,21 @@
   },
   {
     "id": "fal:kling-video",
+    "vendorModel": "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
     "kind": "video",
     "displayName": "Kling 2.5",
     "allowedEndpoints": [],
     "responseShape": "video",
     "uiCapabilities": {
       "durations": [5, 10],
-      "resolutions": ["720p", "1080p"],
+      "resolutions": null,
       "aspectRatios": ["16:9", "9:16", "1:1"],
       "supportsFirstFrame": true,
       "supportsLastFrame": true,
-      "maxReferenceImages": 4,
+      "maxReferenceImages": 0,
       "maxReferenceVideos": 0,
       "maxReferenceAudios": 0,
-      "maxTotalReferences": 4,
+      "maxTotalReferences": 0,
       "maxCombinedVideoRefSeconds": null,
       "maxCombinedAudioRefSeconds": null,
       "framesAndReferencesExclusive": false,
@@ -53,16 +56,17 @@
   },
   {
     "id": "replicate:seedance-1-pro",
+    "vendorModel": "bytedance/seedance-1-pro",
     "kind": "video",
     "displayName": "Seedance 1 Pro",
     "allowedEndpoints": [],
     "responseShape": "video",
     "uiCapabilities": {
       "durations": [5, 10],
-      "resolutions": ["480p", "720p", "1080p"],
+      "resolutions": ["480p", "1080p"],
       "aspectRatios": ["16:9", "9:16", "1:1", "4:3"],
       "supportsFirstFrame": true,
-      "supportsLastFrame": false,
+      "supportsLastFrame": true,
       "maxReferenceImages": 0,
       "maxReferenceVideos": 0,
       "maxReferenceAudios": 0,
@@ -85,7 +89,7 @@
       "resolutions": ["1024x1024", "1024x1536", "1536x1024"],
       "aspectRatios": ["1:1", "3:2", "2:3"],
       "qualities": ["low", "medium", "high"],
-      "supportsImageReference": true,
+      "supportsImageReference": false,
       "maxImages": 4
     }
   },
@@ -112,17 +116,18 @@
   },
   {
     "id": "elevenlabs:eleven-multilingual-v2",
+    "vendorModel": "eleven_multilingual_v2",
     "kind": "audio",
     "displayName": "ElevenLabs Multilingual v2",
     "allowedEndpoints": [],
     "responseShape": "audio",
     "uiCapabilities": {
       "category": "tts",
-      "voices": ["rachel", "drew", "clyde", "domi", "dave"],
+      "voices": ["rachel"],
       "defaultVoice": "rachel",
       "supportsLyrics": false,
       "supportsInstrumental": false,
-      "supportsStyleInstructions": true,
+      "supportsStyleInstructions": false,
       "durations": null,
       "minPromptLength": 1,
       "inputs": ["text"],
@@ -133,6 +138,7 @@
   },
   {
     "id": "elevenlabs:eleven-music",
+    "vendorModel": "music_v1",
     "kind": "audio",
     "displayName": "ElevenLabs Music",
     "allowedEndpoints": [],
@@ -141,9 +147,9 @@
       "category": "music",
       "voices": null,
       "defaultVoice": null,
-      "supportsLyrics": true,
+      "supportsLyrics": false,
       "supportsInstrumental": true,
-      "supportsStyleInstructions": true,
+      "supportsStyleInstructions": false,
       "durations": null,
       "minPromptLength": 1,
       "inputs": ["text"],
@@ -154,14 +160,15 @@
   },
   {
     "id": "replicate:topaz-upscale",
+    "vendorModel": "topazlabs/video-upscale",
     "kind": "upscale",
     "displayName": "Topaz Video Upscale",
     "allowedEndpoints": [],
-    "responseShape": "upscaledImage",
+    "responseShape": "video",
     "uiCapabilities": {
       "speed": "Medium",
       "p75DurationSeconds": 60,
-      "supportedTypes": ["video", "image"]
+      "supportedTypes": ["video"]
     }
   }
 ]
