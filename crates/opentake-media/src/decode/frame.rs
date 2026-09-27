@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use ffmpeg_sidecar::event::FfmpegEvent;
 use image::ImageEncoder;
+use rayon::prelude::*;
 
 use crate::cancel::MediaCancelToken;
 use crate::error::{MediaError, Result};
@@ -24,6 +25,11 @@ use crate::ff;
 use crate::frame::RgbaFrame;
 
 const FRAME_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Source positions and blend factors within this distance of a whole frame
+/// are that frame. Absorbs f64 error in `(n / target_fps) * source_fps`, so
+/// equal rates never request a spurious interpolation.
+const FRAME_POSITION_EPSILON: f64 = 1e-6;
 
 /// A frame decode request.
 #[derive(Clone, Debug)]
@@ -145,6 +151,24 @@ pub fn convert_frame_rate(
     Ok(samples)
 }
 
+/// Source-frame endpoints `(first, next, alpha)` for project frame
+/// `source_frame` on the `target_fps` timebase of an asset decoded at
+/// `source_fps`. A position within [`FRAME_POSITION_EPSILON`] of a whole frame
+/// snaps to it, giving `first == next` and `alpha == 0`.
+pub fn source_frame_pair(source_frame: i64, target_fps: f64, source_fps: f64) -> (i64, i64, f64) {
+    let timestamp = source_frame.max(0) as f64 / target_fps;
+    let position = timestamp * source_fps;
+    let whole = position.round();
+    let position = if (position - whole).abs() < FRAME_POSITION_EPSILON {
+        whole
+    } else {
+        position
+    };
+    let first = position.floor().max(0.0) as i64;
+    let next = position.ceil().max(0.0) as i64;
+    (first, next, position - first as f64)
+}
+
 /// Interpolate two equal-size RGBA frames at `alpha` in `[0, 1]`.
 ///
 /// The optical-flow path estimates a deterministic local block-motion field,
@@ -188,9 +212,9 @@ pub fn interpolate_frame_pair(
     };
 
     let alpha = alpha.clamp(0.0, 1.0);
-    let frame = if alpha == 0.0 {
+    let frame = if alpha <= FRAME_POSITION_EPSILON {
         first.clone()
-    } else if alpha == 1.0 {
+    } else if alpha >= 1.0 - FRAME_POSITION_EPSILON {
         last.clone()
     } else {
         match mode_used {
@@ -219,27 +243,41 @@ fn blend_frames(first: &RgbaFrame, last: &RgbaFrame, alpha: f64) -> RgbaFrame {
     RgbaFrame::new(first.width, first.height, rgba)
 }
 
+#[cfg(test)]
+thread_local! {
+    static OPTICAL_FLOW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn optical_flow_frame(first: &RgbaFrame, last: &RgbaFrame, alpha: f64) -> RgbaFrame {
+    #[cfg(test)]
+    OPTICAL_FLOW_CALLS.with(|calls| calls.set(calls.get() + 1));
     let flow = estimate_block_motion(first, last);
     let mut rgba = vec![0; first.rgba.len()];
-    for y in 0..first.height {
-        for x in 0..first.width {
-            let (motion_x, motion_y) = flow.at(x, y);
-            let x = x as f64;
-            let y = y as f64;
-            let from_first = sample_bilinear(first, x - alpha * motion_x, y - alpha * motion_y);
-            let from_last = sample_bilinear(
-                last,
-                x + (1.0 - alpha) * motion_x,
-                y + (1.0 - alpha) * motion_y,
-            );
-            let offset = ((y as u32 * first.width + x as u32) * 4) as usize;
-            for channel in 0..4 {
-                rgba[offset + channel] =
-                    lerp_channel(from_first[channel], from_last[channel], alpha);
+    // Rows are independent; each output byte is computed exactly as in a
+    // sequential pass, so the result does not depend on scheduling.
+    rgba.par_chunks_mut(first.width as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y = y as u32;
+            for x in 0..first.width {
+                let (motion_x, motion_y) = flow.at(x, y);
+                let from_first = sample_bilinear(
+                    first,
+                    x as f64 - alpha * motion_x,
+                    y as f64 - alpha * motion_y,
+                );
+                let from_last = sample_bilinear(
+                    last,
+                    x as f64 + (1.0 - alpha) * motion_x,
+                    y as f64 + (1.0 - alpha) * motion_y,
+                );
+                let offset = x as usize * 4;
+                for channel in 0..4 {
+                    row[offset + channel] =
+                        lerp_channel(from_first[channel], from_last[channel], alpha);
+                }
             }
-        }
-    }
+        });
     RgbaFrame::new(first.width, first.height, rgba)
 }
 
@@ -268,12 +306,18 @@ fn estimate_block_motion(first: &RgbaFrame, last: &RgbaFrame) -> BlockMotionFiel
     let rows = first.height.div_ceil(block_size);
     let search_radius = (block_size / 2).clamp(1, 12) as i32;
     let sample_step = (block_size / 8).max(1);
-    let mut vectors = Vec::with_capacity((columns * rows) as usize);
+    // Luma is computed once per pixel instead of once per candidate sample.
+    let first_luma = luma_plane(first);
+    let last_luma = luma_plane(last);
+    let width = first.width as usize;
 
-    for row in 0..rows {
-        for column in 0..columns {
-            let start_x = column * block_size;
-            let start_y = row * block_size;
+    // Blocks are independent and searched in the same candidate order as a
+    // sequential pass, so the field does not depend on scheduling.
+    let vectors = (0..columns * rows)
+        .into_par_iter()
+        .map(|block| {
+            let start_x = (block % columns) * block_size;
+            let start_y = (block / columns) * block_size;
             let end_x = (start_x + block_size).min(first.width);
             let end_y = (start_y + block_size).min(first.height);
             let mut best = (f64::INFINITY, i32::MAX, 0, 0);
@@ -292,9 +336,9 @@ fn estimate_block_motion(first: &RgbaFrame, last: &RgbaFrame) -> BlockMotionFiel
                             {
                                 255.0
                             } else {
-                                luma_at(last, target_x as u32, target_y as u32)
+                                last_luma[target_y as usize * width + target_x as usize]
                             };
-                            error += (luma_at(first, x, y) - target).abs();
+                            error += (first_luma[y as usize * width + x as usize] - target).abs();
                             samples += 1;
                         }
                     }
@@ -306,9 +350,9 @@ fn estimate_block_motion(first: &RgbaFrame, last: &RgbaFrame) -> BlockMotionFiel
                     }
                 }
             }
-            vectors.push((best.3 as f64, best.2 as f64));
-        }
-    }
+            (best.3 as f64, best.2 as f64)
+        })
+        .collect();
 
     BlockMotionField {
         block_size,
@@ -318,13 +362,18 @@ fn estimate_block_motion(first: &RgbaFrame, last: &RgbaFrame) -> BlockMotionFiel
     }
 }
 
-fn luma_at(frame: &RgbaFrame, x: u32, y: u32) -> f64 {
-    let offset = ((y * frame.width + x) * 4) as usize;
-    let r = frame.rgba[offset] as f64;
-    let g = frame.rgba[offset + 1] as f64;
-    let b = frame.rgba[offset + 2] as f64;
-    let a = frame.rgba[offset + 3] as f64 / 255.0;
-    (0.2126 * r + 0.7152 * g + 0.0722 * b) * a
+fn luma_plane(frame: &RgbaFrame) -> Vec<f64> {
+    frame
+        .rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let r = pixel[0] as f64;
+            let g = pixel[1] as f64;
+            let b = pixel[2] as f64;
+            let a = pixel[3] as f64 / 255.0;
+            (0.2126 * r + 0.7152 * g + 0.0722 * b) * a
+        })
+        .collect()
 }
 
 fn sample_bilinear(frame: &RgbaFrame, x: f64, y: f64) -> [u8; 4] {
@@ -825,6 +874,68 @@ mod tests {
     use std::process::Command;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    fn two_tone(value: u8) -> RgbaFrame {
+        let mut frame = RgbaFrame::black(8, 8);
+        for pixel in frame.rgba.chunks_mut(8) {
+            pixel[..3].copy_from_slice(&[value; 3]);
+        }
+        frame
+    }
+
+    #[test]
+    fn near_endpoint_alpha_returns_endpoint_without_optical_flow() {
+        let first = two_tone(40);
+        let last = two_tone(200);
+        OPTICAL_FLOW_CALLS.with(|calls| calls.set(0));
+        for (alpha, expected) in [(1e-12, &first), (1.0 - 1e-12, &last)] {
+            let result = interpolate_frame_pair(
+                &first,
+                &last,
+                alpha,
+                FrameInterpolationMode::OpticalFlow,
+                FrameInterpolationFallback::Error,
+                true,
+            )
+            .unwrap();
+            assert_eq!(&result.frame, expected);
+        }
+        assert_eq!(OPTICAL_FLOW_CALLS.with(|calls| calls.get()), 0);
+
+        interpolate_frame_pair(
+            &first,
+            &last,
+            0.5,
+            FrameInterpolationMode::OpticalFlow,
+            FrameInterpolationFallback::Error,
+            true,
+        )
+        .unwrap();
+        assert_eq!(OPTICAL_FLOW_CALLS.with(|calls| calls.get()), 1);
+    }
+
+    #[test]
+    fn equal_rates_map_every_frame_to_itself() {
+        for fps in [24.0, 25.0, 30.0, 50.0, 60.0] {
+            for n in 0..10_000 {
+                assert_eq!(
+                    source_frame_pair(n, fps, fps),
+                    (n, n, 0.0),
+                    "{fps} fps frame {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn differing_rates_keep_real_fractional_positions() {
+        // 24 fps source on a 30 fps timeline: frame 1 sits 0.8 into source 0.
+        let (first, next, alpha) = source_frame_pair(1, 30.0, 24.0);
+        assert_eq!((first, next), (0, 1));
+        assert!((alpha - 0.8).abs() < 1e-9);
+        assert_eq!(source_frame_pair(5, 30.0, 24.0), (4, 4, 0.0));
+        assert_eq!(source_frame_pair(-3, 30.0, 24.0), (0, 0, 0.0));
+    }
 
     // --- fit_within: pure scaling math ---
 

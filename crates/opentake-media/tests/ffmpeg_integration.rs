@@ -563,7 +563,7 @@ fn continuous_decode_scales_real_main10_frames_without_corruption() {
 /// Lossless frame-numbered clip: columns `2b..2b+1` are white when bit `b` of
 /// the source frame number is set, so the number survives whatever YUV range
 /// conversion the local ffmpeg applies. `vf` retimes the frames.
-fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
+fn make_numbered(path: &Path, fps: &str, frames: u32, vf: Option<&str>) -> bool {
     let mut command = Command::new("ffmpeg");
     command.args([
         "-v",
@@ -635,7 +635,7 @@ fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
     }
     let dir = tempfile::tempdir().unwrap();
     let clip = dir.path().join("numbered30.mp4");
-    if !make_numbered(&clip, 30, 150, None) {
+    if !make_numbered(&clip, "30", 150, None) {
         eprintln!("skip: could not generate test media");
         return;
     }
@@ -686,7 +686,7 @@ fn vfr_gap_single_and_streamed_frames_hold_the_last_displayed_frame() {
     let dir = tempfile::tempdir().unwrap();
     let clip = dir.path().join("vfr.mp4");
     // Source frames 0-29 at 0-0.967s, frame 30 onward shifted to 2.0s.
-    if !make_numbered(&clip, 30, 60, Some("setpts='if(gte(N,30),PTS+1/TB,PTS)'")) {
+    if !make_numbered(&clip, "30", 60, Some("setpts='if(gte(N,30),PTS+1/TB,PTS)'")) {
         eprintln!("skip: could not generate test media");
         return;
     }
@@ -710,7 +710,7 @@ fn mismatched_fps_single_and_streamed_frames_follow_floor_rule() {
     }
     let dir = tempfile::tempdir().unwrap();
     let clip = dir.path().join("numbered24.mp4");
-    if !make_numbered(&clip, 24, 60, None) {
+    if !make_numbered(&clip, "24", 60, None) {
         eprintln!("skip: could not generate test media");
         return;
     }
@@ -739,7 +739,7 @@ fn same_fps_single_and_streamed_frames_are_identity() {
     }
     let dir = tempfile::tempdir().unwrap();
     let clip = dir.path().join("numbered30.mp4");
-    if !make_numbered(&clip, 30, 90, None) {
+    if !make_numbered(&clip, "30", 90, None) {
         eprintln!("skip: could not generate test media");
         return;
     }
@@ -752,6 +752,33 @@ fn same_fps_single_and_streamed_frames_are_identity() {
         let (actual, index) = frame_at(&clip, timeline as f64 / 30.0);
         assert_eq!(index, timeline);
         assert!((actual - timeline as f64 / 30.0).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn ntsc_source_on_integer_timeline_matches_between_single_and_streamed_frames() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("numbered2997.mp4");
+    if !make_numbered(&clip, "30000/1001", 250, None) {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+    // Timeline frame F shows the last 29.97 fps source frame at or before
+    // F / 30 s; the drift accumulates instead of rounding to the nearest frame.
+    let expected = |timeline: i64| timeline * 1000 / 1001;
+    let streamed_frames = streamed(&clip, 30, 0, 248);
+    assert_eq!(
+        streamed_frames,
+        (0..248).map(|f| (f, expected(f))).collect::<Vec<_>>()
+    );
+    // Paused preview and export resolve Nearest through single-frame decode.
+    for timeline in [0, 1, 2, 29, 30, 31, 120, 247] {
+        let (_, index) = frame_at(&clip, timeline as f64 / 30.0);
+        assert_eq!(index, expected(timeline), "timeline frame {timeline}");
     }
 }
 
