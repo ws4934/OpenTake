@@ -628,7 +628,6 @@ mod tests {
             nat_size: (16.0, 16.0),
             crop_uv: (0.0, 0.0, 1.0, 1.0),
             opacity: 1.0,
-            needs_premultiply: false,
             clip_id: "fixture-clip",
             color_grade: None,
             lut: None,
@@ -781,13 +780,7 @@ mod tests {
         let invalid_path = temp.path().join("invalid-lottie.json");
         std::fs::write(&invalid_path, b"{not valid lottie}").expect("write invalid fixture");
         let mut media = HashMap::new();
-        media.insert(
-            "invalid".into(),
-            MediaInfo {
-                path: invalid_path,
-                straight_alpha: false,
-            },
-        );
+        media.insert("invalid".into(), MediaInfo { path: invalid_path });
         let mut state = PlaybackResolverState::new(
             media,
             HashMap::new(),
@@ -869,13 +862,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("missing image fixture");
         let missing_path = temp.path().join("gone.png");
         let mut media = HashMap::new();
-        media.insert(
-            "missing-image".into(),
-            MediaInfo {
-                path: missing_path,
-                straight_alpha: false,
-            },
-        );
+        media.insert("missing-image".into(), MediaInfo { path: missing_path });
         let mut state = PlaybackResolverState::new(
             media,
             HashMap::new(),

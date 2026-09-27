@@ -36,7 +36,7 @@
 ### 着色器（`gpu/shader.wgsl`）
 - **顶点**：quad `[0,1]²` → 乘 `nat` 得源像素 `[0,natW]×[0,natH]` → 行向量仿射 `p'=p·M`（CG 语义）映到画布像素（原点左下 y 上）→ NDC（wgpu NDC y 也向上，几何无需额外翻 y）。UV 取 crop 子矩形并**翻 v 一次**（`1-v`，对齐「纹理行 0=顶部」与「y 上」）；另算 `canvas_uv`（原点左上 y 下）供蒙版求值。
 - **片元像素链**（顺序固定，1:1 镜像 `opentake_domain::grade`，进阶效果落地部分）：
-  1. 取样后统一回到**直通（非预乘）**色：`FLAG_PREMULTIPLY` 决定是否需我方预乘（直通源）或先 un-premultiply（已预乘源），保证整条链数学无歧义。
+  1. 取样后统一回到**直通（非预乘）**色：纹理一律为预乘（直通帧在 `upload_rgba` 上传期预乘），先 un-premultiply，保证整条链数学无歧义。
   2. **绿幕抠图**（`FLAG_CHROMA`）：CbCr 色度距离 `smoothstep` 出 matte 缩 alpha + spill 抑制。
   3. **调色**（`FLAG_GRADE`）：调色定义在线性光，故 `srgb_to_linear` → `apply_grade_linear`（曝光 2^stops → 白平衡逐通道增益 → Lift/Gamma/Gain → 0.18 pivot 对比 → 709 luma 保亮饱和）→ `linear_to_srgb`。白平衡已在 CPU 端预解为逐通道增益。
   4. **蒙版**（线性/圆形）：每个 SDF 出覆盖（羽化 `smoothstep01` + 反相），多蒙版取交（乘积）缩 alpha；上限 `MASK_CAP=4`。

@@ -21,7 +21,7 @@
 - **[sandbox.md](sandbox.md)** — `sandbox.rs`：`SandboxPolicy`（网络默认全拒 / 超时熔断 / 文档大小上限 / 无文件系统访问，**建模为类型**）+ `AllowedOrigin`（仅 https/loopback、无通配、拒明文远程）+ 纯检查 `check_url`（`data:` 放行）/ `check_document_size`。
 - **[manifest-source.md](manifest-source.md)** — `source.rs`（值类型：`MotionSource` Code/Template、`MotionRenderRequest` camelCase + 范围校验、`RenderedClip` 磁盘帧 + 末帧定格、`ParamValue`、`limits` 硬上限）+ `manifest.rs`（`MotionPlugin` 模板清单：容错解码 + 严格 `validate`/`validate_params`、`DurationMode`/`FpsPolicy`/`ParamSpec`）+ `error.rs`（`MotionError` thiserror）。
 - **[cache.md](cache.md)** — `cache.rs`：`content_hash`（SHA-256 over 源+参数+fps+尺寸+透明，规范字节流 + `opentake-motion/v1` 版本前缀 + 参数类型标签 + `-0.0` 归一）+ `MotionCache`（`root/<hash>/`、`is_cached` 按帧数完整性判定 partial=miss、`frame_file` 零填充）。
-- **[integration.md](integration.md)** — `integration.rs`：`MotionClipSource` 把 `RenderedClip` 适配成 render 的 `SourceMetrics` + `FrameProvider`（`natural_size`/`needs_premultiply` 跟透明/过末端钳位/缺帧 None）+ `FrameDecoder` 解码器注入（PNG→RGBA 不硬接，调用层提供）。含 **Lottie 方法澄清**（`lottie_frame` 仅转发，非真 Lottie 源）。
+- **[integration.md](integration.md)** — `integration.rs`：`MotionClipSource` 把 `RenderedClip` 适配成 render 的 `SourceMetrics` + `FrameProvider`（`natural_size`/过末端钳位/缺帧 None）+ `FrameDecoder` 解码器注入（PNG→RGBA 不硬接，调用层提供）。含 **Lottie 方法澄清**（`lottie_frame` 仅转发，非真 Lottie 源）。
 
 ## 规格与设计
 

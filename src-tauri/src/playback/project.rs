@@ -10,7 +10,7 @@
 //! can hoist the single shared projection into one `pub(crate)` helper once all
 //! three paths are stable (tracked as a follow-up; see the export.rs header note).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use opentake_domain::{Clip, ClipType, MediaManifest, MediaSource, TextStyle, Timeline, Track};
@@ -22,7 +22,6 @@ pub struct MediaInfo {
     /// Absolute, decode-ready path (project-relative entries already joined to
     /// the bundle dir).
     pub path: PathBuf,
-    pub straight_alpha: bool,
 }
 
 /// A text clip projected from the timeline, keyed by clip id. The box's width /
@@ -36,20 +35,15 @@ pub struct TextInfo {
 }
 
 /// [`SourceMetrics`] backed by the media manifest: only intrinsic size is known
-/// here (orientation/alpha use the documented identity/false defaults; ffmpeg
-/// auto-rotates on decode in this cut), mirroring the preview/export adapters.
+/// here (orientation uses the documented identity default; ffmpeg auto-rotates
+/// on decode in this cut), mirroring the preview/export adapters.
 pub struct ManifestMetrics {
     pub sizes: HashMap<String, (u32, u32)>,
-    pub straight_alpha: HashSet<String>,
 }
 
 impl SourceMetrics for ManifestMetrics {
     fn natural_size(&self, media_ref: &str) -> Option<(u32, u32)> {
         self.sizes.get(media_ref).copied()
-    }
-
-    fn needs_premultiply(&self, media_ref: &str) -> bool {
-        self.straight_alpha.contains(media_ref)
     }
 }
 
@@ -143,13 +137,7 @@ pub fn project_media_with_proxies(
                 sizes.insert(entry.id.clone(), (w as u32, h as u32));
             }
         }
-        media.insert(
-            entry.id.clone(),
-            MediaInfo {
-                path,
-                straight_alpha: entry.carries_straight_alpha(),
-            },
-        );
+        media.insert(entry.id.clone(), MediaInfo { path });
     }
     (sizes, media)
 }

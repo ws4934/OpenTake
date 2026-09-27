@@ -5,6 +5,7 @@
 //! VRAM doesn't grow unbounded. Video frames are NOT long-lived here; the
 //! compositor uploads the current frame on demand.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
@@ -104,9 +105,12 @@ pub(crate) fn upload_lut_table_3d(
     }
 }
 
-/// Upload a [`DecodedFrame`] as an RGBA8 texture.
+/// Upload a [`DecodedFrame`] as a premultiplied-alpha RGBA8 texture.
 ///
-/// `srgb` selects the texture format: `Rgba8UnormSrgb` makes the sampler return
+/// Every texture the compositor samples is premultiplied: a straight-alpha
+/// frame (`premultiplied == false`, e.g. FFmpeg `rgba` output) is premultiplied
+/// here so bilinear filtering never blends the color of fully transparent
+/// texels into visible edges. Opaque frames upload unchanged. `srgb` selects the texture format: `Rgba8UnormSrgb` makes the sampler return
 /// linear values (hardware sRGB decode); `Rgba8Unorm` keeps raw bytes. The PoC
 /// composites in the sRGB non-linear domain (SPEC §3.7), so callers pass
 /// `srgb = false` to sample raw encoded bytes and blend them directly.
@@ -137,6 +141,11 @@ pub fn upload_rgba(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    let rgba = if frame.premultiplied {
+        Cow::Borrowed(frame.rgba.as_slice())
+    } else {
+        premultiply_rgba(&frame.rgba)
+    };
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: &texture,
@@ -144,7 +153,7 @@ pub fn upload_rgba(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &frame.rgba,
+        &rgba,
         wgpu::ImageDataLayout {
             offset: 0,
             bytes_per_row: Some(frame.width * 4),
@@ -159,6 +168,23 @@ pub fn upload_rgba(
         width: frame.width,
         height: frame.height,
     }
+}
+
+/// Premultiply straight RGBA8 (`c = round(c * a / 255)`), borrowing the input
+/// untouched when every pixel is opaque.
+fn premultiply_rgba(rgba: &[u8]) -> Cow<'_, [u8]> {
+    let pixels = rgba.as_chunks::<4>().0;
+    if pixels.iter().all(|px| px[3] == u8::MAX) {
+        return Cow::Borrowed(rgba);
+    }
+    let mut out = rgba.to_vec();
+    for px in out.as_chunks_mut::<4>().0 {
+        let a = u16::from(px[3]);
+        for c in &mut px[..3] {
+            *c = ((u16::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// LRU cache mapping an opaque content-hash key to a shared [`GpuTexture`].
@@ -238,5 +264,24 @@ mod tests {
         let c = TextureCache::new(0);
         assert_eq!(c.capacity, 1);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn premultiply_scales_color_by_alpha() {
+        let straight = [
+            255, 255, 255, 128, 255, 0, 0, 64, 0, 255, 0, 0, 10, 20, 30, 255,
+        ];
+        assert_eq!(
+            premultiply_rgba(&straight).as_ref(),
+            &[128, 128, 128, 128, 64, 0, 0, 64, 0, 0, 0, 0, 10, 20, 30, 255]
+        );
+    }
+
+    #[test]
+    fn premultiply_borrows_opaque_frames_unchanged() {
+        let opaque = [1, 2, 3, 255, 250, 128, 0, 255];
+        let out = premultiply_rgba(&opaque);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), &opaque);
     }
 }

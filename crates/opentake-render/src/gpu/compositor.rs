@@ -25,7 +25,6 @@ use opentake_domain::{MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS};
 const MASK_CAP: usize = MAX_MASKS_PER_CLIP;
 
 /// Flag bits packed into `canvas_op_flags[3]` (bitcast to u32 in WGSL).
-const FLAG_PREMULTIPLY: u32 = 1;
 const FLAG_GRADE: u32 = 2;
 const FLAG_CHROMA: u32 = 4;
 
@@ -583,11 +582,7 @@ impl Compositor {
                 continue;
             };
             // Assemble flags + the A-tier parameter blocks for this draw.
-            let mut flags: u32 = if draw.needs_premultiply {
-                FLAG_PREMULTIPLY
-            } else {
-                0
-            };
+            let mut flags: u32 = 0;
             let grade = match draw.color_grade {
                 Some(g) if !g.is_identity() => {
                     flags |= FLAG_GRADE;

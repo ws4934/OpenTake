@@ -49,7 +49,7 @@ fn full_pipeline_render_cache_and_ingest() {
     // Consume the clip through the render-crate clip-source traits.
     let source = MotionClipSource::new(clip, image_decoder);
     assert_eq!(source.natural_size("motion-ref"), Some((320, 180)));
-    assert!(source.needs_premultiply("motion-ref")); // transparent overlay
+    assert!(source.clip().transparent); // straight-alpha overlay, premultiplied at upload
 
     let frame3 = source
         .decoded_frame("motion-ref", 3)

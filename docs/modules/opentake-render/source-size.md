@@ -15,7 +15,6 @@
 - `SourceMetrics`（建 plan 时一次性纯元数据查询，不解码）：
   - `natural_size(media_ref)`：视频解码帧尺寸 / 图片像素尺寸 / Lottie 画布尺寸（上游 `imageNativeSize` / `naturalSize`）。
   - `preferred_transform(media_ref)`：容器 display matrix → 行优先 6 元组（默认单位，上游 `preferredTransform`，media 侧用 ffprobe rotate/display matrix 实现）。
-  - `needs_premultiply(media_ref)`：源是否直通 alpha 需预乘（默认 false，上游 `trackContainsAlpha`）。
   - `lottie_frame_count(media_ref)`：Lottie 内部总帧数（取模用，默认 None）。
   - 除 `natural_size` 外均有默认实现，最小实现只需 `natural_size`。
 - `FrameProvider`（合成时逐帧惰性拉像素）：`decoded_frame(media_ref, source_frame)`（预览解到最近关键帧丢帧 / 导出顺序解码）、`image_pixels(media_ref)`（单帧，上游 `createPixelBuffer` sRGB 预乘等价）、`lottie_frame(media_ref, frame)`（预乘 RGBA）。
@@ -35,10 +34,10 @@
 - **render 不碰 IO**：解码、文件系统、`media_ref` 解析全在实现侧（media / 调用方）；本 crate 只持 trait 与纯函数。
 - **`DecodedFrame` 形状**：`rgba.len() == width*height*4`，行优先左上原点；`premultiplied` 如实标注（合成器据此决定是否 un-premultiply）。
 - **导出尺寸偶数 ≥2**：编码器要求；短边缩放语义按 `ExportResolution`（不夹 1.0）。
-- **`preferred_transform` 默认单位、`needs_premultiply` 默认 false、`lottie_frame_count` 默认 None**：最小实现安全可用。
+- **`preferred_transform` 默认单位、`lottie_frame_count` 默认 None**：最小实现安全可用。
 
 ## 关系
-- `SourceMetrics` 被 [render-plan.md](render-plan.md) 的 `build_render_plan` 调用，决定 `nat_size` / `preferred_transform` / `needs_premultiply` / `lottie_frame_count`。
+- `SourceMetrics` 被 [render-plan.md](render-plan.md) 的 `build_render_plan` 调用，决定 `nat_size` / `preferred_transform` / `lottie_frame_count`。
 - `FrameProvider` / `DecodedFrame` 供 [gpu-compositor.md](gpu-compositor.md) 经 `TextureResolver` 取像素；实现侧见 [opentake-media 规格 SPEC](../opentake-media/SPEC.md)（ffmpeg 解码 + display matrix + alpha 探测）。
 - `export_render_size` 供导出后端（src-tauri）定画布像素尺寸。
 

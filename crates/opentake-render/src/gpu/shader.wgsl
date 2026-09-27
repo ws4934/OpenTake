@@ -34,7 +34,6 @@ const POLY_POINT_CAP: u32 = 16u;
 const EFFECT_CAP: u32 = 8u;
 
 // Flag bits packed into U.canvas_op_flags.w (bitcast to u32).
-const FLAG_PREMULTIPLY: u32 = 1u;   // straight-alpha source needs premultiply
 const FLAG_GRADE: u32 = 2u;         // color grade active
 const FLAG_CHROMA: u32 = 4u;        // chroma key active
 
@@ -499,21 +498,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let flags = bitcast<u32>(u.canvas_op_flags.w);
 
     // Work on STRAIGHT (non-premultiplied) color so chroma/grade/mask math is
-    // unambiguous. The source is either already straight (FLAG_PREMULTIPLY clear)
-    // or premultiplied (set) — un-premultiply the latter, run the chain, then
-    // premultiply once at the end. This keeps the whole A-tier chain correct
-    // regardless of source alpha state.
+    // unambiguous. Every source texture is premultiplied (straight frames are
+    // premultiplied at upload, `upload_rgba`) so bilinear filtering never bleeds
+    // the color of fully transparent texels: un-premultiply the sample, run the
+    // chain, then premultiply once at the end. (Guard divide-by-zero.)
     var rgb = sampled.rgb;
     var alpha = sampled.a;
-    if ((flags & FLAG_PREMULTIPLY) == 0u) {
-        // Source was already premultiplied (no premultiply requested) -> recover
-        // straight rgb for the chain. (Guard divide-by-zero.)
-        if (alpha > 1e-6) {
-            rgb = rgb / alpha;
-        }
+    if (alpha > 1e-6) {
+        rgb = rgb / alpha;
     }
-    // else: FLAG_PREMULTIPLY set means the source is STRAIGHT alpha and must be
-    // premultiplied by us; rgb is already straight, nothing to undo.
 
     // 1. Chroma key (matte from straight source color; suppress spill).
     if ((flags & FLAG_CHROMA) != 0u) {
