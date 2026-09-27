@@ -4999,6 +4999,7 @@ fn create_media_proxy_blocking(
     let proxy = MediaProxy {
         relative_path: relative_path.clone(),
         source_sha256: created.source_sha256.clone(),
+        source_stamp: created.source_stamp,
         width: created.width,
         height: created.height,
     };
@@ -8309,6 +8310,7 @@ mod tests {
                 relative_path: "media/proxies/proxy.mp4".into(),
                 source_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
+                source_stamp: None,
                 width: 1280,
                 height: 720,
             }),
@@ -8396,6 +8398,7 @@ mod tests {
                 relative_path: "media/proxies/proxy.mp4".into(),
                 source_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
+                source_stamp: None,
                 width: 1280,
                 height: 720,
             }),

@@ -141,6 +141,7 @@ fn unrelated_history_keeps_latest_relink_proxy_and_generation_results() {
     entry.proxy = Some(MediaProxy {
         relative_path: "media/proxy.mp4".into(),
         source_sha256: "a".repeat(64),
+        source_stamp: None,
         width: 640,
         height: 360,
     });
@@ -173,6 +174,7 @@ fn registration_stays_undoable_without_removing_later_imports() {
     state.manifest.entries[1].proxy = Some(MediaProxy {
         relative_path: "media/proxy.mp4".into(),
         source_sha256: "b".repeat(64),
+        source_stamp: None,
         width: 640,
         height: 360,
     });

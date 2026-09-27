@@ -11,7 +11,8 @@
 //! moves its playhead from the `playback_frame` events; scrub / pause stay on the
 //! existing `<video>` + `composite_frame` path (wired in PR3).
 
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, State};
@@ -26,7 +27,10 @@ use super::audio::{
 use super::engine::{
     BoundedReaper, FrameSink, PlaybackClock, PlaybackEngine, PlayheadEmitter, ReapPermit,
 };
-use super::project::{project_media_with_proxies, project_text, source_preview_timeline};
+use super::project::{
+    project_media_with_proxies_for_refs, project_text, source_preview_timeline,
+    timeline_media_refs, PendingProxyCheck,
+};
 use super::session::{
     PlaybackCommandError, PlaybackIdentity, ProjectTransition, SessionControl, SessionRegistry,
     StartDecision, StartTicket,
@@ -43,6 +47,7 @@ const PAUSED_PREPARE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// stream); `_audio` is `None` for a silent timeline (wall-clock driven).
 struct RunningPlayback {
     identity: PlaybackIdentity,
+    proxy_check_cancel: opentake_media::MediaCancelToken,
     engine: PlaybackEngine,
     audio: Option<super::audio::AudioPlayback>,
     publication: PublicationGate,
@@ -54,6 +59,7 @@ type PreparedAudio =
     Result<(Arc<dyn PlaybackClock>, Option<AudioPlayback>), opentake_media::MediaError>;
 
 struct PlaybackResources {
+    proxy_check_cancel: opentake_media::MediaCancelToken,
     engine: PlaybackEngine,
     audio: Option<AudioPlayback>,
     publication: PublicationGate,
@@ -66,6 +72,7 @@ impl RunningPlayback {
     }
 
     fn shutdown(self) -> Result<(), PlaybackCommandError> {
+        self.proxy_check_cancel.cancel();
         self.publication.close();
         if let Some(server) = self.server.as_ref() {
             server.clear_session(&self.identity);
@@ -362,6 +369,7 @@ impl PlaybackState {
     ) -> Result<(), PlaybackCommandError> {
         let identity = ticket.identity().clone();
         let PlaybackResources {
+            proxy_check_cancel,
             engine,
             audio,
             publication,
@@ -374,6 +382,7 @@ impl PlaybackState {
             publication.close();
             let running = RunningPlayback {
                 identity,
+                proxy_check_cancel,
                 engine,
                 audio,
                 publication,
@@ -389,6 +398,7 @@ impl PlaybackState {
                 drop(slot);
                 let running = RunningPlayback {
                     identity,
+                    proxy_check_cancel,
                     engine,
                     audio,
                     publication,
@@ -404,6 +414,7 @@ impl PlaybackState {
             drop(slot);
             let running = RunningPlayback {
                 identity,
+                proxy_check_cancel,
                 engine,
                 audio,
                 publication,
@@ -418,6 +429,7 @@ impl PlaybackState {
         }
         slot.running = Some(RunningPlayback {
             identity,
+            proxy_check_cancel,
             engine,
             audio,
             publication,
@@ -472,6 +484,7 @@ impl PlaybackState {
                 let running = slot.running.as_ref().ok_or_else(|| {
                     PlaybackCommandError::superseded("playback session is no longer installed")
                 })?;
+                running.proxy_check_cancel.cancel();
                 // Freeze every observable output before touching audio or waiting
                 // on the render thread. A decode already in flight can finish,
                 // but its pixels and playhead tick cannot cross this gate.
@@ -507,6 +520,7 @@ impl PlaybackState {
         slot.paused_prepare_restart = None;
         Self::cancel_prepare(&mut slot);
         if let Some(running) = slot.running.as_ref() {
+            running.proxy_check_cancel.cancel();
             running.close_publication();
             if let Some(server) = running.server.as_ref() {
                 server.clear_session(&running.identity);
@@ -667,6 +681,68 @@ fn cleanup_audio_after_engine_ready_failure(
         .map_err(PlaybackCommandError::engine)
 }
 
+/// Validate old or changed proxy sources away from playback startup. Only one
+/// full-file hash may run at once; a stopped session cancels queued and active
+/// checks. The core compare-and-set also rejects a superseded proxy or project.
+fn revalidate_proxies_in_background(
+    core: AppCore,
+    project_epoch: u64,
+    project_dir: PathBuf,
+    pending: Vec<PendingProxyCheck>,
+    cancel: opentake_media::MediaCancelToken,
+) {
+    static HASH_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let limit = HASH_LIMIT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    for check in pending {
+        let limit = Arc::clone(&limit);
+        let core = core.clone();
+        let dir = project_dir.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let permit = loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                match tokio::time::timeout(
+                    Duration::from_millis(100),
+                    limit.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => break permit,
+                    Ok(Err(_)) => return,
+                    Err(_) => continue,
+                }
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if cancel.checkpoint() {
+                    return;
+                }
+                let Ok(Some((stamp, hash))) =
+                    opentake_media::file_sha256_with_stamp_cancellable(&check.source_path, &cancel)
+                else {
+                    return;
+                };
+                if cancel.checkpoint() {
+                    return;
+                }
+                let verified_stamp = (hash == check.proxy.source_sha256).then_some(stamp);
+                let _ = core.reconcile_media_proxy_for_project(
+                    project_epoch,
+                    &dir,
+                    &check.asset_id,
+                    &check.proxy,
+                    verified_stamp,
+                );
+            })
+            .await;
+        });
+    }
+}
+
 /// Start (or restart) continuous playback from `from_frame`.
 ///
 /// `from_frame` is the current playhead (the front end owns playhead state). The
@@ -712,8 +788,9 @@ pub async fn playback_start(
     // the await below (Tauri async commands require a Send future).
     let (
         timeline,
-        sizes,
-        media,
+        manifest,
+        referenced,
+        prefer_proxy,
         text,
         render_size,
         fps,
@@ -732,7 +809,7 @@ pub async fn playback_start(
             None => root_timeline,
         };
         let prefer_proxy = app.state::<crate::media::MediaProxyState>().enabled();
-        let (sizes, media) = project_media_with_proxies(&manifest, &project_dir, prefer_proxy);
+        let referenced = timeline_media_refs(&timeline);
         let text = project_text(&timeline);
         let render_size =
             playback_render_size(timeline.width, timeline.height, PLAYBACK_PREVIEW_CAP);
@@ -748,8 +825,9 @@ pub async fn playback_start(
         let sink: Arc<dyn FrameSink> = Arc::new(concrete_sink);
         (
             timeline,
-            sizes,
-            media,
+            manifest,
+            referenced,
+            prefer_proxy,
             text,
             render_size,
             fps,
@@ -760,6 +838,38 @@ pub async fn playback_start(
             project_dir,
         )
     };
+
+    // Path confinement and file metadata are synchronous I/O. Only resolve
+    // sources actually reachable from this playback timeline, off the async
+    // executor, and never read a full original merely to start playback.
+    let projection_dir = project_dir.clone();
+    let projection_cancel = cancel.clone();
+    let projected = spawn_ready_off_executor(move || {
+        if projection_cancel.checkpoint() {
+            return Err("playback source preparation cancelled".into());
+        }
+        Ok(project_media_with_proxies_for_refs(
+            &manifest,
+            &projection_dir,
+            prefer_proxy,
+            Some(&referenced),
+        ))
+    })
+    .await;
+    let (sizes, media, pending_proxies) = match projected {
+        Ok(projected) if !cancel.is_cancelled() => projected,
+        Ok(_) => {
+            app.state::<PlaybackState>().finish_prepare(&cancel);
+            return Err(PlaybackCommandError::cancelled(
+                "playback source preparation cancelled",
+            ));
+        }
+        Err(error) => {
+            app.state::<PlaybackState>().finish_prepare(&cancel);
+            return Err(error);
+        }
+    };
+    let verification_dir = project_dir.clone();
 
     // Decoding + mixing the whole timeline's audio (ffmpeg per clip) can take
     // seconds on a long project; run it (and cpal setup) off the IPC thread so
@@ -835,11 +945,13 @@ pub async fn playback_start(
         }
     };
     let current = app.state::<AppCore>().project_revision();
+    let proxy_check_cancel = opentake_media::MediaCancelToken::new();
     let result = app.state::<PlaybackState>().install_if_current(
         ticket,
         cleanup,
         current,
         PlaybackResources {
+            proxy_check_cancel: proxy_check_cancel.clone(),
             engine,
             audio,
             publication,
@@ -848,6 +960,17 @@ pub async fn playback_start(
         start_at,
         &cancel,
     );
+    if result.is_ok() {
+        if let Some(project_dir) = verification_dir {
+            revalidate_proxies_in_background(
+                app.state::<AppCore>().inner().clone(),
+                authoritative.project_epoch,
+                project_dir,
+                pending_proxies,
+                proxy_check_cancel,
+            );
+        }
+    }
     result
 }
 
@@ -945,6 +1068,7 @@ mod tests {
                 .expect("install playback session");
             slot.running = Some(RunningPlayback {
                 identity,
+                proxy_check_cancel: opentake_media::MediaCancelToken::new(),
                 engine,
                 audio: None,
                 publication: gate.clone(),
@@ -1108,6 +1232,7 @@ mod tests {
                 cleanup,
                 pending_identity.revision(),
                 PlaybackResources {
+                    proxy_check_cancel: opentake_media::MediaCancelToken::new(),
                     engine,
                     audio: Some(audio),
                     publication: publication.clone(),
@@ -1659,6 +1784,7 @@ mod tests {
                 cleanup,
                 current.revision(),
                 PlaybackResources {
+                    proxy_check_cancel: opentake_media::MediaCancelToken::new(),
                     engine,
                     audio: Some(audio),
                     publication,

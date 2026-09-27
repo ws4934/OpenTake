@@ -88,12 +88,26 @@ impl MediaColorMetadata {
 
 /// Project-local low-resolution media used only for interactive playback.
 /// Export always resolves [`MediaManifestEntry::source`]. The source digest
-/// prevents a stale proxy being paired with bytes that changed in place.
+/// prevents a stale proxy being paired with bytes that changed in place; the
+/// retained source stamp avoids rereading large files every time playback starts.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaSourceStamp {
+    pub len: u64,
+    pub modified_ns: i64,
+    /// Native device/inode or volume/file ID, prefixed with its platform.
+    pub file_id: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaProxy {
     pub relative_path: String,
     pub source_sha256: String,
+    /// Older bundles lack a source stamp and safely fall back to the original
+    /// while their proxy digest is checked on a background worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_stamp: Option<MediaSourceStamp>,
     pub width: u32,
     pub height: u32,
 }
@@ -705,6 +719,18 @@ impl MediaAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_proxy_without_source_stamp_still_decodes() {
+        let proxy: MediaProxy = serde_json::from_str(
+            r#"{"relativePath":"media/proxies/old.mp4","sourceSha256":"abc","width":640,"height":360}"#,
+        )
+        .unwrap();
+        assert_eq!(proxy.source_stamp, None);
+        assert!(!serde_json::to_string(&proxy)
+            .unwrap()
+            .contains("sourceStamp"));
+    }
 
     // --- MediaSource ---
 

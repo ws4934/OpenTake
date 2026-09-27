@@ -63,6 +63,7 @@ pub use lut::{CubeLut, CubeLutError, LutReference, LutReferenceValidationError};
 pub use media::{
     GenerationInput, GenerationJobStatus, GenerationStatus, MediaAsset, MediaColorMetadata,
     MediaFolder, MediaManifest, MediaManifestEntry, MediaProxy, MediaResolver, MediaSource,
+    MediaSourceStamp,
 };
 pub use signal::{
     ContextSignal, EditingSkeleton, EditingStage, StageGuidance, TrackHint, TrackRole,
