@@ -195,6 +195,7 @@ Closes #28
 - Keep a PR in draft while it is incomplete, unverified or waiting on another PR; mark it ready for review afterwards.
 - Merge only when PR checks and the PR message check pass and review feedback is resolved. Never skip or delete tests to make CI pass.
 - Merge method: squash merge, with the PR title as the commit subject.
+- Branch cleanup: delete the head branch as soon as its PR is merged, on GitHub and in your clone. The repository setting "Automatically delete head branches" does this on merge; otherwise use `gh pr merge --squash --delete-branch` or the "Delete branch" button. When a PR is closed without merging, delete its branch too unless the work will continue in a new PR. Fork branches belong to their authors.
 - Syncing with `main`: rebase or merge on your own branch; only merge (never force-push) on someone else's branch.
 - Changing someone else's PR: prefer review comments; if you push to it directly, leave a PR comment describing the change.
 
@@ -216,6 +217,14 @@ gh issue create \
 gh pr create --draft --base main \
   --title "fix(export): keep the old movie until the new export succeeds (#28)" \
   --body-file pr.md
+
+# Squash-merge a PR and delete its branch
+gh pr merge 123 --squash --delete-branch
+
+# Drop local branches whose remote branch is gone
+git fetch --prune
+git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads \
+  | awk '$2 == "[gone]" {print $1}' | xargs -r git branch -D
 
 # Check a PR title and description locally
 python3 scripts/check_pr_message.py \
