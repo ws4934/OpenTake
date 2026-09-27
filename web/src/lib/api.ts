@@ -1303,6 +1303,7 @@ export async function applyCaptionTranslationReview(
       request: {
         projectEpoch: result.projectEpoch,
         version: result.version,
+        projectDir: result.projectDir,
         sourceLocale: result.sourceLocale,
         targetLocale: result.targetLocale,
         provider: result.provider,

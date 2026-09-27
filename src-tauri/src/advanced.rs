@@ -15,8 +15,8 @@ use opentake_agent::tools::args::{
 };
 use opentake_agent::tools::names::ToolName;
 use opentake_core::{
-    AppCore, DerivedStemProvenance, MotionPlacement, PreparedMediaImportOp, ProbedMedia,
-    ProjectRevision,
+    AppCore, DerivedStemProvenance, GeneratedMediaExpectation, MotionPlacement,
+    PreparedMediaImportOp, ProbedMedia, ProjectRevision,
 };
 use opentake_domain::{
     luma709, AnimPair, CaptionTranslationInput, ColorGrade, ColorMatchInput, GenerationInput,
@@ -1050,7 +1050,7 @@ pub async fn advanced_clone_voice(
 #[serde(rename_all = "camelCase")]
 pub struct ApplyCaptionTranslationReviewRequest {
     project_epoch: u64,
-    version: u64,
+    project_dir: Option<PathBuf>,
     source_locale: String,
     target_locale: String,
     provider: String,
@@ -1111,11 +1111,9 @@ pub fn advanced_apply_caption_translation_review(
     let edit = state
         .bridge
         .core
-        .apply_at_revision(
-            ProjectRevision {
-                project_epoch: request.project_epoch,
-                version: request.version,
-            },
+        .apply_for_project(
+            request.project_epoch,
+            request.project_dir.as_deref(),
             EditCommand::ApplyCaptionTranslations { changes },
         )
         .map_err(|error| error.to_string())?;
@@ -1338,6 +1336,13 @@ impl TauriAdvancedWorkflowBridge {
             .find(|clip| clip.id == args.clip_id)
             .cloned()
             .ok_or_else(|| advanced_resource(format!("clip not found: {}", args.clip_id)))?;
+        let expectation = GeneratedMediaExpectation::for_placement(
+            &snapshot,
+            &MotionPlacement::Replace {
+                clip_id: clip.id.clone(),
+            },
+        )
+        .map_err(|error| advanced_execution(error.to_string()))?;
         if clip.media_type != opentake_domain::ClipType::Video
             || clip.nested_sequence_id.is_some()
             || clip.reversed
@@ -1472,9 +1477,12 @@ impl TauriAdvancedWorkflowBridge {
                 source_end_frame: Some(end),
                 ..GenerationInput::default()
             };
+            // Preserve the rendered bytes if the target clip changes before
+            // the edit can be registered; the user can import this output.
+            published.commit();
             let committed = self.core.commit_motion_media_for_project(
                 snapshot.project_epoch,
-                snapshot.version,
+                expectation,
                 &project_dir,
                 published.path(),
                 "AI Matte",
@@ -1497,9 +1505,13 @@ impl TauriAdvancedWorkflowBridge {
             );
             let committed = match committed {
                 Ok(committed) => committed,
-                Err(error) => return Err(advanced_execution(error.to_string())),
+                Err(error) => {
+                    return Err(advanced_execution(format!(
+                        "{error}; generated output retained at {} for recovery",
+                        published.path().display()
+                    )))
+                }
             };
-            published.commit();
             asset_id = Some(committed.media.id);
             action_name = Some(committed.edit.action_name);
             true
@@ -1562,6 +1574,13 @@ impl TauriAdvancedWorkflowBridge {
             .find(|clip| clip.id == args.clip_id)
             .cloned()
             .ok_or_else(|| advanced_resource(format!("clip not found: {}", args.clip_id)))?;
+        let expectation = GeneratedMediaExpectation::for_placement(
+            &snapshot,
+            &MotionPlacement::ReplaceAndClearMasks {
+                clip_id: clip.id.clone(),
+            },
+        )
+        .map_err(|error| advanced_execution(error.to_string()))?;
         if clip.media_type != opentake_domain::ClipType::Video
             || clip.nested_sequence_id.is_some()
             || clip.reversed
@@ -1694,11 +1713,12 @@ impl TauriAdvancedWorkflowBridge {
                 source_end_frame: Some(end),
                 ..GenerationInput::default()
             };
+            published.commit();
             let committed = self
                 .core
                 .commit_generated_media_for_project(
                     snapshot.project_epoch,
-                    snapshot.version,
+                    expectation,
                     &project_dir,
                     published.path(),
                     "Object Removed",
@@ -1721,8 +1741,12 @@ impl TauriAdvancedWorkflowBridge {
                     },
                     "Remove Masked Object",
                 )
-                .map_err(|error| advanced_execution(error.to_string()))?;
-            published.commit();
+                .map_err(|error| {
+                    advanced_execution(format!(
+                        "{error}; generated output retained at {} for recovery",
+                        published.path().display()
+                    ))
+                })?;
             asset_id = Some(committed.media.id);
             action_name = Some(committed.edit.action_name);
             true
@@ -2331,11 +2355,9 @@ impl TauriAdvancedWorkflowBridge {
         let (applied, action_name) = if apply_requested {
             let edit = self
                 .core
-                .apply_at_revision(
-                    ProjectRevision {
-                        project_epoch: snapshot.project_epoch,
-                        version: snapshot.version,
-                    },
+                .apply_for_project(
+                    snapshot.project_epoch,
+                    snapshot.project_dir.as_deref(),
                     EditCommand::ApplyCaptionTranslations { changes },
                 )
                 .map_err(|error| advanced_execution(error.to_string()))?;
@@ -2358,6 +2380,7 @@ impl TauriAdvancedWorkflowBridge {
             result: json!({
                 "projectEpoch": snapshot.project_epoch,
                 "version": snapshot.version,
+                "projectDir": snapshot.project_dir,
                 "sourceLocale": source_locale,
                 "targetLocale": target_locale,
                 "provider": provider,
@@ -2668,6 +2691,10 @@ impl TauriAdvancedWorkflowBridge {
         let media_dir = project_dir.join(opentake_project::layout::MEDIA_DIR);
         std::fs::create_dir_all(&media_dir)
             .map_err(|_| advanced_execution("project media directory is unavailable"))?;
+        let start_frame = args.start_frame.unwrap_or(snapshot.timeline.total_frames());
+        if start_frame < 0 {
+            return Err(advanced_invalid("startFrame must be non-negative"));
+        }
         let destination = media_dir.join(format!("avatar-{}.mp4", uuid::Uuid::new_v4()));
         let output = self.avatar_provider.generate(
             &AvatarProviderRequest {
@@ -2679,12 +2706,16 @@ impl TauriAdvancedWorkflowBridge {
             cancel,
         )?;
         if cancel.checkpoint() {
-            let _ = std::fs::remove_file(&destination);
-            return Err(cancelled_workflow("avatar generation cancelled"));
+            return Err(cancelled_workflow(format!(
+                "avatar generation cancelled; completed output retained at {}",
+                destination.display()
+            )));
         }
         let output_probe = probe(&destination).map_err(|error| {
-            let _ = std::fs::remove_file(&destination);
-            media_workflow_error(error)
+            advanced_execution(format!(
+                "avatar output probe failed: {error}; output retained at {}",
+                destination.display()
+            ))
         })?;
         let fps = snapshot.timeline.fps.max(1) as f64;
         if !output_probe.has_video
@@ -2692,15 +2723,9 @@ impl TauriAdvancedWorkflowBridge {
             || output_probe.duration_secs <= 0.0
             || ((output_probe.duration_secs - audio.duration) * fps).abs() > 1.0
         {
-            let _ = std::fs::remove_file(&destination);
             return Err(advanced_execution(
-                "avatar output must contain synchronized video/audio matching narration within one frame",
+                format!("avatar output at {} must contain synchronized video/audio matching narration within one frame", destination.display()),
             ));
-        }
-        let start_frame = args.start_frame.unwrap_or(snapshot.timeline.total_frames());
-        if start_frame < 0 {
-            let _ = std::fs::remove_file(&destination);
-            return Err(advanced_invalid("startFrame must be non-negative"));
         }
         let duration_frames = (output_probe.duration_secs * fps).round().max(1.0) as i32;
         let aspect_ratio = output_probe
@@ -2742,7 +2767,7 @@ impl TauriAdvancedWorkflowBridge {
             .core
             .commit_generated_media_for_project(
                 snapshot.project_epoch,
-                snapshot.version,
+                GeneratedMediaExpectation::TimelineFps(snapshot.timeline.fps),
                 &project_dir,
                 &destination,
                 "Generated avatar",
@@ -2757,8 +2782,10 @@ impl TauriAdvancedWorkflowBridge {
                 "Generate Avatar",
             )
             .map_err(|error| {
-                let _ = std::fs::remove_file(&destination);
-                advanced_execution(error.to_string())
+                advanced_execution(format!(
+                    "{error}; generated output retained at {} for recovery",
+                    destination.display()
+                ))
             })?;
         Ok(AdvancedWorkflowCommit {
             result: json!({
@@ -2865,12 +2892,9 @@ impl TauriAdvancedWorkflowBridge {
                     },
                     cancel,
                 )?;
-                if cancel.checkpoint() {
-                    let _ = self
-                        .voice_provider
-                        .revoke(&provider_voice_id, &MediaCancelToken::new());
-                    return Err(cancelled_workflow("voice enrollment cancelled"));
-                }
+                // A completed remote enrollment has already been paid for.
+                // Persist it even if cancellation arrived while the provider
+                // was returning, so the user can revoke it deliberately later.
                 let record = VoiceModelRecord {
                     id: voice_model_id.clone(),
                     provider: PROVIDER.into(),
@@ -2885,20 +2909,17 @@ impl TauriAdvancedWorkflowBridge {
                 };
                 let edit = self
                     .core
-                    .apply_at_revision_persisted(
-                        ProjectRevision {
-                            project_epoch: snapshot.project_epoch,
-                            version: snapshot.version,
-                        },
+                    .apply_for_project_persisted(
+                        snapshot.project_epoch,
+                        &project_dir,
                         EditCommand::SaveVoiceModel {
                             record: record.clone(),
                         },
                     )
                     .map_err(|error| {
-                        let _ = self
-                            .voice_provider
-                            .revoke(&provider_voice_id, &MediaCancelToken::new());
-                        advanced_execution(error.to_string())
+                        advanced_execution(format!(
+                            "{error}; provider voice {provider_voice_id} retained for recovery"
+                        ))
                     })?;
                 Ok(AdvancedWorkflowCommit {
                     result: json!({
@@ -2981,21 +3002,25 @@ impl TauriAdvancedWorkflowBridge {
                     cancel,
                 )?;
                 if cancel.checkpoint() {
-                    let _ = std::fs::remove_file(&destination);
-                    return Err(cancelled_workflow("voice generation cancelled"));
+                    return Err(cancelled_workflow(format!(
+                        "voice generation cancelled; completed output retained at {}",
+                        destination.display()
+                    )));
                 }
                 let output_probe = probe(&destination).map_err(|error| {
-                    let _ = std::fs::remove_file(&destination);
-                    media_workflow_error(error)
+                    advanced_execution(format!(
+                        "voice output probe failed: {error}; output retained at {}",
+                        destination.display()
+                    ))
                 })?;
                 if output_probe.has_video
                     || !output_probe.has_audio
                     || output_probe.duration_secs <= 0.0
                 {
-                    let _ = std::fs::remove_file(&destination);
-                    return Err(advanced_execution(
-                        "voice provider output must be non-empty audio",
-                    ));
+                    return Err(advanced_execution(format!(
+                        "voice provider output at {} must be non-empty audio",
+                        destination.display()
+                    )));
                 }
                 let fps = snapshot.timeline.fps.max(1) as f64;
                 let duration_frames = (output_probe.duration_secs * fps).round().max(1.0) as i32;
@@ -3031,7 +3056,7 @@ impl TauriAdvancedWorkflowBridge {
                     .core
                     .commit_generated_media_for_project(
                         snapshot.project_epoch,
-                        snapshot.version,
+                        GeneratedMediaExpectation::TimelineFps(snapshot.timeline.fps),
                         &project_dir,
                         &destination,
                         format!("{} voice", record.voice_name),
@@ -3046,8 +3071,10 @@ impl TauriAdvancedWorkflowBridge {
                         "Generate Cloned Voice",
                     )
                     .map_err(|error| {
-                        let _ = std::fs::remove_file(&destination);
-                        advanced_execution(error.to_string())
+                        advanced_execution(format!(
+                            "{error}; generated output retained at {} for recovery",
+                            destination.display()
+                        ))
                     })?;
                 Ok(AdvancedWorkflowCommit {
                     result: json!({
