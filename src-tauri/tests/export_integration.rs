@@ -336,6 +336,85 @@ fn build_manifest_with_audio(
 // (see `[lib] name` in src-tauri/Cargo.toml).
 use opentake_tauri_lib::export::{run_export, ExportQuality, ExportRequest};
 
+fn assert_preflight_rejects_source(
+    timeline: &Timeline,
+    manifest: &MediaManifest,
+    out: &Path,
+    expected_media_ref: &str,
+) {
+    let request = ExportRequest {
+        out_path: out.to_string_lossy().into_owned(),
+        codec: Default::default(),
+        quality: ExportQuality::P720,
+    };
+    let error = run_export(timeline, manifest, &None, &request)
+        .expect_err("unavailable media must fail before an output is created");
+    assert!(
+        error.contains(expected_media_ref),
+        "error must identify the offending media: {error}"
+    );
+    assert!(!out.exists(), "failed preflight must not leave an output");
+}
+
+#[test]
+fn export_rejects_missing_image_overlay_before_creating_output() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let missing_image = dir.path().join("removed.png");
+    let video = dir.path().join("background.mp4");
+    assert!(make_video(&video, 64, 64, 10, 3));
+    let mut timeline = build_timeline(3, 64, 64, 10.0);
+    let mut overlay = Track::new("overlay", ClipType::Video);
+    let mut image_clip = Clip::new("image", "image-2", 0, 3);
+    image_clip.media_type = ClipType::Image;
+    overlay.clips.push(image_clip);
+    timeline.tracks.insert(0, overlay);
+    let mut manifest = build_manifest(&video, 64, 64, 10.0);
+    let mut image_entry = manifest.entries[0].clone();
+    image_entry.id = "image-2".into();
+    image_entry.name = "removed.png".into();
+    image_entry.kind = ClipType::Image;
+    image_entry.source = MediaSource::External {
+        absolute_path: missing_image.to_string_lossy().into_owned(),
+    };
+    manifest.entries.push(image_entry);
+    assert_preflight_rejects_source(&timeline, &manifest, &dir.path().join("out.mp4"), "image-2");
+}
+
+#[test]
+fn export_rejects_missing_video_on_muted_track_before_creating_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut timeline = build_timeline(3, 64, 64, 10.0);
+    timeline.tracks[0].muted = true;
+    let manifest = build_manifest(&dir.path().join("removed.mp4"), 64, 64, 10.0);
+    assert_preflight_rejects_source(&timeline, &manifest, &dir.path().join("out.mp4"), "asset-1");
+}
+
+#[test]
+fn export_rejects_corrupt_video_before_creating_output() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let corrupt = dir.path().join("broken.mp4");
+    std::fs::write(&corrupt, b"not a playable video stream").unwrap();
+    let timeline = build_timeline(3, 64, 64, 10.0);
+    let manifest = build_manifest(&corrupt, 64, 64, 10.0);
+    assert_preflight_rejects_source(&timeline, &manifest, &dir.path().join("out.mp4"), "asset-1");
+}
+
+#[test]
+fn export_rejects_missing_audible_source_before_creating_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let timeline = build_timeline(3, 64, 64, 10.0);
+    let manifest = build_manifest_with_audio(&dir.path().join("removed.mp4"), 64, 64, 10.0, true);
+    assert_preflight_rejects_source(&timeline, &manifest, &dir.path().join("out.mp4"), "asset-1");
+}
+
 #[test]
 fn export_full_timeline_produces_playable_mp4() {
     if !ffmpeg_ready() {
