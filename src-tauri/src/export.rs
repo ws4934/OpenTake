@@ -229,7 +229,7 @@ impl Drop for ExportGuard {
 impl ExportControl {
     /// Request cancellation only when the caller owns the active operation.
     /// A delayed cancel for a completed predecessor is an intentional no-op.
-    fn request_cancel(&self, operation_id: &str) -> bool {
+    pub(crate) fn request_cancel(&self, operation_id: &str) -> bool {
         let state = self
             .operation
             .lock()
@@ -3382,7 +3382,11 @@ mod tests {
         let hook: AudioExportProgress = Arc::new(move |done, total| {
             if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
                 progress_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
             }
         });
         let worker_core = core.clone();

@@ -6563,7 +6563,11 @@ mod tests {
         let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
             if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
                 progress_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
             }
         });
         let worker_core = core.clone();
@@ -6684,7 +6688,11 @@ mod tests {
         let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
             if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
                 progress_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
             }
         });
         let worker_core = core.clone();
