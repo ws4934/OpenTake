@@ -2573,7 +2573,10 @@ def validate_release_notes_contract(notes_path: Path) -> list[str]:
 
 
 def validate_repository_metadata(
-    repository_root: Path, *, expected_version: str | None = None
+    repository_root: Path,
+    *,
+    expected_version: str | None = None,
+    require_release_notes: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     if expected_version is None:
@@ -2610,6 +2613,8 @@ def validate_repository_metadata(
         errors.append(f"repository metadata is OpenTake {expected_version}")
     if wix_version != expected_wix_version:
         errors.append(f"Windows installer version is {expected_wix_version}")
+    if not require_release_notes:
+        return errors
     notes = repository_root / "docs" / "releases" / f"{expected_version}.md"
     try:
         notes_missing = not notes.is_file() or not notes.read_text(
@@ -2761,6 +2766,9 @@ def _validate_failed_recovery_run_command(arguments: list[str]) -> None:
 
 def main(arguments: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if arguments is None else arguments
+    workflow_only = arguments == ["--workflow-only"]
+    if workflow_only:
+        arguments = []
     if arguments:
         if arguments[0] == "resolve-release-state":
             _resolve_release_state_command(arguments[1:])
@@ -2778,8 +2786,13 @@ def main(arguments: list[str] | None = None) -> None:
     if not WORKFLOW_PATH.is_file():
         raise SystemExit(f"release workflow is missing: {WORKFLOW_PATH}")
     errors = validate_workflow(WORKFLOW_PATH.read_text(encoding="utf-8"))
-    errors.extend(validate_repository_metadata(REPOSITORY_ROOT))
-    errors.extend(validate_release_notes_contract(RELEASE_NOTES_PATH))
+    errors.extend(
+        validate_repository_metadata(
+            REPOSITORY_ROOT, require_release_notes=not workflow_only
+        )
+    )
+    if not workflow_only:
+        errors.extend(validate_release_notes_contract(RELEASE_NOTES_PATH))
     if errors:
         raise SystemExit("release workflow is missing: " + ", ".join(errors))
     print("Release workflow contract is complete")

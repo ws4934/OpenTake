@@ -1,6 +1,7 @@
 fn main() {
-    let is_windows_msvc =
-        std::env::var("TARGET").is_ok_and(|target| target.contains("windows-msvc"));
+    let target = std::env::var("TARGET").expect("Cargo must provide TARGET");
+    println!("cargo:rustc-env=OPENTAKE_BUILD_TARGET={target}");
+    let is_windows_msvc = target.contains("windows-msvc");
     let attributes = if is_windows_msvc {
         // Keep tauri-build's icon and version resources, but let the linker
         // below provide the single manifest shared by binary and test targets.

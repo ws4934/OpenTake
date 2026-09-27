@@ -109,7 +109,7 @@ def _write_valid_fixture(root: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    (root / "THIRD_PARTY_NOTICES.md").write_text(
+    (root / "NOTICE").write_text(
         "\n".join(notice_lines) + "\n" + LICENSE_TEXT, encoding="utf-8"
     )
 
@@ -144,7 +144,7 @@ class LicenseInventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _write_valid_fixture(root)
-            notices_path = root / "THIRD_PARTY_NOTICES.md"
+            notices_path = root / "NOTICE"
             notices = notices_path.read_text(encoding="utf-8")
             package = "@codemirror/lang-css"
             contract = inventory.CODEMIRROR_PACKAGES[package]
@@ -275,7 +275,7 @@ class LicenseInventoryTests(unittest.TestCase):
             root = Path(directory)
             _write_valid_fixture(root)
             contract = inventory.CODEMIRROR_PACKAGES[package]
-            notices_path = root / "THIRD_PARTY_NOTICES.md"
+            notices_path = root / "NOTICE"
             notices = notices_path.read_text(encoding="utf-8")
             notices_path.write_text(
                 notices.replace(_notice_row(package, contract), "", 1),

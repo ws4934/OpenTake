@@ -1,25 +1,13 @@
 name: Batch import regression
 
 on:
-  pull_request:
-    paths:
-      - 'crates/opentake-core/**'
-      - 'crates/opentake-domain/**'
-      - 'crates/opentake-ops/**'
-      - 'crates/opentake-project/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'scripts/verify_batch_import.py'
-      - 'scripts/test_verify_batch_import.py'
-      - '.github/workflows/batch-import.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: batch-import-${{ github.event.pull_request.number || github.ref }}
+  group: batch-import-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,7 +20,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      TARGET_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -59,5 +47,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+# This manual workflow compiles a release benchmark; PRs use pr.yml only.
 # This is supplemental evidence only. Existing workspace/Tauri CI and native
 # product gates still apply; catalog-size checks do not claim an RSS measurement.

@@ -3782,6 +3782,7 @@ dependencies = [
  "opentake-process-tree",
  "ort",
  "ort-tract",
+ "rayon",
  "reqwest 0.12.28",
  "rustfft",
  "ryu-js",

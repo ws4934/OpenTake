@@ -8,6 +8,8 @@
 //! piece sitting inside the region — splitting once more if that piece overruns
 //! `end`. This is the shared "make room" primitive behind add / move / paste.
 
+use std::collections::HashSet;
+
 use opentake_domain::{Clip, ClipType, Timeline};
 
 use crate::engines::{OverwriteAction, OverwriteEngine};
@@ -26,6 +28,27 @@ pub fn clear_region(
     prune: bool,
     ids: &dyn IdGen,
 ) {
+    clear_region_excluding(
+        timeline,
+        track_index,
+        start,
+        end,
+        prune,
+        ids,
+        &HashSet::new(),
+    );
+}
+
+/// Protect all targets of one trim batch while clearing the newly exposed span.
+pub fn clear_region_excluding(
+    timeline: &mut Timeline,
+    track_index: usize,
+    start: i32,
+    end: i32,
+    prune: bool,
+    ids: &dyn IdGen,
+    excluding: &HashSet<String>,
+) -> bool {
     if track_index >= timeline.tracks.len()
         || start < 0
         || end < start
@@ -35,15 +58,24 @@ pub fn clear_region(
             .flat_map(|track| &track.clips)
             .any(|clip| !clip_arithmetic_is_safe(clip))
     {
-        return;
+        return false;
     }
     let Some(actions) =
         OverwriteEngine::try_compute_overwrite(&timeline.tracks[track_index].clips, start, end)
     else {
-        return;
+        return false;
     };
 
     for action in actions {
+        let clip_id = match &action {
+            OverwriteAction::Remove { clip_id }
+            | OverwriteAction::TrimEnd { clip_id, .. }
+            | OverwriteAction::TrimStart { clip_id, .. }
+            | OverwriteAction::Split { clip_id, .. } => clip_id,
+        };
+        if excluding.contains(clip_id) {
+            continue;
+        }
         match action {
             OverwriteAction::Remove { clip_id } => {
                 remove_clip(timeline, &clip_id);
@@ -128,6 +160,7 @@ pub fn clear_region(
     if prune {
         crate::ops::tracks::prune_empty_tracks(timeline);
     }
+    true
 }
 
 fn clip_arithmetic_is_safe(clip: &Clip) -> bool {
