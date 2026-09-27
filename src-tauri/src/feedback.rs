@@ -169,7 +169,10 @@ fn detect_os_version() -> Option<String> {
     let output = Command::new("uname").arg("-r").output().ok()?;
 
     #[cfg(target_os = "windows")]
-    let output = Command::new("cmd").args(["/C", "ver"]).output().ok()?;
+    let output = opentake_media::process_tree::background_command("cmd")
+        .args(["/C", "ver"])
+        .output()
+        .ok()?;
 
     if !output.status.success() {
         return None;

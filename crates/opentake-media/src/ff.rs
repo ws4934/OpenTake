@@ -16,7 +16,9 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::OnceLock;
@@ -730,7 +732,7 @@ pub fn ffmpeg() -> FfmpegCommand {
 /// to skip when the binary is unavailable, keeping the default test run green on
 /// machines without ffmpeg.
 pub fn ffmpeg_available() -> bool {
-    Command::new(ffmpeg_path())
+    opentake_process_tree::background_command(ffmpeg_path())
         .arg("-version")
         .output()
         .map(|o| o.status.success())

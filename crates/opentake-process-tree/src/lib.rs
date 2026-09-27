@@ -7,6 +7,34 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(any(test, windows))]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Windows `creation_flags` replaces earlier flags; every contained console
+/// helper must carry all three bits in the single call to `creation_flags`.
+#[cfg(any(test, windows))]
+const fn contained_windows_flags() -> u32 {
+    WINDOWS_CREATE_NO_WINDOW | 0x0000_0200 | 0x0000_0004
+}
+
+/// Spawn an ordinary one-shot command without showing a console window from
+/// the GUI application. Call [`configure_command`] instead when a process tree
+/// must be contained and cancelled as a unit.
+pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = command;
+        command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        command
+    }
+}
+
+#[cfg(any(test, windows))]
 fn wait_for_processes_to_exit(
     timeout: Duration,
     mut active_processes: impl FnMut() -> io::Result<u32>,
@@ -46,8 +74,7 @@ pub fn configure_command(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+        command.creation_flags(contained_windows_flags());
     }
 }
 
@@ -378,6 +405,14 @@ mod contract_tests {
     use std::time::Duration;
 
     #[test]
+    fn windows_console_flags_preserve_job_containment_and_hide_the_window() {
+        let flags = contained_windows_flags();
+        assert_ne!(flags & WINDOWS_CREATE_NO_WINDOW, 0);
+        assert_ne!(flags & 0x0000_0200, 0); // CREATE_NEW_PROCESS_GROUP
+        assert_ne!(flags & 0x0000_0004, 0); // CREATE_SUSPENDED
+    }
+
+    #[test]
     fn attach_rejects_process_ids_with_group_or_broadcast_semantics() {
         for process_id in [0, 1] {
             match ProcessTree::attach(process_id) {
@@ -430,13 +465,49 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     const TEST_NAME: &str = "tests::windows_suspended_job_contains_fast_exit_descendant";
+    const NO_WINDOW_TEST_NAME: &str = "tests::windows_console_commands_have_no_visible_window";
     const MODE_ENV: &str = "OPENTAKE_PROCESS_TREE_TEST_MODE";
     const DIR_ENV: &str = "OPENTAKE_PROCESS_TREE_TEST_DIR";
+
+    #[test]
+    fn windows_console_commands_have_no_visible_window() {
+        const ENV: &str = "OPENTAKE_PROCESS_TREE_NO_WINDOW_CHILD";
+        if std::env::var_os(ENV).is_some() {
+            // SAFETY: GetConsoleWindow reads process console state and takes no pointers.
+            assert!(unsafe { GetConsoleWindow() }.is_null());
+            return;
+        }
+        let executable = std::env::current_exe().expect("current test executable");
+        let args = [
+            "--exact",
+            NO_WINDOW_TEST_NAME,
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        let background = background_command(&executable)
+            .args(args)
+            .env(ENV, "1")
+            .output()
+            .expect("spawn hidden one-shot child");
+        assert!(
+            background.status.success(),
+            "{}",
+            String::from_utf8_lossy(&background.stderr)
+        );
+
+        let mut command = Command::new(executable);
+        command.args(args).env(ENV, "1");
+        configure_command(&mut command);
+        let mut child = command.spawn().expect("spawn hidden contained child");
+        let _tree = ProcessTree::attach(child.id()).expect("resume child in job");
+        assert!(child.wait().expect("wait hidden contained child").success());
+    }
 
     struct TestProcessHandle(HANDLE);
 
