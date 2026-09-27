@@ -8496,7 +8496,7 @@ mod tests {
         assert!(save_time < Duration::from_secs(1));
         assert!(read.expect("reader must finish during transcode") < Duration::from_millis(100));
         transitioned.expect("project transition must finish during transcode");
-        let error = worker_result.unwrap_err();
+        let error = worker_result.err().expect("stale project rejects proxy");
         assert!(error.contains("project changed"), "{error}");
         assert!(!stage_output.exists(), "stale transcode stage must be removed");
         let reopened = AppCore::new();
@@ -8540,7 +8540,10 @@ mod tests {
         let stage_output = stage_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         token.cancel();
         release_tx.send(()).unwrap();
-        assert_eq!(worker.join().unwrap().unwrap_err(), "media_proxy_cancelled");
+        assert_eq!(
+            worker.join().unwrap().err().expect("cancelled proxy fails"),
+            "media_proxy_cancelled"
+        );
         assert!(!stage_output.exists());
         assert!(core.media().entries[0].proxy.is_none());
         assert!(!bundle.join("media/proxies").exists());
