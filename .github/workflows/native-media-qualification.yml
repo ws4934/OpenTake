@@ -90,6 +90,8 @@ jobs:
               'export::tests::save_range_refuses_before_output_creation',
               'media::tests::save_clip_as_media_refuses_before_media_output_creation',
               'media::tests::ffmpeg_audio_clip_cancel_mid_render_leaves_no_output_or_manifest_change',
+              'media::tests::ffmpeg_video_clip_cancel_mid_render_leaves_no_output_or_manifest_change',
+              'export::tests::ffmpeg_range_cancel_mid_render_leaves_no_output_or_manifest_change',
               'media::tests::project_switch_before_saved_media_transaction_leaves_replacement_unchanged',
               'media::tests::cancellation_inside_core_commit_rolls_back_without_terminal_progress'
             )
