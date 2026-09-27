@@ -231,6 +231,38 @@ describe("Inspector completion surface", () => {
     await act(async () => root.unmount());
   });
 
+  it("seeks both playhead values when navigating to the next keyframe", async () => {
+    const clip = visualClip({
+      opacityTrack: {
+        keyframes: [
+          { frame: 0, value: 1, interpolationOut: "linear" },
+          { frame: 60, value: 0.5, interpolationOut: "linear" },
+        ],
+      },
+    });
+    useProjectStore.setState({ timeline: timelineWith(clip), projectPath: "/tmp/demo.opentake" });
+    useEditorUiStore.setState({
+      selectedClipIds: new Set([clip.id]),
+      inspectorTab: "video",
+      currentFrame: 10,
+      activeFrame: 10,
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<Inspector />));
+
+    const next = [...container.querySelectorAll<HTMLButtonElement>(
+      `button[aria-label="${t("inspector.keyframe.next")}"]`,
+    )].find((button) => !button.disabled);
+    expect(next).not.toBeUndefined();
+    await act(async () => next!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+    expect(useEditorUiStore.getState().currentFrame).toBe(60);
+    expect(useEditorUiStore.getState().activeFrame).toBe(60);
+    await act(async () => root.unmount());
+  });
+
   it("labels numeric controls and disables animated writes outside the clip", async () => {
     const crop = { left: 0, top: 0, right: 0, bottom: 0 };
     const clip = visualClip({

@@ -115,6 +115,50 @@ import { forceRefresh, startSync, stopSync } from "./sync";
 import { useProjectStore } from "./projectStore";
 import { useEditorUiStore } from "./uiStore";
 
+function timelineOfFrames(durationFrames: number): Timeline {
+  return {
+    ...srv.timeline,
+    tracks: [
+      {
+        id: "v1",
+        type: "video",
+        muted: false,
+        hidden: false,
+        syncLocked: true,
+        clips: [
+          {
+            id: "clip-long",
+            mediaRef: "media",
+            mediaType: "video",
+            sourceClipType: "video",
+            startFrame: 0,
+            durationFrames,
+            trimStartFrame: 0,
+            trimEndFrame: 0,
+            speed: 1,
+            volume: 1,
+            fadeInFrames: 0,
+            fadeOutFrames: 0,
+            fadeInInterpolation: "linear",
+            fadeOutInterpolation: "linear",
+            opacity: 1,
+            transform: {
+              centerX: 0.5,
+              centerY: 0.5,
+              width: 1,
+              height: 1,
+              rotation: 0,
+              flipHorizontal: false,
+              flipVertical: false,
+            },
+            crop: { left: 0, top: 0, right: 0, bottom: 0 },
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function snapshot(
   projectEpoch: number,
   version: number,
@@ -221,6 +265,42 @@ describe("project event sync", () => {
       expect(useEditorUiStore.getState().activeFrame).toBe(90);
     } finally {
       srv.timeline = previousTimeline;
+    }
+  });
+
+  it("keeps a keyframe-navigated activeFrame when a refresh fits the timeline", async () => {
+    useProjectStore.setState({ projectEpoch: 1, timelineVersion: 0, projectPath: null });
+    useEditorUiStore.setState({ currentFrame: 20, activeFrame: 45, isPlaying: false });
+    const previousTimeline = srv.timeline;
+    srv.timeline = timelineOfFrames(300);
+    srv.snapshotResponses.push(Promise.resolve(snapshot(1, 1, null)));
+
+    try {
+      await forceRefresh();
+
+      expect(useEditorUiStore.getState().currentFrame).toBe(20);
+      expect(useEditorUiStore.getState().activeFrame).toBe(45);
+    } finally {
+      srv.timeline = previousTimeline;
+    }
+  });
+
+  it("keeps the fractional playback frame when a refresh lands during playback", async () => {
+    useProjectStore.setState({ projectEpoch: 1, timelineVersion: 0, projectPath: null });
+    useEditorUiStore.setState({ currentFrame: 10, activeFrame: 60.4, isPlaying: true });
+    const previousTimeline = srv.timeline;
+    srv.timeline = timelineOfFrames(300);
+    srv.snapshotResponses.push(Promise.resolve(snapshot(1, 1, null)));
+
+    try {
+      await forceRefresh();
+
+      expect(useEditorUiStore.getState().currentFrame).toBe(10);
+      expect(useEditorUiStore.getState().activeFrame).toBe(60.4);
+      expect(useEditorUiStore.getState().isPlaying).toBe(true);
+    } finally {
+      srv.timeline = previousTimeline;
+      useEditorUiStore.setState({ isPlaying: false });
     }
   });
 

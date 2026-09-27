@@ -304,7 +304,10 @@ interface UiState {
   resolveProjectSettingsPrompt: (applySuggested: boolean) => void;
 
   // Playback / playhead
+  /** Parked playhead: where a seek / scrub / pause left it (integer frame). */
   currentFrame: number;
+  /** Frame shown and edited right now. Playback ticks advance only this (it
+   *  may be fractional); seeks set both via `setCurrentFrame`. */
   activeFrame: number;
   isPlaying: boolean;
   isScrubbing: boolean;
