@@ -62,7 +62,7 @@ use opentake_media::{
     thumbnail::{
         encode_sprite, representative_thumbnail_times, save_sprite, sprite::grid_geometry,
         video_thumbnail_times, EncodedSpriteArtifact, ThumbnailCacheMeta, VideoThumb,
-        MAX_VIDEO_THUMBNAILS, THUMB_MAX_SIZE, THUMB_TOLERANCE_SECS,
+        MAX_VIDEO_THUMBNAILS, THUMB_MAX_SIZE,
     },
     waveform::store::CACHE_SUBDIR,
     FrameRequest, MediaEngine, MediaError, PcmFormat, PcmSpec, ProxyProgressCallback, ProxyRequest,
@@ -960,7 +960,6 @@ fn decode_poster_to(
     let req = FrameRequest {
         time_secs: target,
         max_size,
-        tolerance_secs: THUMB_TOLERANCE_SECS,
         apply_rotation: true,
     };
     let (actual, frame) = decode_frame_at(path, &req).map_err(|e| e.to_string())?;
@@ -1087,7 +1086,6 @@ fn video_sprite(
     let req = FrameRequest {
         time_secs: 0.0,
         max_size: THUMB_MAX_SIZE,
-        tolerance_secs: THUMB_TOLERANCE_SECS,
         apply_rotation: true,
     };
     let mut thumbs = Vec::with_capacity(times.len());
@@ -3925,7 +3923,6 @@ pub fn request_timeline_sprite(
             let request = FrameRequest {
                 time_secs: 0.0,
                 max_size: THUMB_MAX_SIZE,
-                tolerance_secs: THUMB_TOLERANCE_SECS,
                 apply_rotation: true,
             };
             let cancel = context.cancel_token();
@@ -4182,7 +4179,6 @@ pub async fn analyze_stabilization(
             match tauri::async_runtime::spawn_blocking(move || {
                 let request = FrameRequest {
                     max_size: (320, 180),
-                    tolerance_secs: 0.1,
                     ..FrameRequest::default()
                 };
                 let decoded = decode_frames_at_cancellable(&path, &times, &request, &worker_cancel);
@@ -5207,7 +5203,6 @@ pub fn preload_media(
                     let request = FrameRequest {
                         time_secs: 0.0,
                         max_size: PREVIEW_POSTER_MAX_SIZE,
-                        tolerance_secs: THUMB_TOLERANCE_SECS,
                         apply_rotation: true,
                     };
                     let cancel = context.cancel_token();

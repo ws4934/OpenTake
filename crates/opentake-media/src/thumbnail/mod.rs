@@ -27,8 +27,6 @@ use crate::frame::RgbaFrame;
 
 /// Thumbnail max box (upstream `maximumSize = 120×68`).
 pub const THUMB_MAX_SIZE: (u32, u32) = (120, 68);
-/// Seek tolerance for thumbnail decoding (upstream 1.0 s).
-pub const THUMB_TOLERANCE_SECS: f64 = 1.0;
 /// Default max pixel for an image thumbnail's long edge (upstream 120).
 pub const IMAGE_THUMB_MAX_PIXEL: u32 = 120;
 /// Progressive publish stride (upstream publishes every 50 frames).
@@ -111,7 +109,6 @@ pub fn video_thumbnails(
     let req = FrameRequest {
         time_secs: 0.0,
         max_size: THUMB_MAX_SIZE,
-        tolerance_secs: THUMB_TOLERANCE_SECS,
         apply_rotation: true,
     };
 

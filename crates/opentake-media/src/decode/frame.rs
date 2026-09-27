@@ -1,8 +1,8 @@
 //! Single/batch frame decode via the system ffmpeg CLI. Replaces upstream's
 //! `AVAssetImageGenerator` (`MediaVisualCache`, `FrameSampler`, `MediaAsset`).
 //!
-//! `decode_frame_at` seeks near a timestamp (allowing a tolerance to land on the
-//! nearest decodable frame) and returns the frame as packed RGBA8.
+//! `decode_frame_at` returns the frame on screen at a timestamp (the last frame
+//! whose pts is `<= t`) as packed RGBA8, together with that frame's real pts.
 //! `decode_frames_at` decodes a batch of ascending timestamps, de-duplicating
 //! frames whose actual time does not advance (upstream's `t > lastTime` rule).
 //!
@@ -28,12 +28,13 @@ const FRAME_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// A frame decode request.
 #[derive(Clone, Debug)]
 pub struct FrameRequest {
+    /// Presentation time to sample. The decoded frame is the one displayed at
+    /// this instant: the last frame with pts `<= time_secs`, or the first frame
+    /// when the request precedes it.
     pub time_secs: f64,
     /// Upper bound box; the frame is scaled down to fit while preserving aspect
     /// ratio (never enlarged). `(0, 0)` disables scaling.
     pub max_size: (u32, u32),
-    /// Seek tolerance: ffmpeg seeks to `time - tolerance` and decodes forward.
-    pub tolerance_secs: f64,
     /// Apply container rotation (display matrix). Default true.
     pub apply_rotation: bool,
 }
@@ -43,7 +44,6 @@ impl Default for FrameRequest {
         FrameRequest {
             time_secs: 0.0,
             max_size: (0, 0),
-            tolerance_secs: 1.0,
             apply_rotation: true,
         }
     }
@@ -395,21 +395,33 @@ fn frame_args_with_color(
     req: &FrameRequest,
     color: Option<&opentake_domain::MediaColorMetadata>,
 ) -> Vec<String> {
-    let seek = (req.time_secs - req.tolerance_secs).max(0.0);
+    let time_secs = req.time_secs.max(0.0);
+    let target_us = target_micros(req);
     let mut args: Vec<String> = Vec::new();
     if let Some(color) = color {
         args.extend(crate::color::hdr_decode_input_args(color));
     }
-    // Fast input seek to just before the target keyframe window.
-    args.push("-ss".into());
-    args.push(format!("{seek:.6}"));
+    // Keyframe seek at/before the target with source timestamps kept (relative
+    // to the container start). Accurate seek is off because it drops every
+    // frame before the target, including the one still on screen at it.
+    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
+    args.push(format!("{time_secs:.6}"));
     args.push("-i".into());
     args.push(path.to_string_lossy().into_owned());
-    // Grab a single frame at/after the seek point.
     args.push("-frames:v".into());
     args.push("1".into());
 
-    let mut filters: Vec<String> = Vec::new();
+    // Select the displayed frame before any conversion work: move timestamps
+    // to microseconds (logged by showinfo so the real pts can be reported),
+    // shift the target to 0, then `fps=1:start_time=0:round=up` emits the last
+    // frame with pts <= 0 as its first output, padding with the first frame
+    // when none precedes the target.
+    let mut filters: Vec<String> = vec![
+        format!("settb=1/{MICROS_PER_SEC}"),
+        "showinfo=checksum=0".to_string(),
+        format!("setpts=PTS-{target_us}"),
+        "fps=fps=1:start_time=0:round=up".to_string(),
+    ];
     if let Some(filter) = color.and_then(crate::color::hdr_tonemap_filter) {
         filters.push(filter);
     }
@@ -435,10 +447,10 @@ fn frame_args_with_color(
             "scale=w={mw}:h={mh}:force_original_aspect_ratio=decrease"
         ));
     }
-    if !filters.is_empty() {
-        args.push("-vf".into());
-        args.push(filters.join(","));
-    }
+    args.push("-vf".into());
+    args.push(filters.join(","));
+    args.push("-fps_mode".into());
+    args.push("passthrough".into());
     args.push("-pix_fmt".into());
     args.push("rgba".into());
     args.push("-f".into());
@@ -453,20 +465,71 @@ fn frame_args_for_input(
     color: Option<&opentake_domain::MediaColorMetadata>,
 ) -> Vec<String> {
     let mut args = frame_args_with_color(Path::new(input), req, color);
+    // A pipe cannot seek: decode from the start and let the display-frame
+    // filters select the target.
     let seek_index = args
         .iter()
         .position(|argument| argument == "-ss")
         .expect("frame args always contain seek");
-    let seek = args.drain(seek_index..seek_index + 2).collect::<Vec<_>>();
-    let input_index = args
-        .iter()
-        .position(|argument| argument == "-i")
-        .expect("frame args always contain input");
-    args.splice(input_index + 2..input_index + 2, seek);
+    args.drain(seek_index..seek_index + 2);
     args
 }
 
-/// Decode the frame at/after `req.time_secs`, returning `(actual_secs, frame)`.
+const MICROS_PER_SEC: i64 = 1_000_000;
+
+/// Microsecond pts from a `showinfo` frame line (`... n:   3 pts:1200000 ...`).
+fn showinfo_pts(line: &str) -> Option<i64> {
+    if !line.contains("Parsed_showinfo_") {
+        return None;
+    }
+    let rest = line.split_once(" pts:")?.1.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Read the first output frame and report the real pts of the source frame the
+/// display-frame filters selected: the last logged pts `<= target_us`, else the
+/// first one after it. Log lines are ordered, so once a frame after the target
+/// has been logged the selection is final.
+fn read_displayed_frame(
+    events: impl IntoIterator<Item = FfmpegEvent>,
+    target_us: i64,
+) -> Option<(f64, RgbaFrame)> {
+    let mut frame = None;
+    let mut at_or_before: Option<i64> = None;
+    let mut after: Option<i64> = None;
+    for event in events {
+        match event {
+            FfmpegEvent::OutputFrame(output)
+                if frame.is_none() && output.width > 0 && output.height > 0 =>
+            {
+                frame = Some(RgbaFrame::new(output.width, output.height, output.data));
+            }
+            FfmpegEvent::Log(_, line) => match showinfo_pts(&line) {
+                Some(pts) if pts <= target_us => {
+                    at_or_before = Some(at_or_before.map_or(pts, |seen| seen.max(pts)));
+                }
+                Some(pts) => after = Some(after.map_or(pts, |seen| seen.min(pts))),
+                None => {}
+            },
+            _ => {}
+        }
+        if frame.is_some() && after.is_some() {
+            break;
+        }
+    }
+    let pts = at_or_before.or(after).unwrap_or(target_us);
+    frame.map(|frame| (pts as f64 / MICROS_PER_SEC as f64, frame))
+}
+
+fn target_micros(req: &FrameRequest) -> i64 {
+    (req.time_secs.max(0.0) * MICROS_PER_SEC as f64).round() as i64
+}
+
+/// Decode the frame displayed at `req.time_secs`, returning `(actual_secs,
+/// frame)` where `actual_secs` is that source frame's presentation time.
 pub fn decode_frame_at(path: &Path, req: &FrameRequest) -> Result<(f64, RgbaFrame)> {
     decode_frame_at_cancellable(path, req, &MediaCancelToken::new())
 }
@@ -503,23 +566,12 @@ pub fn decode_frame_at_cancellable(
         }
     };
     let reader_cancel = cancel.clone();
-    let requested_time = req.time_secs;
+    let target_us = target_micros(req);
     let reader = match thread::Builder::new()
         .name("opentake-frame-events".to_string())
         .spawn(move || {
             reader_cancel.reader_started();
-            let result = iter
-                .filter_map(|event| match event {
-                    FfmpegEvent::OutputFrame(frame) if frame.width > 0 && frame.height > 0 => {
-                        let actual = requested_time.max(frame.timestamp as f64);
-                        Some((
-                            actual,
-                            RgbaFrame::new(frame.width, frame.height, frame.data),
-                        ))
-                    }
-                    _ => None,
-                })
-                .next();
+            let result = read_displayed_frame(iter, target_us);
             reader_cancel.reader_finished();
             result
         }) {
@@ -541,7 +593,7 @@ pub fn decode_frame_at_cancellable(
             return Err(MediaError::Cancelled);
         }
         if reader.is_finished() {
-            // The iterator stops after the first frame. Explicitly terminate
+            // The reader stops once the frame is selected. Explicitly terminate
             // the single-frame command before joining so no producer remains
             // blocked trying to publish a later event into a dropped receiver.
             let _ = child.kill();
@@ -605,7 +657,7 @@ pub fn decode_frame_file_at_cancellable(
         .name("opentake-retained-frame-input".to_string())
         .spawn(move || std::io::copy(&mut input, &mut stdin))
         .map_err(MediaError::Io)?;
-    let result = decode_first_child_frame(&mut child, req.time_secs, cancel);
+    let result = decode_first_child_frame(&mut child, req, cancel);
     match feeder.join() {
         Ok(Ok(_)) => result,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => result,
@@ -618,9 +670,10 @@ pub fn decode_frame_file_at_cancellable(
 
 fn decode_first_child_frame(
     child: &mut ffmpeg_sidecar::child::FfmpegChild,
-    requested_time: f64,
+    req: &FrameRequest,
     cancel: &MediaCancelToken,
 ) -> Result<(f64, RgbaFrame)> {
+    let requested_time = req.time_secs;
     let iter = match child.iter() {
         Ok(iter) => iter,
         Err(error) => {
@@ -630,21 +683,12 @@ fn decode_first_child_frame(
         }
     };
     let reader_cancel = cancel.clone();
+    let target_us = target_micros(req);
     let reader = match thread::Builder::new()
         .name("opentake-retained-frame-events".to_string())
         .spawn(move || {
             reader_cancel.reader_started();
-            let result = iter
-                .filter_map(|event| match event {
-                    FfmpegEvent::OutputFrame(frame) if frame.width > 0 && frame.height > 0 => {
-                        Some((
-                            requested_time.max(frame.timestamp as f64),
-                            RgbaFrame::new(frame.width, frame.height, frame.data),
-                        ))
-                    }
-                    _ => None,
-                })
-                .next();
+            let result = read_displayed_frame(iter, target_us);
             reader_cancel.reader_finished();
             result
         }) {
@@ -875,24 +919,113 @@ mod tests {
     // --- frame_args: CLI contract ---
 
     #[test]
-    fn frame_args_seek_is_time_minus_tolerance_clamped() {
+    fn frame_args_keyframe_seek_to_target_and_select_displayed_frame() {
         let req = FrameRequest {
             time_secs: 5.0,
-            tolerance_secs: 1.0,
             ..Default::default()
         };
         let args = frame_args(Path::new("/x.mp4"), &req);
         let ss = args.iter().position(|a| a == "-ss").unwrap();
-        assert_eq!(args[ss + 1], "4.000000");
-        // clamps to 0
-        let req0 = FrameRequest {
-            time_secs: 0.5,
-            tolerance_secs: 2.0,
-            ..Default::default()
-        };
-        let args0 = frame_args(Path::new("/x.mp4"), &req0);
-        let ss0 = args0.iter().position(|a| a == "-ss").unwrap();
-        assert_eq!(args0[ss0 + 1], "0.000000");
+        assert_eq!(args[ss + 1], "5.000000");
+        for flag in ["-noaccurate_seek", "-copyts", "-start_at_zero"] {
+            let at = args.iter().position(|a| a == flag).unwrap();
+            assert!(at < ss, "{flag} must be an input option");
+        }
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert!(args[vf + 1].starts_with(
+            "settb=1/1000000,showinfo=checksum=0,setpts=PTS-5000000,fps=fps=1:start_time=0:round=up"
+        ));
+        assert!(args.windows(2).any(|w| w == ["-fps_mode", "passthrough"]));
+
+        let negative = frame_args(
+            Path::new("/x.mp4"),
+            &FrameRequest {
+                time_secs: -0.5,
+                ..Default::default()
+            },
+        );
+        let ss0 = negative.iter().position(|a| a == "-ss").unwrap();
+        assert_eq!(negative[ss0 + 1], "0.000000");
+        assert!(negative.iter().any(|a| a.contains("setpts=PTS-0,")));
+    }
+
+    #[test]
+    fn retained_input_args_drop_the_seek_but_keep_selection() {
+        let args = frame_args_for_input(
+            "fd:",
+            &FrameRequest {
+                time_secs: 2.0,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!args.iter().any(|a| a == "-ss"));
+        assert!(args.windows(2).any(|w| w == ["-i", "fd:"]));
+        assert!(args.iter().any(|a| a.contains("setpts=PTS-2000000")));
+    }
+
+    #[test]
+    fn showinfo_pts_parses_padded_and_negative_values() {
+        let padded =
+            "[Parsed_showinfo_1 @ 0x1] [info] n:   0 pts: 966667 pts_time:0.966667 duration:1";
+        assert_eq!(showinfo_pts(padded), Some(966_667));
+        let negative = "[Parsed_showinfo_1 @ 0x1] [info] n:   2 pts:-33333 pts_time:-0.033333";
+        assert_eq!(showinfo_pts(negative), Some(-33_333));
+        assert_eq!(
+            showinfo_pts("[Parsed_showinfo_1 @ 0x1] [info] config in time_base: 1/1000000"),
+            None
+        );
+        assert_eq!(showinfo_pts("[h264 @ 0x2] [error] pts: 5"), None);
+    }
+
+    fn showinfo_event(pts: i64) -> FfmpegEvent {
+        FfmpegEvent::Log(
+            ffmpeg_sidecar::event::LogLevel::Info,
+            format!("[Parsed_showinfo_1 @ 0x1] [info] n:   0 pts:{pts} pts_time:0"),
+        )
+    }
+
+    fn output_event(value: u8) -> FfmpegEvent {
+        FfmpegEvent::OutputFrame(ffmpeg_sidecar::event::OutputVideoFrame {
+            width: 1,
+            height: 1,
+            pix_fmt: "rgba".to_string(),
+            output_index: 0,
+            data: vec![value, value, value, 255],
+            frame_num: 0,
+            timestamp: 0.0,
+        })
+    }
+
+    #[test]
+    fn displayed_frame_reports_real_pts_of_last_frame_at_or_before_target() {
+        let (actual, frame) = read_displayed_frame(
+            [
+                showinfo_event(900_000),
+                showinfo_event(966_667),
+                output_event(7),
+                showinfo_event(2_000_000),
+            ],
+            1_200_000,
+        )
+        .unwrap();
+        assert!((actual - 0.966_667).abs() < 1e-9);
+        assert_eq!(frame.rgba[0], 7);
+    }
+
+    #[test]
+    fn displayed_frame_falls_back_to_first_frame_after_target() {
+        let (actual, _) = read_displayed_frame(
+            [
+                output_event(1),
+                showinfo_event(500_000),
+                showinfo_event(600_000),
+            ],
+            0,
+        )
+        .unwrap();
+        assert!((actual - 0.5).abs() < 1e-9);
+        assert!(read_displayed_frame([showinfo_event(0)], 0).is_none());
     }
 
     #[test]
@@ -907,7 +1040,7 @@ mod tests {
     #[test]
     fn frame_args_adds_scale_filter_only_when_boxed() {
         let plain = frame_args(Path::new("/x.mp4"), &FrameRequest::default());
-        assert!(!plain.iter().any(|a| a == "-vf"));
+        assert!(!plain.iter().any(|a| a.contains("scale=")));
 
         let boxed = frame_args(
             Path::new("/x.mp4"),

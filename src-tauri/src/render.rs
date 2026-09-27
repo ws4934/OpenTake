@@ -913,7 +913,6 @@ impl MediaResolver<'_> {
             let request = FrameRequest {
                 time_secs: index as f64 / source_fps,
                 max_size: self.preview_box,
-                tolerance_secs: 0.0,
                 apply_rotation: true,
             };
             match info.retained {
@@ -1047,12 +1046,7 @@ impl TextureResolver for MediaResolver<'_> {
 
         let req = FrameRequest {
             time_secs,
-            // A wide seek tolerance makes ffmpeg decode far more than the target
-            // frame per call (the dominant per-frame CPU/RSS cost during scrub).
-            // 0.1s lands on a nearby keyframe with ~10x less waste; the streaming
-            // playback engine (#53) replaces this seek-per-frame path entirely.
             max_size: self.preview_box,
-            tolerance_secs: 0.1,
             apply_rotation: true,
         };
         let decoded = match info.retained {
@@ -1955,10 +1949,6 @@ fn source_frame_request(frame: i32, timeline_fps: i32, max_size: u32) -> FrameRe
     FrameRequest {
         time_secs: (frame.max(0) as f64) / fps as f64,
         max_size: (max_size, max_size),
-        // Source-tab stills and captures promise the frame selected by the app
-        // transport. The generic one-second thumbnail tolerance can seek back
-        // to frame zero for short generated clips whose opening frame is blank.
-        tolerance_secs: 0.0,
         apply_rotation: true,
     }
 }
@@ -2131,7 +2121,6 @@ mod tests {
 
         assert!((request.time_secs - (22.0 / 30.0)).abs() < f64::EPSILON);
         assert_eq!(request.max_size, (0, 0));
-        assert_eq!(request.tolerance_secs, 0.0);
         assert!(request.apply_rotation);
     }
 

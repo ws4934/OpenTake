@@ -35,12 +35,6 @@ pub const VIDEO_COVER_MAX_SIZE: (u32, u32) = (320, 180);
 /// Default bounded 16:9 surface for an authoritative project composite.
 pub const PROJECT_COMPOSITE_COVER_BOUNDS: (u32, u32) = (640, 360);
 
-/// Seek tolerance (seconds) for the video cover grab. Upstream's
-/// `AVAssetImageGenerator` uses its default tolerances (not zero); a modest
-/// window keeps the grab cheap and reliably lands a decodable frame near the
-/// clip's in-point.
-pub const VIDEO_COVER_TOLERANCE_SECS: f64 = 1.0;
-
 /// JPEG quality for the cover. Upstream encodes at `compressionFactor: 0.7`;
 /// `image`'s `JpegEncoder` takes a 1–100 quality, so 72 ≈ 0.7. Named (not
 /// hardcoded) per the media-layer "no magic thresholds" rule.
@@ -277,7 +271,6 @@ fn encode_source(source: &ThumbnailSource, fps: i32) -> Result<Vec<u8>> {
             let req = FrameRequest {
                 time_secs,
                 max_size: VIDEO_COVER_MAX_SIZE,
-                tolerance_secs: VIDEO_COVER_TOLERANCE_SECS,
                 apply_rotation: true, // upstream appliesPreferredTrackTransform
             };
             let (_actual, frame) = decode_frame_at(&source.path, &req)?;

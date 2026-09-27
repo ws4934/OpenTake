@@ -197,11 +197,9 @@ pub fn sample_frames(
     if times.is_empty() {
         return Ok(Vec::new());
     }
-    let tolerance = (interval / 2.0).max(1.0);
     let req = FrameRequest {
         time_secs: 0.0,
         max_size: opts.max_size,
-        tolerance_secs: tolerance,
         apply_rotation: true,
     };
 

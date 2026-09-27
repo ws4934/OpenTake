@@ -32,7 +32,9 @@ const FAILURE_LOG_TAIL_LINES: usize = 20;
 ///
 /// `start_frame` / `end_frame` are source-frame positions on the project
 /// timeline fps timebase. `end_frame` is exclusive. The worker emits one RGBA
-/// frame per project frame by forcing ffmpeg through an `fps=` filter.
+/// frame per project frame: frame `F` is the source frame displayed at
+/// `F / timeline_fps` (the last one with pts `<= F / timeline_fps`), the same
+/// rule single-frame decode uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoStreamRequest {
     pub path: PathBuf,
@@ -298,6 +300,8 @@ fn send_with_backpressure(
 }
 
 fn stream_frame_from_output(req: &VideoStreamRequest, frame: OutputVideoFrame) -> StreamVideoFrame {
+    // The filter chain emits one frame per grid slot starting exactly at
+    // `start_frame`, so the output count is the slot offset.
     let source_frame = req.start_frame + i64::from(frame.frame_num);
     StreamVideoFrame {
         source_frame,
@@ -320,7 +324,10 @@ fn video_stream_args_with_color(
     color: Option<&opentake_domain::MediaColorMetadata>,
 ) -> Vec<String> {
     let mut args = Vec::new();
-    args.push("-ss".to_string());
+    // Keyframe seek with source timestamps kept (relative to the container
+    // start) so the fps grid below is the absolute project-frame grid. Accurate
+    // seek is off because it drops the frame still on screen at the start.
+    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
     args.push(format!("{:.6}", req.start_secs()));
     if let Some(color) = color {
         args.extend(crate::color::hdr_decode_input_args(color));
@@ -340,11 +347,19 @@ fn video_stream_args_with_color(
         args.push(frame_limit.to_string());
     }
 
-    let mut filters = Vec::new();
+    // `round=up` maps a source frame to the first slot at/after its pts, so
+    // slot F shows the last frame with pts <= F / fps. The first decoded frame
+    // is pulled back to half a slot before `start_frame` when it starts later
+    // (late first frame), then `trim` drops the slots before `start_frame`.
+    let lead_secs = (req.start_frame as f64 - 0.5).max(0.0) / req.timeline_fps as f64;
+    let mut filters = vec![
+        format!("setpts='if(eq(N,0),min(PTS,{lead_secs:.6}/TB),PTS)'"),
+        format!("fps=fps={}:round=up", req.timeline_fps),
+        format!("trim=start_pts={}", req.start_frame),
+    ];
     if let Some(filter) = color.and_then(crate::color::hdr_tonemap_filter) {
         filters.push(filter);
     }
-    filters.push(format!("fps=fps={}", req.timeline_fps));
     if req.max_size.0 > 0 || req.max_size.1 > 0 {
         let mw = if req.max_size.0 > 0 {
             req.max_size.0.to_string()
@@ -362,6 +377,8 @@ fn video_stream_args_with_color(
     }
     args.push("-vf".to_string());
     args.push(filters.join(","));
+    args.push("-fps_mode".to_string());
+    args.push("passthrough".to_string());
     args.push("-pix_fmt".to_string());
     args.push("rgba".to_string());
     args.push("-f".to_string());
@@ -451,6 +468,11 @@ mod tests {
         let args = video_stream_args(&request());
         let ss = args.iter().position(|arg| arg == "-ss").unwrap();
         assert_eq!(args[ss + 1], "2.000000");
+        for flag in ["-noaccurate_seek", "-copyts", "-start_at_zero"] {
+            let at = args.iter().position(|arg| arg == flag).unwrap();
+            let input = args.iter().position(|arg| arg == "-i").unwrap();
+            assert!(at < input, "{flag} must be an input option");
+        }
 
         let frames = args.iter().position(|arg| arg == "-frames:v").unwrap();
         assert_eq!(args[frames + 1], "5");
@@ -460,8 +482,11 @@ mod tests {
     fn stream_args_force_project_fps_rgba_rawvideo() {
         let args = video_stream_args(&request());
         let vf = args.iter().position(|arg| arg == "-vf").unwrap();
-        assert!(args[vf + 1].contains("fps=fps=30"));
+        assert!(args[vf + 1].starts_with(
+            "setpts='if(eq(N,0),min(PTS,1.983333/TB),PTS)',fps=fps=30:round=up,trim=start_pts=60,"
+        ));
         assert!(args[vf + 1].contains("force_original_aspect_ratio=decrease"));
+        assert!(args.windows(2).any(|w| w == ["-fps_mode", "passthrough"]));
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "rgba"]));
         assert!(args.windows(2).any(|w| w == ["-f", "rawvideo"]));
         assert_eq!(args.last().unwrap(), "-");

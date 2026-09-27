@@ -2716,7 +2716,6 @@ fn inspect_video_frames(
             INSPECT_MEDIA_FRAME_MAX_DIMENSION,
             INSPECT_MEDIA_FRAME_MAX_DIMENSION,
         ),
-        tolerance_secs: 0.25,
         apply_rotation: true,
     };
     let decoded = decode_frames_at(path, &times, &decode)
@@ -3068,9 +3067,6 @@ impl TextureResolver for InspectResolver<'_> {
         let req = FrameRequest {
             time_secs,
             max_size: self.render_box,
-            // Tight tolerance keeps each inspected frame on the exact target time
-            // (quality over the scrub-oriented wide tolerance the preview uses).
-            tolerance_secs: 0.0,
             apply_rotation: true,
         };
         let (_actual, frame) = decode_frame_at(&info.path, &req).ok()?;

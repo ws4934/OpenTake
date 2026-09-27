@@ -17,7 +17,7 @@ use image::ImageEncoder;
 use opentake_domain::ClipType;
 use opentake_media::{
     decode::frame::decode_frame_png_cancellable,
-    thumbnail::{image_thumbnail, IMAGE_THUMB_MAX_PIXEL, THUMB_MAX_SIZE, THUMB_TOLERANCE_SECS},
+    thumbnail::{image_thumbnail, IMAGE_THUMB_MAX_PIXEL, THUMB_MAX_SIZE},
     FrameRequest, MediaCancelToken,
 };
 use serde::Serialize;
@@ -344,7 +344,6 @@ impl PrewarmScheduler {
                         let request = FrameRequest {
                             time_secs: 0.0,
                             max_size: THUMB_MAX_SIZE,
-                            tolerance_secs: THUMB_TOLERANCE_SECS,
                             apply_rotation: true,
                         };
                         let cancel = context.cancel_token();

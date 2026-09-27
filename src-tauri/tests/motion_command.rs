@@ -116,7 +116,6 @@ fn sandbox_progress_cancel_validated_mp4_result() {
             &opentake_media::FrameRequest {
                 time_secs,
                 max_size: (64, 36),
-                tolerance_secs: 0.0,
                 apply_rotation: true,
             },
         )
@@ -204,7 +203,6 @@ fn sandbox_progress_cancel_validated_mp4_result() {
                 &opentake_media::FrameRequest {
                     time_secs: 0.0,
                     max_size: (64, 36),
-                    tolerance_secs: 0.0,
                     apply_rotation: true,
                 },
             )
@@ -215,7 +213,6 @@ fn sandbox_progress_cancel_validated_mp4_result() {
                 &opentake_media::FrameRequest {
                     time_secs: 0.3,
                     max_size: (64, 36),
-                    tolerance_secs: 0.0,
                     apply_rotation: true,
                 },
             )
@@ -272,7 +269,6 @@ fn sandbox_progress_cancel_validated_mp4_result() {
         &opentake_media::FrameRequest {
             time_secs: 0.3,
             max_size: (64, 36),
-            tolerance_secs: 0.0,
             apply_rotation: true,
         },
     )

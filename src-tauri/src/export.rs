@@ -585,7 +585,6 @@ impl MediaResolver<'_> {
                 &FrameRequest {
                     time_secs: index as f64 / source_fps,
                     max_size: self.render_box,
-                    tolerance_secs: 0.0,
                     apply_rotation: true,
                 },
             )
@@ -674,10 +673,6 @@ impl TextureResolver for MediaResolver<'_> {
         let req = FrameRequest {
             time_secs,
             max_size: self.render_box,
-            // Export advances frame-by-frame; a tight tolerance keeps each
-            // composited frame on the exact target time (quality over the
-            // scrub-oriented wide tolerance the preview uses).
-            tolerance_secs: 0.0,
             apply_rotation: true,
         };
         let (_actual, frame) = decode_frame_at(&info.path, &req).ok()?;

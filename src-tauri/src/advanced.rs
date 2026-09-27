@@ -1243,7 +1243,6 @@ impl TauriAdvancedWorkflowBridge {
         }
         let request = FrameRequest {
             max_size: (640, 360),
-            tolerance_secs: 0.05,
             ..FrameRequest::default()
         };
         let decoded = decode_frames_at_cancellable(&path, &times, &request, cancel);
@@ -1861,7 +1860,6 @@ impl TauriAdvancedWorkflowBridge {
         }
         let request = FrameRequest {
             max_size: (640, 640),
-            tolerance_secs: 0.1,
             ..FrameRequest::default()
         };
         let target = decode_color_sample(
@@ -4597,7 +4595,6 @@ mod tests {
             &[0.25, 0.75],
             &FrameRequest {
                 max_size: (64, 48),
-                tolerance_secs: 0.1,
                 ..FrameRequest::default()
             },
             &MediaCancelToken::new(),
