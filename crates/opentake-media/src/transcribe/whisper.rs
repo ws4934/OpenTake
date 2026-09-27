@@ -262,6 +262,14 @@ impl Transcriber for WhisperTranscriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
+        if let Some(cancel) = opts.cancel.clone() {
+            params.set_abort_callback_safe(Some(move || cancel.is_cancelled()));
+        }
+        if let Some(progress) = opts.progress.clone() {
+            params.set_progress_callback_safe(Some(move |percent| {
+                (progress.0)(0.25 + 0.75 * (percent as f64 / 100.0).clamp(0.0, 1.0));
+            }));
+        }
         if let Some(lang) = opts.preferred_language.as_deref() {
             params.set_language(Some(lang));
         }
@@ -273,6 +281,13 @@ impl Transcriber for WhisperTranscriber {
         state
             .full(params, &pcm.samples_f32)
             .map_err(|e| MediaError::Transcribe(format!("full: {e}")))?;
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            return Err(MediaError::Cancelled);
+        }
 
         let n_segments = state
             .full_n_segments()

@@ -15,13 +15,19 @@
 //! DTOs are camelCase (`web/src/lib/types.ts` contract; the repo's #1 bug class),
 //! with a serde round-trip test.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 
 use opentake_core::dto::EditResultDto;
-use opentake_core::{AppCore, ProjectRevision};
+use opentake_core::{AppCore, ProjectRevision, ProjectRuntimeSnapshot};
 use opentake_domain::{Clip, ClipType, MediaManifest, TextLayout, TextStyle, Transform};
 use opentake_media::{
-    caption_specs, dominant_speech_track, CaptionCase, CaptionTarget, TranscriptionResult,
+    caption_specs, dominant_speech_track, CaptionCase, CaptionTarget, MediaCancelToken,
+    MediaEngine, TranscriptionResult,
 };
 use opentake_ops::{CaptionEntry, EditCommand};
 use tauri::State;
@@ -92,6 +98,8 @@ pub struct CaptionRequestDto {
     pub censor_profanity: bool,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// Result of a caption Generate: the edit outcome plus a caption count for the UI.
@@ -102,6 +110,99 @@ pub struct GenerateCaptionsResult {
     pub edit: EditResultDto,
     /// How many caption clips were placed (0 when no speech was detected).
     pub caption_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptionGenerationProgress {
+    operation_id: String,
+    completed: usize,
+    total: usize,
+    fraction: f64,
+}
+
+type CaptionProgressCallback = Arc<dyn Fn(usize, usize, f64) + Send + Sync>;
+
+struct ActiveCaptionGeneration {
+    id: String,
+    cancel: MediaCancelToken,
+    notify: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Default)]
+pub struct CaptionGenerationState {
+    active: Arc<Mutex<Option<ActiveCaptionGeneration>>>,
+}
+
+struct CaptionGenerationGuard {
+    state: CaptionGenerationState,
+    id: String,
+}
+
+impl CaptionGenerationState {
+    fn begin(
+        &self,
+        id: String,
+    ) -> Result<
+        (
+            MediaCancelToken,
+            tokio::sync::oneshot::Receiver<()>,
+            CaptionGenerationGuard,
+        ),
+        String,
+    > {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.is_some() {
+            return Err("caption generation is already running".into());
+        }
+        let cancel = MediaCancelToken::new();
+        let (notify, receiver) = tokio::sync::oneshot::channel();
+        *active = Some(ActiveCaptionGeneration {
+            id: id.clone(),
+            cancel: cancel.clone(),
+            notify: Some(notify),
+        });
+        Ok((
+            cancel,
+            receiver,
+            CaptionGenerationGuard {
+                state: self.clone(),
+                id,
+            },
+        ))
+    }
+
+    fn cancel(&self, id: &str) -> bool {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = active.as_mut().filter(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.cancel.cancel();
+        if entry.cancel.is_cancelled() {
+            if let Some(notify) = entry.notify.take() {
+                let _ = notify.send(());
+            }
+            return true;
+        }
+        false
+    }
+}
+
+impl Drop for CaptionGenerationGuard {
+    fn drop(&mut self) {
+        let mut active = self.state.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.as_ref().is_some_and(|entry| entry.id == self.id) {
+            *active = None;
+        }
+    }
+}
+
+#[tauri::command]
+pub fn cancel_caption_generation(
+    state: State<'_, CaptionGenerationState>,
+    operation_id: String,
+) -> bool {
+    state.cancel(&operation_id)
 }
 
 /// `generate_captions`: transcribe the selected source and place styled caption
@@ -117,14 +218,83 @@ fn begin_caption_generation(
 }
 
 #[tauri::command]
-pub fn generate_captions(
+pub async fn generate_captions(
+    app: AppHandle,
     core: State<'_, AppCore>,
     media: State<'_, MediaState>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
+    state: State<'_, CaptionGenerationState>,
     request: CaptionRequestDto,
 ) -> Result<GenerateCaptionsResult, String> {
-    let _admission = begin_caption_generation(&admission)?;
+    use opentake_media::ort_worker::{JobKind, JobPriority, JobRequest, WorkerError};
+
+    let activity = begin_caption_generation(&admission)?;
+    let operation_id = request
+        .operation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let (cancel, cancelled, guard) = state.begin(operation_id.clone())?;
     let snapshot = core.runtime_snapshot();
+    let core = core.inner().clone();
+    let cache_root = media.engine().cache_root().to_path_buf();
+    let models_dir = media.engine().models_dir().to_path_buf();
+    let worker = crate::search::production_index_worker(media.engine().export_pause());
+    let job = worker
+        .submit(
+            JobRequest::new(
+                JobKind::Transcribe,
+                format!(
+                    "{}@{}",
+                    opentake_media::DEFAULT_WHISPER_MODEL.file_name,
+                    opentake_media::DEFAULT_WHISPER_MODEL.sha1
+                ),
+                format!("captions:{operation_id}"),
+                JobPriority::Interactive,
+            ),
+            move |_, worker_cancel| {
+                let _activity = activity;
+                let _guard = guard;
+                if worker_cancel.is_cancelled() || cancel.is_cancelled() {
+                    return Err(WorkerError::Cancelled);
+                }
+                let engine = MediaEngine::new(cache_root, models_dir);
+                let progress: CaptionProgressCallback = Arc::new(move |done, total, part| {
+                    let _ = app.emit(
+                        "captions://progress",
+                        CaptionGenerationProgress {
+                            operation_id: operation_id.clone(),
+                            completed: done,
+                            total,
+                            fraction: (done as f64 + part) / total.max(1) as f64,
+                        },
+                    );
+                });
+                generate_captions_blocking(&core, &engine, snapshot, request, &cancel, progress)
+                    .map_err(|error| {
+                        if cancel.is_cancelled() {
+                            WorkerError::Cancelled
+                        } else {
+                            WorkerError::Job(error)
+                        }
+                    })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let wait = tauri::async_runtime::spawn_blocking(move || job.wait());
+    tokio::select! {
+        result = wait => result.map_err(|error| error.to_string())?.map_err(|error| error.to_string()),
+        _ = cancelled => Err("caption generation cancelled".into()),
+    }
+}
+
+fn generate_captions_blocking(
+    core: &AppCore,
+    engine: &MediaEngine,
+    snapshot: ProjectRuntimeSnapshot,
+    request: CaptionRequestDto,
+    cancel: &MediaCancelToken,
+    on_progress: CaptionProgressCallback,
+) -> Result<GenerateCaptionsResult, String> {
     let revision = ProjectRevision {
         project_epoch: snapshot.project_epoch,
         version: snapshot.version,
@@ -157,6 +327,9 @@ pub fn generate_captions(
     let auto_detect = matches!(request.source, CaptionSource::Auto);
     let eligible = eligible_targets(timeline, manifest, &request.source);
     if eligible.is_empty() {
+        if cancel.is_cancelled() {
+            return Err("caption generation cancelled".into());
+        }
         return Ok(GenerateCaptionsResult {
             edit: unchanged_edit(&snapshot.version),
             caption_count: 0,
@@ -176,45 +349,59 @@ pub fn generate_captions(
     // here so it takes effect if/when the whisper backend gains masking (today it
     // is a no-op in the backend, matching upstream's transcription-level boundary).
     let uses_options = language.is_some() || request.censor_profanity;
-    let mut transcripts: std::collections::HashMap<String, TranscriptionResult> =
-        std::collections::HashMap::new();
-    let mut first_error: Option<String> = None;
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for t in &eligible {
-        if !seen.insert(t.media_ref.clone()) {
-            continue;
-        }
-        let (path, is_video) =
-            match crate::transcribe::resolve_asset_from_snapshot(&snapshot, &t.media_ref) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    first_error = first_error.or(Some(e));
-                    continue;
-                }
+    let sources = eligible
+        .iter()
+        .filter(|t| seen.insert(t.media_ref.clone()))
+        .map(|t| {
+            (
+                t.media_ref.clone(),
+                crate::transcribe::resolve_asset_from_snapshot(&snapshot, &t.media_ref),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_progress = Arc::clone(&on_progress);
+    let transcripts = transcribe_unique_sources(
+        sources,
+        cancel,
+        |path| {
+            (!uses_options)
+                .then(|| {
+                    opentake_media::transcribe::cache::cached_on_disk(engine.cache_root(), path)
+                })
+                .flatten()
+        },
+        || crate::transcribe::load_backend(engine),
+        |path, _is_video, backend, completed, total| {
+            let progress = Arc::clone(&source_progress);
+            let last_percent = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+            let opts = opentake_media::TranscribeOptions {
+                preferred_language: language.clone(),
+                censor_profanity: request.censor_profanity,
+                cancel: Some(cancel.clone()),
+                progress: Some(opentake_media::transcribe::TranscriptionProgress(Arc::new(
+                    move |part: f64| {
+                        use std::sync::atomic::Ordering;
+                        let percent = (part.clamp(0.0, 1.0) * 100.0).floor() as u32;
+                        if last_percent.swap(percent, Ordering::Relaxed) != percent {
+                            progress(completed, total, part);
+                        }
+                    },
+                ))),
+                ..Default::default()
             };
-        let result = if uses_options {
-            crate::transcribe::load_backend(media.engine()).and_then(|backend| {
-                let opts = opentake_media::TranscribeOptions {
-                    preferred_language: language.clone(),
-                    censor_profanity: request.censor_profanity,
-                    ..Default::default()
-                };
-                opentake_media::transcribe::transcribe_file(&path, &backend, &opts)
-                    .map_err(|e| e.to_string())
-            })
-        } else {
-            crate::transcribe::transcribe_with_cache(media.engine(), &path, is_video, None)
-        };
-        match result {
-            Ok(r) => {
-                transcripts.insert(t.media_ref.clone(), r);
+            let result = opentake_media::transcribe::transcribe_file(path, backend, &opts)
+                .map_err(|error| error.to_string())?;
+            if !uses_options && !cancel.is_cancelled() {
+                crate::transcribe::persist_full_transcript(engine.cache_root(), path, &result);
             }
-            Err(e) => first_error = first_error.or(Some(e)),
-        }
-    }
+            Ok(result)
+        },
+        |done, total| on_progress(done, total, 0.0),
+    )?;
     if transcripts.is_empty() {
-        if let Some(e) = first_error {
-            return Err(e);
+        if cancel.is_cancelled() {
+            return Err("caption generation cancelled".into());
         }
         return Ok(GenerateCaptionsResult {
             edit: unchanged_edit(&snapshot.version),
@@ -241,10 +428,13 @@ pub fn generate_captions(
                 .filter(|t| t.track_id == winner)
                 .collect(),
             None => {
+                if cancel.is_cancelled() {
+                    return Err("caption generation cancelled".into());
+                }
                 return Ok(GenerateCaptionsResult {
                     edit: unchanged_edit(&snapshot.version),
                     caption_count: 0,
-                })
+                });
             }
         }
     } else {
@@ -263,6 +453,9 @@ pub fn generate_captions(
     };
     let specs = caption_specs(&targets, fps, case, &group_id, &fits);
     if specs.is_empty() {
+        if cancel.is_cancelled() {
+            return Err("caption generation cancelled".into());
+        }
         return Ok(GenerateCaptionsResult {
             edit: unchanged_edit(&snapshot.version),
             caption_count: 0,
@@ -294,7 +487,10 @@ pub fn generate_captions(
     let count = entries.len();
     // Place atomically only if the project and version still match the snapshot
     // used for media resolution and caption layout.
-    let edit = apply_captions_at_revision(&core, revision, entries)?;
+    if !cancel.try_commit() {
+        return Err("caption generation cancelled".into());
+    }
+    let edit = apply_captions_at_revision(core, revision, entries)?;
     Ok(GenerateCaptionsResult {
         edit,
         caption_count: count,
@@ -309,6 +505,58 @@ fn apply_captions_at_revision(
     core.apply_at_revision(revision, EditCommand::AddCaptions { entries })
         .map(EditResultDto::from)
         .map_err(|error| error.to_string())
+}
+
+/// Resolve each distinct source once. The backend is loaded lazily on the first
+/// cache miss and kept alive across all sources (including a failed source).
+/// The closures make loading, cache hits and cancellation testable without a
+/// Whisper model or a desktop runtime.
+fn transcribe_unique_sources<B>(
+    sources: Vec<(String, Result<(PathBuf, bool), String>)>,
+    cancel: &MediaCancelToken,
+    mut cached: impl FnMut(&Path) -> Option<TranscriptionResult>,
+    mut load: impl FnMut() -> Result<B, String>,
+    mut transcribe: impl FnMut(&Path, bool, &B, usize, usize) -> Result<TranscriptionResult, String>,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<HashMap<String, TranscriptionResult>, String> {
+    let total = sources.len();
+    progress(0, total);
+    let mut backend: Option<Result<B, String>> = None;
+    let mut transcripts = HashMap::new();
+    let mut first_error = None;
+    for (completed, (id, source)) in sources.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("caption generation cancelled".into());
+        }
+        let result = source.and_then(|(path, is_video)| {
+            if let Some(result) = cached(&path) {
+                return Ok(result);
+            }
+            let backend = backend.get_or_insert_with(&mut load);
+            match backend {
+                Ok(backend) => transcribe(&path, is_video, backend, completed, total),
+                Err(error) => Err(error.clone()),
+            }
+        });
+        if cancel.is_cancelled() {
+            return Err("caption generation cancelled".into());
+        }
+        match result {
+            Ok(result) => {
+                transcripts.insert(id, result);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        progress(completed + 1, total);
+    }
+    if transcripts.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    Ok(transcripts)
 }
 
 /// One caption-eligible clip located on the timeline: the clip + its track id +
@@ -428,6 +676,73 @@ fn new_caption_group_id() -> String {
 mod tests {
     use super::*;
     use opentake_domain::{MediaManifestEntry, MediaSource, Timeline, Track};
+
+    fn transcript(text: &str) -> TranscriptionResult {
+        TranscriptionResult {
+            text: text.into(),
+            language: Some("en".into()),
+            segments: Vec::new(),
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn caption_sources_reuse_one_backend_and_continue_after_a_failed_source() {
+        let sources = (0..3)
+            .map(|index| {
+                (
+                    format!("source-{index}"),
+                    Ok((PathBuf::from(format!("source-{index}.wav")), false)),
+                )
+            })
+            .collect();
+        let mut loads = 0;
+        let mut progress = Vec::new();
+        let results = transcribe_unique_sources(
+            sources,
+            &MediaCancelToken::new(),
+            |_| None, // an options variant bypasses the shared transcript cache
+            || {
+                loads += 1;
+                Ok(())
+            },
+            |path, _, _, _, _| {
+                if path == Path::new("source-1.wav") {
+                    Err("bad audio".into())
+                } else {
+                    Ok(transcript(&path.to_string_lossy()))
+                }
+            },
+            |done, total| progress.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(loads, 1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(progress, [(0, 3), (1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn caption_cancel_during_transcription_stops_before_commit() {
+        let state = CaptionGenerationState::default();
+        let (cancel, mut notified, guard) = state.begin("op-1".into()).unwrap();
+        assert!(!state.cancel("unrelated"));
+        let result = transcribe_unique_sources(
+            vec![("source".into(), Ok((PathBuf::from("speech.wav"), false)))],
+            &cancel,
+            |_| None,
+            || Ok(()),
+            |_, _, _, _, _| {
+                assert!(state.cancel("op-1"));
+                Ok(transcript("speech"))
+            },
+            |_, _| {},
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(!cancel.try_commit());
+        assert!(notified.try_recv().is_ok());
+        drop(guard);
+        assert!(!state.cancel("op-1"));
+    }
 
     fn entry(id: &str, kind: ClipType, has_audio: bool) -> MediaManifestEntry {
         MediaManifestEntry {

@@ -1,0 +1,66 @@
+name: Caption generation PR qualification
+
+# #11 changes the native Tauri command and Whisper integration, which the
+# lightweight PR gate intentionally does not compile. Run only linked tests.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - 'src-tauri/src/captions.rs'
+      - 'src-tauri/src/transcribe.rs'
+      - 'crates/opentake-media/src/transcribe/**'
+      - '.github/workflows/caption-generation-qualification.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  captions:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      PR_BODY: ${{ github.event.pull_request.body }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: native-media-windows-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: native-media-windows-${{ runner.arch }}-
+      - name: Compile native captions and run issue 11 acceptance cases
+        run: |
+          if ($env:PR_BODY -cnotmatch '(?im)^\s*(?:closes|fixes|resolves)\s+#11\b') {
+            throw 'Link issue #11 in the pull request description'
+          }
+          cargo clippy --locked -p opentake-tauri --lib -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Native captions lint failed' }
+
+          function Assert-CargoCase([string]$package, [string]$case) {
+            $output = cargo test --locked -p $package --lib $case -- --exact --nocapture --test-threads=1 2>&1
+            $code = $LASTEXITCODE
+            $lines = @($output | ForEach-Object { "$_" })
+            $lines | ForEach-Object { Write-Output $_ }
+            if ($code -ne 0) { throw "Issue regression failed: $package $case" }
+            $log = $lines -join "`n"
+            if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;' -or $log -match 'SKIP:') {
+              throw "Issue regression was skipped or did not run: $package $case"
+            }
+          }
+
+          Assert-CargoCase opentake-tauri 'captions::tests::caption_sources_reuse_one_backend_and_continue_after_a_failed_source'
+          Assert-CargoCase opentake-tauri 'captions::tests::caption_cancel_during_transcription_stops_before_commit'
+          Assert-CargoCase opentake-tauri 'search::tests::bounded_single_worker_cancels_skips_stale_and_yields_to_playback_export'
+          Assert-CargoCase opentake-media 'transcribe::tests::cancelled_transcription_does_not_open_source_or_run_inference'

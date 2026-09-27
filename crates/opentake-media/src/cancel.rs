@@ -35,6 +35,14 @@ pub struct MediaCancelToken {
     is_phase: bool,
 }
 
+impl std::fmt::Debug for MediaCancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaCancelToken")
+            .field("is_cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
 impl Default for MediaCancelToken {
     fn default() -> Self {
         let state = Arc::new(CancelState::default());

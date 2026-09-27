@@ -13,20 +13,26 @@ const mocks = vi.hoisted(() => ({
   apply: vi.fn(),
   cancel: vi.fn(),
   undo: vi.fn(),
+  generate: vi.fn(),
+  modelStatus: vi.fn(),
+  captionProgress: vi.fn(),
+  cancelCaption: vi.fn(),
 }));
 
 vi.mock("../../lib/api", () => ({
   isTauri: true,
   applyCaptionTranslationReview: mocks.apply,
   cancelAdvancedWorkflow: mocks.cancel,
+  cancelCaptionGeneration: mocks.cancelCaption,
   downloadTranscribeModel: vi.fn(),
   onTranscribeProgress: vi.fn(),
+  onCaptionGenerationProgress: mocks.captionProgress,
   translateCaptions: mocks.translate,
-  transcribeModelStatus: vi.fn(),
+  transcribeModelStatus: mocks.modelStatus,
 }));
 
 vi.mock("../../store/editActions", () => ({
-  generateCaptions: vi.fn(),
+  generateCaptions: mocks.generate,
   undo: mocks.undo,
 }));
 
@@ -104,6 +110,10 @@ describe("CaptionsTab translation review", () => {
     mocks.apply.mockReset().mockResolvedValue({ result: { applied: true }, actionName: "Translate Captions" });
     mocks.cancel.mockReset().mockResolvedValue(true);
     mocks.undo.mockReset().mockResolvedValue(undefined);
+    mocks.generate.mockReset();
+    mocks.modelStatus.mockReset().mockResolvedValue({ installed: true, model: "base", bytes: 100 });
+    mocks.captionProgress.mockReset().mockResolvedValue(() => {});
+    mocks.cancelCaption.mockReset().mockResolvedValue(true);
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -135,5 +145,28 @@ describe("CaptionsTab translation review", () => {
     expect(container.textContent).toContain("caption IDs and frame ranges are unchanged");
     await act(async () => button("Undo Translation").click());
     expect(mocks.undo).toHaveBeenCalledOnce();
+  });
+
+  it("shows progress for the active operation and cancels that exact operation", async () => {
+    let rejectGeneration!: (error: Error) => void;
+    mocks.generate.mockImplementation(() => new Promise((_resolve, reject) => { rejectGeneration = reject; }));
+    await act(async () => root.render(<CaptionsTab />));
+    const button = (label: string) => Array.from(container.querySelectorAll("button"))
+      .find((candidate) => candidate.textContent?.includes(label))!;
+    await act(async () => { button("Generate Captions").click(); });
+    const operationId = mocks.generate.mock.calls[0][0].operationId as string;
+    expect(operationId).toBeTruthy();
+    const progress = mocks.captionProgress.mock.calls[0][0] as (event: {
+      operationId: string; completed: number; total: number; fraction: number;
+    }) => void;
+    await act(async () => {
+      progress({ operationId: "other-operation", completed: 3, total: 3, fraction: 1 });
+      progress({ operationId, completed: 1, total: 3, fraction: 0.5 });
+    });
+    expect(container.textContent).toContain("50% (1/3 sources)");
+    await act(async () => { button("Cancel caption generation").click(); });
+    expect(mocks.cancelCaption).toHaveBeenCalledWith(operationId);
+    await act(async () => { rejectGeneration(new Error("caption generation cancelled")); });
+    expect(container.textContent).toContain("Caption generation cancelled.");
   });
 });
