@@ -560,8 +560,9 @@ fn continuous_decode_scales_real_main10_frames_without_corruption() {
     }
 }
 
-/// Lossless frame-numbered clip: the luma of source frame `N` is `N + 16`, so
-/// the decoded red channel names the source frame. `vf` retimes the frames.
+/// Lossless frame-numbered clip: columns `2b..2b+1` are white when bit `b` of
+/// the source frame number is set, so the number survives whatever YUV range
+/// conversion the local ffmpeg applies. `vf` retimes the frames.
 fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -570,7 +571,9 @@ fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
         "-f",
         "lavfi",
         "-i",
-        &format!("color=black:s=16x16:r={fps},format=gray,geq=lum='N+16'"),
+        &format!(
+            "color=black:s=16x16:r={fps},format=gray,geq=lum='if(mod(floor(N/pow(2,floor(X/2))),2),235,16)'"
+        ),
         "-frames:v",
         &frames.to_string(),
     ]);
@@ -578,7 +581,9 @@ fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
         command.args(["-vf", vf, "-fps_mode", "vfr"]);
     }
     command
-        .args(["-c:v", "libx264", "-crf", "0", "-g", "15", "-y"])
+        .args([
+            "-c:v", "libx264", "-crf", "0", "-g", "15", "-pix_fmt", "yuv420p", "-y",
+        ])
         .arg(path)
         .status()
         .map(|s| s.success())
@@ -586,7 +591,11 @@ fn make_numbered(path: &Path, fps: u32, frames: u32, vf: Option<&str>) -> bool {
 }
 
 fn source_index(frame: &RgbaFrame) -> i64 {
-    i64::from(frame.rgba[0]) - 16
+    let row = (frame.height / 2 * frame.width) as usize * 4;
+    (0..8)
+        .filter(|bit| frame.rgba[row + (bit * 2 + 1) * 4] > 128)
+        .map(|bit| 1 << bit)
+        .sum()
 }
 
 fn frame_at(path: &Path, time_secs: f64) -> (f64, i64) {
