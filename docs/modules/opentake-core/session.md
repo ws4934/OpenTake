@@ -94,6 +94,16 @@ ProbedMedia { duration_secs, width: Option<i32>, height: Option<i32>, fps: Optio
 
 > **关键不变量**：manifest 变更**刻意在撤销事务之外**——上游把导入直接追加 manifest，只文件夹移动（经 [`apply`](core-router.md)）可撤销。**导入不 bump timeline version。**
 
+### 批量导入的原子性与复杂度
+
+`AppCore::import_media_batch_for_project_persisted[_checked]` 在持锁并校验工程身份后，只建立一份回滚检查点。`session/import.rs` 为本批次建立一次 source→条目位置、asset id→条目位置及文件夹索引；按计划顺序更新索引并入库，不逐文件克隆 manifest，不调用 `CreateFolder` / `MoveToFolder` 编辑命令。已有 source 复用原素材 id 和元数据；指定目标文件夹才重新归类，未指定时保留原位置。既有文件夹和已创建计划文件夹均须存在；空名称、重复计划 key、前向引用及失效目标都会拒绝整批。
+
+**导入及其文件夹/归类是一个带外变更**：版本、undo、redo、Agent 的事务归属均不变化，撤销先前编辑不会删除此次导入。单独由用户发起的文件夹编辑仍经 `EditCommand` 撤销。这延续普通导入的语义，避免大目录导入挤掉用户的 200 步编辑历史。只在一次 manifest 持久化成功后发送 `MediaChanged` / `ProjectSaved`；中途准备或写入失败恢复完整检查点，不发送成功事件。
+
+单文件 `import_media_file_checked` 只追加新条目或复用原条目，最终身份校验失败时截断本次追加，不再克隆整份清单。音轨分离结果在变更前共用来源/校验和/执行模型校验，批量和单文件保存相同 provenance。批量核心成本与已有目录和本次计划大小线性相关；不包含调用方的文件扫描、FFprobe 或素材复制。
+
+可重复的 release 检查：`cargo test --release -p opentake-core release_batch_import -- --ignored --nocapture`，覆盖带文件夹 2000 个文件和不带文件夹 5000 个文件，两项目标各 <200ms，且不增加撤销历史。内存结构以零新增历史快照和有界目录序列化大小间接断言，不把它表述为进程 RSS 实测。
+
 ### `relink_media_file`
 
 把已有 asset（按 id）重链到新磁盘文件，**保持同 id**，使每个引用它的 clip 在位恢复（镜像上游 `EditorViewModel+Relink.applyRelink`：同 asset、换 url、刷新元数据）：
