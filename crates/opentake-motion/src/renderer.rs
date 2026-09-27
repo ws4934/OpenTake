@@ -1745,27 +1745,8 @@ mod chromium_backend {
                 .stderr(Stdio::piped());
             configure_command(&mut command);
             #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::process::CommandExt;
-
-                // Tauri exits with process::exit, so destructors cannot be the
-                // only containment boundary for a retained Chromium process.
-                let parent_pid = unsafe { libc::getpid() };
-                // SAFETY: the pre-exec hook only calls async-signal-safe kernel
-                // functions, and reports failure before the child executes.
-                unsafe {
-                    command.pre_exec(move || {
-                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::getppid() != parent_pid {
-                            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            let mut child = command.spawn().map_err(|error| {
+            kill_with_parent_process(&mut command);
+            let mut child = spawn_browser(command).map_err(|error| {
                 let _ = std::fs::remove_dir_all(&profile);
                 if error.kind() == std::io::ErrorKind::NotFound {
                     MotionError::renderer_unavailable(format!(
@@ -1904,9 +1885,71 @@ mod chromium_backend {
         }
     }
 
+    /// Kill the browser when the app process dies. Tauri exits with
+    /// `process::exit`, so destructors cannot be the only containment boundary
+    /// for a retained Chromium process.
+    #[cfg(target_os = "linux")]
+    fn kill_with_parent_process(command: &mut Command) {
+        use std::os::unix::process::CommandExt;
+
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: the pre-exec hook only calls async-signal-safe kernel
+        // functions, and reports failure before the child executes.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Launch a browser process. Linux delivers the parent-death signal when
+    /// the *thread* that forked the child exits, and renders run on pooled
+    /// blocking threads that retire when idle, which would kill a retained
+    /// browser mid-reuse. A spawner thread that lives as long as the process
+    /// therefore forks every browser.
+    #[cfg(target_os = "linux")]
+    fn spawn_browser(command: Command) -> std::io::Result<Child> {
+        type Request = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+        static SPAWNER: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
+        let spawner = SPAWNER.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<Request>();
+            // Never joined: the thread must outlive every browser it launches.
+            // If it cannot start, the dropped receiver fails each launch below.
+            let _ = thread::Builder::new()
+                .name("opentake-chromium-spawner".to_string())
+                .spawn(move || {
+                    for (mut command, reply) in receiver {
+                        let _ = reply.send(command.spawn());
+                    }
+                });
+            Mutex::new(sender)
+        });
+        let stopped = || std::io::Error::other("Chromium spawner thread is not running");
+        let (reply, response) = mpsc::sync_channel(1);
+        spawner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send((command, reply))
+            .map_err(|_| stopped())?;
+        response.recv().map_err(|_| stopped())?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_browser(mut command: Command) -> std::io::Result<Child> {
+        command.spawn()
+    }
+
     fn create_private_profile() -> std::io::Result<PathBuf> {
+        // Keep the owning pid in the name so leftovers can be traced to a process.
+        let prefix = format!("opentake-chromium-{}-", std::process::id());
         let mut builder = tempfile::Builder::new();
-        builder.prefix("opentake-chromium-");
+        builder.prefix(&prefix);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3231,6 +3274,29 @@ mod chromium_backend {
             let permissions = std::fs::metadata(&profile).unwrap().permissions().mode();
             assert_eq!(permissions & 0o777, 0o700);
             std::fs::remove_dir_all(profile).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn browser_launched_from_a_retired_thread_keeps_running() {
+            // Renders run on blocking-pool threads that exit when idle; the
+            // parent-death signal must follow the process, not that thread.
+            let mut child = thread::spawn(|| {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                kill_with_parent_process(&mut command);
+                spawn_browser(command).unwrap()
+            })
+            .join()
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let status = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                status.is_none(),
+                "browser died with its launching thread: {status:?}"
+            );
         }
 
         #[test]
