@@ -4,6 +4,7 @@ name: Native media PR qualification
 # PR description to select the native acceptance cases for #8, #64 and #97.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
     paths:
       - 'src-tauri/src/export.rs'
       - 'src-tauri/src/media.rs'
@@ -84,6 +85,7 @@ jobs:
           if ($linked.Contains(8)) {
             $cases += @(
               'export::tests::owned_export_lease_preserves_cancellation_across_worker_handoff',
+              'export::tests::cancel_export_command_returns_while_save_worker_owns_lease',
               'export::tests::pre_cancelled_export_leaves_existing_output_untouched',
               'export::tests::save_range_refuses_before_output_creation',
               'media::tests::save_clip_as_media_refuses_before_media_output_creation',

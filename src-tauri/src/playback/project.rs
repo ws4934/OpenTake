@@ -117,6 +117,12 @@ pub(crate) struct PendingProxyCheck {
     pub proxy: MediaProxy,
 }
 
+pub(crate) type ProxyMediaProjection = (
+    HashMap<String, (u32, u32)>,
+    HashMap<String, MediaInfo>,
+    Vec<PendingProxyCheck>,
+);
+
 /// Include clips reachable through nested sequences; unreferenced assets never
 /// cause source I/O just because they happen to have a stored proxy.
 pub(crate) fn timeline_media_refs(timeline: &Timeline) -> HashSet<String> {
@@ -149,11 +155,7 @@ pub(crate) fn project_media_with_proxies_for_refs(
     project_dir: &Option<PathBuf>,
     prefer_proxy: bool,
     referenced: Option<&HashSet<String>>,
-) -> (
-    HashMap<String, (u32, u32)>,
-    HashMap<String, MediaInfo>,
-    Vec<PendingProxyCheck>,
-) {
+) -> ProxyMediaProjection {
     let mut sizes: HashMap<String, (u32, u32)> = HashMap::new();
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
     let mut pending = Vec::new();
