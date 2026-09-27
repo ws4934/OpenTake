@@ -3520,33 +3520,43 @@ fn build_single_clip_export(
 /// extraction already exists via `extract_audio`). Requires a saved project —
 /// there must be a bundle `media/` dir to write into.
 #[tauri::command]
-pub fn save_clip_as_media(
+pub async fn save_clip_as_media(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, crate::export::ExportControl>,
-    media: State<'_, MediaState>,
-    prewarm: State<'_, prewarm::PrewarmScheduler>,
     clip_id: String,
     operation_id: String,
 ) -> Result<MediaListDto, String> {
+    core.ensure_project_mutable().map_err(|e| e.to_string())?;
+    let guard = control.try_begin(&operation_id)?;
+    let snapshot = core.runtime_snapshot();
+    let owned_core = core.inner().clone();
+    let owned_control = control.inner().clone();
     let progress_app = app.clone();
     let progress_operation_id = operation_id.clone();
     let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
         crate::export::emit_export_progress(&progress_app, &progress_operation_id, done, total);
     });
-    save_clip_as_media_impl(&core, || {
-        save_clip_as_media_workflow(
-            &core,
-            &control,
+    tauri::async_runtime::spawn_blocking(move || {
+        let media = app.state::<MediaState>();
+        let prewarm = app.state::<prewarm::PrewarmScheduler>();
+        save_clip_as_media_workflow_from_snapshot(
+            &owned_core,
+            &owned_control,
             media.engine(),
             &prewarm,
+            snapshot,
             &clip_id,
             &operation_id,
             on_progress,
+            Some(guard),
         )
     })
+    .await
+    .map_err(|error| format!("save clip worker failed: {error}"))?
 }
 
+#[cfg(test)]
 fn save_clip_as_media_impl(
     core: &AppCore,
     workflow: impl FnOnce() -> Result<MediaListDto, String>,
@@ -3555,6 +3565,8 @@ fn save_clip_as_media_impl(
     workflow()
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn save_clip_as_media_workflow(
     core: &AppCore,
     control: &crate::export::ExportControl,
@@ -3563,8 +3575,33 @@ fn save_clip_as_media_workflow(
     clip_id: &str,
     operation_id: &str,
     on_progress: crate::export::AudioExportProgress,
+    claimed_guard: Option<crate::export::ExportGuard>,
 ) -> Result<MediaListDto, String> {
-    let snapshot = core.runtime_snapshot();
+    save_clip_as_media_workflow_from_snapshot(
+        core,
+        control,
+        engine,
+        prewarm,
+        core.runtime_snapshot(),
+        clip_id,
+        operation_id,
+        on_progress,
+        claimed_guard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_clip_as_media_workflow_from_snapshot(
+    core: &AppCore,
+    control: &crate::export::ExportControl,
+    engine: &MediaEngine,
+    prewarm: &prewarm::PrewarmScheduler,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
+    clip_id: &str,
+    operation_id: &str,
+    on_progress: crate::export::AudioExportProgress,
+    claimed_guard: Option<crate::export::ExportGuard>,
+) -> Result<MediaListDto, String> {
     let project_dir = snapshot
         .project_dir
         .clone()
@@ -3572,7 +3609,10 @@ fn save_clip_as_media_workflow(
     let (single_timeline, subset, media_type) =
         build_single_clip_export(&snapshot.timeline, &snapshot.media, clip_id)?;
     let ext = save_clip_extension(media_type)?;
-    let mut guard = control.try_begin(operation_id)?;
+    let mut guard = match claimed_guard {
+        Some(guard) => guard,
+        None => control.try_begin(operation_id)?,
+    };
     let output =
         crate::export::reserve_project_media_output(&project_dir, &format!("clip_{clip_id}"), ext)?;
     let out_path = output.path().to_path_buf();
@@ -6371,6 +6411,7 @@ mod tests {
             "zero",
             "save-as:zero-duration",
             on_progress,
+            None,
         )
         .expect_err("zero-duration video save must fail");
 

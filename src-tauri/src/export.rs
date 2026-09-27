@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use same_file::Handle as FileIdentity;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::render::LottieMaterializer;
 
@@ -2905,35 +2905,37 @@ pub struct SaveRangeAsMediaRequest {
 }
 
 #[tauri::command]
-pub fn save_range_as_media(
+pub async fn save_range_as_media(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,
-    media: State<'_, crate::media::MediaState>,
-    prewarm: State<'_, crate::media::prewarm::PrewarmScheduler>,
     request: SaveRangeAsMediaRequest,
 ) -> Result<crate::media::MediaListDto, String> {
-    let SaveRangeAsMediaRequest {
-        in_frame,
-        out_frame,
-        operation_id,
-    } = request;
-    save_range_as_media_impl(&core, || {
+    core.ensure_project_mutable()
+        .map_err(|error| error.to_string())?;
+    let guard = control.try_begin(&request.operation_id)?;
+    let snapshot = core.runtime_snapshot();
+    let owned_core = core.inner().clone();
+    let owned_control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let media = app.state::<crate::media::MediaState>();
+        let prewarm = app.state::<crate::media::prewarm::PrewarmScheduler>();
         save_range_as_media_workflow(
             &app,
-            &core,
-            &control,
+            &owned_core,
+            &owned_control,
             media.engine(),
             &prewarm,
-            SaveRangeAsMediaRequest {
-                in_frame,
-                out_frame,
-                operation_id,
-            },
+            snapshot,
+            request,
+            guard,
         )
     })
+    .await
+    .map_err(|error| format!("save range worker failed: {error}"))?
 }
 
+#[cfg(test)]
 fn save_range_as_media_impl(
     core: &AppCore,
     workflow: impl FnOnce() -> Result<crate::media::MediaListDto, String>,
@@ -2942,20 +2944,22 @@ fn save_range_as_media_impl(
     workflow()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_range_as_media_workflow(
     app: &AppHandle,
     core: &AppCore,
     control: &ExportControl,
     engine: &opentake_media::MediaEngine,
     prewarm: &crate::media::prewarm::PrewarmScheduler,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
     request: SaveRangeAsMediaRequest,
+    mut guard: ExportGuard,
 ) -> Result<crate::media::MediaListDto, String> {
     let SaveRangeAsMediaRequest {
         in_frame,
         out_frame,
-        operation_id,
+        operation_id: _,
     } = request;
-    let snapshot = core.runtime_snapshot();
     let project_dir = snapshot
         .project_dir
         .clone()
@@ -2963,7 +2967,6 @@ fn save_range_as_media_workflow(
     let total_frames = snapshot.timeline.total_frames();
     validate_save_range(total_frames, in_frame, out_frame)?;
 
-    let mut guard = control.try_begin(&operation_id)?;
     let output = reserve_project_media_output(
         &project_dir,
         &format!("range_{in_frame}_{out_frame}"),
