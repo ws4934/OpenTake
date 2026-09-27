@@ -511,10 +511,10 @@ fn apply_captions_at_revision(
 /// cache miss and kept alive across all sources (including a failed source).
 /// The closures make loading, cache hits and cancellation testable without a
 /// Whisper model or a desktop runtime.
-type CaptionSource = (String, Result<(PathBuf, bool), String>);
+type CaptionSourceInput = (String, Result<(PathBuf, bool), String>);
 
 fn transcribe_unique_sources<B>(
-    sources: Vec<CaptionSource>,
+    sources: Vec<CaptionSourceInput>,
     cancel: &MediaCancelToken,
     mut cached: impl FnMut(&Path) -> Option<TranscriptionResult>,
     mut load: impl FnMut() -> Result<B, String>,
