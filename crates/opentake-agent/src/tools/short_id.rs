@@ -21,7 +21,7 @@ use crate::tools::result::{Block, ToolResult};
 const ID_PREFIX_FLOOR: usize = 8;
 
 /// Scalar argument keys whose string value is an id prefix to expand
-/// (upstream `scalarIdKeys`).
+/// (upstream `scalarIdKeys` plus OpenTake-only tool keys).
 const SCALAR_ID_KEYS: &[&str] = &[
     "clipId",
     "sourceClipId",
@@ -32,10 +32,17 @@ const SCALAR_ID_KEYS: &[&str] = &[
     "videoSourceMediaRef",
     "folderId",
     "parentFolderId",
+    "beatClipId",
+    "beatMediaRef",
+    "referenceMediaRef",
+    "narrationMediaRef",
+    "portraitMediaRef",
+    "audioMediaRef",
+    "referenceAudioMediaRef",
 ];
 
 /// Array argument keys whose string elements are id prefixes to expand
-/// (upstream `arrayIdKeys`).
+/// (upstream `arrayIdKeys` plus OpenTake-only tool keys).
 const ARRAY_ID_KEYS: &[&str] = &[
     "clipIds",
     "assetIds",
@@ -44,6 +51,7 @@ const ARRAY_ID_KEYS: &[&str] = &[
     "referenceImageMediaRefs",
     "referenceVideoMediaRefs",
     "referenceAudioMediaRefs",
+    "captionClipIds",
 ];
 
 fn uuid_regex() -> &'static Regex {
@@ -353,6 +361,97 @@ mod tests {
         let ids = current_id_universe(&tl, &m);
         for want in ["track-1", "clip-1", "link-1", "cap-1", "folder-1"] {
             assert!(ids.contains(want), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn expand_opentake_tool_keys_with_uuid_prefixes() {
+        let u = universe(&[A, B, C]);
+        for key in [
+            "beatClipId",
+            "beatMediaRef",
+            "referenceMediaRef",
+            "narrationMediaRef",
+            "portraitMediaRef",
+            "audioMediaRef",
+            "referenceAudioMediaRef",
+        ] {
+            let out = expand_id_prefixes(&serde_json::json!({ key: &A[..15] }), &u).unwrap();
+            assert_eq!(out[key], serde_json::json!(A), "{key}");
+            let err = expand_id_prefixes(&serde_json::json!({ key: "11111111" }), &u).unwrap_err();
+            assert!(err.message.contains("Ambiguous id"), "{key}");
+        }
+        let out = expand_id_prefixes(
+            &serde_json::json!({"captionClipIds": [&A[..15], &B[..15]]}),
+            &u,
+        )
+        .unwrap();
+        assert_eq!(out["captionClipIds"], serde_json::json!([A, B]));
+        let err = expand_id_prefixes(&serde_json::json!({"captionClipIds": ["11111111"]}), &u)
+            .unwrap_err();
+        assert!(err.message.contains("Ambiguous id"));
+
+        let nested = serde_json::json!({"segments": [{"narrationMediaRef": &C[..9]}]});
+        let out = expand_id_prefixes(&nested, &u).unwrap();
+        assert_eq!(
+            out["segments"][0]["narrationMediaRef"],
+            serde_json::json!(C)
+        );
+    }
+
+    /// Keys that end like an id but name something outside the timeline/media
+    /// id universe, so outbound shortening never produces a prefix for them.
+    const NON_UNIVERSE_ID_KEYS: &[&str] = &[
+        "consentId",
+        "voiceId",
+        "templateId",
+        "workflowId",
+        "maskId",
+        "documentId",
+    ];
+
+    fn allowed_keys_in(source: &str) -> Vec<String> {
+        const MARKER: &str = "ALLOWED_KEYS: &'static [&'static str] = &[";
+        let mut keys = Vec::new();
+        for block in source.split(MARKER).skip(1) {
+            let list = &block[..block.find(']').expect("closed ALLOWED_KEYS list")];
+            keys.extend(
+                list.split(',')
+                    .map(|item| item.trim().trim_matches('"'))
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        keys
+    }
+
+    #[test]
+    fn every_id_shaped_tool_argument_key_is_expanded_or_exempt() {
+        let keys: Vec<String> = [
+            include_str!("args.rs"),
+            include_str!("../mcp/motion_documents.rs"),
+            include_str!("../mcp/dispatch.rs"),
+        ]
+        .into_iter()
+        .flat_map(allowed_keys_in)
+        .collect();
+        assert!(keys.iter().any(|key| key == "beatClipId"));
+        for key in &keys {
+            let key = key.as_str();
+            if NON_UNIVERSE_ID_KEYS.contains(&key) {
+                continue;
+            }
+            if key.ends_with("Ids") || key.ends_with("MediaRefs") {
+                assert!(
+                    ARRAY_ID_KEYS.contains(&key),
+                    "{key} missing from ARRAY_ID_KEYS"
+                );
+            } else if key.ends_with("Id") || key.ends_with("MediaRef") || key == "mediaRef" {
+                assert!(
+                    SCALAR_ID_KEYS.contains(&key),
+                    "{key} missing from SCALAR_ID_KEYS"
+                );
+            }
         }
     }
 }

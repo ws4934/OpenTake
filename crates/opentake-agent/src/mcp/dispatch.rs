@@ -485,6 +485,23 @@ impl Dispatcher {
             ));
         }
 
+        // 2. Snapshot the pre-run state.
+        let before = self.handle.timeline();
+        let manifest = self.handle.media();
+
+        // 3. Expand inbound short-id prefixes against the pre-run id universe.
+        //    Motion document tools take project ids too, so this runs first.
+        let universe = short_id::current_id_universe(&before, &manifest);
+        let args = match short_id::expand_id_prefixes(&args, &universe) {
+            Ok(v) => v,
+            Err(e) => {
+                return DispatchReceipt::complete(ToolResult::public_error(
+                    PublicErrorKind::InvalidArguments(tool),
+                    e.message,
+                ));
+            }
+        };
+
         // Motion Studio operations must acquire the host's publication lock in
         // publication -> identity order. Admit against the exact project while
         // the caller's lifecycle lease is still held, then execute from
@@ -513,22 +530,6 @@ impl Dispatcher {
                 Err(error) => DispatchReceipt::complete(motion_document_error(tool, error)),
             };
         }
-
-        // 2. Snapshot the pre-run state.
-        let before = self.handle.timeline();
-        let manifest = self.handle.media();
-
-        // 3. Expand inbound short-id prefixes against the pre-run id universe.
-        let universe = short_id::current_id_universe(&before, &manifest);
-        let args = match short_id::expand_id_prefixes(&args, &universe) {
-            Ok(v) => v,
-            Err(e) => {
-                return DispatchReceipt::complete(ToolResult::public_error(
-                    PublicErrorKind::InvalidArguments(tool),
-                    e.message,
-                ));
-            }
-        };
 
         // 4 + 5. Decode typed args and run the body. `op` collects what the body
         // did for the rule layer; `result` is the body's neutral output.
@@ -585,7 +586,12 @@ impl Dispatcher {
                     return receipt.result;
                 }
                 TimelineResultCompletion::MotionDocument { tool, operation } => {
-                    return finish_motion_document_operation(tool, operation, cancel)
+                    let result = finish_motion_document_operation(tool, operation, cancel);
+                    let universe = short_id::current_id_universe(
+                        &self.handle.timeline(),
+                        &self.handle.media(),
+                    );
+                    return short_id::shorten_ids(result, &universe);
                 }
                 TimelineResultCompletion::Capture(request) => request,
             };
@@ -4994,6 +5000,61 @@ mod tests {
         assert_eq!(executed.load(Ordering::SeqCst), 1);
     }
 
+    struct RecordingPublishBridge {
+        clip_id: Arc<Mutex<Option<String>>>,
+    }
+
+    impl MotionDocumentBridge for RecordingPublishBridge {
+        fn can_edit_motion_documents(&self) -> bool {
+            true
+        }
+
+        fn admit(
+            &self,
+            request: crate::mcp::motion_documents::MotionDocumentRequest,
+        ) -> Result<
+            Box<dyn AdmittedMotionDocumentOperation>,
+            crate::mcp::motion_documents::MotionDocumentBridgeError,
+        > {
+            if let crate::mcp::motion_documents::MotionDocumentRequest::Publish(publish) = request {
+                *self.clip_id.lock().unwrap() = publish.clip_id;
+            }
+            Ok(Box::new(DeferredDocumentOperation {
+                executed: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    #[test]
+    fn publish_motion_document_expands_a_clip_id_prefix_before_admission() {
+        const MOTION_CLIP: &str = "7d3e9b12-4c6a-4f8e-b1d2-93a0c5e7f601";
+        let mut tl = Timeline::new();
+        let mut track = Track::new("track-v", ClipType::Video);
+        track
+            .clips
+            .push(Clip::new(MOTION_CLIP, "motion-asset", 0, 30));
+        tl.tracks.push(track);
+        let clip_id = Arc::new(Mutex::new(None));
+        let dispatcher = dispatcher_with(Arc::new(StateHandle::new(tl, MediaManifest::new())))
+            .with_motion_document_bridge(Some(Arc::new(RecordingPublishBridge {
+                clip_id: clip_id.clone(),
+            })));
+        let result = dispatcher.dispatch(
+            "publish_motion_document",
+            serde_json::json!({
+                "documentId": "0b8f4c2e-6a1d-4e3b-9c7f-5d2a8e1b0c94",
+                "revisionHash": "a".repeat(64),
+                "width": 640,
+                "height": 360,
+                "fps": 30,
+                "durationFrames": 30,
+                "clipId": &MOTION_CLIP[..8],
+            }),
+        );
+        assert!(!result.is_error, "{}", result.text_joined());
+        assert_eq!(clip_id.lock().unwrap().as_deref(), Some(MOTION_CLIP));
+    }
+
     #[test]
     fn unknown_tool_is_error() {
         let d = dispatcher_with(Arc::new(TestHandle::new()));
@@ -6336,6 +6397,33 @@ mod tests {
         assert!(result.text_joined().contains("Cancelled"));
         assert!(handle.commands.lock().unwrap().is_empty());
         assert_eq!(handle.timeline(), before);
+    }
+
+    #[test]
+    fn auto_cut_to_beats_expands_a_beat_clip_id_prefix() {
+        const MUSIC_CLIP: &str = "3a9c1e57-8b2d-4f60-a4e1-6c0d9b7f2e38";
+        let handle = linked_beat_handle();
+        {
+            let mut state = handle.state.lock().unwrap();
+            let mut track = Track::new("music-track", ClipType::Audio);
+            let mut music = Clip::new(MUSIC_CLIP, "music", 0, 100);
+            music.media_type = ClipType::Audio;
+            track.clips.push(music);
+            state.timeline.tracks.push(track);
+        }
+        let dispatcher = dispatcher_with(handle.clone());
+
+        let result = dispatcher.dispatch(
+            "auto_cut_to_beats",
+            serde_json::json!({
+                "clipIds": ["video-a"],
+                "beatClipId": &MUSIC_CLIP[..8],
+                "write": false
+            }),
+        );
+
+        assert!(!result.is_error, "{}", result.text_joined());
+        assert_eq!(first_json(&result)["applied"], false);
     }
 
     #[test]
