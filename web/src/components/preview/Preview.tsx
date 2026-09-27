@@ -212,7 +212,6 @@ export function Preview() {
   useEffect(() => {
     retireSourcePlaybackStart(sourcePlaybackGenerationRef, sourcePlaybackStartingRef);
     mediaRef.current?.pause();
-    mediaRef.current = null;
     setMediaTime(0);
     setMediaDuration(Math.max(0, previewItem?.duration ?? 0));
     setMediaPlaying(false);
@@ -964,6 +963,17 @@ export function MediaPreview({
     };
   }, [item.id, item.path, item.type, item.missing, projectEpoch]);
 
+  // Stable ref callback: an inline one is a new function every render, so React
+  // would detach (null) and re-attach it on each commit — pausing the element
+  // that is playing whenever onTime/onPlayingChange re-render the parent.
+  const attachMedia = useCallback(
+    (el: HTMLMediaElement | null) => {
+      if (!el) mediaRef.current?.pause();
+      mediaRef.current = el;
+    },
+    [mediaRef],
+  );
+
   const box: React.CSSProperties = {
     maxWidth: "100%",
     maxHeight: "100%",
@@ -983,10 +993,7 @@ export function MediaPreview({
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "var(--space-md)", padding: "var(--space-xl)" }}>
         <Icon icon={Play} size={28} />
         <audio
-          ref={(el) => {
-            if (!el) mediaRef.current?.pause();
-            mediaRef.current = el;
-          }}
+          ref={attachMedia}
           src={url}
           onTimeUpdate={(e) => onTime(e.currentTarget.currentTime)}
           onLoadedMetadata={(e) => onDuration(e.currentTarget.duration || 0)}
@@ -1006,10 +1013,7 @@ export function MediaPreview({
   // eagerly buffering the whole file behind a blank frame.
   return (
     <video
-      ref={(el) => {
-        if (!el) mediaRef.current?.pause();
-        mediaRef.current = el;
-      }}
+      ref={attachMedia}
       src={url}
       poster={posterUrl ?? undefined}
       preload="metadata"
