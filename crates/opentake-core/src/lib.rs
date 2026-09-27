@@ -45,9 +45,10 @@ pub mod session;
 // --- Assembly façade ---
 pub use crate::core::{
     AppCore, BundleExportSnapshot, CapabilityImportCommit, CommittedMediaImport,
-    DeferredCoreEvents, ImportCommitWarning, MotionMediaCommit, MotionPlacement, OwnedUndoResult,
-    PreparedMediaFolderRef, PreparedMediaImportOp, ProjectAssetAuthority, ProjectRevision,
-    ProjectRuntimeSnapshot, ProjectUndoSnapshot, TimelineSnapshot,
+    DeferredCoreEvents, GeneratedMediaExpectation, ImportCommitWarning, MotionMediaCommit,
+    MotionPlacement, OwnedUndoResult, PreparedMediaFolderRef, PreparedMediaImportOp,
+    ProjectAssetAuthority, ProjectRevision, ProjectRuntimeSnapshot, ProjectUndoSnapshot,
+    TimelineSnapshot,
 };
 pub use session::{
     importable_clip_type, DerivedStemProvenance, EditorSession, GenerationJobCommit,

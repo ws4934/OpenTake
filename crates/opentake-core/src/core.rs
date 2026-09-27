@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use opentake_domain::{
-    ClipType, GenerationInput, MediaAsset, MediaManifest, MediaManifestEntry, MediaProxy, Timeline,
+    Clip, ClipType, GenerationInput, MediaAsset, MediaManifest, MediaManifestEntry, MediaProxy,
+    Timeline,
 };
 use opentake_ops::command::{ClipEntry, EditCommand, EditResult};
 use opentake_ops::IdGen;
@@ -190,6 +191,85 @@ pub enum MotionPlacement {
     ReplaceAndClearMasks {
         clip_id: String,
     },
+}
+
+/// The state that a long-running render actually depends on. This is captured
+/// before invoking a provider or renderer and checked under the session lock
+/// immediately before committing the result.
+#[derive(Clone, Debug)]
+pub enum GeneratedMediaExpectation {
+    ExactVersion(u64),
+    TimelineFps(i32),
+    ClipUnchanged { clip: Box<Clip>, track_id: String },
+}
+
+impl From<u64> for GeneratedMediaExpectation {
+    fn from(version: u64) -> Self {
+        Self::ExactVersion(version)
+    }
+}
+
+impl GeneratedMediaExpectation {
+    pub fn for_placement(
+        snapshot: &ProjectRuntimeSnapshot,
+        placement: &MotionPlacement,
+    ) -> Result<Self> {
+        let clip_id = match placement {
+            MotionPlacement::Add { .. } => return Ok(Self::TimelineFps(snapshot.timeline.fps)),
+            MotionPlacement::Replace { clip_id }
+            | MotionPlacement::ReplaceAndClearMasks { clip_id } => clip_id,
+        };
+        snapshot
+            .timeline
+            .tracks
+            .iter()
+            .find_map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .find(|clip| &clip.id == clip_id)
+                    .map(|clip| Self::ClipUnchanged {
+                        clip: Box::new(clip.clone()),
+                        track_id: track.id.clone(),
+                    })
+            })
+            .ok_or_else(|| CoreError::Media(format!("replacement clip not found: {clip_id}")))
+    }
+
+    fn check(&self, version: u64, timeline: &Timeline) -> Result<()> {
+        match self {
+            Self::ExactVersion(expected) if *expected != version => Err(CoreError::Media(
+                "project changed while preparing a generated-media edit".into(),
+            )),
+            Self::TimelineFps(expected) if *expected != timeline.fps => Err(CoreError::Media(
+                "timeline frame rate changed while generating media".into(),
+            )),
+            Self::ClipUnchanged { clip, track_id } => {
+                let current = timeline
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == *track_id)
+                    .and_then(|track| track.clips.iter().find(|candidate| candidate.id == clip.id));
+                if current.is_some_and(|current| {
+                    current.media_ref == clip.media_ref
+                        && current.trim_start_frame == clip.trim_start_frame
+                        && current.trim_end_frame == clip.trim_end_frame
+                        && current.duration_frames == clip.duration_frames
+                        && current.speed == clip.speed
+                        && current.reversed == clip.reversed
+                        && current.link_group_id == clip.link_group_id
+                        && current.masks == clip.masks
+                }) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Media(
+                        "target clip changed while generating media".into(),
+                    ))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Result of atomically registering a rendered video and placing/replacing it.
@@ -733,6 +813,90 @@ impl AppCore {
                 check_project_path: true,
             }),
         )
+    }
+
+    /// Commit an externally prepared edit against the current document when
+    /// its original project session is still active. The command itself must
+    /// validate any target content it depends on (for example, caption text).
+    pub fn apply_for_project(
+        &self,
+        expected_project_epoch: u64,
+        expected_project_dir: Option<&Path>,
+        command: EditCommand,
+    ) -> Result<EditResult> {
+        let (result, media_count) = {
+            let mut session = self.lock();
+            if session.project_epoch != expected_project_epoch
+                || session.editor.project_dir() != expected_project_dir
+            {
+                return Err(CoreError::StaleProject);
+            }
+            let result = session.editor.apply(command, self.ids.as_ref())?;
+            let count = result
+                .manifest_changed
+                .then(|| session.editor.media_count());
+            (result, count)
+        };
+        if result.changed {
+            self.events.emit(&CoreEvent::TimelineChanged {
+                project_epoch: expected_project_epoch,
+                version: result.timeline_version,
+            });
+        }
+        if let Some(count) = media_count {
+            self.events.emit(&CoreEvent::MediaChanged {
+                project_epoch: expected_project_epoch,
+                count,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Persist a paid provider's registration against the same project even
+    /// after unrelated timeline edits; rollback remains exact on save failure.
+    pub fn apply_for_project_persisted(
+        &self,
+        expected_project_epoch: u64,
+        expected_project_dir: &Path,
+        command: EditCommand,
+    ) -> Result<EditResult> {
+        let (result, count, written) = {
+            let mut session = self.lock();
+            ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
+            let before = session.editor.checkpoint_editor_state();
+            let outcome = (|| {
+                let result = session.editor.apply(command, self.ids.as_ref())?;
+                let count = result
+                    .manifest_changed
+                    .then(|| session.editor.media_count());
+                let written = session.editor.save_project(None)?;
+                Ok((result, count, written))
+            })();
+            match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    session.editor.restore_editor_state(before);
+                    return Err(error);
+                }
+            }
+        };
+        if result.changed {
+            self.events.emit(&CoreEvent::TimelineChanged {
+                project_epoch: expected_project_epoch,
+                version: result.timeline_version,
+            });
+        }
+        if let Some(count) = count {
+            self.events.emit(&CoreEvent::MediaChanged {
+                project_epoch: expected_project_epoch,
+                count,
+            });
+        }
+        self.events.emit(&CoreEvent::ProjectSaved {
+            path: written.to_string_lossy().into_owned(),
+            project_epoch: expected_project_epoch,
+        });
+        Ok(result)
     }
 
     /// Apply one revision-bound edit and durably save the project under the
@@ -1419,7 +1583,7 @@ impl AppCore {
     pub fn commit_motion_media_for_project(
         &self,
         expected_project_epoch: u64,
-        expected_version: u64,
+        expected_version: impl Into<GeneratedMediaExpectation>,
         expected_project_dir: &Path,
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -1450,7 +1614,7 @@ impl AppCore {
         &self,
         publication: &MutexGuard<'_, ()>,
         expected_project_epoch: u64,
-        expected_version: u64,
+        expected_version: impl Into<GeneratedMediaExpectation>,
         expected_project_dir: &Path,
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -1486,7 +1650,7 @@ impl AppCore {
     pub fn commit_generated_media_for_project(
         &self,
         expected_project_epoch: u64,
-        expected_version: u64,
+        expected_version: impl Into<GeneratedMediaExpectation>,
         expected_project_dir: &Path,
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -1525,7 +1689,7 @@ impl AppCore {
         &self,
         _publication: &MutexGuard<'_, ()>,
         expected_project_epoch: u64,
-        expected_version: u64,
+        expected_version: impl Into<GeneratedMediaExpectation>,
         expected_project_dir: &Path,
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -1563,10 +1727,49 @@ impl AppCore {
         let (commit, count, written) = {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
-            if session.editor.version() != expected_version {
-                return Err(CoreError::Media(
-                    "project changed while preparing a generated-media edit".into(),
-                ));
+            let timeline = session.editor.timeline();
+            expected_version
+                .into()
+                .check(session.editor.version(), &timeline)?;
+            if provenance.provider.as_deref() == Some("elevenlabs") {
+                if let Some(voice_id) = provenance.voice.as_deref() {
+                    if !timeline.voice_models.iter().any(|record| {
+                        record.id == voice_id
+                            && !record.revoked
+                            && provenance.consent_id.as_deref() == Some(record.consent_id.as_str())
+                            && provenance.source_asset_id.as_deref()
+                                == Some(record.source_audio_asset_id.as_str())
+                    }) {
+                        return Err(CoreError::Media(
+                            "voice model changed while generating audio".into(),
+                        ));
+                    }
+                }
+            }
+            for id in std::iter::once(provenance.source_asset_id.as_ref())
+                .chain(
+                    provenance
+                        .reference_image_asset_ids
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .map(Some),
+                )
+                .chain(
+                    provenance
+                        .reference_audio_asset_ids
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .map(Some),
+                )
+                .flatten()
+            {
+                if session.editor.media_entry(id).is_none() {
+                    return Err(CoreError::Media(format!(
+                        "generation source media was removed: {id}"
+                    )));
+                }
             }
             session.editor.ensure_mutable()?;
             let before = session.editor.checkpoint_editor_state();
@@ -2329,7 +2532,7 @@ mod import_tests;
 mod tests {
     use super::*;
     use opentake_domain::{Clip, ClipType, MediaColorMetadata, MediaProxy, Timeline, Track};
-    use opentake_ops::command::ClipEntry;
+    use opentake_ops::command::{ClipEntry, ClipProperties};
     use std::sync::Mutex;
 
     /// Build a core whose session has one empty video track, ready for AddClips.
@@ -2445,6 +2648,210 @@ mod tests {
         assert_eq!(after_commit.version, before_commit.version);
 
         let _ = std::fs::remove_dir_all(bundle);
+    }
+
+    #[test]
+    fn generated_media_commit_allows_unrelated_edits_and_checks_target_identity() {
+        let bundle = project_bundle("generated-conflict-aware");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let media_dir = opentake_project::layout::media_dir(&bundle);
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let add_output = media_dir.join("paid-add.mp4");
+        let replace_output = media_dir.join("replacement.mp4");
+        let conflict_output = media_dir.join("conflicting.mp4");
+        for output in [&add_output, &replace_output, &conflict_output] {
+            std::fs::write(output, b"completed-provider-output").unwrap();
+        }
+        let probe = ProbedMedia {
+            duration_secs: 1.0,
+            width: Some(64),
+            height: Some(36),
+            fps: Some(30.0),
+            has_audio: false,
+            color: None,
+        };
+        let first = core.runtime_snapshot();
+        let placement = MotionPlacement::Add {
+            start_frame: 0,
+            duration_frames: 30,
+            track_index: Some(0),
+        };
+        let add_expectation = GeneratedMediaExpectation::for_placement(&first, &placement).unwrap();
+        core.apply(EditCommand::InsertTrack {
+            kind: ClipType::Audio,
+            at: None,
+        })
+        .unwrap();
+        let added = core
+            .commit_motion_media_for_project(
+                first.project_epoch,
+                add_expectation,
+                &bundle,
+                &add_output,
+                "Paid add",
+                &probe,
+                GenerationInput::default(),
+                placement,
+            )
+            .unwrap();
+        let clip_id = added.edit.affected_clip_ids[0].clone();
+
+        let before_replace = core.runtime_snapshot();
+        let placement = MotionPlacement::Replace {
+            clip_id: clip_id.clone(),
+        };
+        let replace_expectation =
+            GeneratedMediaExpectation::for_placement(&before_replace, &placement).unwrap();
+        core.apply(EditCommand::InsertTrack {
+            kind: ClipType::Audio,
+            at: None,
+        })
+        .unwrap();
+        core.commit_motion_media_for_project(
+            before_replace.project_epoch,
+            replace_expectation,
+            &bundle,
+            &replace_output,
+            "Replacement",
+            &probe,
+            GenerationInput::default(),
+            placement,
+        )
+        .unwrap();
+
+        let before_conflict = core.runtime_snapshot();
+        let placement = MotionPlacement::Replace {
+            clip_id: clip_id.clone(),
+        };
+        let conflict_expectation =
+            GeneratedMediaExpectation::for_placement(&before_conflict, &placement).unwrap();
+        core.apply(EditCommand::SetClipProperties {
+            clip_ids: vec![clip_id],
+            properties: Box::new(ClipProperties {
+                trim_start_frame: Some(1),
+                ..ClipProperties::default()
+            }),
+        })
+        .unwrap();
+        let err = core
+            .commit_motion_media_for_project(
+                before_conflict.project_epoch,
+                conflict_expectation,
+                &bundle,
+                &conflict_output,
+                "Conflicting",
+                &probe,
+                GenerationInput::default(),
+                placement,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("target clip changed"));
+        assert_eq!(
+            std::fs::read(&conflict_output).unwrap(),
+            b"completed-provider-output"
+        );
+        let _ = std::fs::remove_dir_all(bundle);
+    }
+
+    #[test]
+    fn deferred_project_identity_edits_survive_unrelated_version_changes() {
+        let bundle = project_bundle("deferred-identity-edit");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let initial = core.runtime_snapshot();
+        core.apply(EditCommand::InsertTrack {
+            kind: ClipType::Audio,
+            at: None,
+        })
+        .unwrap();
+        let result = core
+            .apply_for_project_persisted(
+                initial.project_epoch,
+                &bundle,
+                EditCommand::SetTimelineSettings {
+                    fps: 24,
+                    width: 1280,
+                    height: 720,
+                },
+            )
+            .unwrap();
+        assert!(result.changed);
+        let mismatch = core
+            .apply_for_project(
+                initial.project_epoch,
+                Some(Path::new("/different-project.opentake")),
+                EditCommand::InsertTrack {
+                    kind: ClipType::Audio,
+                    at: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(mismatch, CoreError::StaleProject));
+        let reopened = AppCore::new();
+        reopened.open_project(&bundle).unwrap();
+        assert_eq!(reopened.get_timeline().timeline.fps, 24);
+        let _ = std::fs::remove_dir_all(bundle);
+    }
+
+    #[test]
+    fn reviewed_caption_apply_ignores_unrelated_edits_but_rejects_text_conflicts() {
+        let core = core_with_track();
+        {
+            let mut session = core.lock();
+            let mut timeline = session.editor.timeline();
+            let mut caption = Clip::new("caption", "", 0, 30);
+            caption.media_type = ClipType::Text;
+            caption.source_clip_type = ClipType::Text;
+            caption.caption_group_id = Some("captions".into());
+            caption.text_content = Some("Hello".into());
+            timeline.tracks[0].clips.push(caption);
+            session.editor.seed_from_timeline(timeline);
+        }
+        let snapshot = core.runtime_snapshot();
+        core.apply(EditCommand::InsertTrack {
+            kind: ClipType::Audio,
+            at: None,
+        })
+        .unwrap();
+        let change = opentake_ops::CaptionTranslationChange {
+            clip_id: "caption".into(),
+            expected_source_text: "Hello".into(),
+            translated_text: "你好".into(),
+            input: opentake_domain::CaptionTranslationInput {
+                source_text: "Hello".into(),
+                source_locale: "en".into(),
+                target_locale: "zh".into(),
+                provider: "fixture".into(),
+                model: "fixture".into(),
+            },
+        };
+        core.apply_for_project(
+            snapshot.project_epoch,
+            None,
+            EditCommand::ApplyCaptionTranslations {
+                changes: vec![change.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            core.get_timeline().timeline.tracks[0].clips[0]
+                .text_content
+                .as_deref(),
+            Some("你好")
+        );
+        let err = core
+            .apply_for_project(
+                snapshot.project_epoch,
+                None,
+                EditCommand::ApplyCaptionTranslations {
+                    changes: vec![change],
+                },
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Caption text changed during review"));
     }
 
     #[test]

@@ -862,6 +862,7 @@ export interface CaptionTranslationResult {
   result: {
     projectEpoch: number;
     version: number;
+    projectDir: string | null;
     sourceLocale: string;
     targetLocale: string;
     provider: string;

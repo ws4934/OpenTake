@@ -18,7 +18,8 @@ use opentake_agent::mcp::motion::{
     MotionCommit, MotionDocumentReference, MotionOutputMetadata, MotionSourceRequest,
 };
 use opentake_core::{
-    AppCore, DeferredCoreEvents, MotionPlacement, ProbedMedia, ProjectAssetAuthority,
+    AppCore, DeferredCoreEvents, GeneratedMediaExpectation, MotionPlacement, ProbedMedia,
+    ProjectAssetAuthority,
 };
 use opentake_domain::{GenerationInput, GenerationJobStatus};
 use opentake_motion::{
@@ -789,6 +790,7 @@ struct PreparedMotionCommit {
     transparent: bool,
     render_dimensions: Option<(u32, u32, u32)>,
     placement: MotionPlacement,
+    expectation: Option<GeneratedMediaExpectation>,
 }
 
 impl TauriMotionBridge {
@@ -864,6 +866,7 @@ impl TauriMotionBridge {
                     duration_frames: timeline_duration_frames,
                     track_index: request.track_index,
                 },
+                expectation: None,
             },
             cancel,
         )
@@ -944,6 +947,20 @@ impl TauriMotionBridge {
                 placement: MotionPlacement::Replace {
                     clip_id: request.clip_id,
                 },
+                expectation: Some(
+                    GeneratedMediaExpectation::for_placement(
+                        &snapshot,
+                        &MotionPlacement::Replace {
+                            clip_id: clip.id.clone(),
+                        },
+                    )
+                    .map_err(|error| {
+                        MotionBridgeError::new(
+                            MotionBridgeErrorKind::RenderFailed,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             },
             cancel,
         )
@@ -1117,8 +1134,17 @@ impl TauriMotionBridge {
             transparent,
             render_dimensions,
             placement,
+            expectation: prepared_expectation,
         } = request;
         let snapshot = self.core.runtime_snapshot();
+        let expectation = match prepared_expectation {
+            Some(expectation) => expectation,
+            None => GeneratedMediaExpectation::for_placement(&snapshot, &placement).map_err(
+                |error| {
+                    MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error.to_string())
+                },
+            )?,
+        };
         if expected_authority.as_ref().is_some_and(|authority| {
             snapshot.project_epoch != authority.project_epoch
                 || snapshot.project_dir.as_ref() != Some(&authority.project_path)
@@ -1283,10 +1309,13 @@ impl TauriMotionBridge {
             ));
         }
         let mut events = DeferredCoreEvents::default();
+        // The bytes are complete and synced. Keep them recoverable if a target
+        // clip was edited during the render or persistence later fails.
+        published.commit();
         let committed = self.core.commit_motion_media_for_project_deferred(
             &publication,
             snapshot.project_epoch,
-            snapshot.version,
+            expectation,
             &project_dir,
             published.path(),
             "Motion Graphic",
@@ -1300,11 +1329,13 @@ impl TauriMotionBridge {
             Err(error) => {
                 return Err(MotionBridgeError::new(
                     MotionBridgeErrorKind::RenderFailed,
-                    format!("motion project commit failed: {error}"),
+                    format!(
+                        "motion project commit failed: {error}; output retained at {}",
+                        published.path().display()
+                    ),
                 ));
             }
         };
-        published.commit();
         drop(identity);
         drop(publication);
         self.core.emit_deferred(events);
@@ -1497,6 +1528,7 @@ impl MotionBridge for TauriMotionBridge {
                     duration_frames: request.duration_frames,
                     track_index: request.track_index,
                 },
+                expectation: None,
             },
             cancel,
         )
@@ -1608,6 +1640,20 @@ impl MotionBridge for TauriMotionBridge {
                 placement: MotionPlacement::Replace {
                     clip_id: request.clip_id,
                 },
+                expectation: Some(
+                    GeneratedMediaExpectation::for_placement(
+                        &snapshot,
+                        &MotionPlacement::Replace {
+                            clip_id: clip.id.clone(),
+                        },
+                    )
+                    .map_err(|error| {
+                        MotionBridgeError::new(
+                            MotionBridgeErrorKind::RenderFailed,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             },
             cancel,
         )

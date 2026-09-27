@@ -61,6 +61,7 @@ function translationResult(): CaptionTranslationResult {
     result: {
       projectEpoch: 7,
       version: 9,
+      projectDir: "/tmp/Captions.opentake",
       sourceLocale: "en-US",
       targetLocale: "zh-CN",
       provider: "openai",
