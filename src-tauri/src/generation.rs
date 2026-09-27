@@ -809,6 +809,11 @@ impl TauriGenerationBridge {
                 if args.style_instructions.is_some() && !caps.supports_style_instructions {
                     return Err("selected model does not support style instructions".to_string());
                 }
+                if let Some(voice) = args.voice.as_deref() {
+                    if !caps.supports_voice(voice) {
+                        return Err(format!("voice '{voice}' is not supported by this model"));
+                    }
+                }
                 let timeline_span = match (
                     args.video_source_start_frame,
                     args.video_source_end_frame,

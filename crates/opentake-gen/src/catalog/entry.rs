@@ -110,6 +110,16 @@ pub struct AudioCaps {
     pub max_seconds: Option<u32>,
 }
 
+impl AudioCaps {
+    pub fn supports_voice(&self, voice: &str) -> bool {
+        self.voices.as_ref().is_some_and(|voices| {
+            voices
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(voice))
+        })
+    }
+}
+
 /// Upscale capability matrix. Port of `UpscaleCaps` (`ModelCatalog.swift:236-240`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,6 +145,9 @@ pub enum UiCapabilities {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogEntry {
     pub id: String,
+    /// BYOK provider identifier; the stable public `id` is also persisted in
+    /// existing projects and must not be replaced with a vendor API path.
+    pub vendor_model: Option<String>,
     pub kind: ModelKind,
     pub display_name: String,
     pub allowed_endpoints: Vec<String>,
@@ -154,6 +167,8 @@ pub struct CatalogEntry {
 enum Field {
     #[serde(rename = "id")]
     Id,
+    #[serde(rename = "vendorModel")]
+    VendorModel,
     #[serde(rename = "kind")]
     Kind,
     #[serde(rename = "displayName")]
@@ -199,6 +214,7 @@ impl<'de> Deserialize<'de> for CatalogEntry {
                 M: MapAccess<'de>,
             {
                 let mut id = None;
+                let mut vendor_model = None;
                 let mut kind = None;
                 let mut display_name = None;
                 let mut allowed_endpoints: Option<Vec<String>> = None;
@@ -215,6 +231,7 @@ impl<'de> Deserialize<'de> for CatalogEntry {
                 while let Some(key) = map.next_key::<Field>()? {
                     match key {
                         Field::Id => id = Some(map.next_value()?),
+                        Field::VendorModel => vendor_model = Some(map.next_value()?),
                         Field::Kind => kind = Some(map.next_value()?),
                         Field::DisplayName => display_name = Some(map.next_value()?),
                         Field::AllowedEndpoints => allowed_endpoints = Some(map.next_value()?),
@@ -254,6 +271,7 @@ impl<'de> Deserialize<'de> for CatalogEntry {
 
                 Ok(CatalogEntry {
                     id: id.ok_or_else(|| de::Error::missing_field("id"))?,
+                    vendor_model,
                     kind,
                     display_name: display_name
                         .ok_or_else(|| de::Error::missing_field("displayName"))?,

@@ -1,8 +1,8 @@
 //! Built-in static catalog. Under BYOK, `list_models()` returns this catalog
 //! compiled into the binary (no backend required), with the same structure as
 //! the managed `/v1/models` response so UI/agent behave identically (axiom A5).
-//! Entry ids use the `prefix:vendorModel` convention; pricing is omitted (BYOK
-//! does not bill) but capability matrices are filled.
+//! Entry ids remain stable project-facing identifiers. `vendorModel` carries
+//! the provider's API identifier independently; pricing is omitted under BYOK.
 
 use super::entry::CatalogEntry;
 
@@ -54,5 +54,48 @@ mod tests {
         for p in ["fal", "replicate", "openai", "elevenlabs"] {
             assert!(prefixes.contains(p), "missing provider {p}");
         }
+    }
+
+    #[test]
+    fn byok_routes_use_documented_vendor_identifiers() {
+        // fal.ai model pages, Replicate official model pages, and ElevenLabs
+        // /docs/api-reference/{text-to-speech/convert,music/compose}.
+        let entries = builtin_catalog();
+        for (id, vendor) in [
+            ("fal:flux-pro", "fal-ai/flux-pro/v1.1"),
+            ("fal:flux-kontext", "fal-ai/flux-pro/kontext/text-to-image"),
+            (
+                "fal:kling-video",
+                "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
+            ),
+            ("replicate:seedance-1-pro", "bytedance/seedance-1-pro"),
+            ("replicate:topaz-upscale", "topazlabs/video-upscale"),
+            (
+                "elevenlabs:eleven-multilingual-v2",
+                "eleven_multilingual_v2",
+            ),
+            ("elevenlabs:eleven-music", "music_v1"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.vendor_model.as_deref(), Some(vendor), "{id}");
+        }
+        let image = entries
+            .iter()
+            .find(|entry| entry.id == "openai:gpt-image-1")
+            .unwrap();
+        let super::super::entry::UiCapabilities::Image(caps) = &image.ui_capabilities else {
+            panic!("image model must have image capabilities");
+        };
+        assert!(!caps.supports_image_reference);
+        let eleven = entries
+            .iter()
+            .find(|entry| entry.id == "elevenlabs:eleven-multilingual-v2")
+            .unwrap();
+        let super::super::entry::UiCapabilities::Audio(caps) = &eleven.ui_capabilities else {
+            panic!("ElevenLabs TTS must have audio capabilities");
+        };
+        assert!(caps.supports_voice("RACHEL"));
+        assert!(!caps.supports_voice("../voices"));
+        assert!(!caps.supports_style_instructions);
     }
 }

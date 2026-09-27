@@ -80,7 +80,7 @@ impl ReplicateAdapter {
                     input["image"] = json!(u);
                 }
                 if let Some(u) = &p.end_frame_url {
-                    input["end_image"] = json!(u);
+                    input["last_frame_image"] = json!(u);
                 }
                 input
             }
@@ -91,7 +91,7 @@ impl ReplicateAdapter {
                 }
                 input
             }
-            GenerationParams::Upscale(p) => json!({ "video": p.source_url, "image": p.source_url }),
+            GenerationParams::Upscale(p) => json!({ "video": p.source_url }),
         }
     }
 
@@ -148,8 +148,20 @@ impl ProviderAdapter for ReplicateAdapter {
         params: &GenerationParams,
     ) -> Result<GenerationJob, GenError> {
         use serde_json::json;
-        let url = format!("{}/predictions", self.api_base);
-        let body = json!({ "version": route.vendor_model, "input": Self::map_input(params) });
+        // Official models use their stable owner/name route and accept only
+        // `input`; version-hash routes retain the legacy predictions endpoint.
+        let (url, body) = match route.vendor_model.split_once('/') {
+            Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains(':') => {
+                (
+                    format!("{}/models/{owner}/{name}/predictions", self.api_base),
+                    json!({ "input": Self::map_input(params) }),
+                )
+            }
+            _ => (
+                format!("{}/predictions", self.api_base),
+                json!({ "version": route.vendor_model, "input": Self::map_input(params) }),
+            ),
+        };
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
@@ -255,6 +267,38 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v == "Bearer r8-token"));
+    }
+
+    #[tokio::test]
+    async fn official_seedance_route_uses_model_predictions_and_last_frame_field() {
+        // https://replicate.com/bytedance/seedance-1-pro/api/schema
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockrep/v1/models/bytedance/seedance-1-pro/predictions",
+            201,
+            json!({"id":"p", "status":"starting"}),
+        );
+        let a = adapter(&mock);
+        let mut route = ModelRoute::parse("replicate:seedance-1-pro").unwrap();
+        route.vendor_model = "bytedance/seedance-1-pro".into();
+        let params = crate::params::VideoParams {
+            prompt: "scene".into(),
+            duration: 5,
+            aspect_ratio: "16:9".into(),
+            end_frame_url: Some("https://x/end.png".into()),
+            ..Default::default()
+        };
+        a.submit(&route, &GenerationParams::Video(params))
+            .await
+            .unwrap();
+        match mock.last_call().unwrap().body {
+            Body::Json(body) => {
+                assert!(body.get("version").is_none());
+                assert_eq!(body["input"]["last_frame_image"], "https://x/end.png");
+            }
+            _ => panic!("expected JSON"),
+        }
     }
 
     #[tokio::test]
