@@ -1221,7 +1221,7 @@ fn encode_png_bytes(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
 /// used by the live playback transport.
 fn encode_still_frame(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
     let mut rgb = Vec::with_capacity(frame.rgba.len() / 4 * 3);
-    for pixel in frame.rgba.chunks_exact(4) {
+    for pixel in frame.rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&pixel[..3]);
     }
     let mut response = Vec::with_capacity(12);
