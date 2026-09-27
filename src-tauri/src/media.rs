@@ -8498,13 +8498,27 @@ mod tests {
         transitioned.expect("project transition must finish during transcode");
         let error = worker_result.err().expect("stale project rejects proxy");
         assert!(error.contains("project changed"), "{error}");
-        assert!(!stage_output.exists(), "stale transcode stage must be removed");
+        assert!(
+            !stage_output.exists(),
+            "stale transcode stage must be removed"
+        );
         let reopened = AppCore::new();
         reopened.open_project(bundle.clone()).unwrap();
-        assert_eq!(reopened.media().entries.len(), 2, "latest save was persisted");
-        assert!(reopened.media().entries.iter().all(|entry| entry.proxy.is_none()));
+        assert_eq!(
+            reopened.media().entries.len(),
+            2,
+            "latest save was persisted"
+        );
+        assert!(reopened
+            .media()
+            .entries
+            .iter()
+            .all(|entry| entry.proxy.is_none()));
         assert!(!bundle.join("media/proxies").exists());
-        assert!(core.media().entries.is_empty(), "replacement project was untouched");
+        assert!(
+            core.media().entries.is_empty(),
+            "replacement project was untouched"
+        );
     }
 
     #[test]
