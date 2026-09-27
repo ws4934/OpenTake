@@ -158,6 +158,7 @@ export function Inspector() {
           <MarqueeSummary count={selectedClips.length} t={t} />
         ) : single ? (
           <ClipInspector
+            key={single.id}
             clip={single}
             tab={inspectorTab}
             setTab={setInspectorTab}
