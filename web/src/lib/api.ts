@@ -1387,6 +1387,28 @@ export async function generateCaptions(
   throw new Error("caption generation requires the desktop app (whisper)");
 }
 
+/** Cancel one pending or running caption generation operation. */
+export async function cancelCaptionGeneration(operationId: string): Promise<boolean> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl<boolean>("cancel_caption_generation", { operationId });
+  return false;
+}
+
+/** Progress belongs to one operation; callers filter by their own operationId. */
+export async function onCaptionGenerationProgress(
+  handler: (progress: { operationId: string; completed: number; total: number; fraction: number }) => void,
+): Promise<() => void> {
+  await ensureTauri();
+  if (!listenImpl) return () => {};
+  return listenImpl("captions://progress", (e) => {
+    const p = e.payload as { operationId?: string; completed?: number; total?: number; fraction?: number } | undefined;
+    if (p && typeof p.operationId === "string" && typeof p.completed === "number"
+      && typeof p.total === "number" && typeof p.fraction === "number") {
+      handler({ operationId: p.operationId, completed: p.completed, total: p.total, fraction: p.fraction });
+    }
+  });
+}
+
 // MARK: - Semantic search (SigLIP2 visual model + index + query, search-wiring)
 
 /** Whether the SigLIP2 visual-search model is installed. Never downloads. The

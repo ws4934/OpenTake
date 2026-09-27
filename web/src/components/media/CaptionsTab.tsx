@@ -16,7 +16,7 @@
  * available, otherwise all captionable audio".
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useT, type TFunction } from "../../i18n";
 import { useProjectStore } from "../../store/projectStore";
 import { useMediaStore } from "../../store/mediaStore";
@@ -25,9 +25,11 @@ import { generateCaptions } from "../../store/editActions";
 import {
   applyCaptionTranslationReview,
   cancelAdvancedWorkflow,
+  cancelCaptionGeneration,
   downloadTranscribeModel,
   isTauri,
   onTranscribeProgress,
+  onCaptionGenerationProgress,
   translateCaptions,
   transcribeModelStatus,
 } from "../../lib/api";
@@ -60,7 +62,7 @@ type Phase =
   | { kind: "idle" }
   | { kind: "needsModel"; status: ModelStatus }
   | { kind: "downloading"; fraction: number }
-  | { kind: "transcribing" };
+  | { kind: "transcribing"; fraction: number; completed: number; total: number };
 
 export function CaptionsTab() {
   const t = useT();
@@ -98,6 +100,8 @@ export function CaptionsTab() {
   const [language, setLanguage] = useState("");
 
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const captionOperationId = useRef<string | null>(null);
+  const cancelledCaptionOperationId = useRef<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [translationSourceLocale, setTranslationSourceLocale] = useState("auto");
   const [translationTargetLocale, setTranslationTargetLocale] = useState("zh-CN");
@@ -130,6 +134,13 @@ export function CaptionsTab() {
   }, [captionTracks, trackId]);
 
   const busy = phase.kind === "downloading" || phase.kind === "transcribing";
+  const transcriptionLabel = phase.kind === "transcribing" && phase.total > 0
+    ? t("captions.generatingProgress", {
+      percent: Math.round(phase.fraction * 100),
+      completed: phase.completed,
+      total: phase.total,
+    })
+    : t("captions.generating");
   const hasSelection = selectedClipIds.size > 0;
 
   /** The request source: a chosen track wins; else the live selection; else auto. */
@@ -152,7 +163,10 @@ export function CaptionsTab() {
 
   const runGenerate = async () => {
     setNote(null);
-    setPhase({ kind: "transcribing" });
+    const operationId = crypto.randomUUID();
+    captionOperationId.current = operationId;
+    cancelledCaptionOperationId.current = null;
+    setPhase({ kind: "transcribing", fraction: 0, completed: 0, total: 0 });
     const request: CaptionRequest = {
       source: requestSource(),
       style: buildStyle(),
@@ -161,17 +175,45 @@ export function CaptionsTab() {
       textCase,
       censorProfanity,
       language: language.trim() || undefined,
+      operationId,
     };
+    let unlisten = () => {};
     try {
+      unlisten = await onCaptionGenerationProgress((progress) => {
+        if (progress.operationId === captionOperationId.current) {
+          setPhase({ kind: "transcribing", fraction: progress.fraction, completed: progress.completed, total: progress.total });
+        }
+      });
       const result = await generateCaptions(request);
       if (result.captionCount === 0) setNote(t("captions.noSpeech"));
       else setNote(t("captions.added", { count: result.captionCount }));
     } catch (err) {
-      setNote(t("captions.failed", { error: err instanceof Error ? err.message : String(err) }));
+      if (cancelledCaptionOperationId.current === operationId) setNote(t("captions.cancelled"));
+      else setNote(t("captions.failed", { error: err instanceof Error ? err.message : String(err) }));
     } finally {
-      setPhase({ kind: "idle" });
+      unlisten();
+      if (captionOperationId.current === operationId) {
+        captionOperationId.current = null;
+        setPhase({ kind: "idle" });
+      }
     }
   };
+
+  const onCancelGeneration = async () => {
+    const operationId = captionOperationId.current;
+    if (!operationId) return;
+    cancelledCaptionOperationId.current = operationId;
+    try {
+      if (!(await cancelCaptionGeneration(operationId))) cancelledCaptionOperationId.current = null;
+    } catch (err) {
+      cancelledCaptionOperationId.current = null;
+      setNote(t("captions.failed", { error: err instanceof Error ? err.message : String(err) }));
+    }
+  };
+
+  useEffect(() => () => {
+    if (captionOperationId.current) void cancelCaptionGeneration(captionOperationId.current);
+  }, []);
 
   /** Generate click: gate on the model being installed first (upstream shows a
    *  download prompt when the on-device model isn't present). */
@@ -400,6 +442,9 @@ export function CaptionsTab() {
           display: "flex",
           flexDirection: "column",
           gap: SPACE.sm,
+          position: "relative",
+          zIndex: 1,
+          background: "var(--bg-surface)",
         }}
       >
         {note && (
@@ -427,8 +472,13 @@ export function CaptionsTab() {
             {phase.kind === "downloading"
               ? t("captions.downloading", { percent: Math.round(phase.fraction * 100) })
               : phase.kind === "transcribing"
-                ? t("captions.generating")
+                ? transcriptionLabel
                 : t("captions.generate")}
+          </button>
+        )}
+        {phase.kind === "transcribing" && (
+          <button type="button" onClick={() => void onCancelGeneration()}>
+            {t("captions.cancelGenerate")}
           </button>
         )}
       </div>
@@ -440,6 +490,7 @@ export function CaptionsTab() {
             inset: 0,
             background: "var(--bg-surface)",
             opacity: 0.72,
+            pointerEvents: "none",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -449,7 +500,7 @@ export function CaptionsTab() {
         >
           {phase.kind === "downloading"
             ? t("captions.downloading", { percent: Math.round(phase.fraction * 100) })
-            : t("captions.generating")}
+            : transcriptionLabel}
         </div>
       )}
     </div>

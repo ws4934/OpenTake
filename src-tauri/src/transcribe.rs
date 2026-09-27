@@ -321,7 +321,11 @@ pub(crate) fn transcribe_with_cache(
 /// Write a full transcript into the on-disk cache (`<cache_root>/Transcripts/<key>.json`)
 /// using the same file-identity key the cache reads, so a hinted transcription is
 /// served from cache on the next call. Best-effort: a write failure is non-fatal.
-fn persist_full_transcript(cache_root: &Path, path: &Path, result: &TranscriptionResult) {
+pub(crate) fn persist_full_transcript(
+    cache_root: &Path,
+    path: &Path,
+    result: &TranscriptionResult,
+) {
     let Some(key) = opentake_media::cache_key::file_identity_key(path) else {
         return;
     };
