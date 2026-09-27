@@ -4940,8 +4940,8 @@ fn create_media_proxy_blocking(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create_media_proxy_blocking_with(
-    app: AppHandle,
+fn create_media_proxy_blocking_with<R: Runtime>(
+    app: AppHandle<R>,
     asset_id: String,
     max_width: Option<u32>,
     max_height: Option<u32>,
