@@ -302,7 +302,7 @@ impl AudioStreamConsumer {
         }
     }
 
-    fn sample_frame(&mut self, frame: u64) -> (f32, f32) {
+    fn ready_at(&mut self, frame: u64) -> bool {
         let generation = self.control.generation.load(Ordering::Acquire);
         if self.current.as_ref().is_none_or(|chunk| {
             let frames = chunk.samples.len() / MIX_CHANNELS;
@@ -313,11 +313,19 @@ impl AudioStreamConsumer {
             self.current = None;
             self.discard_stale();
         }
-        if let Some(chunk) = self.current.as_ref() {
-            let offset = frame.saturating_sub(chunk.start_frame) as usize * MIX_CHANNELS;
-            if offset + 1 < chunk.samples.len() {
-                return (chunk.samples[offset], chunk.samples[offset + 1]);
-            }
+        self.current.as_ref().is_some_and(|chunk| {
+            let frames = chunk.samples.len() / MIX_CHANNELS;
+            chunk.generation == generation
+                && frame >= chunk.start_frame
+                && frame < chunk.start_frame.saturating_add(frames as u64)
+        })
+    }
+
+    fn sample_frame(&mut self, frame: u64) -> (f32, f32) {
+        if self.ready_at(frame) {
+            let chunk = self.current.as_ref().expect("ready chunk");
+            let offset = (frame - chunk.start_frame) as usize * MIX_CHANNELS;
+            return (chunk.samples[offset], chunk.samples[offset + 1]);
         }
         self.control.underruns.fetch_add(1, Ordering::Relaxed);
         (0.0, 0.0)
@@ -345,6 +353,7 @@ pub struct AudioClock {
 
 struct AudioClockProgress {
     observed_pos: u64,
+    observed_underruns: u64,
     observed_at: Instant,
     fallback: Option<(Instant, i32)>,
     last_frame: i32,
@@ -358,6 +367,9 @@ impl AudioClock {
         stream: Option<Arc<AudioStreamControl>>,
     ) -> Self {
         let observed_pos = pos.load(Ordering::Acquire);
+        let observed_underruns = stream
+            .as_ref()
+            .map_or(0, |control| control.underruns.load(Ordering::Acquire));
         let initial_frame = audio_position_frame(observed_pos, rate, fps);
         Self {
             pos,
@@ -366,6 +378,7 @@ impl AudioClock {
             stream,
             progress: Mutex::new(AudioClockProgress {
                 observed_pos,
+                observed_underruns,
                 observed_at: Instant::now(),
                 fallback: None,
                 last_frame: initial_frame,
@@ -389,9 +402,19 @@ impl PlaybackClock for AudioClock {
             .progress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let underruns = self
+            .stream
+            .as_ref()
+            .map_or(0, |control| control.underruns.load(Ordering::Acquire));
 
         if pos != progress.observed_pos {
             progress.observed_pos = pos;
+            progress.observed_underruns = underruns;
+            progress.observed_at = now;
+        } else if underruns != progress.observed_underruns {
+            // The callback is alive but waiting for a decoded window. Hold the
+            // video clock at the same frame until the sound can actually play.
+            progress.observed_underruns = underruns;
             progress.observed_at = now;
         } else if progress.fallback.is_none()
             && now.saturating_duration_since(progress.observed_at) >= AUDIO_CLOCK_STALL_TIMEOUT
@@ -426,21 +449,30 @@ impl PlaybackClock for AudioClock {
         // isn't a multiple of fps (e.g. 44100 Hz @ 24 fps) — plain truncation would
         // land a half-sample short and frame() would report frame-1.
         let pos = ((frame.max(0) as f64 / fps as f64) * self.rate as f64).round() as u64;
-        // Release pairs with the callback's AcqRel fetch_add so it observes the seek.
-        self.pos.store(pos, Ordering::Release);
+        let moved = self.pos.load(Ordering::Acquire) != pos;
+        if moved {
+            // Release pairs with the callback's AcqRel fetch_add so it observes the seek.
+            self.pos.store(pos, Ordering::Release);
+        }
         let mut progress = self
             .progress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *progress = AudioClockProgress {
             observed_pos: pos,
+            observed_underruns: self
+                .stream
+                .as_ref()
+                .map_or(0, |control| control.underruns.load(Ordering::Acquire)),
             observed_at: Instant::now(),
             fallback: None,
             last_frame: frame.max(0),
         };
         drop(progress);
-        if let Some(stream) = &self.stream {
-            stream.request_seek(pos);
+        if moved {
+            if let Some(stream) = &self.stream {
+                stream.request_seek(pos);
+            }
         }
     }
 }
@@ -940,28 +972,68 @@ where
                     }
                     return;
                 }
-                let start = pos.fetch_add(out_frames as u64, Ordering::AcqRel);
-                for (i, frame) in data.chunks_mut(channels).enumerate() {
-                    let audio_frame = start.saturating_add(i as u64);
-                    let (left, right) = match &mut samples {
-                        PlaybackSamples::Buffered(buffer) => {
-                            let base = usize::try_from(audio_frame)
-                                .ok()
-                                .and_then(|frame| frame.checked_mul(MIX_CHANNELS));
-                            match base.filter(|base| base + 1 < buffer.len()) {
-                                Some(base) => (buffer[base], buffer[base + 1]),
-                                None => (0.0, 0.0),
-                            }
+                let mut written = 0;
+                while written < out_frames {
+                    let Some((start, count)) =
+                        claim_ready_audio_block(&mut samples, &pos, out_frames - written)
+                    else {
+                        for sample in &mut data[written * channels..] {
+                            *sample = T::from_sample(0.0f32);
                         }
-                        PlaybackSamples::Streaming(consumer) => consumer.sample_frame(audio_frame),
+                        return;
                     };
-                    write_frame(frame, left, right);
+                    for (i, frame) in data[written * channels..(written + count) * channels]
+                        .chunks_mut(channels)
+                        .enumerate()
+                    {
+                        let audio_frame = start.saturating_add(i as u64);
+                        let (left, right) = match &mut samples {
+                            PlaybackSamples::Buffered(buffer) => {
+                                let base = usize::try_from(audio_frame)
+                                    .ok()
+                                    .and_then(|frame| frame.checked_mul(MIX_CHANNELS));
+                                match base.filter(|base| base + 1 < buffer.len()) {
+                                    Some(base) => (buffer[base], buffer[base + 1]),
+                                    None => (0.0, 0.0),
+                                }
+                            }
+                            PlaybackSamples::Streaming(consumer) => {
+                                consumer.sample_frame(audio_frame)
+                            }
+                        };
+                        write_frame(frame, left, right);
+                    }
+                    written += count;
                 }
             },
             err_fn,
             None,
         )
         .map_err(|e| format!("build output stream: {e}"))
+}
+
+/// Keep the audio master clock at the first undecoded sample. Once the next
+/// window arrives, playback resumes at that exact sample rather than dropping
+/// the start of a clip while the callback is emitting silence.
+fn claim_ready_audio_block(
+    samples: &mut PlaybackSamples,
+    pos: &AtomicU64,
+    out_frames: usize,
+) -> Option<(u64, usize)> {
+    let mut count = out_frames;
+    if let PlaybackSamples::Streaming(consumer) = samples {
+        let start = pos.load(Ordering::Acquire);
+        if !consumer.ready_at(start) {
+            consumer.control.underruns.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let chunk = consumer.current.as_ref().expect("ready chunk");
+        let end = chunk
+            .start_frame
+            .saturating_add((chunk.samples.len() / MIX_CHANNELS) as u64);
+        count = count.min((end - start) as usize);
+    }
+    Some((pos.fetch_add(count as u64, Ordering::AcqRel), count))
 }
 
 /// Query the default output device's sample rate (Hz), or `None` if unavailable.
@@ -1814,6 +1886,122 @@ mod tests {
         assert_eq!(consumer.sample_frame(10), (0.75, -0.75));
         assert_eq!(consumer.sample_frame(99), (0.0, 0.0));
         assert_eq!(control.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prefilled_audio_survives_start_and_resume_at_the_same_frame() {
+        let first_sample = 48_000;
+        let control = Arc::new(AudioStreamControl::new(first_sample));
+        let (sender, receiver) = bounded(4);
+        sender
+            .send(Ok(AudioStreamChunk {
+                generation: 0,
+                start_frame: first_sample,
+                samples: vec![0.75, -0.75, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125],
+            }))
+            .unwrap();
+        let pos = Arc::new(AtomicU64::new(first_sample));
+        let clock = AudioClock::new(Arc::clone(&pos), 48_000, 30, Some(Arc::clone(&control)));
+        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
+            receiver,
+            control: Arc::clone(&control),
+            current: None,
+        });
+
+        clock.seek(30); // render thread initialization
+        clock.seek(30); // first Resume
+        assert_eq!(control.generation.load(Ordering::Acquire), 0);
+        for expected in [
+            [(0.75, -0.75), (0.5, -0.5)],
+            [(0.25, -0.25), (0.125, -0.125)],
+        ] {
+            let (start, count) =
+                claim_ready_audio_block(&mut samples, &pos, 2).expect("prefilled block");
+            assert_eq!(count, 2);
+            let PlaybackSamples::Streaming(consumer) = &mut samples else {
+                unreachable!()
+            };
+            assert_eq!(consumer.sample_frame(start), expected[0]);
+            assert_eq!(consumer.sample_frame(start + 1), expected[1]);
+        }
+        assert_eq!(control.underruns.load(Ordering::Acquire), 0);
+
+        clock.seek(31); // pause at the next frame
+        let paused_generation = control.generation.load(Ordering::Acquire);
+        clock.seek(31); // resume at exactly that paused position
+        assert_eq!(
+            control.generation.load(Ordering::Acquire),
+            paused_generation
+        );
+    }
+
+    #[test]
+    fn audio_decode_stall_preserves_the_first_unplayed_sample() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(4);
+        let pos = AtomicU64::new(0);
+        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
+            receiver,
+            control: Arc::clone(&control),
+            current: None,
+        });
+
+        assert_eq!(claim_ready_audio_block(&mut samples, &pos, 128), None);
+        assert_eq!(pos.load(Ordering::Acquire), 0);
+        sender
+            .send(Ok(AudioStreamChunk {
+                generation: 0,
+                start_frame: 0,
+                samples: vec![0.8, -0.8, 0.6, -0.6],
+            }))
+            .unwrap();
+        assert_eq!(claim_ready_audio_block(&mut samples, &pos, 2), Some((0, 2)));
+        let PlaybackSamples::Streaming(consumer) = &mut samples else {
+            unreachable!()
+        };
+        assert_eq!(consumer.sample_frame(0), (0.8, -0.8));
+        assert_eq!(consumer.sample_frame(1), (0.6, -0.6));
+    }
+
+    #[test]
+    fn callback_crossing_a_window_boundary_waits_without_skipping_samples() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(4);
+        sender
+            .send(Ok(AudioStreamChunk {
+                generation: 0,
+                start_frame: 0,
+                samples: vec![0.5, 0.5, 0.5, 0.5],
+            }))
+            .unwrap();
+        let pos = AtomicU64::new(0);
+        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
+            receiver,
+            control,
+            current: None,
+        });
+
+        assert_eq!(
+            claim_ready_audio_block(&mut samples, &pos, 128),
+            Some((0, 2))
+        );
+        assert_eq!(claim_ready_audio_block(&mut samples, &pos, 126), None);
+        assert_eq!(pos.load(Ordering::Acquire), 2);
+        sender
+            .send(Ok(AudioStreamChunk {
+                generation: 0,
+                start_frame: 2,
+                samples: vec![0.75, -0.75, 0.75, -0.75],
+            }))
+            .unwrap();
+        assert_eq!(
+            claim_ready_audio_block(&mut samples, &pos, 126),
+            Some((2, 2))
+        );
+        let PlaybackSamples::Streaming(consumer) = &mut samples else {
+            unreachable!()
+        };
+        assert_eq!(consumer.sample_frame(2), (0.75, -0.75));
     }
 
     #[test]
