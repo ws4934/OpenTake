@@ -447,7 +447,7 @@ function isReversedVideo(clip: TrimClip): boolean {
  * available leading/trailing source. Mirrors upstream's `mouseDragged` trim
  * clamp; the unbounded source clamp for image/text is left to `trimSourceValues`.
  */
-export function clampTrimDeltaFrames(clip: TrimClip, edge: TrimEdge, delta: number): number {
+export function clampTrimDeltaFrames(clip: TrimClip & Pick<Clip, "startFrame">, edge: TrimEdge, delta: number): number {
   const speed = clip.speed > 0 ? clip.speed : 1;
   if (edge === "left") {
     // Positive delta shrinks duration (left edge moves right): keep ≥1 frame.
@@ -457,7 +457,7 @@ export function clampTrimDeltaFrames(clip: TrimClip, edge: TrimEdge, delta: numb
       const available = isReversedVideo(clip) ? clip.trimEndFrame : clip.trimStartFrame;
       d = Math.max(d, -Math.floor(available / speed));
     }
-    return d;
+    return Math.max(d, -clip.startFrame);
   }
   // Right: negative delta shrinks duration (right edge moves left): keep ≥1 frame.
   let d = Math.max(delta, -(clip.durationFrames - 1));

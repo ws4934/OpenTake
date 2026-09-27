@@ -6,7 +6,12 @@
 //! frames; their deltas are translated to timeline frames via `round(delta /
 //! speed)` before touching `start_frame` / `duration_frames`.
 
+use std::collections::HashSet;
+
 use opentake_domain::{Clip, ClipType, Timeline};
+
+use crate::id::IdGen;
+use crate::ops::clear_region::clear_region_excluding;
 
 /// Which edge a trim drag grabs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,12 +106,70 @@ fn trim_clip_internal_checked(
 /// A `(clip_id, trim_start, trim_end)` edit, in source frames.
 pub type TrimEdit = (String, i32, i32);
 
-/// Apply a batch of trim edits (one undo group upstream; here just sequential).
-/// 1:1 port of `trimClips(_:)`.
-pub fn trim_clips(timeline: &mut Timeline, edits: &[TrimEdit]) -> bool {
+/// Preflight the whole batch, then overwrite only its net expansion regions.
+pub fn trim_clips(timeline: &mut Timeline, edits: &[TrimEdit], ids: &dyn IdGen) -> bool {
     let mut candidate = timeline.clone();
+    let mut protected = HashSet::new();
+    let mut previous_bounds = Vec::new();
     for (id, ts, te) in edits {
+        if protected.insert(id.clone()) {
+            if let Some((ti, ci)) = find(timeline, id) {
+                let clip = &timeline.tracks[ti].clips[ci];
+                let Some(end) = clip.start_frame.checked_add(clip.duration_frames) else {
+                    return false;
+                };
+                previous_bounds.push((id, ti, clip.start_frame, end));
+            }
+        }
         if !trim_clip_internal_checked(&mut candidate, id, *ts, *te) {
+            return false;
+        }
+    }
+    // Protected targets cannot clear each other; refuse conflicting final bounds.
+    for track in &candidate.tracks {
+        let targets: Vec<_> = track
+            .clips
+            .iter()
+            .filter(|clip| protected.contains(&clip.id) && clip.media_type != ClipType::Text)
+            .collect();
+        if targets
+            .windows(2)
+            .any(|pair| pair[0].end_frame() > pair[1].start_frame)
+        {
+            return false;
+        }
+    }
+    for (id, ti, previous_start, previous_end) in previous_bounds {
+        let clip = candidate.tracks[ti]
+            .clips
+            .iter()
+            .find(|clip| clip.id == *id)
+            .expect("trim preflight preserves its targets");
+        let (start, end) = (clip.start_frame, clip.end_frame());
+        if start < previous_start
+            && !clear_region_excluding(
+                &mut candidate,
+                ti,
+                start,
+                previous_start,
+                false,
+                ids,
+                &protected,
+            )
+        {
+            return false;
+        }
+        if end > previous_end
+            && !clear_region_excluding(
+                &mut candidate,
+                ti,
+                previous_end,
+                end,
+                false,
+                ids,
+                &protected,
+            )
+        {
             return false;
         }
     }
