@@ -1,7 +1,8 @@
 /**
  * Inspector (SPEC §6). Title bar + one of four content states: marquee summary,
  * clip inspector (with Text/Video/Audio/AI Edit tabs), media-asset source, or project
- * metadata. Editable fields commit via SetClipProperties; a field whose
+ * metadata. Editable fields commit via SetClipProperties (speed uses the
+ * animation-preserving SetClipSpeed command); a field whose
  * property already has an active keyframe track stays editable but commits
  * via UpsertKeyframe at the playhead instead (see `../../lib/keyframeValue`).
  * AI Edit proposals are reviewed here and accepted through the same undoable
@@ -686,7 +687,7 @@ function ClipInspector({
                   format={(v) => v.toFixed(2)}
                   suffix="x"
                   width={56}
-                  onCommit={(v) => commit({ speed: v })}
+                  onCommit={(v) => edit.setClipSpeed([clip.id], v)}
                 />
               </Row>
             </section>

@@ -483,6 +483,29 @@ function planSplitHalves(clip: Clip, atFrame: number): [Clip, Clip] | null {
     : null;
 }
 
+/** Browser demo counterpart of Clip::rescale_keyframes; rounded duplicate
+ * frames keep the last value, like the Rust keyframe upsert. */
+function rescaleClipKeyframes(clip: Clip, previousDuration: number): void {
+  if (previousDuration <= 0 || previousDuration === clip.durationFrames) return;
+  const scale = clip.durationFrames / previousDuration;
+  const rescale = <Value,>(track: KeyframeTrack<Value> | undefined) => {
+    if (!track) return;
+    const seen = new Set<number>();
+    track.keyframes = track.keyframes.reverse().filter((keyframe) => {
+      keyframe.frame = Math.round(keyframe.frame * scale);
+      if (keyframe.frame < 0 || keyframe.frame > clip.durationFrames || seen.has(keyframe.frame)) return false;
+      seen.add(keyframe.frame);
+      return true;
+    }).sort((left, right) => left.frame - right.frame);
+  };
+  rescale(clip.opacityTrack);
+  rescale(clip.positionTrack);
+  rescale(clip.scaleTrack);
+  rescale(clip.rotationTrack);
+  rescale(clip.cropTrack);
+  rescale(clip.volumeTrack);
+}
+
 function upsertSmoothKeyframe<Value>(
   track: KeyframeTrack<Value>,
   frame: number,
@@ -1686,6 +1709,78 @@ export function createFallbackStore(initialTimeline?: Timeline) {
         case "splitClips": {
           return splitClipsAtomically(cmd.clipIds, cmd.atFrame, "Split Clips");
         }
+        case "setClipSpeed": {
+          const refused = () => result(false, "Set Clip Speed", []);
+          if (!cmd.clipIds.length || !Number.isFinite(cmd.speed) || cmd.speed <= 0) return refused();
+          // Work on a candidate so a collision in a later target cannot leave
+          // earlier clips changed. The real editing/history engine is Rust.
+          const candidate = structuredClone(timeline);
+          const locations = new Map(candidate.tracks.flatMap((track) =>
+            track.clips.map((clip) => [clip.id, { track, clip }] as const)));
+          const targets = [...new Set(cmd.clipIds)];
+          const groups = new Set<string>();
+          for (const id of targets) {
+            const target = locations.get(id);
+            if (!target) return refused();
+            if (target.clip.linkGroupId) groups.add(target.clip.linkGroupId);
+          }
+          const direct = new Set(targets);
+          for (const { clip } of locations.values()) {
+            if (!direct.has(clip.id) && clip.mediaType !== "text" &&
+              clip.linkGroupId && groups.has(clip.linkGroupId)) targets.push(clip.id);
+          }
+          const affected = new Set<string>();
+          for (const id of targets) {
+            const { track, clip } = locations.get(id)!;
+            if (clip.nestedSequenceId && Math.abs(cmd.speed - 1) > Number.EPSILON) return refused();
+            if (clip.speed === cmd.speed) continue;
+            const oldDuration = clip.durationFrames;
+            const oldEnd = clip.startFrame + oldDuration;
+            const duration = Math.max(1, Math.round(oldDuration * clip.speed / cmd.speed));
+            if (checkedFrameEnd(clip.startFrame, duration, clip.trimStartFrame, clip.trimEndFrame,
+              cmd.speed, clip.mediaType === "image" || clip.mediaType === "text") === null) return refused();
+            const moving = new Set<string>();
+            if (cmd.ripple) {
+              let chainEnd = oldEnd;
+              for (const next of [...track.clips].sort((a, b) => a.startFrame - b.startFrame)) {
+                if (next.id === id || next.startFrame < oldEnd) continue;
+                if (next.startFrame !== chainEnd) break;
+                moving.add(next.id);
+                chainEnd = next.startFrame + next.durationFrames;
+              }
+            }
+            clip.speed = cmd.speed;
+            clip.durationFrames = duration;
+            delete clip.loudnessNormalization;
+            rescaleClipKeyframes(clip, oldDuration);
+            clip.fadeInFrames = Math.max(0, Math.min(duration, clip.fadeInFrames));
+            clip.fadeOutFrames = Math.max(0, Math.min(duration - clip.fadeInFrames, clip.fadeOutFrames));
+            const delta = duration - oldDuration;
+            for (const next of track.clips) {
+              if (moving.has(next.id)) {
+                next.startFrame += delta;
+                if (checkedClipEnd(next) === null) return refused();
+              }
+            }
+            moving.add(id);
+            if (delta !== 0) {
+              let previousEnd = 0;
+              let previousMovingEnd = 0;
+              for (const next of [...track.clips].sort((a, b) => a.startFrame - b.startFrame)) {
+                const changed = moving.has(next.id);
+                if (next.startFrame < (changed ? previousEnd : previousMovingEnd)) return refused();
+                const end = checkedClipEnd(next);
+                if (end === null) return refused();
+                previousEnd = Math.max(previousEnd, end);
+                if (changed) previousMovingEnd = Math.max(previousMovingEnd, end);
+              }
+            }
+            for (const moved of moving) affected.add(moved);
+          }
+          if (!affected.size) return refused();
+          timeline = candidate;
+          return result(true, "Set Clip Speed", [...affected]);
+        }
         case "setClipProperties": {
           if (cmd.clipIds.length === 0 || new Set(cmd.clipIds).size !== cmd.clipIds.length) {
             return result(false, "Set Clip Property", []);
@@ -1731,6 +1826,9 @@ export function createFallbackStore(initialTimeline?: Timeline) {
               delete next.loudnessNormalization;
             }
             next.durationFrames = durationFrames;
+            if (p.durationFrames !== undefined || p.speed !== undefined) {
+              rescaleClipKeyframes(next, c.durationFrames);
+            }
             next.trimStartFrame = trimStartFrame;
             next.trimEndFrame = trimEndFrame;
             next.speed = speed;

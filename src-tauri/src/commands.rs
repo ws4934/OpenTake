@@ -1418,6 +1418,12 @@ pub enum EditRequest {
     #[serde(rename_all = "camelCase")]
     TrimClips { edits: Vec<TrimEditDto> },
     #[serde(rename_all = "camelCase")]
+    SetClipSpeed {
+        clip_ids: Vec<String>,
+        speed: f64,
+        ripple: bool,
+    },
+    #[serde(rename_all = "camelCase")]
     SetClipProperties {
         clip_ids: Vec<String>,
         // Boxed to keep `EditRequest` small: `ClipPropertiesDto` carries a full
@@ -1667,6 +1673,15 @@ impl EditRequest {
             }
             EditRequest::TrimClips { edits } => EditCommand::TrimClips {
                 edits: edits.into_iter().map(TrimEditDto::into_edit).collect(),
+            },
+            EditRequest::SetClipSpeed {
+                clip_ids,
+                speed,
+                ripple,
+            } => EditCommand::SetClipSpeed {
+                clip_ids,
+                speed,
+                ripple,
             },
             EditRequest::SetClipProperties {
                 clip_ids,
@@ -3497,6 +3512,7 @@ mod edit_request_serde_tests {
             EditRequest::SplitClips { .. } => "SplitClips",
             EditRequest::FreezeFrame { .. } => "FreezeFrame",
             EditRequest::TrimClips { .. } => "TrimClips",
+            EditRequest::SetClipSpeed { .. } => "SetClipSpeed",
             EditRequest::SetClipProperties { .. } => "SetClipProperties",
             EditRequest::SetTransformAtFrame { .. } => "SetTransformAtFrame",
             EditRequest::SetKeyframes { .. } => "SetKeyframes",
@@ -3569,6 +3585,7 @@ mod edit_request_serde_tests {
                 | ("SplitClip", EditCommand::SplitClip { .. })
                 | ("SplitClips", EditCommand::SplitClips { .. })
                 | ("TrimClips", EditCommand::TrimClips { .. })
+                | ("SetClipSpeed", EditCommand::SetClipSpeed { .. })
                 | ("SetClipProperties", EditCommand::SetClipProperties { .. })
                 | (
                     "SetTransformAtFrame",
@@ -3629,6 +3646,10 @@ mod edit_request_serde_tests {
 
     fn assert_every_edit_request_maps_to_exact_edit_command() {
         let cases = [
+            (
+                r#"{"type":"setClipSpeed","clipIds":["c"],"speed":2.0,"ripple":true}"#,
+                "SetClipSpeed",
+            ),
             (
                 r#"{"type":"createNestedSequence","name":"Scene","clipIds":["c"]}"#,
                 "CreateNestedSequence",
@@ -3804,7 +3825,7 @@ mod edit_request_serde_tests {
             ),
         ];
 
-        assert_eq!(cases.len(), 56);
+        assert_eq!(cases.len(), 57);
         for (json, expected_route) in cases {
             let mut hostile = serde_json::from_str::<serde_json::Value>(json).unwrap();
             hostile
@@ -3839,6 +3860,28 @@ mod edit_request_serde_tests {
     #[test]
     fn every_edit_request_maps_to_exact_edit_command() {
         assert_every_edit_request_maps_to_exact_edit_command();
+    }
+
+    #[test]
+    fn clip_speed_dto_preserves_target_order_speed_and_ripple_mode() {
+        for (speed, ripple) in [(2.0, true), (0.5, false)] {
+            let request: EditRequest = serde_json::from_value(serde_json::json!({
+                "type": "setClipSpeed", "clipIds": ["b", "a"], "speed": speed, "ripple": ripple,
+            }))
+            .unwrap();
+            match request.into_command().unwrap() {
+                EditCommand::SetClipSpeed {
+                    clip_ids,
+                    speed: actual_speed,
+                    ripple: actual_ripple,
+                } => {
+                    assert_eq!(clip_ids, ["b", "a"]);
+                    assert_eq!(actual_speed, speed);
+                    assert_eq!(actual_ripple, ripple);
+                }
+                command => panic!("unexpected speed route: {command:?}"),
+            }
+        }
     }
 
     #[test]

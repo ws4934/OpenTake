@@ -913,6 +913,13 @@ pub enum EditCommand {
     },
     /// Overwrite-style trim: resize clips in place from new source-frame trims.
     TrimClips { edits: Vec<TrimEdit> },
+    /// Retime animation and, optionally, each target's contiguous following
+    /// chain. Linked non-text partners participate once in the same transaction.
+    SetClipSpeed {
+        clip_ids: Vec<String>,
+        speed: f64,
+        ripple: bool,
+    },
     /// Assign clip properties (timing changes propagate to linked partners).
     /// `properties` is boxed: it carries a full `TextStyle`, which would
     /// otherwise make this the dominant `EditCommand` variant (the enum is
@@ -1331,6 +1338,11 @@ pub fn apply(
             media_ref,
         } => freeze_frame(state, clip_id, at_frame, duration_frames, media_ref, ids),
         EditCommand::TrimClips { edits } => trim(state, edits),
+        EditCommand::SetClipSpeed {
+            clip_ids,
+            speed,
+            ripple,
+        } => set_clip_speed(state, clip_ids, speed, ripple),
         EditCommand::SetClipProperties {
             clip_ids,
             properties,
@@ -3987,6 +3999,128 @@ fn same_timing_properties(left: &ClipProperties, right: &ClipProperties) -> bool
         && left.speed == right.speed
 }
 
+fn set_clip_speed(
+    state: &mut EditorState,
+    clip_ids: Vec<String>,
+    speed: f64,
+    ripple: bool,
+) -> Result<EditResult, EditError> {
+    if clip_ids.is_empty() {
+        return Err(EditError::Invalid(
+            "Missing or empty 'clipIds' array".into(),
+        ));
+    }
+    // Preserve caller order, then append partners in timeline order. A clip
+    // selected directly and through a link group must never be processed twice.
+    let mut direct = HashSet::new();
+    let mut targets: Vec<String> = clip_ids
+        .into_iter()
+        .filter(|id| direct.insert(id.clone()))
+        .collect();
+    let partners = ops::timing_propagation_partners(&state.timeline, &direct);
+    targets.extend(
+        state
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter(|clip| partners.contains(&clip.id) && clip.media_type != ClipType::Text)
+            .map(|clip| clip.id.clone()),
+    );
+    let props = ClipProperties {
+        speed: Some(speed),
+        ..Default::default()
+    };
+    for id in &targets {
+        validate_clip_property_target(state, id, &props)?;
+    }
+    let count = targets.len();
+    transact(
+        state,
+        "Set Clip Speed",
+        move |_| format!("Retimed {count} clip(s)"),
+        |st| {
+            let mut affected = Vec::new();
+            let mut affected_ids = HashSet::new();
+            for id in &targets {
+                // Earlier targets may have moved this target as part of a chain.
+                // Re-evaluate its current position instead of applying stale plans.
+                validate_clip_property_target(st, id, &props)?;
+                let location = st.find_clip(id).expect("validated speed target exists");
+                let track_index = location.track_index;
+                let original = &st.timeline.tracks[track_index].clips[location.clip_index];
+                if original.speed == speed {
+                    continue;
+                }
+                let old_end = original.end_frame();
+                let mut moving = if ripple {
+                    st.timeline.tracks[track_index].contiguous_clip_ids(old_end, id)
+                } else {
+                    HashSet::new()
+                };
+                apply_property_changes(&mut st.timeline, id, &props, false);
+                let track = &mut st.timeline.tracks[track_index];
+                let delta = track.clips[location.clip_index].end_frame() - old_end;
+                if delta != 0 {
+                    for clip in &mut track.clips {
+                        if moving.contains(&clip.id) {
+                            clip.start_frame =
+                                clip.start_frame.checked_add(delta).ok_or_else(|| {
+                                    EditError::Invalid("retime chain frame overflow".into())
+                                })?;
+                            validate_effective_clip_timing(
+                                clip,
+                                &ClipProperties::default(),
+                                &clip.id,
+                            )?;
+                        }
+                    }
+                }
+                moving.insert(id.clone());
+                if delta != 0 {
+                    // Refuse collisions instead of overwriting an unrelated clip.
+                    // Unchanged, pre-existing overlaps elsewhere are not our edit.
+                    let mut sorted: Vec<_> = track.clips.iter().collect();
+                    sorted.sort_by_key(|clip| clip.start_frame);
+                    let mut previous_end = 0;
+                    let mut previous_moving_end = 0;
+                    for clip in sorted {
+                        let changed = moving.contains(&clip.id);
+                        if clip.start_frame
+                            < if changed {
+                                previous_end
+                            } else {
+                                previous_moving_end
+                            }
+                        {
+                            return Err(EditError::Invalid(format!(
+                                "speed change would overlap clip {} on track {}",
+                                clip.id, track.id
+                            )));
+                        }
+                        let end = clip
+                            .start_frame
+                            .checked_add(clip.duration_frames)
+                            .ok_or_else(|| {
+                                EditError::Invalid("retime chain frame overflow".into())
+                            })?;
+                        previous_end = previous_end.max(end);
+                        if changed {
+                            previous_moving_end = previous_moving_end.max(end);
+                        }
+                    }
+                }
+                for clip in &track.clips {
+                    if moving.contains(&clip.id) && affected_ids.insert(clip.id.clone()) {
+                        affected.push(clip.id.clone());
+                    }
+                }
+            }
+            Ok(affected)
+        },
+    )
+}
+
 fn set_clip_properties(
     state: &mut EditorState,
     clip_ids: Vec<String>,
@@ -4262,6 +4396,7 @@ fn apply_property_changes(
     };
     let clip = &mut timeline.tracks[ti].clips[ci];
 
+    let previous_duration = clip.duration_frames;
     if props.duration_frames.is_some()
         || props.trim_start_frame.is_some()
         || props.trim_end_frame.is_some()
@@ -4273,8 +4408,6 @@ fn apply_property_changes(
 
     if let Some(v) = props.duration_frames {
         clip.duration_frames = v;
-        clip.clamp_keyframes_to_duration();
-        clip.clamp_fades_to_duration();
     }
     if let Some(v) = props.trim_start_frame {
         clip.trim_start_frame = v;
@@ -4288,10 +4421,15 @@ fn apply_property_changes(
         if props.duration_frames.is_none() && v > 0.0 {
             let source_consumed = clip.duration_frames as f64 * clip.speed;
             clip.duration_frames = (1).max((source_consumed / v).round() as i32);
-            clip.clamp_keyframes_to_duration();
-            clip.clamp_fades_to_duration();
         }
         clip.speed = v;
+    }
+    if props.duration_frames.is_some() || props.speed.is_some() {
+        if previous_duration > 0 && clip.duration_frames != previous_duration {
+            clip.rescale_keyframes(clip.duration_frames as f64 / previous_duration as f64);
+        }
+        clip.clamp_keyframes_to_duration();
+        clip.clamp_fades_to_duration();
     }
     // Setting a scalar clears the matching keyframe track.
     if let Some(v) = props.volume {

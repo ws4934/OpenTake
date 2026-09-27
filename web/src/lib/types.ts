@@ -588,6 +588,7 @@ export type EditRequest =
   | { type: "splitClips"; clipIds: string[]; atFrame: number }
   | { type: "freezeFrame"; clipId: string; atFrame: number; durationFrames: number }
   | { type: "trimClips"; edits: TrimEditReq[] }
+  | { type: "setClipSpeed"; clipIds: string[]; speed: number; ripple: boolean }
   | { type: "setClipProperties"; clipIds: string[]; properties: ClipPropertiesReq }
   | { type: "setTransformAtFrame"; clipId: string; frame: number; transform: Transform }
   | { type: "setKeyframes"; clipId: string; property: KeyframeProperty; payload: KeyframePayloadReq }

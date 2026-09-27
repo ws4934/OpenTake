@@ -19,6 +19,7 @@
 
 - 放置 / 插入：`AddClips` / `AddClipsAutoTrack`（在按媒体类型新建的共享轨上放置）/ `InsertClips`（波纹插入）。
 - 片段结构：`MoveClips` / `DuplicateClips`（Alt 拖拽深拷贝）/ `RemoveClips` / `SplitClip` / `TrimClips`。
+- 调速：`SetClipSpeed { clip_ids, speed, ripple }`。Inspector 通过 `setClipSpeed` IPC 默认启用 ripple；时长按 `round(old_duration × old_speed / new_speed)`（至少一帧）计算，先按新旧时长比缩放所有动画关键帧，再裁边和限制淡入淡出。选中片段按调用顺序去重处理，未直接选中的联动非文本伙伴按时间线顺序追加，各自在**当前位置**移动本轨的紧邻后续链；有间隙的片段不移动。增长或链尾位移碰撞、整数溢出、非法速度及不支持的嵌套调速均原子拒绝，不覆盖其他片段、不消耗历史。一次 Undo 还原整次调整。普通 `SetClipProperties` 的 speed/durationFrames 同样缩放动画，但为 Agent 保留**非 ripple** 语义，需调用者处理片段间距；这与上游 Agent 的直接裁剪关键帧行为有意不同。稳定化采样轨的重定基仍由独立问题跟踪，不包含在本命令的动画修复中。
 - 属性：`SetClipProperties` / `SetColorGrade` / `SetChromaKey` / `SetMasks` / `SetEffects` / `SwapMedia`（原位换 `media_ref` 保留全部编辑属性）。
 - 关键帧：`SetKeyframes` / `StampKeyframe` / `RemoveKeyframe` / `MoveKeyframe` / `SetKeyframeInterpolation`（公开 API 用**绝对时间线帧**）。
 - 波纹删除：`RippleDeleteRanges`（按帧区间）/ `RippleDeleteClips`（按选中片段）。
