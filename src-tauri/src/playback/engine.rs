@@ -14,7 +14,7 @@
 //! master clock, the MJPEG sink, and the Tauri event emitter without touching the
 //! loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -283,6 +283,7 @@ pub struct RenderLoop {
     render_size: RenderSize,
     state: PlaybackResolverState,
     last_video_sources: HashMap<String, i64>,
+    reversed_clips: HashSet<String>,
 }
 
 fn active_video_sources(frame_plan: &FramePlan) -> HashMap<String, i64> {
@@ -296,15 +297,32 @@ fn active_video_sources(frame_plan: &FramePlan) -> HashMap<String, i64> {
         .collect()
 }
 
-fn rewinds_any_active_video_source(
+/// Clips whose forward stream must restart because their source frame moved
+/// backwards since the previous frame. Reversed clips descend by design and
+/// are served by reverse windows, so they never count as a rewind.
+fn rewound_video_sources<'a>(
     previous: &HashMap<String, i64>,
-    current: &HashMap<String, i64>,
-) -> bool {
-    current.iter().any(|(clip_id, source_frame)| {
-        previous
-            .get(clip_id)
-            .is_some_and(|prev| source_frame < prev)
-    })
+    current: &'a HashMap<String, i64>,
+    reversed: &HashSet<String>,
+) -> Vec<&'a str> {
+    current
+        .iter()
+        .filter(|(clip_id, source_frame)| {
+            !reversed.contains(*clip_id)
+                && previous
+                    .get(*clip_id)
+                    .is_some_and(|prev| *source_frame < prev)
+        })
+        .map(|(clip_id, _)| clip_id.as_str())
+        .collect()
+}
+
+fn reversed_video_clips(plan: &RenderPlan) -> HashSet<String> {
+    plan.clip_plans
+        .iter()
+        .filter(|clip| clip.reversed && matches!(clip.source, TextureSource::Decoded { .. }))
+        .map(|clip| clip.clip_id.clone())
+        .collect()
 }
 
 impl RenderLoop {
@@ -347,7 +365,7 @@ impl RenderLoop {
             .map(opentake_project::ProjectRoot::open)
             .transpose()
             .map_err(|error| format!("open project LUT storage: {error}"))?;
-        let state = PlaybackResolverState::new_with_project_root(
+        let mut state = PlaybackResolverState::new_with_project_root(
             media,
             text,
             plan.fps,
@@ -355,6 +373,8 @@ impl RenderLoop {
             cancel,
             project_root,
         );
+        let reversed_clips = reversed_video_clips(&plan);
+        state.set_reversed_clips(reversed_clips.clone());
         Ok(RenderLoop {
             device: dev.device,
             queue: dev.queue,
@@ -364,6 +384,7 @@ impl RenderLoop {
             render_size,
             state,
             last_video_sources: HashMap::new(),
+            reversed_clips,
         })
     }
 
@@ -380,9 +401,11 @@ impl RenderLoop {
     pub fn render_frame(&mut self, target: i32) -> Result<DecodedFrame, String> {
         let frame_plan = self.plan.frame(&self.timeline, target);
         let current_video_sources = active_video_sources(&frame_plan);
-        if rewinds_any_active_video_source(&self.last_video_sources, &current_video_sources) {
-            self.state.clear_streams();
-        }
+        self.state.reset_streams(rewound_video_sources(
+            &self.last_video_sources,
+            &current_video_sources,
+            &self.reversed_clips,
+        ));
         let mut resolver = StreamingResolver::new(&self.device, &self.queue, &mut self.state);
         resolver.sync_active(&frame_plan)?;
         let composite = self
@@ -1109,7 +1132,10 @@ mod tests {
             }],
         });
 
-        assert!(rewinds_any_active_video_source(&previous, &current));
+        assert_eq!(
+            rewound_video_sources(&previous, &current, &HashSet::new()),
+            vec!["clip-1"]
+        );
     }
 
     #[test]
@@ -1138,6 +1164,60 @@ mod tests {
             }],
         });
 
-        assert!(!rewinds_any_active_video_source(&previous, &current));
+        assert!(rewound_video_sources(&previous, &current, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn only_the_rewound_clip_restarts_its_stream() {
+        let previous = HashMap::from([("rewound".to_string(), 7), ("forward".to_string(), 3)]);
+        let current = HashMap::from([("rewound".to_string(), 2), ("forward".to_string(), 4)]);
+
+        assert_eq!(
+            rewound_video_sources(&previous, &current, &HashSet::new()),
+            vec!["rewound"]
+        );
+    }
+
+    #[test]
+    fn reversed_clip_never_restarts_streams_across_sixty_frames() {
+        use opentake_domain::{Clip, ClipType, Track};
+
+        let mut timeline = Timeline::new();
+        timeline.fps = 30;
+        let mut forward_track = Track::new("t1", ClipType::Video);
+        forward_track
+            .clips
+            .push(Clip::new("forward", "asset-forward", 0, 60));
+        let mut reversed_track = Track::new("t2", ClipType::Video);
+        let mut reversed = Clip::new("reversed", "asset-reversed", 0, 60);
+        reversed.reversed = true;
+        reversed_track.clips.push(reversed);
+        timeline.tracks.push(forward_track);
+        timeline.tracks.push(reversed_track);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::from([
+                ("asset-forward".to_string(), (64, 36)),
+                ("asset-reversed".to_string(), (64, 36)),
+            ]),
+        };
+        let plan = try_build_render_plan(&timeline, RenderSize::new(64, 36), &metrics)
+            .expect("two-track plan");
+        let reversed_clips = reversed_video_clips(&plan);
+        assert_eq!(reversed_clips, HashSet::from(["reversed".to_string()]));
+
+        let mut previous = HashMap::new();
+        for frame in 0..60 {
+            let current = active_video_sources(&plan.frame(&timeline, frame));
+            assert_eq!(current.len(), 2, "both clips draw at frame {frame}");
+            if frame > 0 {
+                assert!(current["reversed"] < previous["reversed"]);
+                assert!(current["forward"] > previous["forward"]);
+            }
+            assert!(
+                rewound_video_sources(&previous, &current, &reversed_clips).is_empty(),
+                "frame {frame} must not restart any stream"
+            );
+            previous = current;
+        }
     }
 }
