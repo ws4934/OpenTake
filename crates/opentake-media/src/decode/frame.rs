@@ -365,7 +365,9 @@ fn estimate_block_motion(first: &RgbaFrame, last: &RgbaFrame) -> BlockMotionFiel
 fn luma_plane(frame: &RgbaFrame) -> Vec<f64> {
     frame
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             let r = pixel[0] as f64;
             let g = pixel[1] as f64;
