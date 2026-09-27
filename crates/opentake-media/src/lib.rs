@@ -58,6 +58,7 @@ pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod frame;
+pub mod identity;
 pub mod index_coordinator;
 pub mod library;
 pub mod ort_worker;
@@ -152,6 +153,7 @@ pub fn trim_video_range(
 pub use cancel::MediaCancelToken;
 pub use error::{MediaError, Result};
 pub use frame::RgbaFrame;
+pub use identity::{ContentHashCache, FileStamp};
 
 pub use color::{hdr_decode_input_args, hdr_tonemap_filter};
 pub use probe::{parse_probe, probe, MediaProbe};

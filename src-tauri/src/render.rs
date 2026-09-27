@@ -37,7 +37,8 @@ use opentake_core::{AppCore, EditCommand, ProjectRevision};
 use opentake_domain::{ClipType, LutReference, MediaSource, TextStyle, Timeline};
 use opentake_media::{
     decode_frame_at_cancellable, decode_frame_file_at_cancellable, interpolate_frame_pair,
-    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken,
+    ContentHashCache, FileStamp, FrameInterpolationFallback, FrameInterpolationMode, FrameRequest,
+    MediaCancelToken,
 };
 use opentake_ops::command::RenameEntry;
 use opentake_project::ProjectRoot;
@@ -149,6 +150,8 @@ struct GpuContext {
     /// never cross a device-loss boundary. Rc texture caches remain local to a
     /// composite call because Tauri managed state must be Send + Sync.
     lottie: LottieMaterializer,
+    /// Image content hashes, revalidated by file identity on every lookup.
+    content_hashes: ContentHashCache,
 }
 
 /// Tauri managed state holding the (lazily created) GPU context. `None` until the
@@ -371,6 +374,7 @@ const MAX_LOTTIE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOTTIE_DIMENSION: usize = 4096;
 
 struct CachedLottie {
+    stamp: FileStamp,
     content_hash: String,
     composition: velato::Composition,
 }
@@ -386,13 +390,16 @@ pub(crate) struct LottieMetadata {
 
 /// Device-lifetime Lottie JSON parser/rasterizer shared by preview, playback,
 /// and export. GPU textures live in the caller's [`TextureCache`]; parsed
-/// documents live here and are replaced whenever the source content hash
-/// changes. Dropping the owning GPU context drops both halves, so a recovered
+/// documents live here; a document is re-read only when its file identity
+/// ([`FileStamp`]) changes and re-parsed only when its content hash changes.
+/// Dropping the owning GPU context drops both halves, so a recovered
 /// device never receives a texture or Vello pipeline created by the old device.
 pub(crate) struct LottieMaterializer {
     documents: HashMap<PathBuf, CachedLottie>,
     scene_renderer: velato::Renderer,
     gpu_renderer: Option<velato::vello::Renderer>,
+    #[cfg(test)]
+    document_reads: usize,
 }
 
 impl LottieMaterializer {
@@ -401,16 +408,44 @@ impl LottieMaterializer {
             documents: HashMap::new(),
             scene_renderer: velato::Renderer::new(),
             gpu_renderer: None,
+            #[cfg(test)]
+            document_reads: 0,
         }
     }
 
+    #[cfg(all(test, feature = "playback-engine"))]
+    pub(crate) fn document_reads(&self) -> usize {
+        self.document_reads
+    }
+
+    fn is_current(&self, path: &std::path::Path, stamp: FileStamp) -> bool {
+        self.documents
+            .get(path)
+            .is_some_and(|cached| cached.stamp == stamp)
+    }
+
     fn ensure_document(&mut self, path: &std::path::Path) -> Result<(), String> {
+        // Stat before reading: a write racing the read changes the stamp, so
+        // the next frame re-reads instead of trusting a torn document.
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("read Lottie document {}: {error}", path.display()))?;
+        let stamp = FileStamp::of(&metadata);
+        if self.is_current(path, stamp) {
+            return Ok(());
+        }
         let bytes = std::fs::read(path)
             .map_err(|error| format!("read Lottie document {}: {error}", path.display()))?;
-        self.ensure_document_bytes(path, &bytes)
+        self.ensure_document_bytes(path, &bytes, stamp)
     }
 
     fn ensure_document_file(&mut self, path: &std::path::Path, file: &File) -> Result<(), String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("stat retained Lottie document: {error}"))?;
+        let stamp = FileStamp::of(&metadata);
+        if self.is_current(path, stamp) {
+            return Ok(());
+        }
         let mut input = file
             .try_clone()
             .map_err(|error| format!("clone retained Lottie document: {error}"))?;
@@ -422,26 +457,32 @@ impl LottieMaterializer {
             .take((MAX_LOTTIE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|error| format!("read retained Lottie document: {error}"))?;
-        self.ensure_document_bytes(path, &bytes)
+        self.ensure_document_bytes(path, &bytes, stamp)
     }
 
     fn ensure_document_bytes(
         &mut self,
         path: &std::path::Path,
         bytes: &[u8],
+        stamp: FileStamp,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            self.document_reads += 1;
+        }
         let json = if is_lottie_container(path) {
             extract_lottie_animation(path, bytes)?
         } else {
             bytes.to_vec()
         };
-        self.ensure_json_document_bytes(path, &json)
+        self.ensure_json_document_bytes(path, &json, stamp)
     }
 
     fn ensure_json_document_bytes(
         &mut self,
         path: &std::path::Path,
         bytes: &[u8],
+        stamp: FileStamp,
     ) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() > MAX_LOTTIE_BYTES {
             return Err(format!(
@@ -468,10 +509,14 @@ impl LottieMaterializer {
             self.documents.insert(
                 path.to_path_buf(),
                 CachedLottie {
+                    stamp,
                     content_hash,
                     composition,
                 },
             );
+        } else if let Some(cached) = self.documents.get_mut(path) {
+            // Touched but byte-identical: keep the parsed composition.
+            cached.stamp = stamp;
         }
         Ok(())
     }
@@ -771,6 +816,7 @@ struct MediaResolver<'d> {
     queue: &'d wgpu::Queue,
     cache: &'d mut TextureCache,
     lottie: &'d mut LottieMaterializer,
+    content_hashes: &'d mut ContentHashCache,
     media: &'d HashMap<String, MediaInfo<'d>>,
     timeline_fps: i32,
     /// Text clips by id (content + style + box) for on-demand rasterization.
@@ -975,8 +1021,10 @@ impl TextureResolver for MediaResolver<'_> {
         };
         let key = if is_image {
             let content_hash = match info.retained {
-                Some(file) => opentake_media::file_sha256_file_cancellable(file, self.cancel),
-                None => opentake_media::file_sha256(&info.path),
+                Some(file) => self
+                    .content_hashes
+                    .sha256_file(&info.path, file, self.cancel),
+                None => self.content_hashes.sha256(&info.path),
             };
             let Ok(content_hash) = content_hash else {
                 return self
@@ -1297,6 +1345,7 @@ fn composite_empty_timeline_canvas(
             compositor: Compositor::new(&dev.device),
             text_rasterizer: CosmicTextRasterizer::new(),
             lottie: LottieMaterializer::new(),
+            content_hashes: ContentHashCache::new(),
             device: dev.device,
             queue: dev.queue,
         });
@@ -1572,6 +1621,7 @@ fn composite_timeline_frame_with_authority(
             compositor,
             text_rasterizer,
             lottie: LottieMaterializer::new(),
+            content_hashes: ContentHashCache::new(),
         });
     }
     let result = {
@@ -1583,6 +1633,7 @@ fn composite_timeline_frame_with_authority(
             queue: &ctx.queue,
             cache: &mut texture_cache,
             lottie: &mut ctx.lottie,
+            content_hashes: &mut ctx.content_hashes,
             media: &media,
             timeline_fps: plan.fps,
             text: &text,

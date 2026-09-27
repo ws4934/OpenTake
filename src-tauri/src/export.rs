@@ -58,9 +58,9 @@ use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
     decode_frame_at, extract_pcm, extract_pcm_cancellable_with_progress, interpolate_frame_pair,
-    ExportPreset, ExportResolution as EncodeResolution, FrameInterpolationFallback,
-    FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer, PcmFormat,
-    PcmProgressCallback, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
+    ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
+    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer,
+    PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
 };
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::compositor::{
@@ -525,6 +525,7 @@ struct MediaResolver<'d> {
     queue: &'d opentake_render::wgpu::Queue,
     cache: &'d mut TextureCache,
     lottie: &'d mut LottieMaterializer,
+    content_hashes: &'d mut ContentHashCache,
     media: &'d HashMap<String, MediaInfo>,
     timeline_fps: i32,
     text: &'d HashMap<String, TextInfo>,
@@ -654,7 +655,7 @@ impl TextureResolver for MediaResolver<'_> {
 
         let info = self.media.get(media_ref)?;
         let key = if is_image {
-            let content_hash = opentake_media::file_sha256(&info.path).ok()?;
+            let content_hash = self.content_hashes.sha256(&info.path).ok()?;
             format!("i:{content_hash}")
         } else {
             format!("v:{media_ref}:{source_frame}")
@@ -1709,6 +1710,7 @@ pub(crate) fn run_export_with_control(
     let mut lut_cache = HashMap::new();
     let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
     let mut lottie = LottieMaterializer::new();
+    let mut content_hashes = ContentHashCache::new();
     for f in start_frame..end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
@@ -1731,6 +1733,7 @@ pub(crate) fn run_export_with_control(
             queue: &dev.queue,
             cache: &mut texture_cache,
             lottie: &mut lottie,
+            content_hashes: &mut content_hashes,
             media: &media,
             timeline_fps: plan.fps,
             text: &text,
