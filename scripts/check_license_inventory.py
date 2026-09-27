@@ -116,7 +116,7 @@ def validate_inventory(repository_root: Path = REPOSITORY_ROOT) -> list[str]:
     errors: list[str] = []
     package_json_path = repository_root / "web" / "package.json"
     lockfile_path = repository_root / "web" / "pnpm-lock.yaml"
-    notices_path = repository_root / "THIRD_PARTY_NOTICES.md"
+    notices_path = repository_root / "NOTICE"
 
     try:
         package_json = json.loads(package_json_path.read_text(encoding="utf-8"))
@@ -133,7 +133,7 @@ def validate_inventory(repository_root: Path = REPOSITORY_ROOT) -> list[str]:
         notices = notices_path.read_text(encoding="utf-8")
     except OSError:
         notices = ""
-        errors.append("THIRD_PARTY_NOTICES.md must be readable")
+        errors.append("NOTICE must be readable")
 
     dependencies = package_json.get("dependencies")
     if not isinstance(dependencies, dict):
