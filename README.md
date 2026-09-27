@@ -118,7 +118,7 @@ reads or stores the Codex credential.
 
 | Capability | Technology |
 |:--|:--|
-| Codec | FFmpeg (`ffmpeg-next`) — battle-tested Rust bindings |
+| Codec | Bundled FFmpeg/ffprobe CLI (`ffmpeg-sidecar`), no libav linkage |
 | Compositor | wgpu custom compositor — multi-track layering + per-frame property sampling + affine/crop/blend |
 | Audio Playback | cpal |
 | Transcription | whisper-rs (requires installed model) |
@@ -275,7 +275,7 @@ Key files for comparison:
 
 - **Rust** ≥ 1.96 (via [rustup](https://rustup.rs))
 - **Node.js** ≥ 20 + **pnpm**
-- **FFmpeg** ≥ 6.0 (`brew install ffmpeg` / `winget install ffmpeg` / `apt install ffmpeg`)
+- **Python** ≥ 3.10 (`python3`) — prepares checksum-pinned FFmpeg/ffprobe binaries automatically for Tauri dev/build; no system FFmpeg or Homebrew needed
 
 ### Build
 

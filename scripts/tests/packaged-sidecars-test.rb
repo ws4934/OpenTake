@@ -95,8 +95,10 @@ def packaged_paths(package, target)
     [macos.join("ffmpeg"), macos.join("ffprobe")]
   elsif target.include?("windows")
     [package.join("ffmpeg.exe"), package.join("ffprobe.exe")]
+  elsif target.include?("linux")
+    [package.join("ffmpeg"), package.join("ffprobe")]
   else
-    raise "packaged smoke is only defined for macOS and Windows"
+    raise "unsupported packaged sidecar target: #{target}"
   end
 end
 
@@ -106,7 +108,7 @@ def packaged_macos_windows_sidecars_resolve_and_execute(package: nil)
   target = host_target
   assert(lock.fetch("targets").key?(target), "unsupported packaged sidecar target: #{target}")
 
-  %w[tauri.macos.conf.json tauri.windows.conf.json].each do |name|
+  %w[tauri.macos.conf.json tauri.windows.conf.json tauri.linux.conf.json].each do |name|
     config = JSON.parse(ROOT.join("src-tauri", name).read)
     assert(config.dig("bundle", "externalBin") == %w[binaries/ffmpeg binaries/ffprobe],
            "#{name} must package the locked ffmpeg and ffprobe sidecars")

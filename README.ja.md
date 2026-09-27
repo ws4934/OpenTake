@@ -98,7 +98,7 @@ OpenTake は互換 Agent ツールを提供し、メディア・生成・provide
 
 | 機能 | 技術 |
 |:--|:--|
-| コーデック | FFmpeg (`ffmpeg-next`) |
+| コーデック | 同梱 FFmpeg/ffprobe CLI (`ffmpeg-sidecar`) |
 | コンポジター | wgpu カスタムコンポジター |
 | 音声再生 | cpal |
 | 文字起こし | whisper-rs |
@@ -221,6 +221,8 @@ PRIMARY-CN/
 ---
 
 ## 🚀 クイックスタート
+
+Python ≥ 3.10 (`python3`) が必要です。Tauri の開発・ビルド前に検証済み FFmpeg/ffprobe を自動取得します。システム FFmpeg や Homebrew は不要です。
 
 ```bash
 git clone https://github.com/appergb/OpenTake.git
