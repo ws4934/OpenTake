@@ -395,7 +395,7 @@ fn relative_to_authority(path: &Path, root: &Path) -> Option<PathBuf> {
 }
 
 fn is_home_thumbnail_exception(scope: &Scope, path: &Path, bundle_path: &Path) -> bool {
-    paths_equal_for_authority(path, &bundle_path.join("thumbnail.jpg"))
+    paths_equal_for_authority(path, &bundle_path.join(HOME_THUMBNAIL_FILE))
         && scope_has_exact_file_grant(scope, path)
 }
 
@@ -760,10 +760,39 @@ fn validate_opened_resident_regular_file(file: &File) -> std::io::Result<PathBuf
     Ok(final_path)
 }
 
+const HOME_THUMBNAIL_FILE: &str = "thumbnail.jpg";
+
 /// Validate one exact Home thumbnail grant without expanding it to a recursive
-/// bundle scope. The returned path comes from the retained file handle.
-pub(crate) fn validate_resident_regular_file(path: &Path) -> std::io::Result<PathBuf> {
-    open_retained_regular_file(path).map(|(_, final_path)| final_path)
+/// bundle scope.
+///
+/// The cover is opened through a retained no-follow root for its `.opentake`
+/// bundle, so only the `thumbnail.jpg` leaf of a real bundle directory
+/// qualifies: a symlinked bundle or leaf is rejected. Ancestor directories may
+/// be symlinks, junctions or `subst` drives (macOS `/tmp`, linked volumes), so
+/// the requested path is not compared with the returned one. The returned path
+/// comes from the retained file handle and must itself have the Home cover
+/// shape that the asset protocol re-checks for every request.
+pub(crate) fn validate_resident_home_thumbnail(thumbnail: &Path) -> std::io::Result<PathBuf> {
+    let not_a_cover = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is not the thumbnail of a .opentake bundle",
+        )
+    };
+    let bundle = opentake_ancestor(thumbnail).ok_or_else(not_a_cover)?;
+    if !paths_equal_for_authority(thumbnail, &bundle.join(HOME_THUMBNAIL_FILE)) {
+        return Err(not_a_cover());
+    }
+    let root = ProjectRoot::open(&bundle).map_err(std::io::Error::other)?;
+    let file = root
+        .open_asset_file(Path::new(HOME_THUMBNAIL_FILE))
+        .map_err(std::io::Error::other)?;
+    let final_path = validate_opened_resident_regular_file(&file)?;
+    let final_bundle = opentake_ancestor(&final_path).ok_or_else(not_a_cover)?;
+    if !paths_equal_for_authority(&final_path, &final_bundle.join(HOME_THUMBNAIL_FILE)) {
+        return Err(not_a_cover());
+    }
+    Ok(final_path)
 }
 
 pub(crate) fn scope_allows_lexical_path(scope: &Scope, path: &Path) -> bool {

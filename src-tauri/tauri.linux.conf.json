@@ -1,8 +1,8 @@
 {
   "bundle": {
     "externalBin": [
-      "binaries/ffmpeg",
-      "binaries/ffprobe"
+      "binaries/opentake-ffmpeg",
+      "binaries/opentake-ffprobe"
     ]
   }
 }

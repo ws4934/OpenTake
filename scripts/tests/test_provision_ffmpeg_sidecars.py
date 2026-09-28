@@ -204,7 +204,7 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             mock.patch.object(provisioner.time, "sleep", delays.append),
         ):
             provisioner.provision("ffmpeg", record, "x86_64-unknown-linux-gnu")
-        return binary_dir / "ffmpeg-x86_64-unknown-linux-gnu"
+            return provisioner.destination("ffmpeg", "x86_64-unknown-linux-gnu")
 
     def test_download_with_the_wrong_bytes_is_fetched_again(self) -> None:
         binary = b"pinned ffmpeg"
@@ -323,6 +323,39 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             ) as metadata:
                 provisioner.verify(binary, expected_sha, "7.0")
                 self.assertEqual(metadata.call_count, 2)
+
+    def test_linux_sidecars_never_take_the_distribution_tool_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary_dir = Path(directory)
+            with mock.patch.object(provisioner, "BIN_DIR", binary_dir):
+                cases = [
+                    ("ffmpeg", "x86_64-unknown-linux-gnu", "opentake-ffmpeg-x86_64-unknown-linux-gnu"),
+                    ("ffprobe", "x86_64-unknown-linux-gnu", "opentake-ffprobe-x86_64-unknown-linux-gnu"),
+                    ("ffmpeg", "aarch64-apple-darwin", "ffmpeg-aarch64-apple-darwin"),
+                    ("ffprobe", "x86_64-apple-darwin", "ffprobe-x86_64-apple-darwin"),
+                    ("ffmpeg", "x86_64-pc-windows-msvc", "ffmpeg-x86_64-pc-windows-msvc.exe"),
+                ]
+                for tool, target, name in cases:
+                    with self.subTest(tool=tool, target=target):
+                        self.assertEqual(
+                            provisioner.destination(tool, target), binary_dir / name
+                        )
+
+    def test_tauri_external_binaries_match_the_provisioned_names(self) -> None:
+        for config_name, target in (
+            ("tauri.linux.conf.json", "x86_64-unknown-linux-gnu"),
+            ("tauri.macos.conf.json", "aarch64-apple-darwin"),
+            ("tauri.windows.conf.json", "x86_64-pc-windows-msvc"),
+        ):
+            with self.subTest(config=config_name):
+                config = json.loads((ROOT / "src-tauri" / config_name).read_text())
+                self.assertEqual(
+                    config["bundle"]["externalBin"],
+                    [
+                        f"binaries/{provisioner.sidecar_name(tool, target)}"
+                        for tool in ("ffmpeg", "ffprobe")
+                    ],
+                )
 
     def test_apple_silicon_lock_pins_archive_and_binary_hashes(self) -> None:
         lock = json.loads((ROOT / "scripts" / "ffmpeg-sidecars.lock.json").read_text())

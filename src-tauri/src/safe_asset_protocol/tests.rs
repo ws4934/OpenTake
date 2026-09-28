@@ -347,6 +347,237 @@ fn current_project_authority_allows_nested_media_without_recursive_scope() {
     assert_eq!(response.body, b"project-media");
 }
 
+/// Build a project whose opened path runs through a symlinked ancestor
+/// (`link -> real`, like macOS `/tmp -> /private/tmp` or a linked volume) and
+/// return the pieces of one authorized project-asset read of `media/a.png`.
+#[cfg(unix)]
+fn symlinked_ancestor_project_read(
+    directory: &Path,
+) -> (
+    AppCore,
+    PathBuf,
+    PathBuf,
+    ProjectAssetAuthority,
+    HelperRequest,
+) {
+    use std::os::unix::fs::symlink;
+    use tauri::Manager;
+
+    let real = directory.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = directory.join("link");
+    symlink(&real, &link).unwrap();
+    let bundle = link.join("P.opentake");
+    let core = AppCore::new();
+    core.save_project(Some(bundle.clone())).unwrap();
+    std::fs::create_dir_all(bundle.join("media")).unwrap();
+    let media = bundle.join("media/a.png");
+    std::fs::write(&media, b"png-bytes").unwrap();
+
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    let authority = project_request_authority(&core, &scope, &media)
+        .unwrap()
+        .expect("the opened project path is the nested-media authority");
+    assert_eq!(authority.project_path, bundle);
+    let request = HelperRequest {
+        token: "symlinked-ancestor-token".to_owned(),
+        parent_pid: std::process::id(),
+        path: media.to_string_lossy().into_owned(),
+        head_only: false,
+        range: None,
+        if_range: None,
+        project: HelperProjectAuthority::from_core(&authority),
+    };
+    (core, real, media, authority, request)
+}
+
+#[cfg(unix)]
+#[test]
+fn project_assets_behind_a_symlinked_ancestor_are_served() {
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    let isolated = helper_response(&request);
+    let final_path = PathBuf::from(isolated.metadata.final_path.clone().unwrap());
+    assert_eq!(
+        final_path,
+        real.join("P.opentake/media/a.png"),
+        "the retained handle reports the resolved path, not the opened alias"
+    );
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        &scope,
+        Some(&authority),
+        None,
+        &request.token,
+        isolated,
+    );
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a symlinked ancestor must not turn the retained root into a 403"
+    );
+    assert_eq!(response.body(), b"png-bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_assets_require_the_retained_root_identity_after_the_read() {
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let (core, _, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+
+    let mut other_root = helper_response(&request);
+    other_root.metadata.project_root_identity = Some(ProjectRootIdentity {
+        volume: authority.root_identity.volume,
+        file: authority.root_identity.file.wrapping_add(1),
+    });
+    let mut unrooted = helper_response(&request);
+    unrooted.metadata.project_root_identity = None;
+
+    for isolated in [other_root, unrooted] {
+        let response = isolated_response_to_http(
+            app.handle(),
+            &core,
+            &scope,
+            Some(&authority),
+            None,
+            &request.token,
+            isolated,
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "bytes read through any root other than the retained one must not be published"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn project_asset_read_rejects_a_bundle_replaced_behind_the_symlinked_ancestor() {
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    std::fs::rename(real.join("P.opentake"), real.join("Parked.opentake")).unwrap();
+    std::fs::create_dir_all(real.join("P.opentake/media")).unwrap();
+    std::fs::write(real.join("P.opentake/media/a.png"), b"replacement").unwrap();
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+
+    let isolated = helper_response(&request);
+    assert!(isolated.body.is_empty());
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        &scope,
+        Some(&authority),
+        None,
+        &request.token,
+        isolated,
+    );
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.body() != b"replacement");
+}
+
+#[cfg(unix)]
+#[test]
+fn home_thumbnail_behind_a_symlinked_ancestor_is_authorized_exactly() {
+    use std::os::unix::fs::symlink;
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let real = directory.path().join("real");
+    std::fs::create_dir_all(real.join("Recent.opentake")).unwrap();
+    let link = directory.path().join("link");
+    symlink(&real, &link).unwrap();
+    let thumbnail = link.join("Recent.opentake/thumbnail.jpg");
+    std::fs::write(&thumbnail, b"jpeg").unwrap();
+
+    let final_path = validate_resident_home_thumbnail(&thumbnail).unwrap();
+    assert_eq!(final_path, real.join("Recent.opentake/thumbnail.jpg"));
+
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_file(&thumbnail).unwrap();
+    scope.allow_file(&final_path).unwrap();
+    let expected = non_project_asset_authority(app.handle(), &AppCore::new(), &scope, &thumbnail)
+        .expect("the exact thumbnail grants authorize the Home cover");
+    let request = HelperRequest {
+        token: "home-thumbnail-token".to_owned(),
+        parent_pid: std::process::id(),
+        path: thumbnail.to_string_lossy().into_owned(),
+        head_only: false,
+        range: None,
+        if_range: None,
+        project: None,
+    };
+    let response = isolated_response_to_http(
+        app.handle(),
+        &AppCore::new(),
+        &scope,
+        None,
+        Some(expected),
+        &request.token,
+        helper_response(&request),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body(), b"jpeg");
+    assert!(
+        !scope_allows_lexical_path(&scope, &link.join("Recent.opentake/project.json")),
+        "the thumbnail grant must stay exact"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_thumbnail_validation_rejects_symlinked_bundles_and_leaves() {
+    use std::os::unix::fs::symlink;
+
+    let directory = local_tempdir();
+    let target = directory.path().join("Target.opentake");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("thumbnail.jpg"), b"jpeg").unwrap();
+    let alias = directory.path().join("Alias.opentake");
+    symlink(&target, &alias).unwrap();
+    assert!(validate_resident_home_thumbnail(&alias.join("thumbnail.jpg")).is_err());
+
+    let linked_leaf = directory.path().join("Leaf.opentake");
+    std::fs::create_dir(&linked_leaf).unwrap();
+    symlink(
+        target.join("thumbnail.jpg"),
+        linked_leaf.join("thumbnail.jpg"),
+    )
+    .unwrap();
+    assert!(validate_resident_home_thumbnail(&linked_leaf.join("thumbnail.jpg")).is_err());
+
+    std::fs::write(target.join("cover.jpg"), b"jpeg").unwrap();
+    assert!(
+        validate_resident_home_thumbnail(&target.join("cover.jpg")).is_err(),
+        "only the bundle's thumbnail.jpg leaf qualifies"
+    );
+    let plain = directory.path().join("Plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::write(plain.join("thumbnail.jpg"), b"jpeg").unwrap();
+    assert!(
+        validate_resident_home_thumbnail(&plain.join("thumbnail.jpg")).is_err(),
+        "a thumbnail outside a .opentake bundle is not a Home cover"
+    );
+    assert!(validate_resident_home_thumbnail(&target.join("thumbnail.jpg")).is_ok());
+}
+
 #[test]
 fn home_thumbnail_exception_requires_an_exact_file_grant() {
     use tauri::Manager;

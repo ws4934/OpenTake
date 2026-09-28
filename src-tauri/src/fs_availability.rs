@@ -17,11 +17,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderStateFromAttributeTag;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+use windows_sys::Win32::Storage::FileSystem::{
+    FileAttributeTagInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, WIN32_FIND_DATAW,
+};
 
 #[cfg(target_os = "macos")]
 const MACOS_SF_DATALESS: u32 = 0x4000_0000;
@@ -76,16 +81,45 @@ fn windows_placeholder_state_is_partial(state: u32) -> bool {
     state & WINDOWS_PARTIAL_PLACEHOLDER_STATES != 0
 }
 
+/// Win32 extended-length form (`\\?\`) of an absolute path that Win32 has
+/// already normalized (`std::path::absolute` uses `GetFullPathNameW`; the
+/// prefix turns normalization off). `FindFirstFileW` is not long-path aware
+/// without the process opt-in, so paths of MAX_PATH (260) or more need it.
+/// Returns `None` for paths that are already verbatim, device or relative.
+#[cfg(any(target_os = "windows", test))]
+fn windows_extended_length_path(absolute: &str) -> Option<String> {
+    if absolute.starts_with(r"\\?\") || absolute.starts_with(r"\\.\") {
+        return None;
+    }
+    if let Some(unc) = absolute.strip_prefix(r"\\") {
+        return Some(format!(r"\\?\UNC\{unc}"));
+    }
+    let bytes = absolute.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+        .then(|| format!(r"\\?\{absolute}"))
+}
+
 #[cfg(target_os = "windows")]
 fn windows_placeholder_is_partial(path: &Path) -> bool {
-    let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let query_path = absolute
+        .to_str()
+        .and_then(windows_extended_length_path)
+        .map_or_else(|| absolute.clone().into_os_string(), Into::into);
+    let mut path_wide = query_path.encode_wide().collect::<Vec<_>>();
     path_wide.push(0);
     let mut find_data = WIN32_FIND_DATAW::default();
     // SAFETY: `path_wide` is NUL-terminated and `find_data` is writable for
     // the duration of the Win32 calls. A successful find handle is closed once.
     let handle = unsafe { FindFirstFileW(path_wide.as_ptr(), &mut find_data) };
     if handle == INVALID_HANDLE_VALUE {
-        return true;
+        // A path that vanished is unavailable. Any other failed directory
+        // query is not evidence of a placeholder: ask the file itself, and
+        // fail closed only when that attribute query fails as well.
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            return true;
+        }
+        return windows_handle_placeholder_is_partial(path).unwrap_or(true);
     }
     // SAFETY: `handle` is the live search handle returned above.
     unsafe { FindClose(handle) };
@@ -95,6 +129,41 @@ fn windows_placeholder_is_partial(path: &Path) -> bool {
         CfGetPlaceholderStateFromAttributeTag(find_data.dwFileAttributes, find_data.dwReserved0)
     };
     windows_placeholder_state_is_partial(state)
+}
+
+/// Classify through an attribute-only handle. Neither the access mask nor
+/// `FILE_FLAG_OPEN_NO_RECALL` requests file data, so this cannot hydrate a
+/// cloud placeholder; std opens long paths in their extended-length form.
+#[cfg(target_os = "windows")]
+fn windows_handle_placeholder_is_partial(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL,
+        )
+        .open(path)?;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `file` owns a live handle and `info` is writable for its exact size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the values come from the same attribute/tag query.
+    let state =
+        unsafe { CfGetPlaceholderStateFromAttributeTag(info.FileAttributes, info.ReparseTag) };
+    Ok(windows_attributes_are_unavailable(info.FileAttributes)
+        || windows_placeholder_state_is_partial(state))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -183,6 +252,51 @@ mod tests {
         assert!(windows_placeholder_state_is_partial(0x10));
         assert!(windows_placeholder_state_is_partial(0x20));
         assert!(!windows_placeholder_state_is_partial(0x08));
+    }
+
+    #[test]
+    fn windows_extended_length_paths_cover_disk_and_unc_forms() {
+        assert_eq!(
+            windows_extended_length_path(r"C:\Media\My clip.mp4").as_deref(),
+            Some(r"\\?\C:\Media\My clip.mp4")
+        );
+        assert_eq!(
+            windows_extended_length_path(r"\\server\share\clip.mp4").as_deref(),
+            Some(r"\\?\UNC\server\share\clip.mp4")
+        );
+        assert_eq!(windows_extended_length_path(r"\\?\C:\Media\clip.mp4"), None);
+        assert_eq!(
+            windows_extended_length_path(r"\\?\UNC\server\share\x"),
+            None
+        );
+        assert_eq!(windows_extended_length_path(r"\\.\pipe\clip"), None);
+        assert_eq!(windows_extended_length_path(r"Media\clip.mp4"), None);
+        assert_eq!(windows_extended_length_path("C:"), None);
+    }
+
+    /// Paths of MAX_PATH or more used to fail the `FindFirstFileW` query and be
+    /// reported as offline cloud placeholders.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_long_paths_are_materialized_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut parent = directory.path().to_path_buf();
+        while parent.as_os_str().len() < 300 {
+            parent.push("a".repeat(40));
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let file = parent.join("thumbnail.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        std::fs::write(parent.join("project.json"), b"{}").unwrap();
+        assert!(file.as_os_str().len() > 260);
+
+        assert!(is_materialized_regular_file(&file));
+        assert!(!is_dataless(&file));
+        assert_eq!(
+            windows_handle_placeholder_is_partial(&file).ok(),
+            Some(false)
+        );
+        assert!(!project_bundle_has_dataless_components(&parent));
     }
 
     #[cfg(target_os = "macos")]

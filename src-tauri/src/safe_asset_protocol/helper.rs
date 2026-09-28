@@ -243,9 +243,12 @@ pub(super) fn isolated_response_to_http<R: Runtime>(
         }
     }
     match (expected_project, opentake_ancestor(&final_path)) {
-        (Some(expected), Some(bundle_path))
-            if metadata.project_root_identity == Some(expected.root_identity)
-                && paths_equal_for_authority(&expected.project_path, &bundle_path) => {}
+        // The helper re-opened the bundle, required this exact retained root
+        // identity and opened every asset component no-follow beneath it, so
+        // the identity is the authority. The handle's final path is resolved
+        // by the OS (symlinked ancestors such as macOS `/tmp`, junctions and
+        // `subst` drives), so it cannot be compared with the opened path.
+        (Some(expected), _) if metadata.project_root_identity == Some(expected.root_identity) => {}
         (None, Some(bundle_path))
             if is_home_thumbnail_exception(scope, &final_path, &bundle_path) => {}
         (None, None) => {}

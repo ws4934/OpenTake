@@ -39,9 +39,16 @@ def host_target() -> str:
     ).strip()
 
 
+def sidecar_name(tool: str, target: str) -> str:
+    """Packaged tool name. Linux deb/rpm bundles install sidecars into the
+    shared /usr/bin, so they must not take the distribution's ffmpeg/ffprobe
+    names; see sidecar_name in src-tauri/src/media_tools.rs."""
+    return f"opentake-{tool}" if "linux" in target else tool
+
+
 def destination(tool: str, target: str) -> Path:
     extension = ".exe" if "windows" in target else ""
-    return BIN_DIR / f"{tool}-{target}{extension}"
+    return BIN_DIR / f"{sidecar_name(tool, target)}-{target}{extension}"
 
 
 def verify_regular_file(path: Path, expected_sha: str) -> None:

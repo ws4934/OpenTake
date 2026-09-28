@@ -546,14 +546,14 @@ fn probe_project_entries_with(
         .collect::<Vec<_>>()
 }
 
+/// Grant exactly the requested cover and the path its retained handle resolves
+/// to. The two differ when an ancestor directory is a symlink, junction or
+/// `subst` drive; the cover itself is opened no-follow through its bundle.
 fn authorize_home_thumbnail(scope: &tauri::scope::fs::Scope, thumbnail: &Path) -> bool {
-    let Ok(final_path) = crate::safe_asset_protocol::validate_resident_regular_file(thumbnail)
+    let Ok(final_path) = crate::safe_asset_protocol::validate_resident_home_thumbnail(thumbnail)
     else {
         return false;
     };
-    if !same_path(thumbnail, &final_path) {
-        return false;
-    }
     scope.allow_file(thumbnail).is_ok() && scope.allow_file(final_path).is_ok()
 }
 
@@ -744,39 +744,69 @@ fn persist_entries(path: &Path, entries: &[ProjectEntry]) -> Result<(), String> 
     result
 }
 
+/// Explorer parses `/select,"<path>"` itself and needs only the path quoted.
+/// Rust's argument quoting would wrap the whole switch in quotes whenever the
+/// path contains a space (`"/select,C:\My Projects\a.opentake"`), which
+/// Explorer does not select, so Windows passes this as a raw argument.
+/// Explorer does not understand the `\\?\` prefix, and Windows file names
+/// cannot contain `"`.
+#[cfg(any(target_os = "windows", test))]
+fn explorer_select_argument(path: &Path) -> Result<OsString, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "project path is not valid Unicode".to_string())?;
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+    if text.contains('"') {
+        return Err("project path contains a quote character".into());
+    }
+    Ok(OsString::from(format!("/select,\"{text}\"")))
+}
+
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = Command::new("explorer.exe");
         if path.exists() {
-            (
-                "open",
-                vec!["-R".into(), path.to_string_lossy().into_owned()],
-            )
+            command.raw_arg(explorer_select_argument(path)?);
         } else {
-            let parent = path.parent().unwrap_or(path);
-            ("open", vec![parent.to_string_lossy().into_owned()])
+            command.arg(path.parent().unwrap_or(path));
         }
-    } else if cfg!(target_os = "windows") {
-        if path.exists() {
-            (
-                "explorer.exe",
-                vec![format!("/select,{}", path.to_string_lossy())],
-            )
+        // Explorer hands the request to the running shell and commonly exits
+        // with status 1 after the window is shown (or keeps running as the
+        // shell), so starting it is the only reliable success signal.
+        command
+            .spawn()
+            .map(drop)
+            .map_err(|error| format!("start file manager: {error}"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+            if path.exists() {
+                (
+                    "open",
+                    vec!["-R".into(), path.to_string_lossy().into_owned()],
+                )
+            } else {
+                let parent = path.parent().unwrap_or(path);
+                ("open", vec![parent.to_string_lossy().into_owned()])
+            }
         } else {
-            let parent = path.parent().unwrap_or(path);
-            ("explorer.exe", vec![parent.to_string_lossy().into_owned()])
+            let target = path.parent().unwrap_or(path);
+            ("xdg-open", vec![target.to_string_lossy().into_owned()])
+        };
+        let status = Command::new(program)
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("start file manager: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("file manager exited with status {status}"))
         }
-    } else {
-        let target = path.parent().unwrap_or(path);
-        ("xdg-open", vec![target.to_string_lossy().into_owned()])
-    };
-    let status = Command::new(program)
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("start file manager: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("file manager exited with status {status}"))
     }
 }
 
@@ -1004,10 +1034,8 @@ impl RetainedProjectParent {
 
     fn unused_quarantine_name(&self) -> Result<OsString, String> {
         for _ in 0..8 {
-            let candidate = OsString::from(format!(
-                ".opentake-trash-{}",
-                uuid::Uuid::new_v4().as_simple()
-            ));
+            let token = uuid::Uuid::new_v4().as_simple().to_string();
+            let candidate = trash_quarantine_name(&self.original_name, &token[..4]);
             match self.parent.symlink_metadata(&candidate) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(candidate);
@@ -1064,6 +1092,34 @@ impl RetainedProjectParent {
             .rename(quarantine_name, &self.parent, &self.original_name)
             .map_err(|error| format!("restore quarantined project entry: {error}"))
     }
+}
+
+/// Longest single path component accepted by common file systems (NAME_MAX
+/// bytes on Unix, UTF-16 units on NTFS; UTF-8 is never shorter in units).
+const MAX_TRASH_NAME_BYTES: usize = 255;
+
+/// Name a project carries from its quarantine rename into the system trash:
+/// `<stem> (Deleted <token>).opentake`. It stays visible (no leading dot),
+/// keeps the original name and the `.opentake` extension, so the trash lists
+/// it recognisably and "Put Back" restores a bundle Home and the open dialog
+/// accept. The stem is shortened on a character boundary to fit one
+/// path component.
+fn trash_quarantine_name(original: &OsStr, token: &str) -> OsString {
+    let suffix = format!(" (Deleted {token}).opentake");
+    let stem = Path::new(original)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.trim_start_matches('.');
+    let mut end = stem
+        .len()
+        .min(MAX_TRASH_NAME_BYTES.saturating_sub(suffix.len()));
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = stem[..end].trim_end();
+    let stem = if stem.is_empty() { "Untitled" } else { stem };
+    OsString::from(format!("{stem}{suffix}"))
 }
 
 fn capture_registered_bundle_identity(
@@ -1480,8 +1536,91 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".opentake-trash-")
+                .contains(" (Deleted ")
         }));
+    }
+
+    #[test]
+    fn trash_receives_a_visible_project_name_that_puts_back_as_a_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = directory.path().join("project-registry.json");
+        let parent = directory.path().join("Projects");
+        let trash = directory.path().join("Trash");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&trash).unwrap();
+        let project = parent.join("Demo.opentake");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("marker"), b"keep").unwrap();
+        let mut registry = ProjectRegistry::load(ledger).unwrap();
+        registry
+            .register_at(
+                project.clone(),
+                10,
+                capture_registered_bundle_identity(&project).unwrap(),
+            )
+            .unwrap();
+        let registered = registry.registered_entry(&project).unwrap();
+        let mut handed_to_trash = None;
+
+        let outcome = move_registered_project_to_trash(&registered, |path| {
+            handed_to_trash = Some(path.to_path_buf());
+            fs::rename(path, trash.join(path.file_name().unwrap()))
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(outcome, TrashOutcome::Trashed);
+        assert!(!project.exists());
+        let handed_to_trash = handed_to_trash.unwrap();
+        assert_eq!(handed_to_trash.parent(), Some(parent.as_path()));
+        let name = handed_to_trash
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_owned();
+        assert!(!name.starts_with('.'), "{name} is hidden in the trash");
+        assert!(name.starts_with("Demo"), "{name} lost the project name");
+        assert_eq!(
+            handed_to_trash
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("opentake")
+        );
+
+        // "Put Back" restores the trashed name into the original folder, where
+        // Home and the open dialog must still recognise it as a project.
+        let restored = parent.join(&name);
+        fs::rename(trash.join(&name), &restored).unwrap();
+        assert!(validated_project_path(&restored).is_ok());
+        assert_eq!(fs::read(restored.join("marker")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn trash_names_are_visible_projects_within_the_component_limit() {
+        assert_eq!(
+            trash_quarantine_name(OsStr::new("My Film.opentake"), "3f2a"),
+            OsString::from("My Film (Deleted 3f2a).opentake")
+        );
+        assert_eq!(
+            trash_quarantine_name(OsStr::new(".Hidden.opentake"), "3f2a"),
+            OsString::from("Hidden (Deleted 3f2a).opentake")
+        );
+        assert_eq!(
+            trash_quarantine_name(OsStr::new("Upper.OPENTAKE"), "3f2a"),
+            OsString::from("Upper (Deleted 3f2a).opentake")
+        );
+        let long_stem = "\u{e9}".repeat(200);
+        let long = trash_quarantine_name(OsStr::new(&format!("{long_stem}.opentake")), "3f2a");
+        let long = long.to_str().unwrap();
+        assert!(long.len() <= 255, "{} bytes", long.len());
+        assert!(long.starts_with("\u{e9}\u{e9}"));
+        assert!(long.ends_with(" (Deleted 3f2a).opentake"));
+        let projects = if cfg!(windows) {
+            Path::new(r"C:\projects")
+        } else {
+            Path::new("/projects")
+        };
+        assert!(validated_project_path(&projects.join(long)).is_ok());
     }
 
     #[cfg(unix)]
@@ -1558,6 +1697,23 @@ mod tests {
             .is_err());
         assert!(registry.registered_entry(&project).is_ok());
         assert!(project.exists());
+    }
+
+    #[test]
+    fn explorer_select_argument_quotes_only_the_path() {
+        assert_eq!(
+            explorer_select_argument(Path::new(r"C:\My Projects\a.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\My Projects\a.opentake""#)
+        );
+        assert_eq!(
+            explorer_select_argument(Path::new(r"C:\Projects\b.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\Projects\b.opentake""#)
+        );
+        assert_eq!(
+            explorer_select_argument(Path::new(r"\\?\C:\Long Projects\c.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\Long Projects\c.opentake""#)
+        );
+        assert!(explorer_select_argument(Path::new(r#"C:\bad"name.opentake"#)).is_err());
     }
 
     #[cfg(target_os = "windows")]
@@ -1749,6 +1905,51 @@ mod tests {
             &scope,
             &project_data
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_thumbnail_behind_a_symlinked_ancestor_is_authorized_exactly() {
+        use crate::safe_asset_protocol::scope_allows_lexical_path;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        // The temp root itself may sit behind a symlink (macOS `/var`), so
+        // build the fixture from its resolved path: the grant for the cover
+        // is the path the retained handle resolves to.
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let real_project = real.join("Linked.opentake");
+        fs::create_dir_all(&real_project).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let project = link.join("Linked.opentake");
+        let thumbnail = project.join("thumbnail.jpg");
+        write_test_jpeg(&thumbnail, [10, 20, 30]);
+        fs::write(project.join("project.json"), b"{}").unwrap();
+        let alias = root.join("Alias.opentake");
+        symlink(&real_project, &alias).unwrap();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+
+        assert!(authorize_home_thumbnail(&scope, &thumbnail));
+        assert!(scope_allows_lexical_path(&scope, &thumbnail));
+        assert!(scope_allows_lexical_path(
+            &scope,
+            &real_project.join("thumbnail.jpg")
+        ));
+        assert!(!scope_allows_lexical_path(
+            &scope,
+            &project.join("project.json")
+        ));
+        assert!(!scope_allows_lexical_path(
+            &scope,
+            &real_project.join("project.json")
+        ));
+        assert!(
+            !authorize_home_thumbnail(&scope, &alias.join("thumbnail.jpg")),
+            "a symlinked bundle is not a Home cover"
+        );
     }
 
     #[test]
