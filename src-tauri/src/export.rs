@@ -1469,6 +1469,7 @@ fn mix_timeline_audio(
             control,
             external_cancel: None,
             on_progress,
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             samples_f32
@@ -1513,6 +1514,40 @@ struct AudioStreamOptions<'a> {
     control: Option<&'a ExportControl>,
     external_cancel: Option<&'a MediaCancelToken>,
     on_progress: Option<AudioExportProgress>,
+    /// Minimum spacing between progress reports ([`PROGRESS_INTERVAL`]).
+    progress_interval: Duration,
+}
+
+/// Rate limit for progress reports that can arrive far more often than the UI
+/// wants them: a value is reported only when it changed, and at most once per
+/// `interval`, except the first value and `last`, which always go out.
+struct ProgressThrottle {
+    interval: Duration,
+    last: i32,
+    reported: Option<(Instant, i32)>,
+}
+
+impl ProgressThrottle {
+    fn new(interval: Duration, last: i32) -> Self {
+        ProgressThrottle {
+            interval,
+            last,
+            reported: None,
+        }
+    }
+
+    fn admit(&mut self, value: i32, now: Instant) -> bool {
+        let admit = match self.reported {
+            None => true,
+            Some((_, reported)) if reported == value => false,
+            Some(_) if value == self.last => true,
+            Some((at, _)) => now.saturating_duration_since(at) >= self.interval,
+        };
+        if admit {
+            self.reported = Some((now, value));
+        }
+        admit
+    }
 }
 
 fn stream_flattened_audio<T: AudioPlanLike>(
@@ -1528,6 +1563,7 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         control,
         external_cancel,
         on_progress,
+        progress_interval,
     } = options;
     if timeline_fps <= 0 || start_frame >= end_frame {
         return Ok(false);
@@ -1603,11 +1639,16 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         })
         .sum();
     let total_work = pending_profile_frames.saturating_add(total_samples).max(1);
+    // A profile pass reports every few thousand frames; the throttle keeps a
+    // long clip from flooding the UI with progress events.
+    let throttle = std::cell::RefCell::new(ProgressThrottle::new(progress_interval, AUDIO_MIX_END));
     let report_work = |done: u64| {
         if let Some(report) = &on_progress {
             let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
             let mapped = AUDIO_MIX_START + (done.min(total_work) * span / total_work) as i32;
-            report(mapped, AUDIO_PROGRESS_TOTAL);
+            if throttle.borrow_mut().admit(mapped, Instant::now()) {
+                report(mapped, AUDIO_PROGRESS_TOTAL);
+            }
         }
     };
     let mut profile_done = 0_u64;
@@ -1639,8 +1680,8 @@ fn stream_flattened_audio<T: AudioPlanLike>(
 
     // One forward decoder per audible clip, opened when the clip enters the
     // range and reaped as soon as it ends (#3). At most
-    // `MAX_OPEN_CLIP_READERS` stay open; a clip beyond the cap reads each
-    // window through a reader opened for that window only.
+    // `MAX_OPEN_CLIP_READERS` are open at once: a clip beyond the ones kept
+    // open reads each window through a reader opened for that window only.
     let mut readers: HashMap<usize, ClipAudioReader> = HashMap::new();
     let mut samples = Vec::new();
     for relative_start in (0..total_samples).step_by(AUDIO_STREAM_WINDOW_SAMPLES) {
@@ -1674,7 +1715,7 @@ fn stream_flattened_audio<T: AudioPlanLike>(
                         &cancel,
                     )
                     .map_err(|error| decode_failure(media_ref, error))?;
-                    if overlap_end < clip_end && open_readers < clip_audio::MAX_OPEN_CLIP_READERS {
+                    if overlap_end < clip_end && clip_audio::keep_clip_reader(open_readers) {
                         entry.insert(reader)
                     } else {
                         transient.insert(reader)
@@ -1754,6 +1795,7 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
             control: Some(control),
             external_cancel: None,
             on_progress: on_progress.clone(),
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             if written_samples == 0 {
@@ -2349,6 +2391,7 @@ pub(crate) fn run_export_with_control(
             control,
             external_cancel: external_cancel.as_ref(),
             on_progress: audio_progress,
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             encoder
@@ -5398,6 +5441,7 @@ mod tests {
                 control: None,
                 external_cancel: Some(&MediaCancelToken::new()),
                 on_progress: Some(progress),
+                progress_interval: Duration::ZERO,
             },
             |samples| {
                 streamed.extend_from_slice(samples);
@@ -5408,8 +5452,8 @@ mod tests {
         assert_eq!(streamed.len(), 2 * MIX_SAMPLE_RATE as usize);
         let reports = reports.lock().unwrap();
         assert!(
-            reports.windows(2).all(|pair| pair[0] <= pair[1]),
-            "progress never goes back"
+            reports.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress never goes back or repeats a value: {reports:?}"
         );
         assert_eq!(reports.last(), Some(&AUDIO_MIX_END));
         let during_profile = reports
@@ -5420,6 +5464,43 @@ mod tests {
             during_profile >= 10,
             "the profile pass reports progress ({during_profile} reports)"
         );
+    }
+
+    #[test]
+    fn audio_progress_throttle_limits_reports_to_the_interval() {
+        // A ten-minute denoised clip reports ~7,000 profile steps; replay
+        // them over 1.5 s of wall time.
+        let start = Instant::now();
+        let steps = 7_000_u64;
+        let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL, AUDIO_MIX_END);
+        let mut admitted = Vec::new();
+        for step in 1..=steps {
+            let now = start + Duration::from_micros(step * 1_500_000 / steps);
+            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
+            let value = AUDIO_MIX_START + (step * span / steps) as i32;
+            if throttle.admit(value, now) {
+                admitted.push((now, value));
+            }
+        }
+        // The first value, one per 200 ms, and the final value.
+        assert!(admitted.len() <= 1 + 7 + 1, "{} reports", admitted.len());
+        assert_eq!(
+            admitted.last().map(|(_, value)| *value),
+            Some(AUDIO_MIX_END)
+        );
+        for pair in admitted[..admitted.len() - 1].windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= PROGRESS_INTERVAL);
+            assert!(pair[0].1 < pair[1].1);
+        }
+
+        // Without an interval, only repeated values are dropped.
+        let mut unthrottled = ProgressThrottle::new(Duration::ZERO, AUDIO_MIX_END);
+        let values = [850, 850, 851, 851, 852, 980, 980];
+        let admitted = values
+            .iter()
+            .filter(|value| unthrottled.admit(**value, start))
+            .count();
+        assert_eq!(admitted, 4);
     }
 
     #[test]
@@ -5453,6 +5534,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let cancel = MediaCancelToken::new();
+        let census = crate::clip_audio::reader_census::start();
         let processes = opentake_media::ffmpeg_status::HelperProcessCount::start();
         let mut streamed = Vec::new();
         let has_audio = stream_flattened_audio(
@@ -5465,6 +5547,7 @@ mod tests {
                 control: None,
                 external_cancel: Some(&cancel),
                 on_progress: None,
+                progress_interval: Duration::ZERO,
             },
             |samples| {
                 streamed.extend_from_slice(samples);
@@ -5476,10 +5559,17 @@ mod tests {
         drop(processes);
         assert!(has_audio);
         assert_eq!(streamed.len(), 6 * MIX_SAMPLE_RATE as usize);
-        // One probe, one decoder for each clip under the cap, and one decoder
-        // per window for each clip beyond it.
+        // One probe, one decoder for each clip kept open (one slot under the
+        // cap), and one decoder per window for each other clip.
         let windows = 3;
-        assert_eq!(spawned, 1 + MAX_OPEN_CLIP_READERS + extra * windows);
+        let kept = MAX_OPEN_CLIP_READERS - 1;
+        assert_eq!(spawned, 1 + kept + (clips.len() - kept) * windows);
+        assert_eq!(
+            census.peak(),
+            MAX_OPEN_CLIP_READERS,
+            "decoders open at once"
+        );
+        assert_eq!(census.live(), 0);
 
         let whole_clips = clips
             .iter()
@@ -5496,6 +5586,80 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         assert!(max_difference < 1.0e-6, "max difference {max_difference}");
+    }
+
+    #[test]
+    fn export_audio_beyond_the_decoder_cap_matches_whole_clips_for_aac() {
+        use crate::clip_audio::fixtures::{encode_sine, ffmpeg_ready};
+        use crate::clip_audio::MAX_OPEN_CLIP_READERS;
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.m4a");
+        if !encode_sine(&source, "aac", 44_100, 8) {
+            eprintln!("skip: ffmpeg could not encode the AAC fixture");
+            return;
+        }
+        let media = HashMap::from([(
+            "tone".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        // Clips past the cap read every 2 s window through a fresh 44.1 kHz
+        // AAC decode, resampled to 48 kHz; the pre-roll keeps each window
+        // edge on the continuous decode.
+        let extra = 4;
+        let clips = (0..MAX_OPEN_CLIP_READERS + extra)
+            .map(|index| {
+                let mut clip = Clip::new(format!("c{index}"), "tone", 0, 180);
+                clip.media_type = ClipType::Audio;
+                clip.trim_start_frame = index as i32;
+                clip.volume = 0.05;
+                clip
+            })
+            .collect::<Vec<_>>();
+        let mut streamed = Vec::new();
+        stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 180,
+                control: None,
+                external_cancel: Some(&MediaCancelToken::new()),
+                on_progress: None,
+                progress_interval: Duration::ZERO,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        assert_eq!(streamed.len(), reference.len());
+        // Without the pre-roll the window edges of the four late clips step
+        // by about 0.01.
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 2.0e-3, "max difference {max_difference}");
     }
 
     #[test]
@@ -5568,6 +5732,7 @@ mod tests {
                 control: None,
                 external_cancel: Some(&cancel),
                 on_progress: None,
+                progress_interval: Duration::ZERO,
             },
             |samples| {
                 streamed.extend_from_slice(samples);
@@ -5644,6 +5809,7 @@ mod tests {
                     control: None,
                     external_cancel: Some(&worker_cancel),
                     on_progress: None,
+                    progress_interval: Duration::ZERO,
                 },
                 |_| Ok(()),
             );

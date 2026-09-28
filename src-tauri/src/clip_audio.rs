@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -36,16 +36,34 @@ const SOURCE_READ_FRAMES: usize = 8 * 1024;
 /// Clip frames resampled (and fed to the denoiser) per step.
 const RENDER_CHUNK_FRAMES: usize = 4 * 1024;
 /// Distinct clip noise profiles remembered across preview windows, playback
-/// sessions and exports.
-const PROFILE_CACHE_CAPACITY: usize = 32;
+/// sessions and exports (a few KB each), least recently used evicted first.
+const PROFILE_CACHE_CAPACITY: usize = 256;
+/// Background profile passes waiting at once; the oldest is dropped beyond
+/// this (a later window asks again if its clip still plays).
+const PROFILE_QUEUE_CAPACITY: usize = 64;
 /// How often a caller waiting for another caller's profile pass checks its
 /// own cancellation.
 const PROFILE_WAIT_POLL: Duration = Duration::from_millis(50);
-/// Clip decoders one mix keeps open across windows. Each is an FFmpeg process
-/// with three pipes; beyond this many overlapping clips, further clips are
-/// decoded by a reader opened for one window and closed again, which keeps a
-/// dense timeline well inside the default open-file limit (256 on macOS).
+/// Clip decoders one mix has open at once. Each is an FFmpeg process with
+/// three pipes. A mix keeps at most one fewer open across windows (see
+/// [`keep_clip_reader`]); further clips are decoded by a reader opened for one
+/// window and closed right after it is read, which keeps a dense timeline well
+/// inside the default open-file limit (256 on macOS).
 pub(crate) const MAX_OPEN_CLIP_READERS: usize = 16;
+
+/// Whether a mix that already keeps `kept` readers open across windows may
+/// keep one more. The last slot under [`MAX_OPEN_CLIP_READERS`] stays free
+/// for the per-window reader of a clip beyond the cap.
+pub(crate) fn keep_clip_reader(kept: usize) -> bool {
+    kept + 1 < MAX_OPEN_CLIP_READERS
+}
+/// Clip frames a reader opened mid-clip decodes and discards before its first
+/// frame. A decode that starts at a seek point differs from a continuous one
+/// for its first few milliseconds (codec priming such as AAC's overlapped
+/// first frame, and the resampler's filter start); the pre-roll moves that
+/// difference out of the frames the reader returns. A denoised reader's
+/// warm-up is longer and covers it.
+const DECODE_PREROLL_FRAMES: usize = 4_096;
 
 /// Timeline mix frame at the start of timeline frame `frame` (rounded, as the
 /// audio clock seeks). Negative before the timeline starts.
@@ -165,18 +183,40 @@ pub(crate) struct ClipAudioReader {
     /// Next clip frame [`ClipAudioReader::read`] returns.
     position: usize,
     cancel: MediaCancelToken,
+    #[cfg(test)]
+    _census: Option<reader_census::Entry>,
 }
 
 impl ClipAudioReader {
-    /// Serve clip frames from `from` on. A denoised reader starts decoding a
-    /// warm-up before `from`, so its output matches a reader that started at
-    /// the clip's first frame.
+    /// Serve clip frames from `from` on. A reader opened mid-clip starts
+    /// decoding a pre-roll (a denoised one a denoise warm-up) before `from`,
+    /// so its output matches a reader that started at the clip's first frame.
     pub(crate) fn open(
         layout: ClipAudioLayout,
         path: &Path,
         channels: usize,
         from: usize,
         denoise: Option<(DenoiseProfile, AudioDenoise)>,
+        cancel: &MediaCancelToken,
+    ) -> Result<Self, MediaError> {
+        Self::open_with_preroll(
+            layout,
+            path,
+            channels,
+            from,
+            denoise,
+            DECODE_PREROLL_FRAMES,
+            cancel,
+        )
+    }
+
+    fn open_with_preroll(
+        layout: ClipAudioLayout,
+        path: &Path,
+        channels: usize,
+        from: usize,
+        denoise: Option<(DenoiseProfile, AudioDenoise)>,
+        preroll: usize,
         cancel: &MediaCancelToken,
     ) -> Result<Self, MediaError> {
         if from > layout.len || channels == 0 || channels > usize::from(u16::MAX) {
@@ -186,9 +226,9 @@ impl ClipAudioReader {
             )));
         }
         let start = if denoise.is_some() {
-            denoise_stream_start(layout.rate, from)
+            denoise_stream_start(layout.rate, from).min(from.saturating_sub(preroll))
         } else {
-            from
+            from.saturating_sub(preroll)
         };
         let source_start = (start as f64 * layout.ratio).floor() as usize;
         let source_from = layout.source_lo + source_start as f64 / f64::from(layout.rate);
@@ -225,9 +265,12 @@ impl ClipAudioReader {
             denoised: VecDeque::new(),
             position: start,
             cancel: cancel.clone(),
+            #[cfg(test)]
+            _census: reader_census::enter(),
         };
         if start < from {
-            // Warm-up: frames before `from` only settle the denoiser.
+            // Pre-roll and denoise warm-up: frames before `from` only settle
+            // the decoder, the resampler and the denoiser.
             let mut discard = Vec::new();
             reader.read(from - start, &mut discard)?;
         }
@@ -384,21 +427,85 @@ pub(crate) fn clip_denoise(
 pub(crate) enum PreviewDenoise {
     /// The clip is not denoised in preview.
     Off,
-    /// The profile is still being computed in the background: play the clip
-    /// undenoised meanwhile.
+    /// The profile is still being computed in the background (or cannot be):
+    /// play the clip undenoised meanwhile.
     Pending,
     Ready(DenoiseProfile, AudioDenoise),
+}
+
+/// The owner of preview's background profile passes (one per playback
+/// state). Cancelling a scope, when its project closes, cancels only the
+/// passes it requested; other owners' passes keep running.
+#[derive(Clone)]
+pub(crate) struct ProfileScope(Arc<ScopeInner>);
+
+struct ScopeInner {
+    id: u64,
+    cancel: Mutex<MediaCancelToken>,
+}
+
+impl ProfileScope {
+    pub(crate) fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        ProfileScope(Arc::new(ScopeInner {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            cancel: Mutex::new(MediaCancelToken::new()),
+        }))
+    }
+
+    fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    fn token(&self) -> MediaCancelToken {
+        self.0
+            .cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Cancel this scope's queued and running passes (its project is
+    /// closing) and forget the passes that failed for it, so the next
+    /// project retries them. Cached profiles stay: they are keyed by source
+    /// file version.
+    pub(crate) fn cancel(&self) {
+        {
+            let mut token = self
+                .0
+                .cancel
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            token.cancel();
+            *token = MediaCancelToken::new();
+        }
+        let service = profiles();
+        let mut store = service.lock();
+        store.drop_queued(|job| job.scope == self.id());
+        store.failed.retain(|(scope, _)| *scope != self.id());
+        drop(store);
+        service.finished.notify_all();
+    }
+}
+
+impl Default for ProfileScope {
+    fn default() -> Self {
+        ProfileScope::new()
+    }
 }
 
 /// Preview's denoise input for a clip. Never runs a profile pass on the
 /// caller's thread: a missing profile is queued on the background worker (once
 /// per layout, however many windows or playback sessions ask) and the clip
-/// plays undenoised until it is ready.
+/// plays undenoised until it is ready. A newer request for the same clip (a
+/// trim changed its layout) replaces the queued one.
 pub(crate) fn preview_clip_denoise(
     config: Option<AudioDenoise>,
+    clip_id: &str,
     layout: &ClipAudioLayout,
     path: &Path,
     channels: usize,
+    scope: &ProfileScope,
 ) -> Result<PreviewDenoise, MediaError> {
     let Some(config) = active_denoise(config)? else {
         return Ok(PreviewDenoise::Off);
@@ -412,40 +519,23 @@ pub(crate) fn preview_clip_denoise(
             config,
         ));
     }
-    if store.in_flight.contains(&key) || store.failed.contains(&key) {
-        return Ok(PreviewDenoise::Pending);
-    }
     let job = ProfileJob {
-        key: key.clone(),
+        key,
+        clip_id: clip_id.to_string(),
         layout: *layout,
         path: path.to_path_buf(),
         channels,
-        cancel: store.background.clone(),
+        scope: scope.id(),
+        cancel: scope.token(),
     };
-    store.in_flight.push(key);
-    #[cfg(test)]
-    test_hooks::record_request(path);
-    let sent = match service.worker() {
-        Some(worker) => worker.send(job).map_err(|mpsc::SendError(job)| job.key),
-        None => Err(job.key),
-    };
-    if let Err(key) = sent {
-        store.in_flight.retain(|queued| *queued != key);
-        return Err(MediaError::Decode(
-            "denoise profile worker is not running".to_string(),
-        ));
+    let running = service.start_worker();
+    let superseded = store.request(job, running);
+    drop(store);
+    if superseded {
+        service.finished.notify_all();
     }
+    service.queued.notify_one();
     Ok(PreviewDenoise::Pending)
-}
-
-/// Cancel queued and running background profile passes (the project is
-/// closing) and forget passes that failed, so the next project retries them.
-/// Cached profiles stay: they are keyed by source file version.
-pub(crate) fn cancel_background_profiles() {
-    let mut store = profiles().lock();
-    store.background.cancel();
-    store.background = MediaCancelToken::new();
-    store.failed.clear();
 }
 
 /// Whether a clip's noise profile still needs a pass (not cached).
@@ -496,38 +586,107 @@ impl ProfileKey {
 
 struct ProfileJob {
     key: ProfileKey,
+    /// The clip that asked; a newer request for it replaces this one.
+    clip_id: String,
     layout: ClipAudioLayout,
     path: PathBuf,
     channels: usize,
+    /// The [`ProfileScope`] that asked, and its cancellation.
+    scope: u64,
     cancel: MediaCancelToken,
 }
 
 struct ProfileStore {
+    /// Least recently used first.
     cache: VecDeque<(ProfileKey, Arc<DenoiseProfile>)>,
     /// Passes running or queued, by any caller: a second caller for the same
     /// key waits for (or, in preview, skips) the first instead of decoding
     /// the clip again.
     in_flight: Vec<ProfileKey>,
-    /// Background passes that failed; preview plays these clips undenoised
-    /// instead of retrying every window. Cleared when the project closes.
-    failed: Vec<ProfileKey>,
-    /// Cancels background passes; replaced when the project closes.
-    background: MediaCancelToken,
+    /// Background passes waiting for the worker, oldest first; it runs the
+    /// newest first.
+    queue: VecDeque<ProfileJob>,
+    /// Background passes that failed, by scope; preview plays these clips
+    /// undenoised instead of retrying every window. Cleared when the scope's
+    /// project closes.
+    failed: Vec<(u64, ProfileKey)>,
 }
 
 impl ProfileStore {
-    fn cached(&self, key: &ProfileKey) -> Option<Arc<DenoiseProfile>> {
-        self.cache
-            .iter()
-            .find(|(cached, _)| cached == key)
-            .map(|(_, profile)| Arc::clone(profile))
+    fn new() -> Self {
+        ProfileStore {
+            cache: VecDeque::new(),
+            in_flight: Vec::new(),
+            queue: VecDeque::new(),
+            failed: Vec::new(),
+        }
+    }
+
+    /// The cached profile for `key`, now the most recently used.
+    fn cached(&mut self, key: &ProfileKey) -> Option<Arc<DenoiseProfile>> {
+        let index = self.cache.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.cache.remove(index)?;
+        let profile = Arc::clone(&entry.1);
+        self.cache.push_back(entry);
+        Some(profile)
+    }
+
+    /// Queue a background pass unless one for its key is in flight or failed
+    /// in its scope, replacing the queued passes of the same clip. Without a
+    /// worker the pass counts as failed, so the clip plays undenoised.
+    /// Returns whether queued passes were dropped (waiters must re-check).
+    fn request(&mut self, job: ProfileJob, worker_running: bool) -> bool {
+        if self.in_flight.contains(&job.key)
+            || self
+                .failed
+                .iter()
+                .any(|(scope, key)| *scope == job.scope && *key == job.key)
+        {
+            return false;
+        }
+        if !worker_running {
+            eprintln!(
+                "[audio] denoise profile worker is not running; {} plays undenoised",
+                job.path.display()
+            );
+            self.failed.push((job.scope, job.key));
+            return false;
+        }
+        let mut superseded =
+            self.drop_queued(|queued| queued.scope == job.scope && queued.clip_id == job.clip_id);
+        while self.queue.len() >= PROFILE_QUEUE_CAPACITY {
+            if let Some(oldest) = self.queue.pop_front() {
+                self.in_flight.retain(|key| *key != oldest.key);
+                superseded = true;
+            }
+        }
+        #[cfg(test)]
+        test_hooks::record_request(&job.path);
+        self.in_flight.push(job.key.clone());
+        self.queue.push_back(job);
+        superseded
+    }
+
+    /// Drop the queued passes `drop` selects. Returns whether any were.
+    fn drop_queued(&mut self, drop: impl Fn(&ProfileJob) -> bool) -> bool {
+        let before = self.queue.len();
+        let in_flight = &mut self.in_flight;
+        self.queue.retain(|job| {
+            if drop(job) {
+                in_flight.retain(|key| *key != job.key);
+                false
+            } else {
+                true
+            }
+        });
+        self.queue.len() != before
     }
 
     /// Record the end of a pass for `key`, caching its profile if it succeeded.
     fn finish(&mut self, key: &ProfileKey, profile: Option<&Arc<DenoiseProfile>>) {
         self.in_flight.retain(|queued| queued != key);
         if let Some(profile) = profile {
-            self.failed.retain(|failed| failed != key);
+            self.failed.retain(|(_, failed)| failed != key);
             self.cache.retain(|(cached, _)| cached != key);
             while self.cache.len() >= PROFILE_CACHE_CAPACITY {
                 self.cache.pop_front();
@@ -539,10 +698,12 @@ impl ProfileStore {
 
 struct ProfileService {
     store: Mutex<ProfileStore>,
-    /// Signalled whenever a pass ends.
+    /// Signalled whenever a pass ends or leaves the queue.
     finished: Condvar,
-    /// `None` when the worker thread could not be started.
-    worker: OnceLock<Option<Mutex<Sender<ProfileJob>>>>,
+    /// Signalled whenever a pass is queued.
+    queued: Condvar,
+    /// Whether the worker thread started.
+    worker: OnceLock<bool>,
 }
 
 impl ProfileService {
@@ -552,28 +713,21 @@ impl ProfileService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The background worker's queue, starting the worker on first use. One
-    /// worker runs the passes one at a time, so preview never runs more than
-    /// one extra decode however many denoised clips it plays.
-    fn worker(&self) -> Option<Sender<ProfileJob>> {
-        let worker = self.worker.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel();
+    /// Start the background worker on first use; false if it could not
+    /// start. One worker runs the passes one at a time, so preview never
+    /// runs more than one extra decode however many denoised clips it plays.
+    fn start_worker(&'static self) -> bool {
+        *self.worker.get_or_init(|| {
             match std::thread::Builder::new()
                 .name("opentake-denoise-profile".to_string())
-                .spawn(move || run_profile_worker(receiver))
+                .spawn(move || run_profile_worker(self))
             {
-                Ok(_) => Some(Mutex::new(sender)),
+                Ok(_) => true,
                 Err(error) => {
                     eprintln!("[audio] could not start the denoise profile worker: {error}");
-                    None
+                    false
                 }
             }
-        });
-        worker.as_ref().map(|sender| {
-            sender
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
         })
     }
 }
@@ -581,19 +735,27 @@ impl ProfileService {
 fn profiles() -> &'static ProfileService {
     static SERVICE: OnceLock<ProfileService> = OnceLock::new();
     SERVICE.get_or_init(|| ProfileService {
-        store: Mutex::new(ProfileStore {
-            cache: VecDeque::new(),
-            in_flight: Vec::new(),
-            failed: Vec::new(),
-            background: MediaCancelToken::new(),
-        }),
+        store: Mutex::new(ProfileStore::new()),
         finished: Condvar::new(),
+        queued: Condvar::new(),
         worker: OnceLock::new(),
     })
 }
 
-fn run_profile_worker(jobs: Receiver<ProfileJob>) {
-    for job in jobs {
+fn run_profile_worker(service: &'static ProfileService) {
+    loop {
+        let job = {
+            let mut store = service.lock();
+            loop {
+                if let Some(job) = store.queue.pop_back() {
+                    break job;
+                }
+                store = service
+                    .queued
+                    .wait(store)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
         #[cfg(test)]
         test_hooks::wait_while_held(&job.path, &job.cancel);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -604,7 +766,6 @@ fn run_profile_worker(jobs: Receiver<ProfileJob>) {
                 "denoise profile pass panicked".to_string(),
             ))
         });
-        let service = profiles();
         let mut store = service.lock();
         store.finish(&job.key, result.as_ref().ok());
         match &result {
@@ -616,7 +777,7 @@ fn run_profile_worker(jobs: Receiver<ProfileJob>) {
                     "[audio] denoise profile for {} failed: {error}",
                     job.path.display()
                 );
-                store.failed.push(job.key.clone());
+                store.failed.push((job.scope, job.key.clone()));
             }
         }
         drop(store);
@@ -626,8 +787,9 @@ fn run_profile_worker(jobs: Receiver<ProfileJob>) {
 
 /// The noise profile of a clip's whole rendered audio, estimated once from
 /// its entire source window (one extra decode) and cached by source version.
-/// Waits for a pass another caller already runs for the same clip; `progress`
-/// reports this caller's own pass in clip frames.
+/// Waits for a pass another caller already runs for the same clip, and takes
+/// over one that only waits in the background queue; `progress` reports this
+/// caller's own pass in clip frames.
 pub(crate) fn clip_denoise_profile(
     layout: &ClipAudioLayout,
     path: &Path,
@@ -642,6 +804,7 @@ pub(crate) fn clip_denoise_profile(
         if let Some(profile) = store.cached(&key) {
             return Ok(profile);
         }
+        store.drop_queued(|job| job.key == key);
         if !store.in_flight.contains(&key) {
             store.in_flight.push(key.clone());
             break;
@@ -694,6 +857,72 @@ fn compute_profile(
         }
     }
     Ok(Arc::new(builder.finish(cancel).map_err(denoise_error)?))
+}
+
+/// Test seam counting the clip readers open at once: a census started on a
+/// thread counts the readers that thread opens until they drop, wherever
+/// they drop.
+#[cfg(test)]
+pub(crate) mod reader_census {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Counts {
+        live: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    thread_local! {
+        static CENSUS: RefCell<Option<Arc<Counts>>> = const { RefCell::new(None) };
+    }
+
+    /// Counts this thread's readers until dropped.
+    pub(crate) struct Census(Arc<Counts>);
+
+    pub(crate) fn start() -> Census {
+        let counts = Arc::new(Counts::default());
+        CENSUS.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&counts)));
+        Census(counts)
+    }
+
+    impl Census {
+        /// Readers open now.
+        pub(crate) fn live(&self) -> usize {
+            self.0.live.load(Ordering::SeqCst)
+        }
+
+        /// The most readers open at once since the census started.
+        pub(crate) fn peak(&self) -> usize {
+            self.0.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Census {
+        fn drop(&mut self) {
+            let _ = CENSUS.try_with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    /// One counted reader.
+    pub(crate) struct Entry(Arc<Counts>);
+
+    pub(super) fn enter() -> Option<Entry> {
+        let counts = CENSUS
+            .try_with(|slot| slot.borrow().clone())
+            .ok()
+            .flatten()?;
+        let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
+        counts.peak.fetch_max(live, Ordering::SeqCst);
+        Some(Entry(counts))
+    }
+
+    impl Drop for Entry {
+        fn drop(&mut self) {
+            self.0.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Test seams for the background profile worker: count passes and requests
@@ -821,6 +1050,28 @@ pub(crate) mod fixtures {
         std::fs::write(path, wav).expect("write WAV fixture");
     }
 
+    /// Encode a 440 Hz sine (amplitude 0.125) of `seconds` at `rate` with
+    /// `codec`; false when this FFmpeg build cannot.
+    pub(crate) fn encode_sine(path: &Path, codec: &str, rate: u32, seconds: u32) -> bool {
+        std::process::Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!(
+                "sine=frequency=440:sample_rate={rate}:duration={seconds}"
+            ))
+            .args(["-c:a", codec, "-b:a", "128k"])
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     pub(crate) fn ffmpeg_ready() -> bool {
         opentake_media::ffmpeg_status::ffmpeg_available()
             && opentake_media::ffmpeg_status::ffprobe_available()
@@ -829,9 +1080,10 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{ffmpeg_ready, noisy_tone, write_wav, RATE};
+    use super::fixtures::{encode_sine, ffmpeg_ready, noisy_tone, write_wav, RATE};
     use super::*;
     use opentake_domain::DenoiseMode;
+    use std::time::Duration;
 
     fn clip(start_frame: i32, duration_frames: i32) -> Clip {
         Clip::new("clip", "media", start_frame, duration_frames)
@@ -890,6 +1142,189 @@ mod tests {
             position += step;
         }
         out
+    }
+
+    fn test_profile() -> Arc<DenoiseProfile> {
+        let cancel = MediaCancelToken::new();
+        let mut builder = DenoiseProfileBuilder::new(1, RATE, 4_096).unwrap();
+        builder.push(&vec![0.01; 4_096], &cancel).unwrap();
+        Arc::new(builder.finish(&cancel).unwrap())
+    }
+
+    fn test_job(clip_id: &str, frames: i32, scope: u64) -> ProfileJob {
+        let layout = ClipAudioLayout::new(&clip(0, frames), 30, RATE).unwrap();
+        let path = PathBuf::from("/nonexistent/opentake-profile-test.wav");
+        ProfileJob {
+            key: ProfileKey::new(&layout, &path, 1),
+            clip_id: clip_id.to_string(),
+            layout,
+            path,
+            channels: 1,
+            scope,
+            cancel: MediaCancelToken::new(),
+        }
+    }
+
+    #[test]
+    fn profile_cache_evicts_the_least_recently_used_profile() {
+        let mut store = ProfileStore::new();
+        let profile = test_profile();
+        let keys = (1..=PROFILE_CACHE_CAPACITY as i32 + 1)
+            .map(|frames| test_job("clip", frames, 0).key)
+            .collect::<Vec<_>>();
+        for key in &keys[..PROFILE_CACHE_CAPACITY] {
+            store.finish(key, Some(&profile));
+        }
+        // Reading the oldest entry makes it the most recently used.
+        assert!(store.cached(&keys[0]).is_some());
+        store.finish(&keys[PROFILE_CACHE_CAPACITY], Some(&profile));
+        assert_eq!(store.cache.len(), PROFILE_CACHE_CAPACITY);
+        assert!(store.cached(&keys[0]).is_some(), "recently read entry kept");
+        assert!(
+            store.cached(&keys[1]).is_none(),
+            "least recently used evicted"
+        );
+        assert!(store.cached(&keys[PROFILE_CACHE_CAPACITY]).is_some());
+    }
+
+    #[test]
+    fn a_newer_request_for_a_clip_replaces_its_queued_pass_and_runs_first() {
+        let mut store = ProfileStore::new();
+        let old_layout = test_job("speech", 90, 7);
+        let old_key = old_layout.key.clone();
+        assert!(!store.request(old_layout, true));
+        assert!(!store.request(test_job("music", 60, 7), true));
+        // A trim gives the clip a new layout: its stale pass leaves the queue.
+        let trimmed = test_job("speech", 80, 7);
+        let trimmed_key = trimmed.key.clone();
+        assert!(store.request(trimmed, true), "the stale pass was dropped");
+        assert!(!store.in_flight.contains(&old_key));
+        assert_eq!(store.queue.len(), 2);
+        assert_eq!(
+            store.queue.back().map(|job| &job.key),
+            Some(&trimmed_key),
+            "the worker takes the newest request first"
+        );
+        // Another scope's request for the same clip id is its own.
+        assert!(!store.request(test_job("speech", 70, 8), true));
+        assert_eq!(store.queue.len(), 3);
+        // The queue is bounded; the oldest requests go first.
+        for frames in 100..100 + PROFILE_QUEUE_CAPACITY as i32 {
+            store.request(test_job(&format!("c{frames}"), frames, 7), true);
+        }
+        assert_eq!(store.queue.len(), PROFILE_QUEUE_CAPACITY);
+        assert_eq!(store.in_flight.len(), PROFILE_QUEUE_CAPACITY);
+        assert!(!store.in_flight.contains(&trimmed_key));
+    }
+
+    #[test]
+    fn preview_plays_undenoised_when_the_profile_worker_is_not_running() {
+        let mut store = ProfileStore::new();
+        let job = test_job("speech", 90, 3);
+        let key = job.key.clone();
+        assert!(!store.request(job, false));
+        assert!(store.queue.is_empty());
+        assert!(!store.in_flight.contains(&key));
+        assert!(store.failed.contains(&(3, key.clone())));
+        // Later windows do not ask again for this scope.
+        store.request(test_job("speech", 90, 3), true);
+        assert!(store.queue.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_profile_scope_leaves_other_scopes_passes_running() {
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoped.wav");
+        write_wav(&path, &noisy_tone(3.0, 250.0, 21));
+        let layout = ClipAudioLayout::new(&clip(0, 60), 30, RATE).unwrap();
+        let config = Some(AudioDenoise {
+            mode: DenoiseMode::Voice,
+            strength: 0.6,
+            preview_enabled: true,
+        });
+        let key = ProfileKey::new(&layout, &path, 1);
+        let in_flight = || profiles().lock().in_flight.contains(&key);
+        let wait_until = |what: &str, ready: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !ready() {
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let hold = test_hooks::hold(&path);
+        let scope = ProfileScope::new();
+        let request = || preview_clip_denoise(config, "speech", &layout, &path, 1, &scope).unwrap();
+        assert!(matches!(request(), PreviewDenoise::Pending));
+        assert_eq!(test_hooks::requests(&path), 1);
+
+        // Another owner's project transition does not touch this pass.
+        ProfileScope::new().cancel();
+        assert!(in_flight());
+        assert!(matches!(request(), PreviewDenoise::Pending));
+        assert_eq!(test_hooks::requests(&path), 1);
+
+        // This owner's transition cancels it (queued or held), and the next
+        // project asks again.
+        scope.cancel();
+        wait_until("the cancelled pass to end", &|| !in_flight());
+        assert!(matches!(request(), PreviewDenoise::Pending));
+        assert_eq!(test_hooks::requests(&path), 2);
+        drop(hold);
+        wait_until("the profile", &|| {
+            !denoise_profile_pending(config, &layout, &path, 1)
+        });
+        assert!(matches!(request(), PreviewDenoise::Ready(..)));
+    }
+
+    #[test]
+    fn reader_opened_mid_clip_pre_rolls_compressed_and_resampled_sources() {
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (name, codec) in [("tone.m4a", "aac"), ("tone.mp3", "libmp3lame")] {
+            let path = dir.path().join(name);
+            if !encode_sine(&path, codec, 44_100, 8) {
+                eprintln!("skip {name}: ffmpeg could not encode it");
+                continue;
+            }
+            let mut source = clip(0, 200);
+            source.trim_start_frame = 7;
+            let layout = ClipAudioLayout::new(&source, 30, RATE).unwrap();
+            let whole = read_all(layout, &path, 0, &[layout.len], None);
+            let cancel = MediaCancelToken::new();
+            for from in [96_000, 123_457, 250_001] {
+                let difference = |preroll| {
+                    let mut reader = ClipAudioReader::open_with_preroll(
+                        layout, &path, 1, from, None, preroll, &cancel,
+                    )
+                    .unwrap();
+                    let mut out = Vec::new();
+                    reader.read(24_000, &mut out).unwrap();
+                    out.iter()
+                        .zip(&whole[from..])
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max)
+                };
+                // A decode started at `from` itself is off by a large step
+                // (decoder priming); the pre-roll leaves only a sub-sample
+                // resampler phase difference (the tone peaks at 0.125).
+                let pre_rolled = difference(DECODE_PREROLL_FRAMES);
+                assert!(
+                    pre_rolled < 5.0e-3,
+                    "{name} from {from}: pre-rolled reader differs by {pre_rolled}"
+                );
+                assert!(
+                    difference(0) > 10.0 * pre_rolled,
+                    "{name} from {from}: the pre-roll is what makes the difference"
+                );
+            }
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ use opentake_render::{even, RenderSize};
 
 use super::audio::{
     build_clock_paused_cancellable, AudioControl, AudioPlayback, AudioPreparePermit,
-    AudioPrepareWorker, AUDIO_PREPARE_BUSY,
+    AudioPrepareWorker, ProfileScope, AUDIO_PREPARE_BUSY,
 };
 use super::engine::{
     BoundedReaper, EngineControl, FrameSink, PlaybackClock, PlaybackEngine, PlaybackErrorSink,
@@ -177,6 +177,9 @@ pub struct PlaybackStateInner {
     slot: Mutex<PlaybackSlot>,
     audio_prepare: AudioPrepareWorker<PreparedAudio>,
     reaper: BoundedReaper,
+    /// Owns preview's background denoise-profile passes; a project
+    /// transition cancels them.
+    profiles: ProfileScope,
 }
 
 /// Managed playback state. Cloning shares it, so async commands can move the
@@ -198,6 +201,7 @@ impl Default for PlaybackState {
             slot: Mutex::new(PlaybackSlot::default()),
             audio_prepare: AudioPrepareWorker::new(),
             reaper: BoundedReaper::new(),
+            profiles: ProfileScope::new(),
         }))
     }
 }
@@ -731,7 +735,7 @@ impl PlaybackState {
         slot.paused_prepare_restart = None;
         Self::cancel_prepare(&mut slot);
         // Preview's background noise-profile passes belong to the old project.
-        crate::clip_audio::cancel_background_profiles();
+        self.profiles.cancel();
         if let Some(running) = slot.running.as_ref() {
             running.proxy_check_cancel.cancel();
             running.close_publication();
@@ -1095,8 +1099,16 @@ pub async fn playback_start(
         let timeline = timeline.clone();
         let media = media.clone();
         let prepare_cancel = cancel.clone();
+        let profiles = app.state::<PlaybackState>().profiles.clone();
         match audio_admission.submit(move || {
-            build_clock_paused_cancellable(&timeline, &media, fps, start_at, &prepare_cancel)
+            build_clock_paused_cancellable(
+                &timeline,
+                &media,
+                fps,
+                start_at,
+                &profiles,
+                &prepare_cancel,
+            )
         }) {
             Ok(receiver) => receiver,
             Err(error) => {
