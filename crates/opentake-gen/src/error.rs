@@ -36,6 +36,18 @@ pub enum GenError {
     #[error("unusable provider response: {0}")]
     Protocol(String),
 
+    /// A 2xx answer whose body this client cannot use: undecodable JSON (a
+    /// proxy page or a truncated body), or a missing or foreign job id. The
+    /// server handled the request, so a submission may have been accepted
+    /// and billed, while a status poll may succeed when repeated.
+    #[error("unusable success response: {0}")]
+    UnusableSuccess(String),
+
+    /// A 2xx response body larger than the request allows. Repeating the
+    /// request returns the same body, so this is final.
+    #[error("response body exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: u64 },
+
     /// A reference file is larger than the upload limit; nothing was read.
     #[error("upload file is {len} bytes, above the {limit}-byte limit")]
     UploadTooLarge { len: u64, limit: u64 },
@@ -76,11 +88,12 @@ impl From<url::ParseError> for GenError {
 
 impl GenError {
     /// Whether the same request may succeed when repeated later: network
-    /// failures and HTTP 408, 429 and 5xx. Authentication, credits, other 4xx
-    /// and unusable responses are final.
+    /// failures, undecodable 2xx bodies and HTTP 408, 429 and 5xx.
+    /// Authentication, credits, other 4xx, oversized bodies and unusable job
+    /// identities are final.
     pub fn is_transient(&self) -> bool {
         match self {
-            GenError::Transport(_) | GenError::Connect(_) => true,
+            GenError::Transport(_) | GenError::Connect(_) | GenError::UnusableSuccess(_) => true,
             GenError::Api { status, .. } => matches!(status, 408 | 429 | 500..=599),
             _ => false,
         }
@@ -94,6 +107,29 @@ impl GenError {
         }
     }
 
+    /// Whether a submission that failed this way may still have been
+    /// accepted (and billed) by the provider: the request may have arrived
+    /// (a reset or timed-out connection, a gateway error from a proxy in
+    /// front of the provider) or it was answered with a 2xx body this client
+    /// cannot use.
+    pub fn submission_outcome_unknown(&self) -> bool {
+        match self {
+            GenError::Transport(_)
+            | GenError::UnusableSuccess(_)
+            | GenError::ResponseTooLarge { .. } => true,
+            GenError::Api { status, .. } => matches!(status, 502 | 504),
+            _ => false,
+        }
+    }
+
+    /// Treat any failure to use a 2xx answer as [`GenError::UnusableSuccess`].
+    pub(crate) fn after_success(self) -> GenError {
+        match self {
+            GenError::UnusableSuccess(_) | GenError::ResponseTooLarge { .. } => self,
+            other => GenError::UnusableSuccess(other.to_string()),
+        }
+    }
+
     /// A short, credential- and URL-free label for logs.
     pub fn kind_label(&self) -> String {
         match self {
@@ -103,6 +139,8 @@ impl GenError {
             GenError::Transport(_) => "transport".to_string(),
             GenError::Connect(_) => "connect".to_string(),
             GenError::Protocol(_) => "protocol".to_string(),
+            GenError::UnusableSuccess(_) => "unusable success response".to_string(),
+            GenError::ResponseTooLarge { .. } => "response too large".to_string(),
             GenError::UploadTooLarge { .. } => "upload too large".to_string(),
             GenError::Api { status, .. } => format!("http {status}"),
             GenError::Other(_) => "other".to_string(),
@@ -270,9 +308,39 @@ mod tests {
             GenError::NotConfigured,
             GenError::Protocol("bad id".into()),
             GenError::UploadTooLarge { len: 2, limit: 1 },
+            GenError::ResponseTooLarge { limit: 1 },
         ] {
             assert!(!final_error.is_transient(), "{final_error:?}");
         }
+        assert!(GenError::UnusableSuccess("truncated".into()).is_transient());
+    }
+
+    #[test]
+    fn a_submission_may_have_been_accepted_unless_it_was_refused() {
+        for unknown in [
+            GenError::Transport("reset".into()),
+            GenError::UnusableSuccess("no id".into()),
+            GenError::ResponseTooLarge { limit: 1 },
+            map_http_error(502, b""),
+            map_http_error(504, b""),
+        ] {
+            assert!(unknown.submission_outcome_unknown(), "{unknown:?}");
+        }
+        for refused in [
+            GenError::Connect("refused".into()),
+            map_http_error(400, b""),
+            map_http_error(401, b""),
+            map_http_error(429, b""),
+            map_http_error(500, b""),
+            map_http_error(503, b""),
+            GenError::Protocol("bad id".into()),
+        ] {
+            assert!(!refused.submission_outcome_unknown(), "{refused:?}");
+        }
+        assert!(matches!(
+            GenError::Protocol("foreign url".into()).after_success(),
+            GenError::UnusableSuccess(message) if message.contains("foreign url")
+        ));
     }
 
     #[test]

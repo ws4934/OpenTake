@@ -196,30 +196,13 @@ impl FalAdapter {
         }
         normalize_output_urls(output)
     }
-}
 
-#[async_trait]
-impl ProviderAdapter for FalAdapter {
-    fn prefix(&self) -> &'static str {
-        "fal"
-    }
-
-    async fn submit(
+    /// Read an accepted submission's routing and status.
+    fn accepted_job(
         &self,
-        route: &ModelRoute,
-        params: &GenerationParams,
+        endpoint: String,
+        resp: &crate::transport::HttpResponse,
     ) -> Result<GenerationJob, GenError> {
-        let endpoint = Self::endpoint(route, params);
-        let url = format!("{}/{}", self.queue_base, endpoint);
-        let body = Self::map_body(&endpoint, params);
-        let (hk, hv) = self.auth_header();
-        let resp = self
-            .http
-            .send(HttpRequest::post(url).header(hk, hv).json(body))
-            .await?;
-        if !resp.is_success() {
-            return Err(map_http_response(&resp));
-        }
         let v: serde_json::Value = resp.json()?;
         let request_id = v
             .get("request_id")
@@ -244,6 +227,35 @@ impl ProviderAdapter for FalAdapter {
             .map(Self::map_status)
             .unwrap_or(JobStatus::Queued);
         Ok(GenerationJob::pending(job_id, status))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for FalAdapter {
+    fn prefix(&self) -> &'static str {
+        "fal"
+    }
+
+    async fn submit(
+        &self,
+        route: &ModelRoute,
+        params: &GenerationParams,
+    ) -> Result<GenerationJob, GenError> {
+        let endpoint = Self::endpoint(route, params);
+        let url = format!("{}/{}", self.queue_base, endpoint);
+        let body = Self::map_body(&endpoint, params);
+        let (hk, hv) = self.auth_header();
+        let resp = self
+            .http
+            .send(HttpRequest::post(url).header(hk, hv).json(body))
+            .await?;
+        if !resp.is_success() {
+            return Err(map_http_response(&resp));
+        }
+        // The provider accepted the request: anything unusable in its answer
+        // leaves the submission's outcome unknown.
+        self.accepted_job(endpoint, &resp)
+            .map_err(GenError::after_success)
     }
 
     async fn poll(&self, job_id: &str) -> Result<GenerationJob, GenError> {
@@ -284,9 +296,14 @@ impl ProviderAdapter for FalAdapter {
 
         match status {
             JobStatus::Succeeded => {
+                // Results can carry inline data URLs.
                 let rresp = self
                     .http
-                    .send(HttpRequest::get(result_url).header(hk, hv))
+                    .send(
+                        HttpRequest::get(result_url)
+                            .header(hk, hv)
+                            .max_response_bytes(crate::transport::MEDIA_RESPONSE_BYTES_MAX),
+                    )
                     .await?;
                 if !rresp.is_success() {
                     return Err(map_http_response(&rresp));
@@ -601,6 +618,29 @@ mod tests {
             a.submit(&route, &params).await,
             Err(GenError::Unauthenticated)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_submission_without_usable_routing_has_an_unknown_outcome() {
+        for body in [
+            json!({"status": "IN_QUEUE"}),
+            json!({
+                "request_id": "r",
+                "status_url": "https://elsewhere.test/status",
+                "response_url": "https://elsewhere.test/result"
+            }),
+        ] {
+            let mock = MockTransport::new();
+            mock.on(Method::Post, "https://mockfal/flux-pro", 200, body.clone());
+            let route = ModelRoute::parse("fal:flux-pro").unwrap();
+            let params = GenerationParams::Image(ImageParams::new("x", "1:1", 1));
+            let error = adapter(&mock).submit(&route, &params).await.unwrap_err();
+            assert!(
+                matches!(error, GenError::UnusableSuccess(_)),
+                "{body}: {error:?}"
+            );
+            assert!(error.submission_outcome_unknown());
+        }
     }
 
     #[test]

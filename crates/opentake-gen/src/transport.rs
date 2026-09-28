@@ -18,6 +18,60 @@ use std::time::Duration;
 /// upload replies). A larger body fails as a transport error.
 pub const CONTROL_RESPONSE_BYTES_MAX: u64 = 8 * 1024 * 1024;
 
+/// Size of each read from a streamed upload file.
+const UPLOAD_READ_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The error for a response body over `limit`: final for a 2xx answer, and
+/// the HTTP error of its status otherwise (a 5xx stays retryable).
+pub(crate) fn oversized_response(status: u16, limit: u64) -> GenError {
+    if (200..300).contains(&status) {
+        GenError::ResponseTooLarge { limit }
+    } else {
+        crate::error::map_http_error(
+            status,
+            format!("response body exceeds the {limit}-byte limit").as_bytes(),
+        )
+    }
+}
+
+/// Stream exactly `len` bytes of `file`, failing clearly when the file no
+/// longer has that size: a request with an explicit `Content-Length` would
+/// otherwise send a truncated file or fail obscurely.
+fn exact_length_file_stream(
+    file: tokio::fs::File,
+    len: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    use tokio::io::AsyncReadExt;
+    futures_util::stream::try_unfold(
+        (file, 0_u64, false),
+        move |(mut file, sent, done)| async move {
+            if done {
+                return Ok(None);
+            }
+            let mut buffer = vec![0_u8; UPLOAD_READ_CHUNK_BYTES];
+            let count = file.read(&mut buffer).await?;
+            if count == 0 {
+                if sent == len {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("upload file shrank to {sent} of {len} bytes while it was sent"),
+                ));
+            }
+            let sent = sent + count as u64;
+            if sent > len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("upload file grew beyond {len} bytes while it was sent"),
+                ));
+            }
+            buffer.truncate(count);
+            Ok(Some((bytes::Bytes::from(buffer), (file, sent, false))))
+        },
+    )
+}
+
 /// Ceiling for synchronous media responses (OpenAI images and speech,
 /// ElevenLabs audio) that are buffered and re-encoded as `data:` URLs. Base64
 /// grows the data by a third, so the resulting URL stays within the desktop
@@ -199,9 +253,16 @@ impl HttpResponse {
         (200..300).contains(&self.status)
     }
 
-    /// Parse the body as JSON into `T`.
+    /// Parse the body as JSON into `T`. An undecodable 2xx body is
+    /// [`GenError::UnusableSuccess`]: the server handled the request.
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, GenError> {
-        serde_json::from_slice(&self.body).map_err(GenError::from)
+        serde_json::from_slice(&self.body).map_err(|error| {
+            if self.is_success() {
+                GenError::UnusableSuccess(format!("undecodable response body: {error}"))
+            } else {
+                GenError::from(error)
+            }
+        })
     }
 
     /// Find a response header value (case-insensitive).
@@ -383,11 +444,20 @@ impl HttpTransport for ReqwestTransport {
                 builder
                     .header("Content-Type", content_type)
                     .header("Content-Length", len.to_string())
-                    .body(reqwest::Body::from(file))
+                    .body(reqwest::Body::wrap_stream(exact_length_file_stream(
+                        file, len,
+                    )))
             }
         };
 
-        let mut resp = builder.send().await.map_err(map_reqwest_error)?;
+        let mut resp = builder.send().await.map_err(|error| {
+            // A file that changed size while it was sent is a local failure:
+            // report it as such instead of as a network error.
+            if let Some(changed) = upload_size_change(&error) {
+                return GenError::Other(anyhow::anyhow!(changed));
+            }
+            map_reqwest_error(error)
+        })?;
         let status = resp.status().as_u16();
         let headers = resp
             .headers()
@@ -399,16 +469,12 @@ impl HttpTransport for ReqwestTransport {
             })
             .collect();
         if resp.content_length().is_some_and(|length| length > limit) {
-            return Err(GenError::Transport(format!(
-                "response body exceeds the {limit}-byte limit"
-            )));
+            return Err(oversized_response(status, limit));
         }
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_error)? {
             if body.len() as u64 + chunk.len() as u64 > limit {
-                return Err(GenError::Transport(format!(
-                    "response body exceeds the {limit}-byte limit"
-                )));
+                return Err(oversized_response(status, limit));
             }
             body.extend_from_slice(&chunk);
         }
@@ -418,6 +484,24 @@ impl HttpTransport for ReqwestTransport {
             body,
         })
     }
+}
+
+/// The size-change message of a failed file upload, if that caused it.
+fn upload_size_change(error: &reqwest::Error) -> Option<String> {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+            ) && io.to_string().starts_with("upload file ")
+            {
+                return Some(io.to_string());
+            }
+        }
+        source = cause.source();
+    }
+    None
 }
 
 /// One canned reply in a `MockTransport` script.
@@ -580,9 +664,7 @@ impl HttpTransport for MockTransport {
             Some(Canned::Response(response)) => {
                 let limit = req.max_response_bytes.unwrap_or(CONTROL_RESPONSE_BYTES_MAX);
                 if response.body.len() as u64 > limit {
-                    return Err(GenError::Transport(format!(
-                        "response body exceeds the {limit}-byte limit"
-                    )));
+                    return Err(oversized_response(response.status, limit));
                 }
                 Ok(response)
             }
@@ -723,7 +805,10 @@ mod tests {
             HttpResponse::new(200, vec![0; 2048]),
         );
         let limited = HttpRequest::get("https://x/big").max_response_bytes(1024);
-        assert!(matches!(m.send(limited).await, Err(GenError::Transport(_))));
+        assert!(matches!(
+            m.send(limited).await,
+            Err(GenError::ResponseTooLarge { limit: 1024 })
+        ));
         let allowed = HttpRequest::get("https://x/big").max_response_bytes(4096);
         assert_eq!(m.send(allowed).await.unwrap().body.len(), 2048);
     }
@@ -896,7 +981,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, GenError::Transport(message) if message.contains("exceeds")),
+            matches!(&error, GenError::ResponseTooLarge { .. }) && !error.is_transient(),
             "{error:?}"
         );
         server.join().unwrap();
@@ -916,7 +1001,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, GenError::Transport(message) if message.contains("exceeds")),
+            matches!(&error, GenError::ResponseTooLarge { .. }) && !error.is_transient(),
             "{error:?}"
         );
         server.join().unwrap();
@@ -977,6 +1062,65 @@ mod tests {
         assert!(!head.contains("transfer-encoding"), "{head}");
         assert_eq!(&request[head_end..], bytes.as_slice());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_error_body_keeps_its_http_status() {
+        let m = MockTransport::new();
+        m.on_raw(
+            Method::Get,
+            "https://x/big",
+            HttpResponse::new(503, vec![b'x'; 2048]),
+        );
+        let error = m
+            .send(HttpRequest::get("https://x/big").max_response_bytes(1024))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GenError::Api { status: 503, .. }),
+            "{error:?}"
+        );
+        assert!(error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn a_streamed_upload_fails_when_the_file_changes_size() {
+        use futures_util::StreamExt;
+        let dir = tempfile_dir("size-change");
+        let path = dir.join("reference.bin");
+        std::fs::write(&path, vec![7_u8; 600_000]).unwrap();
+        async fn collect(path: &Path, len: u64) -> std::io::Result<usize> {
+            let file = tokio::fs::File::open(path).await.unwrap();
+            let stream = exact_length_file_stream(file, len);
+            futures_util::pin_mut!(stream);
+            let mut total = 0;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                assert!(chunk.len() <= UPLOAD_READ_CHUNK_BYTES);
+                total += chunk.len();
+            }
+            Ok(total)
+        }
+        assert_eq!(collect(&path, 600_000).await.unwrap(), 600_000);
+        // The file grew after the size check, or shrank.
+        let grew = collect(&path, 500_000).await.unwrap_err();
+        assert!(grew.to_string().contains("grew"), "{grew}");
+        let shrank = collect(&path, 700_000).await.unwrap_err();
+        assert!(shrank.to_string().contains("shrank"), "{shrank}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn tempfile_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "opentake-gen-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[tokio::test]

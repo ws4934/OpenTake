@@ -50,9 +50,13 @@ pub const VIDEO_UPSCALE_FPS: RangeInclusive<u32> = 15..=60;
 /// The model's default `target_fps`.
 pub const VIDEO_UPSCALE_DEFAULT_FPS: u32 = 30;
 
-/// Encoders round odd sizes to even ones, so the long side of an
-/// aspect-preserving result may differ from the exact product by this much.
-const LONG_SIDE_TOLERANCE: u32 = 2;
+/// Encoders round odd sizes to even ones (or pad to a block size), so a
+/// result's short side may fall this far below the target.
+const SHORT_SIDE_TOLERANCE: u32 = 2;
+
+/// Largest relative difference between the result's and the source's aspect
+/// ratio (rounding, codec padding, anamorphic storage).
+const ASPECT_RATIO_TOLERANCE: f64 = 0.01;
 
 /// What to request for one source video.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,8 +154,11 @@ pub fn expected_upscale_size(
     })
 }
 
-/// Whether a probed result is the size the request asked for: the same
-/// orientation, exactly the target short side, and the source aspect ratio.
+/// Whether a probed result is plausibly what the request asked for. The
+/// result is paid for before it is checked, so the check only rejects a
+/// result that is clearly something else: the source's aspect ratio (within
+/// about 1 %, which also fixes the orientation) and a short side of at least
+/// the target's. A larger result is accepted.
 pub fn upscale_result_matches(
     source_width: u32,
     source_height: u32,
@@ -159,18 +166,13 @@ pub fn upscale_result_matches(
     result_width: u32,
     result_height: u32,
 ) -> bool {
-    let Some((expected_width, expected_height)) =
-        expected_upscale_size(source_width, source_height, target)
-    else {
+    if source_width == 0 || source_height == 0 || result_width == 0 || result_height == 0 {
         return false;
-    };
-    if source_width >= source_height {
-        result_height == expected_height
-            && result_width.abs_diff(expected_width) <= LONG_SIDE_TOLERANCE
-    } else {
-        result_width == expected_width
-            && result_height.abs_diff(expected_height) <= LONG_SIDE_TOLERANCE
     }
+    let source_aspect = f64::from(source_width) / f64::from(source_height);
+    let result_aspect = f64::from(result_width) / f64::from(result_height);
+    ((result_aspect - source_aspect).abs() / source_aspect) <= ASPECT_RATIO_TOLERANCE
+        && result_width.min(result_height) + SHORT_SIDE_TOLERANCE >= target.short_side
 }
 
 #[cfg(test)]
@@ -229,25 +231,53 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_requested_target_size() {
+    fn accepts_results_with_the_source_aspect_and_at_least_the_target_size() {
         let full_hd = video_upscale_resolution("1080p").unwrap();
         let uhd = video_upscale_resolution("4k").unwrap();
+        let hd = video_upscale_resolution("720p").unwrap();
         assert_eq!(
             expected_upscale_size(1280, 720, full_hd),
             Some((1920, 1080))
         );
-        assert!(upscale_result_matches(1280, 720, full_hd, 1920, 1080));
-        assert!(!upscale_result_matches(1280, 720, full_hd, 2560, 1440));
-        assert!(!upscale_result_matches(1280, 720, full_hd, 1920, 1088));
-        assert!(!upscale_result_matches(1280, 720, full_hd, 1080, 1920));
-        assert!(upscale_result_matches(1920, 1080, uhd, 3840, 2160));
-        assert!(!upscale_result_matches(1920, 1080, uhd, 1920, 1080));
-        assert!(upscale_result_matches(1080, 1920, uhd, 2160, 3840));
-        // 854x480 scales to 1281x720; encoders may round the long side.
-        let hd = video_upscale_resolution("720p").unwrap();
-        assert!(upscale_result_matches(854, 480, hd, 1280, 720));
-        assert!(upscale_result_matches(854, 480, hd, 1282, 720));
-        assert!(!upscale_result_matches(854, 480, hd, 1290, 720));
+        for (source, target, result) in [
+            ((1280, 720), full_hd, (1920, 1080)),
+            // Padded to a codec block size.
+            ((1280, 720), full_hd, (1920, 1088)),
+            // Larger than asked for.
+            ((1280, 720), full_hd, (2560, 1440)),
+            ((1920, 1080), uhd, (3840, 2160)),
+            // Portrait, DCI and ultra-wide sources.
+            ((1080, 1920), uhd, (2160, 3840)),
+            ((720, 1280), full_hd, (1080, 1920)),
+            ((2048, 1080), uhd, (4096, 2160)),
+            ((2560, 1080), uhd, (5120, 2160)),
+            // 854x480 scales to 1281x720; encoders round the long side.
+            ((854, 480), hd, (1280, 720)),
+            ((854, 480), hd, (1282, 720)),
+            // An odd short side rounded down.
+            ((854, 480), hd, (1280, 718)),
+        ] {
+            assert!(
+                upscale_result_matches(source.0, source.1, target, result.0, result.1),
+                "{source:?} -> {result:?}"
+            );
+        }
+        for (source, target, result) in [
+            // Rotated.
+            ((1280, 720), full_hd, (1080, 1920)),
+            // Not upscaled to the target.
+            ((1920, 1080), uhd, (1920, 1080)),
+            ((1280, 720), full_hd, (1280, 720)),
+            // Another aspect ratio (4:3, 5 % wider).
+            ((1280, 720), full_hd, (1440, 1080)),
+            ((1280, 720), full_hd, (2016, 1080)),
+            ((0, 720), full_hd, (1920, 1080)),
+        ] {
+            assert!(
+                !upscale_result_matches(source.0, source.1, target, result.0, result.1),
+                "{source:?} -> {result:?}"
+            );
+        }
         assert_eq!(video_upscale_resolution("8k"), None);
     }
 }

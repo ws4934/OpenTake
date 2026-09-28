@@ -183,7 +183,8 @@ impl ProviderAdapter for ReplicateAdapter {
         }
         let v: serde_json::Value = resp.json()?;
         if v.get("id").and_then(|x| x.as_str()).is_none() {
-            return Err(GenError::Protocol(
+            // Accepted, but without an id the job cannot be followed.
+            return Err(GenError::UnusableSuccess(
                 "replicate: missing prediction id".into(),
             ));
         }
@@ -193,7 +194,15 @@ impl ProviderAdapter for ReplicateAdapter {
     async fn poll(&self, job_id: &str) -> Result<GenerationJob, GenError> {
         let url = format!("{}/predictions/{}", self.api_base, job_id);
         let (hk, hv) = self.auth_header();
-        let resp = self.http.send(HttpRequest::get(url).header(hk, hv)).await?;
+        // A finished prediction can carry inline data URLs.
+        let resp = self
+            .http
+            .send(
+                HttpRequest::get(url)
+                    .header(hk, hv)
+                    .max_response_bytes(crate::transport::MEDIA_RESPONSE_BYTES_MAX),
+            )
+            .await?;
         if !resp.is_success() {
             return Err(map_http_response(&resp));
         }
@@ -232,6 +241,21 @@ mod tests {
 
     fn adapter(mock: &MockTransport) -> ReplicateAdapter {
         ReplicateAdapter::new(Arc::new(mock.clone()), "r8-token").with_base("https://mockrep/v1")
+    }
+
+    #[tokio::test]
+    async fn an_accepted_prediction_without_an_id_has_an_unknown_outcome() {
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockrep/v1/predictions",
+            201,
+            json!({"status": "starting"}),
+        );
+        let route = ModelRoute::parse("replicate:owner/model:v123").unwrap();
+        let params = GenerationParams::Image(ImageParams::new("x", "1:1", 1));
+        let error = adapter(&mock).submit(&route, &params).await.unwrap_err();
+        assert!(error.submission_outcome_unknown(), "{error:?}");
     }
 
     #[tokio::test]

@@ -129,6 +129,11 @@ pub struct UpscaleCaps {
     pub p75_duration_seconds: u32,
     /// "video" | "image".
     pub supported_types: Vec<String>,
+    /// Output sizes a resolution-targeted upscaler accepts
+    /// (`target_resolution` values, see [`crate::upscale`]). `None` for a
+    /// scale-factor upscaler.
+    #[serde(default)]
+    pub target_resolutions: Option<Vec<String>>,
 }
 
 /// Capability matrix dispatched by kind. Port of `CatalogEntry.UICapabilities`.
@@ -423,6 +428,7 @@ mod tests {
             UiCapabilities::Upscale(caps) => {
                 assert_eq!(caps.speed, "Medium");
                 assert_eq!(caps.supported_types, vec!["video", "image"]);
+                assert_eq!(caps.target_resolutions, None, "a scale-factor upscaler");
             }
             other => panic!("expected Upscale caps, got {other:?}"),
         }

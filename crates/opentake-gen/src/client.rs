@@ -62,17 +62,20 @@ impl Default for PollPolicy {
 impl PollPolicy {
     /// The wait before retry `attempt` (1-based): the server's `Retry-After`
     /// when given, otherwise exponential backoff with equal jitter.
+    /// The server's `Retry-After` never shortens the backoff: a zero or tiny
+    /// value would otherwise use up the retry budget in moments.
     pub fn retry_delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        if let Some(retry_after) = retry_after {
-            return retry_after.min(self.retry_after_max);
-        }
         let exponent = attempt.saturating_sub(1).min(20);
         let backoff = self
             .retry_base
             .saturating_mul(1_u32 << exponent)
             .min(self.retry_max);
         let half = backoff / 2;
-        half + jitter_up_to(backoff - half)
+        let backoff = half + jitter_up_to(backoff - half);
+        match retry_after {
+            Some(retry_after) => retry_after.min(self.retry_after_max).max(backoff),
+            None => backoff,
+        }
     }
 }
 
@@ -361,17 +364,9 @@ impl GenClient {
     ) -> Result<String, GenError> {
         match &self.inner.mode {
             AuthMode::Byok { registry, catalog } => {
-                let (adapter, mut route) = registry.route(model)?;
-                if let Some(vendor_model) = catalog
-                    .entries()
-                    .iter()
-                    .find(|entry| entry.id == model)
-                    .and_then(|entry| entry.vendor_model.as_deref())
-                {
-                    route.vendor_model = vendor_model.to_owned();
-                }
-                let job = adapter.submit(&route, &params).await?;
-                Ok(job.id)
+                Ok(byok_adapter_submit(registry, catalog, model, &params)
+                    .await?
+                    .id)
             }
             AuthMode::Bearer { base_url, .. } => {
                 let url = Self::endpoint(base_url, "v1/generations")?;
@@ -413,10 +408,15 @@ impl GenClient {
             AuthMode::Bearer { base_url, .. } => {
                 let url = Self::endpoint(base_url, &format!("v1/generations/{job_id}"))?;
                 let (hk, hv) = self.bearer_header().await?;
+                // A finished job can carry inline data URLs.
                 let resp = self
                     .inner
                     .http
-                    .send(HttpRequest::get(url).header(hk, hv))
+                    .send(
+                        HttpRequest::get(url)
+                            .header(hk, hv)
+                            .max_response_bytes(crate::transport::MEDIA_RESPONSE_BYTES_MAX),
+                    )
                     .await?;
                 if !resp.is_success() {
                     return Err(map_http_response(&resp));
@@ -433,9 +433,30 @@ impl GenClient {
         model: &str,
         params: GenerationParams,
     ) -> Result<String, GenError> {
+        Ok(self.submit_byok_job(model, params).await?.id)
+    }
+
+    /// [`Self::submit_byok`] returning the whole submitted job under its
+    /// prefixed id. A synchronous vendor (OpenAI, ElevenLabs) answers with
+    /// the terminal job and its results, which exist nowhere else but in
+    /// this client's memory, so a caller that may outlive the client keeps
+    /// them from here.
+    pub async fn submit_byok_job(
+        &self,
+        model: &str,
+        params: GenerationParams,
+    ) -> Result<GenerationJob, GenError> {
         let route_prefix = crate::provider::ModelRoute::parse(model)?.prefix;
-        let vendor_job = self.submit(model, params, None).await?;
-        Ok(format!("{route_prefix}::{vendor_job}"))
+        let AuthMode::Byok { registry, catalog } = &self.inner.mode else {
+            let id = self.submit(model, params, None).await?;
+            return Ok(GenerationJob::pending(
+                format!("{route_prefix}::{id}"),
+                crate::job::JobStatus::Queued,
+            ));
+        };
+        let mut job = byok_adapter_submit(registry, catalog, model, &params).await?;
+        job.id = format!("{route_prefix}::{}", job.id);
+        Ok(job)
     }
 
     /// Subscribe to a job until it reaches a terminal state, polling at the
@@ -526,6 +547,25 @@ impl GenClient {
             }
         })
     }
+}
+
+/// Submit through the adapter of `model`, using the catalog's vendor model.
+async fn byok_adapter_submit(
+    registry: &ProviderRegistry,
+    catalog: &Catalog,
+    model: &str,
+    params: &GenerationParams,
+) -> Result<GenerationJob, GenError> {
+    let (adapter, mut route) = registry.route(model)?;
+    if let Some(vendor_model) = catalog
+        .entries()
+        .iter()
+        .find(|entry| entry.id == model)
+        .and_then(|entry| entry.vendor_model.as_deref())
+    {
+        route.vendor_model = vendor_model.to_owned();
+    }
+    adapter.submit(&route, params).await
 }
 
 /// Split a BYOK prefixed job id `"<prefix>::<vendorJobId>"`.
@@ -997,7 +1037,11 @@ mod tests {
         let WatchEvent::Retrying { delay, .. } = &events[3] else {
             unreachable!()
         };
-        assert_eq!(*delay, Duration::ZERO, "Retry-After is honored");
+        // `Retry-After: 0` never shortens the backoff (third failure: 2-4 ms).
+        assert!(
+            *delay >= Duration::from_millis(2) && *delay <= Duration::from_millis(4),
+            "{delay:?}"
+        );
         assert_eq!(mock.call_count(), 6);
     }
 
@@ -1115,6 +1159,84 @@ mod tests {
             policy.retry_delay(1, Some(Duration::from_secs(3600))),
             policy.retry_after_max
         );
+        // Half of the full backoff is the jitter floor.
+        for (attempt, floor) in [(1, 1), (4, 8)] {
+            for retry_after in [Duration::ZERO, Duration::from_millis(1)] {
+                let delay = policy.retry_delay(attempt, Some(retry_after));
+                assert!(delay >= Duration::from_secs(floor), "{attempt}: {delay:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_retry_after_does_not_burn_the_retry_budget() {
+        let mock = MockTransport::new();
+        let mut rate_limited = HttpResponse::new(429, b"{}".to_vec());
+        rate_limited
+            .headers
+            .push(("Retry-After".into(), "0".into()));
+        mock.on_raw(Method::Get, RETRY_JOB, rate_limited);
+        let client = managed_client(&mock).with_poll_policy(PollPolicy {
+            retry_base: Duration::from_millis(20),
+            retry_max: Duration::from_millis(20),
+            retry_budget: 3,
+            ..quick_policy()
+        });
+        let started = tokio::time::Instant::now();
+        let events: Vec<WatchEvent> = client.watch("job-r", WATCH_DEADLINE).collect().await;
+        assert!(matches!(
+            events.last(),
+            Some(WatchEvent::Interrupted(
+                WatchInterruption::RetryBudgetExhausted
+            ))
+        ));
+        // Three retries each waited at least half the 20 ms backoff.
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_status_answer_is_retried() {
+        let mock = MockTransport::new();
+        mock.on_raw(
+            Method::Get,
+            RETRY_JOB,
+            HttpResponse::new(200, b"<html>proxy error</html>".to_vec()),
+        );
+        mock.on(
+            Method::Get,
+            RETRY_JOB,
+            200,
+            json!({"id": "job-r", "status": "succeeded", "resultUrls": ["https://out/r.mp4"]}),
+        );
+        let client = managed_client(&mock).with_poll_policy(quick_policy());
+        let events: Vec<WatchEvent> = client.watch("job-r", WATCH_DEADLINE).collect().await;
+        assert!(matches!(
+            &events[0],
+            WatchEvent::Retrying {
+                error: GenError::UnusableSuccess(_),
+                ..
+            }
+        ));
+        assert!(matches!(&events[1], WatchEvent::Snapshot(job) if job.status.is_terminal()));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_accepted_submission_is_reported_as_such() {
+        let mock = MockTransport::new();
+        mock.on_raw(
+            Method::Post,
+            "https://proxy.test/v1/generations",
+            HttpResponse::new(200, b"not json".to_vec()),
+        );
+        let error = managed_client(&mock)
+            .submit(
+                "fal:flux-pro",
+                GenerationParams::Image(crate::params::ImageParams::new("p", "1:1", 1)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.submission_outcome_unknown(), "{error:?}");
     }
 
     #[tokio::test]
