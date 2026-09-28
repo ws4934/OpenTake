@@ -82,6 +82,9 @@ vi.mock("./components/shell/EditorSplit", async () => {
 vi.mock("./components/shell/CompatibilityBanner", () => ({
   CompatibilityBanner: () => null,
 }));
+vi.mock("./components/shell/ProjectOpenNoticesBanner", () => ({
+  ProjectOpenNoticesBanner: () => null,
+}));
 vi.mock("./components/home/HomeView", async () => {
   const React = await vi.importActual<typeof import("react")>("react");
   return {

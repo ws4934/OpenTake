@@ -70,6 +70,8 @@ const srv = vi.hoisted(() => {
     saveDialog: vi.fn(async () => srv.save),
     getDefaultProjectDir: vi.fn(async () => ""),
     checkPathExists: vi.fn(async (_path: string) => false),
+    // A refresh snapshot to return instead of the default one.
+    refreshSnapshot: null as null | Record<string, unknown>,
   };
 });
 
@@ -80,7 +82,7 @@ vi.mock("../lib/api", () => ({
   sampleProjectMaterialize: srv.sampleProjectMaterialize,
   getDefaultProjectDir: srv.getDefaultProjectDir,
   checkPathExists: srv.checkPathExists,
-  getTimeline: async () => ({
+  getTimeline: async () => srv.refreshSnapshot ?? ({
     timeline: srv.timeline,
     projectEpoch: 5,
     version: 0,
@@ -118,7 +120,9 @@ import {
   saveCurrentProjectAs,
 } from "./projectActions";
 import { useEditorUiStore } from "./uiStore";
-import { refreshMedia, useMediaStore } from "./mediaStore";
+import { useMediaStore } from "./mediaStore";
+import { forceRefresh } from "./sync";
+import { projectOpenNotices } from "../lib/projectMessages";
 import { useProjectStore } from "./projectStore";
 import { useRecentStore } from "./recentStore";
 import { useI18nStore } from "../i18n";
@@ -260,7 +264,8 @@ describe("openProjectPath", () => {
     expect(useEditorUiStore.getState().view).toBe("editor");
   });
 
-  it("names media opened offline once, not on later refreshes", async () => {
+  it("keeps open notices naming offline media until dismissed, not on later refreshes", async () => {
+    const warnings = ["media.json:offline-media:m1", "media.json:offline-media:gone"];
     srv.projectOpen.mockImplementationOnce(async () => ({
       timeline: srv.timeline,
       projectEpoch: 11,
@@ -268,28 +273,38 @@ describe("openProjectPath", () => {
       projectPath: "/tmp/unsafe.opentake",
       compatibilityReadOnly: false,
       compatibilityBlockers: [],
-      compatibilityWarnings: ["media.json:offline-media:m1", "media.json:offline-media:gone"],
+      compatibilityWarnings: warnings,
     }));
 
     await openProjectPath("/tmp/unsafe.opentake");
 
-    expect(useEditorUiStore.getState().toast?.message).toBe(
-      "以下素材的路径不安全，已作为离线素材打开，可重新链接：clip, gone",
-    );
+    const notices = useProjectStore.getState().openNotices;
+    expect(notices).toEqual({ projectEpoch: 11, warnings, mediaNames: { m1: "clip" } });
+    expect(projectOpenNotices(notices!.warnings, notices!.mediaNames)).toEqual([
+      "以下素材的路径不安全，已作为离线素材打开，可重新链接：clip、gone",
+    ]);
+    // A notice is not a transient toast that could vanish or be replaced.
+    expect(useEditorUiStore.getState().toast).toBeNull();
 
-    // A later refresh of the same project carries the same warnings but must
-    // not repeat the notice.
-    useEditorUiStore.setState({ toast: null });
-    useProjectStore.getState().replaceProjectSnapshot({
+    // Dismissed, it stays dismissed: a refresh of the same project carries
+    // the same warnings but never records them again.
+    useProjectStore.getState().setOpenNotices(null);
+    srv.refreshSnapshot = {
       timeline: structuredClone(srv.timeline),
       projectEpoch: 11,
       version: 1,
       projectPath: "/tmp/unsafe.opentake",
       compatibilityReadOnly: false,
       compatibilityBlockers: [],
-      compatibilityWarnings: ["media.json:offline-media:m1", "media.json:offline-media:gone"],
-    });
-    await refreshMedia();
+      compatibilityWarnings: warnings,
+    };
+    try {
+      await forceRefresh();
+    } finally {
+      srv.refreshSnapshot = null;
+    }
+    expect(useProjectStore.getState().timelineVersion).toBe(1);
+    expect(useProjectStore.getState().openNotices).toBeNull();
     expect(useEditorUiStore.getState().toast).toBeNull();
   });
 
@@ -309,13 +324,15 @@ describe("openProjectPath", () => {
 
     await openProjectPath("/tmp/big-log.opentake");
 
-    expect(useEditorUiStore.getState().toast?.message).toBe(
+    const notices = useProjectStore.getState().openNotices!;
+    expect(projectOpenNotices(notices.warnings, notices.mediaNames)).toEqual([
       "The generation log was too large; it was moved to generation-log.oversized-1.json inside the project and a new log was started.",
-    );
+    ]);
   });
 
   it("opens a project without warnings silently", async () => {
     await openProjectPath("/tmp/demo.opentake");
+    expect(useProjectStore.getState().openNotices).toBeNull();
     expect(useEditorUiStore.getState().toast).toBeNull();
   });
 
@@ -638,8 +655,9 @@ describe("saveCurrentProject", () => {
     },
     {
       code: "projectIo",
-      zh: "无法读取或写入项目文件。",
-      en: "The project files could not be read or written.",
+      params: { kind: "broken pipe" },
+      zh: "无法读取或写入项目文件（broken pipe）。",
+      en: "The project files could not be read or written (broken pipe).",
     },
     {
       code: "projectInvalidManifest",

@@ -15,7 +15,7 @@ import { useRecentStore } from "./recentStore";
 import { refreshMedia, resetProjectMediaState, useMediaStore } from "./mediaStore";
 import { openDialog, saveDialog } from "../lib/dialog";
 import { t } from "../i18n";
-import { projectErrorMessage, projectOpenNotices } from "../lib/projectMessages";
+import { projectErrorMessage } from "../lib/projectMessages";
 import { stopNativePlaybackForProjectBoundary } from "../components/preview/nativePlaybackSession";
 import { useMotionStudioStore } from "./motionStudioStore";
 
@@ -329,15 +329,18 @@ function projectLifecycleErrorMessage(error: unknown): string {
   return projectErrorMessage(error);
 }
 
-/** Tell the user, once per opened project, about the recoverable problems the
- *  core handled while opening it. Later refreshes of the same project carry
- *  the same warnings but never come through here. */
-function showProjectOpenNotices(snapshot: RuntimeTimelineSnapshot): void {
+/** Keep the recoverable problems the core handled while opening a project
+ *  for the notices banner, naming media as the opened manifest does. Later
+ *  refreshes of the same project carry the same warnings but never come
+ *  through here, so the notices are not repeated. */
+function recordProjectOpenNotices(snapshot: RuntimeTimelineSnapshot): void {
   const warnings = snapshot.compatibilityWarnings ?? [];
-  if (warnings.length === 0) return;
-  const names = new Map(useMediaStore.getState().items.map((item) => [item.id, item.name]));
-  const notices = projectOpenNotices(warnings, names);
-  if (notices.length > 0) useEditorUiStore.getState().pushToast(notices.join("\n"));
+  const mediaNames = Object.fromEntries(
+    useMediaStore.getState().items.map((item) => [item.id, item.name]),
+  );
+  useProjectStore.getState().setOpenNotices(
+    warnings.length === 0 ? null : { projectEpoch: snapshot.projectEpoch, warnings, mediaNames },
+  );
 }
 
 export async function openProjectPath(path: string): Promise<void> {
@@ -359,7 +362,7 @@ export async function openProjectPath(path: string): Promise<void> {
   await refreshMedia();
   useEditorUiStore.getState().resetProjectRuntimeState();
   useEditorUiStore.getState().setView("editor");
-  showProjectOpenNotices(snap);
+  recordProjectOpenNotices(snap);
 }
 
 /** Pick a project bundle with the native dialog, then open it. `.opentake`

@@ -32,7 +32,7 @@ const zh: Dict = {
   "project.unsavedBlocksSwitch": "当前工程的修改未能保存，已取消切换",
   "projectError.projectStorageFull": "磁盘空间不足，无法保存项目。",
   "projectError.projectPermissionDenied": "OpenTake 没有写入项目文件夹的权限。",
-  "projectError.projectIo": "无法读取或写入项目文件。",
+  "projectError.projectIo": "无法读取或写入项目文件（{kind}）。",
   "projectError.projectInvalidManifest":
     "素材列表中有一个无法再次打开的文件路径，因此项目未保存。",
   "projectError.projectComponentTooLarge":
@@ -47,6 +47,9 @@ const zh: Dict = {
   "projectOpen.generationLogMovedAside":
     "生成记录过大，已移到项目内的 {file}，并以空记录打开。",
   "projectOpen.otherNotice": "打开项目时已处理：{notice}",
+  "projectOpen.nameSeparator": "、",
+  "projectOpen.title": "打开项目时已处理的问题",
+  "projectOpen.dismiss": "知道了",
   "projectSettingsMismatch.title": "素材与项目设置不一致",
   "projectSettingsMismatch.description":
     "时间线还没有内容。你可以保留当前项目设置，或改为匹配第一个视频素材。",
@@ -1254,7 +1257,7 @@ const en: Dict = {
   "project.unsavedBlocksSwitch": "The current project's changes could not be saved, so it was kept open",
   "projectError.projectStorageFull": "There is not enough disk space to save the project.",
   "projectError.projectPermissionDenied": "OpenTake is not allowed to write to the project folder.",
-  "projectError.projectIo": "The project files could not be read or written.",
+  "projectError.projectIo": "The project files could not be read or written ({kind}).",
   "projectError.projectInvalidManifest":
     "The media list contains a file path that could not be opened again, so the project was not saved.",
   "projectError.projectComponentTooLarge":
@@ -1271,6 +1274,9 @@ const en: Dict = {
   "projectOpen.generationLogMovedAside":
     "The generation log was too large; it was moved to {file} inside the project and a new log was started.",
   "projectOpen.otherNotice": "Handled while opening the project: {notice}",
+  "projectOpen.nameSeparator": ", ",
+  "projectOpen.title": "Handled while opening this project",
+  "projectOpen.dismiss": "Dismiss",
   "projectSettingsMismatch.title": "Media and project settings differ",
   "projectSettingsMismatch.description":
     "The timeline is still empty. Keep the current project settings or match the first video asset.",

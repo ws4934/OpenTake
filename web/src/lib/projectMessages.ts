@@ -5,7 +5,7 @@
  * language, keeping the core's English message for anything it does not know.
  */
 
-import { t } from "../i18n";
+import { t, type TFunction } from "../i18n";
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return (
@@ -45,25 +45,29 @@ export function projectErrorMessage(error: unknown): string {
  *  shown as is. */
 export function projectOpenNotices(
   warnings: readonly string[],
-  mediaNames: ReadonlyMap<string, string>,
+  mediaNames: Readonly<Record<string, string>>,
+  translate: TFunction = t,
 ): string[] {
   const offline: string[] = [];
   const ignoredProxy: string[] = [];
   const notices: string[] = [];
+  const nameOf = (id: string) => mediaNames[id] ?? id;
   for (const warning of warnings) {
     const offlineId = warning.match(/^media\.json:offline-media:(.+)$/)?.[1];
     const proxyId = warning.match(/^media\.json:ignored-proxy:(.+)$/)?.[1];
     const aside = warning.match(/^generation-log\.json:moved-aside:(.+)$/)?.[1];
-    if (offlineId !== undefined) offline.push(mediaNames.get(offlineId) ?? offlineId);
-    else if (proxyId !== undefined) ignoredProxy.push(mediaNames.get(proxyId) ?? proxyId);
-    else if (aside !== undefined) notices.push(t("projectOpen.generationLogMovedAside", { file: aside }));
-    else notices.push(t("projectOpen.otherNotice", { notice: warning }));
+    if (offlineId !== undefined) offline.push(nameOf(offlineId));
+    else if (proxyId !== undefined) ignoredProxy.push(nameOf(proxyId));
+    else if (aside !== undefined) {
+      notices.push(translate("projectOpen.generationLogMovedAside", { file: aside }));
+    } else notices.push(translate("projectOpen.otherNotice", { notice: warning }));
   }
+  const separator = translate("projectOpen.nameSeparator");
   if (ignoredProxy.length > 0) {
-    notices.unshift(t("projectOpen.ignoredProxy", { names: ignoredProxy.join(", ") }));
+    notices.unshift(translate("projectOpen.ignoredProxy", { names: ignoredProxy.join(separator) }));
   }
   if (offline.length > 0) {
-    notices.unshift(t("projectOpen.offlineMedia", { names: offline.join(", ") }));
+    notices.unshift(translate("projectOpen.offlineMedia", { names: offline.join(separator) }));
   }
   return notices;
 }

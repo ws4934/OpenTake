@@ -21,7 +21,7 @@ use opentake_domain::Timeline;
 use opentake_ops::command::{EditCommand, EditResult};
 
 use crate::core::{AppCore, ProjectRevision, TimelineSnapshot};
-use crate::error::{CoreError, Result};
+use crate::error::{project_error_code, CoreError, Result};
 
 /// Machine + human readable error for the Tauri boundary (`core-SPEC.md` §6.3).
 /// `code` is `"validation"` for rejected input, `"staleProject"` for a
@@ -79,6 +79,11 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// carries them, so a front end can translate the message.
 fn project_error_params(error: &opentake_project::ProjectError) -> BTreeMap<String, String> {
     match error {
+        opentake_project::ProjectError::Io { source, .. }
+            if project_error_code(error) == "projectIo" =>
+        {
+            BTreeMap::from([("kind".to_string(), source.kind().to_string())])
+        }
         opentake_project::ProjectError::ComponentTooLarge { file, size, limit } => {
             BTreeMap::from([
                 ("file".to_string(), file.clone()),
@@ -534,6 +539,16 @@ mod tests {
         let json = serde_json::to_value(&too_large).unwrap();
         assert_eq!(json["params"]["sizeMib"], "17.0");
         assert!(storage_full.params.is_empty());
+        let io = CmdError::from(CoreError::Project(ProjectError::Io {
+            path: secret.into(),
+            source: Error::from(ErrorKind::BrokenPipe),
+        }));
+        assert_eq!(io.code, "projectIo");
+        assert_eq!(
+            io.params,
+            BTreeMap::from([("kind".to_string(), ErrorKind::BrokenPipe.to_string())])
+        );
+        assert!(io.message.contains(&io.params["kind"]), "{}", io.message);
         assert!(serde_json::to_value(&storage_full)
             .unwrap()
             .get("params")

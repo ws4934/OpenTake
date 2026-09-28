@@ -43,6 +43,9 @@ vi.mock("./components/shell/ProjectSettingsMismatchDialog", () => ({
   ProjectSettingsMismatchDialog: () => null,
 }));
 vi.mock("./components/shell/CompatibilityBanner", () => ({ CompatibilityBanner: () => null }));
+vi.mock("./components/shell/ProjectOpenNoticesBanner", () => ({
+  ProjectOpenNoticesBanner: () => null,
+}));
 vi.mock("./components/settings/UpdateDialog", () => ({ UpdateCenter: () => null }));
 
 import App from "./App";
