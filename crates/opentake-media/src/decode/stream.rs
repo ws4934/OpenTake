@@ -194,9 +194,13 @@ pub fn spawn_video_stream_with_color(
     let (tx, rx) = sync_channel(req.queue_capacity);
     let control = StreamDecodeControl::new();
     let worker_control = control.clone();
+    let helper_count = ff::inherited_helper_process_count();
     let worker = thread::Builder::new()
         .name("opentake-video-decode".to_string())
-        .spawn(move || run_video_stream(req, color, tx, worker_control))
+        .spawn(move || {
+            ff::adopt_helper_process_count(helper_count);
+            run_video_stream(req, color, tx, worker_control)
+        })
         .map_err(MediaError::Io)?;
 
     Ok(VideoStream {

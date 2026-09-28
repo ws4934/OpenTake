@@ -33,6 +33,7 @@
 //! preview path in `render.rs` is not touched). A later refactor can hoist the
 //! shared projection into a `pub(crate)` helper once both paths are stable.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -50,6 +51,9 @@ use same_file::Handle as FileIdentity;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
+#[cfg(test)]
+use crate::clip_audio::clip_source_window_secs;
+use crate::clip_audio::{self, ClipAudioLayout, ClipAudioReader};
 use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
@@ -59,12 +63,15 @@ use opentake_media::decode::spawn_video_stream;
 use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
-    decode_frame_at, decode_frame_at_cancellable, extract_pcm,
-    extract_pcm_cancellable_with_progress, interpolate_frame_pair, source_frame_pair,
+    decode_frame_at, decode_frame_at_cancellable, interpolate_frame_pair, source_frame_pair,
     ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
-    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer,
-    PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder,
-    VideoStream, VideoStreamRequest,
+    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmFormat,
+    PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder, VideoStream,
+    VideoStreamRequest,
+};
+#[cfg(test)]
+use opentake_media::{
+    extract_pcm, extract_pcm_cancellable_with_progress, PcmBuffer, PcmProgressCallback,
 };
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::compositor::{
@@ -1162,6 +1169,7 @@ const VIDEO_AUDIO_END: i32 = 800;
 const VIDEO_FINALIZE_END: i32 = 980;
 const VIDEO_EXPORT_END: i32 = 990;
 
+#[cfg(test)]
 fn decode_pcm_with_export_control<F>(
     control: &ExportControl,
     path: &Path,
@@ -1215,6 +1223,7 @@ fn retime_pcm_to_len_with_control(
     retime_pcm_to_len_with_external(samples, target_len, control, None)
 }
 
+#[cfg(test)]
 fn retime_pcm_to_len_with_external(
     samples: &[f32],
     target_len: usize,
@@ -1500,127 +1509,121 @@ fn stream_flattened_audio<T: AudioPlanLike>(
     if timeline_fps <= 0 || start_frame >= end_frame {
         return Ok(false);
     }
-    let mut audible_media = HashSet::new();
-    for plan in clips {
-        let clip = plan.clip();
-        let clip_end = clip.start_frame.saturating_add(clip.duration_frames);
-        if clip.duration_frames <= 0 || clip_end <= start_frame || clip.start_frame >= end_frame {
-            continue;
-        }
-        let Some(info) = media.get(&clip.media_ref) else {
-            continue;
-        };
-        let metadata = opentake_media::probe(&info.path)
-            .map_err(|error| format!("audio probe failed for {}: {error}", clip.media_ref))?;
-        if metadata.has_audio {
-            audible_media.insert(clip.media_ref.clone());
-        }
-    }
-    if audible_media.is_empty() {
-        return Ok(false);
-    }
-
+    let cancel = control
+        .map(ExportControl::media_cancel_token)
+        .or_else(|| external_cancel.cloned())
+        .unwrap_or_default();
+    let decode_failure = |media_ref: &str, error: opentake_media::MediaError| match error {
+        opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
+        error => format!("audio decode failed for {media_ref}: {error}"),
+    };
     let sample_at_frame = |frame: i32| {
-        ((frame.max(0) as f64 / timeline_fps as f64) * MIX_SAMPLE_RATE as f64).round() as usize
+        ((frame.max(0) as f64 / timeline_fps as f64) * MIX_SAMPLE_RATE as f64).round() as u64
     };
     let range_start = sample_at_frame(start_frame);
     let range_end = sample_at_frame(end_frame);
+
+    // Audibility is probed once per source file, not per clip or window.
+    let mut source_has_audio: HashMap<&str, bool> = HashMap::new();
+    let mut layouts = Vec::with_capacity(clips.len());
+    for plan in clips {
+        let clip = plan.clip();
+        let layout = ClipAudioLayout::new(clip, timeline_fps, MIX_SAMPLE_RATE).filter(|layout| {
+            let (clip_start, clip_end) = layout.span();
+            clip_start < range_end && clip_end > range_start
+        });
+        let audible = match (&layout, media.get(&clip.media_ref)) {
+            (Some(_), Some(info)) => match source_has_audio.get(clip.media_ref.as_str()) {
+                Some(audible) => *audible,
+                None => {
+                    check_audio_cancel_with_external(control, external_cancel)?;
+                    let audible =
+                        clip_audio::source_has_audio(&info.path, &cancel).map_err(|error| {
+                            match error {
+                                opentake_media::MediaError::Cancelled => {
+                                    CANCELLED_SENTINEL.to_string()
+                                }
+                                error => {
+                                    format!("audio probe failed for {}: {error}", clip.media_ref)
+                                }
+                            }
+                        })?;
+                    source_has_audio.insert(&clip.media_ref, audible);
+                    audible
+                }
+            },
+            _ => false,
+        };
+        layouts.push(layout.filter(|_| audible));
+    }
+    if layouts.iter().all(Option::is_none) {
+        return Ok(false);
+    }
+
     let total_samples = range_end.saturating_sub(range_start);
     let true_peak_ceiling_dbtp = clips
         .iter()
         .filter_map(AudioPlanLike::true_peak_ceiling_dbtp)
         .min_by(f64::total_cmp);
-    let cancel = control
-        .map(ExportControl::media_cancel_token)
-        .or_else(|| external_cancel.cloned())
-        .unwrap_or_default();
-
+    // One forward decoder per audible clip, opened when the clip enters the
+    // range and reaped as soon as it ends (#3).
+    let mut readers: HashMap<usize, ClipAudioReader> = HashMap::new();
+    let mut samples = Vec::new();
     for relative_start in (0..total_samples).step_by(AUDIO_STREAM_WINDOW_SAMPLES) {
         check_audio_cancel_with_external(control, external_cancel)?;
-        let window_len = AUDIO_STREAM_WINDOW_SAMPLES.min(total_samples - relative_start);
-        let window_start = range_start.saturating_add(relative_start);
-        let window_end = window_start.saturating_add(window_len);
-        let mut mixed = vec![0.0_f32; window_len];
-        for plan in clips {
-            let clip = plan.clip();
-            if !audible_media.contains(&clip.media_ref) || clip.duration_frames <= 0 {
+        let window_len = (AUDIO_STREAM_WINDOW_SAMPLES as u64).min(total_samples - relative_start);
+        let window_start = range_start + relative_start;
+        let window_end = window_start + window_len;
+        let mut mixed = vec![0.0_f32; window_len as usize];
+        for (index, plan) in clips.iter().enumerate() {
+            let Some(layout) = layouts[index] else {
                 continue;
-            }
-            let clip_start = sample_at_frame(clip.start_frame);
-            let clip_end = sample_at_frame(clip.start_frame.saturating_add(clip.duration_frames));
+            };
+            let (clip_start, clip_end) = layout.span();
             let overlap_start = window_start.max(clip_start);
             let overlap_end = window_end.min(clip_end);
-            if overlap_start >= overlap_end || clip_end <= clip_start {
+            if overlap_start >= overlap_end {
                 continue;
             }
-            let Some(info) = media.get(&clip.media_ref) else {
-                continue;
-            };
-            let Some((source_lo, source_hi)) = clip_source_window_secs(clip, timeline_fps) else {
-                continue;
-            };
-            let source_span = source_hi - source_lo;
-            let relative_lo = (overlap_start - clip_start) as f64 / (clip_end - clip_start) as f64;
-            let relative_hi = (overlap_end - clip_start) as f64 / (clip_end - clip_start) as f64;
-            let source_range = (
-                source_lo + source_span * relative_lo,
-                source_lo + source_span * relative_hi,
-            );
-            let decoded = match control {
-                Some(control) => decode_pcm_with_export_control(
-                    control,
-                    &info.path,
-                    Some(source_range),
-                    None,
-                    extract_pcm_cancellable_with_progress,
-                ),
-                None => match external_cancel {
-                    Some(cancel) => extract_pcm_cancellable_with_progress(
-                        &info.path,
-                        &AUDIO_DECODE_SPEC,
-                        Some(source_range),
-                        cancel,
-                        None,
-                    ),
-                    None => extract_pcm(&info.path, &AUDIO_DECODE_SPEC, Some(source_range)),
-                },
-            };
-            let pcm = match decoded {
-                Ok(pcm) => pcm,
-                Err(opentake_media::MediaError::NoTrack(_, _)) => continue,
-                Err(opentake_media::MediaError::Cancelled) => {
-                    return Err(CANCELLED_SENTINEL.to_string());
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "audio decode failed for {}: {error}",
-                        clip.media_ref
-                    ));
+            let media_ref = &plan.clip().media_ref;
+            let reader = match readers.entry(index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let reader = ClipAudioReader::open(
+                        layout,
+                        &media[media_ref].path,
+                        1,
+                        layout.offset_of(overlap_start),
+                        &cancel,
+                    )
+                    .map_err(|error| decode_failure(media_ref, error))?;
+                    entry.insert(reader)
                 }
             };
-            let target_len = overlap_end - overlap_start;
-            let retimed = retime_pcm_to_len_with_external(
-                &pcm.samples_f32,
-                target_len,
-                control,
-                external_cancel,
-            )?;
+            samples.clear();
+            reader
+                .read((overlap_end - overlap_start) as usize, &mut samples)
+                .map_err(|error| decode_failure(media_ref, error))?;
+            if overlap_end == clip_end {
+                readers.remove(&index);
+            }
             let processed = apply_export_denoise_with_external(
-                &retimed,
+                &samples,
                 1,
                 plan.audio_denoise(),
                 control,
                 external_cancel,
             )?;
-            let output_start = overlap_start - window_start;
-            for (offset, sample) in processed.into_iter().take(target_len).enumerate() {
+            let output_start = (overlap_start - window_start) as usize;
+            for (offset, sample) in processed.iter().enumerate() {
                 if offset.is_multiple_of(AUDIO_CANCEL_CHUNK_SAMPLES) {
                     check_audio_cancel_with_external(control, external_cancel)?;
                 }
-                let absolute_sample = overlap_start.saturating_add(offset);
-                let timeline_frame = ((absolute_sample as f64 / MIX_SAMPLE_RATE as f64)
-                    * timeline_fps as f64)
-                    .floor() as i32;
+                let timeline_frame = clip_audio::timeline_frame_at(
+                    overlap_start + offset as u64,
+                    timeline_fps,
+                    MIX_SAMPLE_RATE,
+                );
                 mixed[output_start + offset] += sample * plan.volume_at(timeline_frame) as f32;
             }
         }
@@ -1631,7 +1634,7 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         emit(&mixed)?;
         if let Some(report) = &on_progress {
             let completed = relative_start.saturating_add(window_len);
-            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as usize;
+            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
             let mapped =
                 AUDIO_MIX_START + (completed.saturating_mul(span) / total_samples.max(1)) as i32;
             report(mapped, AUDIO_PROGRESS_TOTAL);
@@ -3633,19 +3636,6 @@ fn project_frame_time_secs(source_frame: i64, timeline_fps: i32) -> f64 {
     (source_frame.max(0) as f64) / fps
 }
 
-fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)> {
-    if clip.duration_frames <= 0 || timeline_fps <= 0 {
-        return None;
-    }
-    let fps = timeline_fps as f64;
-    let lo = clip.trim_start_frame.max(0) as f64 / fps;
-    let consumed = clip.source_frames_consumed().max(0);
-    if consumed == 0 {
-        return None;
-    }
-    Some((lo, lo + consumed as f64 / fps))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5294,6 +5284,173 @@ mod tests {
 
         assert!((lo - 0.5).abs() < 0.0001);
         assert!((hi - 2.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn export_audio_decodes_each_clip_once_and_matches_whole_clip_decodes() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        write_wav(&first, &noisy_tone(40.0, 440.0, 1));
+        write_wav(&second, &noisy_tone(40.0, 660.0, 2));
+
+        // 60 s timeline: A covers 0-30 s, B covers 25-60 s from its 2 s trim
+        // at half volume, so the two overlap for five seconds.
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        let mut a = Clip::new("a", "first", 0, 900);
+        a.media_type = ClipType::Audio;
+        let mut b = Clip::new("b", "second", 750, 1_050);
+        b.media_type = ClipType::Audio;
+        b.trim_start_frame = 60;
+        b.volume = 0.5;
+        for (id, clip) in [("a1", a), ("a2", b)] {
+            let mut track = opentake_domain::Track::new(id, ClipType::Audio);
+            track.clips.push(clip);
+            timeline.tracks.push(track);
+        }
+        assert_eq!(timeline.total_frames(), 1_800);
+        let media = HashMap::from([
+            (
+                "first".to_string(),
+                MediaInfo {
+                    path: first,
+                    source_fps: None,
+                },
+            ),
+            (
+                "second".to_string(),
+                MediaInfo {
+                    path: second,
+                    source_fps: None,
+                },
+            ),
+        ]);
+        let clips = timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.clone())
+            .collect::<Vec<_>>();
+
+        let cancel = MediaCancelToken::new();
+        let processes = opentake_media::ffmpeg_status::HelperProcessCount::start();
+        let mut streamed = Vec::new();
+        let has_audio = stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 1_800,
+                control: None,
+                external_cancel: Some(&cancel),
+                on_progress: None,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let spawned = processes.count();
+        drop(processes);
+
+        assert!(has_audio);
+        assert_eq!(streamed.len(), 60 * MIX_SAMPLE_RATE as usize);
+        // Thirty two-second windows, yet one probe per source file and one
+        // decoder per clip.
+        assert_eq!(spawned, 4, "helper processes for 2 clips over 30 windows");
+        assert_eq!(cancel.spawned_child_count(), 4);
+
+        // The whole-clip projection decoded each clip in one piece; the
+        // streamed windows reproduce it sample for sample.
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        assert_eq!(reference.len(), streamed.len());
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 1.0e-6, "max difference {max_difference}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_export_audio_reaps_the_clip_decoder_promptly() {
+        use std::sync::mpsc;
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            eprintln!("skip: ffmpeg not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("blocking.wav");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(created.success(), "mkfifo must create a blocking input");
+        let cancel = MediaCancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut clip = Clip::new("a", "fifo", 0, 300);
+            clip.media_type = ClipType::Audio;
+            let media = HashMap::from([(
+                "fifo".to_string(),
+                MediaInfo {
+                    path: fifo,
+                    source_fps: None,
+                },
+            )]);
+            let result = stream_flattened_audio(
+                &[clip],
+                &media,
+                AudioStreamOptions {
+                    timeline_fps: 30,
+                    start_frame: 0,
+                    end_frame: 300,
+                    control: None,
+                    external_cancel: Some(&worker_cancel),
+                    on_progress: None,
+                },
+                |_| Ok(()),
+            );
+            done_tx.send(result).expect("publish audio result");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cancel.spawned_child_count() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(cancel.spawned_child_count(), 1, "the clip decoder started");
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancelled export audio must return");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "cancellation took {:?}",
+            cancelled_at.elapsed()
+        );
+        assert_eq!(result.unwrap_err(), CANCELLED_SENTINEL);
+        worker.join().expect("audio worker joins");
+        assert_eq!(cancel.active_reader_count(), 0, "decoder pipes are reaped");
     }
 
     #[test]

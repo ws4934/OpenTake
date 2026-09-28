@@ -76,6 +76,36 @@ pub fn probe_file_cancellable(
     Ok(parse_probe(&json))
 }
 
+/// Upper bound for [`probe_cancellable`]; header probing a local file takes
+/// milliseconds, so this only stops a stuck helper.
+const CANCELLABLE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long [`probe_cancellable`] queues for an ffprobe admission slot.
+const CANCELLABLE_PROBE_ADMISSION_WAIT: Duration = Duration::from_secs(5);
+
+/// [`probe`] for a caller about to decode `path`: the caller's token cancels
+/// the helper (and counts its process), a deadline bounds it, and a saturated
+/// ffprobe admission limit is waited out briefly instead of failing at once.
+pub fn probe_cancellable(path: &Path, cancel: &crate::MediaCancelToken) -> Result<MediaProbe> {
+    if !path.exists() {
+        return Err(MediaError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            path.display().to_string(),
+        )));
+    }
+    match probe_for_decode(
+        ff::ProbeTarget::Path(path),
+        cancel,
+        CANCELLABLE_PROBE_TIMEOUT,
+        CANCELLABLE_PROBE_ADMISSION_WAIT,
+    )? {
+        Some(probe) => Ok(probe),
+        None => Err(MediaError::Ffmpeg(format!(
+            "ffprobe could not read {} as media",
+            path.display()
+        ))),
+    }
+}
+
 /// Probe on behalf of a decoder that is about to run: cancellable through the
 /// caller's token, bounded by `timeout`, and queued for up to `admission_wait`
 /// when every ffprobe slot is busy instead of failing at once. `Ok(None)` means

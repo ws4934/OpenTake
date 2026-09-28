@@ -12,6 +12,7 @@
 //! development tools; the desktop shell pins them to the bundled sidecars before
 //! media initialization.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
@@ -21,7 +22,7 @@ use std::process::Command;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use ffmpeg_sidecar::command::FfmpegCommand;
@@ -648,6 +649,7 @@ fn run_ffprobe(
     if cancel.checkpoint() {
         return Err(crate::error::MediaError::Cancelled);
     }
+    record_helper_process();
     let queued_at = Instant::now();
     let _admission = if admission_wait.is_zero() {
         ProbeAdmission::acquire()?
@@ -785,9 +787,70 @@ pub fn ffprobe_path() -> OsString {
     )
 }
 
-/// A fresh `FfmpegCommand` bound to [`ffmpeg_path`].
+/// A fresh `FfmpegCommand` bound to [`ffmpeg_path`]. Every caller spawns the
+/// command it builds, so this is where FFmpeg helper processes are counted.
 pub fn ffmpeg() -> FfmpegCommand {
+    record_helper_process();
     FfmpegCommand::new_with_path(ffmpeg_path())
+}
+
+thread_local! {
+    static HELPER_PROCESS_COUNT: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+}
+
+/// Counts the FFmpeg and ffprobe processes an operation starts: those started
+/// on this thread while the count is alive, including the ones started by
+/// media workers (such as video decode streams) that this thread spawns.
+/// Other threads are not counted, so parallel tests do not disturb each other.
+/// Nested counts restore the outer one when dropped.
+///
+/// This is an observation seam for tests that bound how many helper processes
+/// an operation needs (for example one decoder per clip rather than one per
+/// frame). It counts processes launched through this module's `ffmpeg()`
+/// builder and ffprobe runner.
+#[doc(hidden)]
+pub struct HelperProcessCount {
+    counter: Arc<AtomicUsize>,
+    outer: Option<Arc<AtomicUsize>>,
+}
+
+impl HelperProcessCount {
+    pub fn start() -> Self {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let outer = HELPER_PROCESS_COUNT.with(|slot| slot.replace(Some(Arc::clone(&counter))));
+        HelperProcessCount { counter, outer }
+    }
+
+    /// Helper processes started so far.
+    pub fn count(&self) -> usize {
+        self.counter.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HelperProcessCount {
+    fn drop(&mut self) {
+        let outer = self.outer.take();
+        HELPER_PROCESS_COUNT.with(|slot| *slot.borrow_mut() = outer);
+    }
+}
+
+fn record_helper_process() {
+    HELPER_PROCESS_COUNT.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.fetch_add(1, Ordering::AcqRel);
+        }
+    });
+}
+
+/// The calling thread's active count, for a worker thread it spawns to adopt
+/// with [`adopt_helper_process_count`].
+pub(crate) fn inherited_helper_process_count() -> Option<Arc<AtomicUsize>> {
+    HELPER_PROCESS_COUNT.with(|slot| slot.borrow().clone())
+}
+
+/// Count this (worker) thread's helper processes toward its spawner's count.
+pub(crate) fn adopt_helper_process_count(counter: Option<Arc<AtomicUsize>>) {
+    HELPER_PROCESS_COUNT.with(|slot| *slot.borrow_mut() = counter);
 }
 
 /// Whether `ffmpeg` is runnable (`-version` exits 0). Used by tests/integration
@@ -1074,6 +1137,34 @@ mod tests {
         trigger.join().unwrap();
         assert!(matches!(result, Err(crate::MediaError::Cancelled)));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn helper_process_count_follows_the_thread_and_its_adopting_workers() {
+        let outer = HelperProcessCount::start();
+        let _ = ffmpeg();
+        {
+            let inner = HelperProcessCount::start();
+            let _ = ffmpeg();
+            let inherited = inherited_helper_process_count();
+            std::thread::spawn(move || {
+                adopt_helper_process_count(inherited);
+                let _ = ffmpeg();
+            })
+            .join()
+            .unwrap();
+            // A thread that did not adopt the count is not counted.
+            std::thread::spawn(|| {
+                let _ = ffmpeg();
+            })
+            .join()
+            .unwrap();
+            assert_eq!(inner.count(), 2);
+        }
+        let _ = ffmpeg();
+        assert_eq!(outer.count(), 2, "the outer count resumes after the inner");
+        drop(outer);
+        assert!(inherited_helper_process_count().is_none());
     }
 
     #[cfg(unix)]

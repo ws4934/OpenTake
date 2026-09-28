@@ -976,3 +976,77 @@ fn export_prores_4444_delivers_straight_alpha_for_translucent_white() {
         "straight-alpha white must stay white (darkest channel {darkest})"
     );
 }
+
+/// A whole export starts helper processes per clip, never per frame or per
+/// audio window (#3). Each export has a fixed set: the preflight probe, color
+/// probe and first-frame decode of each source, one audibility probe per
+/// source, the encoder, the output probe, and the audio mux when the export
+/// has sound. On top of that each clip adds one video decoder, plus one PCM
+/// decoder when it is audible.
+#[test]
+fn export_starts_helper_processes_per_clip_not_per_frame() {
+    use opentake_media::ffmpeg_status::HelperProcessCount;
+
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let frames = 300_u32;
+    let silent = dir.path().join("silent.mp4");
+    let voiced = dir.path().join("voiced.mp4");
+    if !make_video(&silent, 64, 64, 30, frames)
+        || !make_video_with_audio(&voiced, 64, 64, 30, frames)
+    {
+        eprintln!("skip: could not generate fixture media");
+        return;
+    }
+    let count_export = |timeline: &Timeline, manifest: &MediaManifest, name: &str| {
+        let out = dir.path().join(name);
+        let req = ExportRequest {
+            out_path: out.to_string_lossy().into_owned(),
+            codec: Default::default(),
+            quality: ExportQuality::P720,
+        };
+        let processes = HelperProcessCount::start();
+        match run_export(timeline, manifest, &None, &req) {
+            Ok(summary) => {
+                let spawned = processes.count();
+                assert_eq!(summary.frame_count, frames as i32);
+                eprintln!("{name}: {spawned} helper processes");
+                Some(spawned)
+            }
+            Err(error) if error.contains("no GPU device") => None,
+            Err(error) => panic!("export {name} failed: {error}"),
+        }
+    };
+    let mut timeline = build_timeline(frames as i32, 64, 64, 30.0);
+    timeline.width = 64;
+    timeline.height = 64;
+
+    let silent_manifest = build_manifest(&silent, 64, 64, 30.0);
+    let Some(single) = count_export(&timeline, &silent_manifest, "single.mp4") else {
+        eprintln!("skip: no GPU adapter available");
+        return;
+    };
+    assert!(single <= 1 + 6, "one silent clip started {single} helpers");
+
+    let mut dual = timeline.clone();
+    let mut overlay = Track::new("t2", ClipType::Video);
+    overlay
+        .clips
+        .push(Clip::new("clip-2", "asset-1", 0, frames as i32));
+    dual.tracks.push(overlay);
+    let two = count_export(&dual, &silent_manifest, "dual.mp4").unwrap();
+    assert!(
+        two <= 2 + 6,
+        "two silent video tracks started {two} helpers"
+    );
+
+    let voiced_manifest = build_manifest_with_audio(&voiced, 64, 64, 30.0, true);
+    let audible = count_export(&timeline, &voiced_manifest, "voiced.mp4").unwrap();
+    assert!(
+        audible <= 2 + 7,
+        "one audible clip over five audio windows started {audible} helpers"
+    );
+}

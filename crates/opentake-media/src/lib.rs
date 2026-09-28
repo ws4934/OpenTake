@@ -170,8 +170,9 @@ pub use decode::{
     decode_pcm_interleaved_cancellable, extract_pcm, extract_pcm_cancellable,
     extract_pcm_cancellable_with_progress, interpolate_frame_pair, source_frame_pair, ColorHint,
     FrameInterpolationFallback, FrameInterpolationMode, FrameInterpolationResult, FrameRateSample,
-    FrameRequest, PcmBuffer, PcmFormat, PcmProgressCallback, PcmSpec, StreamDecodeControl,
-    StreamVideoFrame, VideoStream, VideoStreamRequest, DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY,
+    FrameRequest, PcmBuffer, PcmFormat, PcmProgressCallback, PcmSpec, PcmStream,
+    StreamDecodeControl, StreamVideoFrame, VideoStream, VideoStreamRequest,
+    DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY,
 };
 
 pub use encode::{ExportPreset, ExportResolution, VideoCodec, VideoEncoder};
@@ -225,6 +226,8 @@ pub use ort_worker::ExecutionProvider;
 /// ffmpeg/ffprobe availability probes (re-exported for integration tests and
 /// host-capability checks).
 pub mod ffmpeg_status {
+    #[doc(hidden)]
+    pub use crate::ff::HelperProcessCount;
     pub use crate::ff::{
         ffmpeg_available, ffmpeg_path, ffprobe_available, packaged_sidecar_beside,
         packaged_sidecar_path,
