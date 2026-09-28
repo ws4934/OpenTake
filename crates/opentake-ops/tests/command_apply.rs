@@ -12,7 +12,8 @@ use opentake_domain::{
     Point2, Rgb,
 };
 use opentake_domain::{
-    Clip, ClipType, MediaManifest, MediaManifestEntry, MediaSource, Timeline, Track, Transform,
+    Clip, ClipType, LoudnessNormalization, MediaManifest, MediaManifestEntry, MediaSource,
+    Timeline, Track, Transform,
 };
 use opentake_ops::command::{
     NewTrackClipMode, PasteClipEntry, PlaceMediaTarget, ProjectTimelineSettings, UnplacedClipEntry,
@@ -453,6 +454,334 @@ fn dissolve_remaps_link_groups_and_transition_targets() {
     assert!(first.link_group_id.is_some());
     assert_eq!(first.link_group_id, audio.link_group_id);
     assert_ne!(first.link_group_id.as_deref(), Some("av"));
+}
+
+fn linear_opacity_ramp(duration: i32) -> KeyframeTrack<f64> {
+    KeyframeTrack::from_keyframes(vec![
+        Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+        Keyframe::with_interpolation(duration, 1.0, Interpolation::Linear),
+    ])
+}
+
+fn loudness() -> LoudnessNormalization {
+    LoudnessNormalization {
+        target_lufs: -16.0,
+        true_peak_ceiling_dbtp: -1.0,
+        input_integrated_lufs: -20.0,
+        input_true_peak_dbtp: -3.0,
+        gain_db: 4.0,
+        output_integrated_lufs: -16.0,
+        output_true_peak_dbtp: -1.5,
+    }
+}
+
+/// Place a compound holding `child_tracks` on root track 0 over `[0, duration)`
+/// and return its id.
+fn create_compound(
+    st: &mut EditorState,
+    ids: &SeqIdGen,
+    child_tracks: Vec<Track>,
+    duration: i32,
+) -> String {
+    let mut child = Timeline::new();
+    child.tracks = child_tracks;
+    apply(
+        st,
+        EditCommand::CreateNestedSequence {
+            name: "Scene".into(),
+            timeline: child,
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: duration,
+        },
+        ids,
+    )
+    .unwrap()
+    .affected_clip_ids[0]
+        .clone()
+}
+
+fn clip_by_media<'a>(st: &'a EditorState, media_ref: &str) -> (usize, &'a Clip) {
+    st.timeline
+        .tracks
+        .iter()
+        .enumerate()
+        .find_map(|(index, track)| {
+            track
+                .clips
+                .iter()
+                .find(|clip| clip.media_ref == media_ref)
+                .map(|clip| (index, clip))
+        })
+        .unwrap_or_else(|| panic!("no clip uses {media_ref}"))
+}
+
+fn opacity_keyframes(clip: &Clip) -> Vec<(i32, f64)> {
+    clip.opacity_track
+        .as_ref()
+        .map(|track| {
+            track
+                .keyframes
+                .iter()
+                .map(|kf| (kf.frame, (kf.value * 1e9).round() / 1e9))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn dissolve_rebases_child_animation_and_fades_to_the_visible_window() {
+    let mut child_clip = Clip::new("child", "asset-child", 0, 100);
+    child_clip.opacity_track = Some(linear_opacity_ramp(100));
+    child_clip.fade_in_frames = 10;
+    child_clip.fade_out_frames = 10;
+    child_clip.loudness_normalization = Some(loudness());
+    let original = child_clip.clone();
+    let mut st = state(vec![
+        video_track("top", true, vec![]),
+        video_track(
+            "background",
+            true,
+            vec![Clip::new("bg", "asset-bg", 0, 100)],
+        ),
+    ]);
+    let ids = SeqIdGen::new("dissolve-");
+    let compound = create_compound(
+        &mut st,
+        &ids,
+        vec![video_track("child-track", true, vec![child_clip])],
+        100,
+    );
+    // Cut the compound's first 20 frames: root frame f still shows child
+    // frame f, now starting at frame 20.
+    apply(
+        &mut st,
+        EditCommand::TrimClips {
+            edits: vec![(compound.clone(), 20, 0)],
+        },
+        &ids,
+    )
+    .unwrap();
+    let before = st.timeline.clone();
+
+    apply(
+        &mut st,
+        EditCommand::DissolveNestedSequence { clip_id: compound },
+        &ids,
+    )
+    .unwrap();
+
+    let (_, leaf) = clip_by_media(&st, "asset-child");
+    assert_eq!(
+        (
+            leaf.start_frame,
+            leaf.duration_frames,
+            leaf.trim_start_frame,
+            leaf.trim_end_frame
+        ),
+        (20, 80, 20, 0)
+    );
+    assert_eq!((leaf.fade_in_frames, leaf.fade_out_frames), (0, 10));
+    assert!(leaf.loudness_normalization.is_none());
+    assert_eq!(opacity_keyframes(leaf), [(0, 0.2), (80, 1.0)]);
+    for frame in 20..100 {
+        assert!(
+            (leaf.opacity_at(frame) - original.opacity_at(frame)).abs() < 1e-9,
+            "frame {frame}: {} != {}",
+            leaf.opacity_at(frame),
+            original.opacity_at(frame)
+        );
+    }
+    assert!((leaf.opacity_at(50) - 0.5).abs() < 1e-9);
+    assert!((leaf.opacity_at(20) - 0.2).abs() < 1e-9);
+
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    assert_eq!(st.timeline, before);
+}
+
+#[test]
+fn dissolve_cuts_right_clipped_children_and_keeps_uncut_children_intact() {
+    let mut long = Clip::new("long", "asset-long", 0, 100);
+    long.opacity_track = Some(linear_opacity_ramp(100));
+    long.fade_in_frames = 10;
+    long.fade_out_frames = 10;
+    long.loudness_normalization = Some(loudness());
+    let original_long = long.clone();
+    let mut inside = Clip::new("inside", "asset-inside", 10, 30);
+    inside.opacity_track = Some(linear_opacity_ramp(30));
+    inside.fade_in_frames = 5;
+    inside.fade_out_frames = 5;
+    inside.loudness_normalization = Some(loudness());
+    let original_inside = inside.clone();
+    let mut st = state(vec![video_track("top", true, vec![])]);
+    let ids = SeqIdGen::new("dissolve-");
+    let compound = create_compound(
+        &mut st,
+        &ids,
+        vec![
+            video_track("child-long", true, vec![long]),
+            video_track("child-inside", true, vec![inside]),
+        ],
+        100,
+    );
+    apply(
+        &mut st,
+        EditCommand::TrimClips {
+            edits: vec![(compound.clone(), 0, 30)],
+        },
+        &ids,
+    )
+    .unwrap();
+
+    apply(
+        &mut st,
+        EditCommand::DissolveNestedSequence { clip_id: compound },
+        &ids,
+    )
+    .unwrap();
+
+    let (_, long_leaf) = clip_by_media(&st, "asset-long");
+    assert_eq!(
+        (
+            long_leaf.start_frame,
+            long_leaf.duration_frames,
+            long_leaf.trim_end_frame
+        ),
+        (0, 70, 30)
+    );
+    assert_eq!(
+        (long_leaf.fade_in_frames, long_leaf.fade_out_frames),
+        (10, 0)
+    );
+    assert!(long_leaf.loudness_normalization.is_none());
+    assert_eq!(opacity_keyframes(long_leaf), [(0, 0.0), (70, 0.7)]);
+    for frame in 0..70 {
+        assert!(
+            (long_leaf.opacity_at(frame) - original_long.opacity_at(frame)).abs() < 1e-9,
+            "frame {frame}"
+        );
+    }
+
+    let (_, inside_leaf) = clip_by_media(&st, "asset-inside");
+    let mut expected = original_inside;
+    expected.id = inside_leaf.id.clone();
+    assert_eq!(inside_leaf, &expected);
+}
+
+#[test]
+fn dissolve_keeps_child_visual_lanes_at_the_compound_layer() {
+    let mut voice = Clip::new("voice", "asset-voice", 0, 50);
+    voice.media_type = ClipType::Audio;
+    voice.source_clip_type = ClipType::Audio;
+    let mut music = Clip::new("music", "asset-music", 0, 100);
+    music.media_type = ClipType::Audio;
+    music.source_clip_type = ClipType::Audio;
+    let mut st = state(vec![
+        video_track("top", true, vec![Clip::new("later", "asset-later", 60, 20)]),
+        video_track(
+            "background",
+            true,
+            vec![Clip::new("bg", "asset-bg", 0, 100)],
+        ),
+        audio_track("music", true, vec![music]),
+    ]);
+    let ids = SeqIdGen::new("dissolve-");
+    let compound = create_compound(
+        &mut st,
+        &ids,
+        vec![
+            video_track(
+                "child-title",
+                true,
+                vec![Clip::new("title", "asset-title", 0, 50)],
+            ),
+            video_track(
+                "child-broll",
+                true,
+                vec![Clip::new("broll", "asset-broll", 0, 50)],
+            ),
+            audio_track("child-voice", true, vec![voice]),
+        ],
+        50,
+    );
+
+    apply(
+        &mut st,
+        EditCommand::DissolveNestedSequence { clip_id: compound },
+        &ids,
+    )
+    .unwrap();
+
+    // Visual track 0 draws on top: the child lanes keep their order at the
+    // compound's layer, above the background the compound covered.
+    let (title_track, _) = clip_by_media(&st, "asset-title");
+    let (broll_track, _) = clip_by_media(&st, "asset-broll");
+    let (background_track, _) = clip_by_media(&st, "asset-bg");
+    let (later_track, _) = clip_by_media(&st, "asset-later");
+    let (voice_track, _) = clip_by_media(&st, "asset-voice");
+    let (music_track, _) = clip_by_media(&st, "asset-music");
+    assert_eq!(title_track, 0);
+    assert_eq!(
+        later_track, title_track,
+        "the top lane reuses the compound's track"
+    );
+    assert_eq!(broll_track, 1);
+    assert_eq!(background_track, 2);
+    assert_eq!(st.timeline.tracks[voice_track].kind, ClipType::Audio);
+    assert!(music_track < voice_track);
+    assert_eq!(
+        st.timeline
+            .tracks
+            .iter()
+            .map(|track| track.kind)
+            .collect::<Vec<_>>(),
+        [
+            ClipType::Video,
+            ClipType::Video,
+            ClipType::Video,
+            ClipType::Audio,
+            ClipType::Audio
+        ]
+    );
+}
+
+#[test]
+fn dissolve_carries_the_compound_track_visibility_and_mute_to_its_lanes() {
+    let mut audio = Clip::new("audio", "asset-audio", 0, 20);
+    audio.media_type = ClipType::Audio;
+    audio.source_clip_type = ClipType::Audio;
+    let mut top = video_track("top", true, vec![]);
+    top.hidden = true;
+    top.muted = true;
+    let mut st = state(vec![top]);
+    let ids = SeqIdGen::new("dissolve-");
+    let compound = create_compound(
+        &mut st,
+        &ids,
+        vec![
+            video_track(
+                "child-video",
+                true,
+                vec![Clip::new("video", "asset-video", 0, 20)],
+            ),
+            audio_track("child-audio", true, vec![audio]),
+        ],
+        20,
+    );
+
+    apply(
+        &mut st,
+        EditCommand::DissolveNestedSequence { clip_id: compound },
+        &ids,
+    )
+    .unwrap();
+
+    let (video_track_index, _) = clip_by_media(&st, "asset-video");
+    let (audio_track_index, _) = clip_by_media(&st, "asset-audio");
+    let video_lane = &st.timeline.tracks[video_track_index];
+    let audio_lane = &st.timeline.tracks[audio_track_index];
+    assert!(video_lane.hidden && video_lane.muted);
+    assert!(audio_lane.muted && !audio_lane.hidden);
 }
 
 #[test]

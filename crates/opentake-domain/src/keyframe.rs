@@ -289,12 +289,48 @@ impl<V: KeyframeInterpolatable + Clone> KeyframeTrack<V> {
             }
         }
     }
+
+    /// Drop everything before clip-relative `offset` and make `offset` the new
+    /// frame 0, for a clip whose head was cut by `offset` frames. A boundary
+    /// keyframe sampled at `offset` keeps the curve continuous and carries the
+    /// interpolation of the segment it cuts, so linear and hold spans keep
+    /// their shape. `None` for an inactive track. 1:1 port of upstream
+    /// `KeyframeTrack.rebased(by:fallback:)`.
+    pub fn rebased(&self, offset: i32, fallback: V) -> Option<Self> {
+        if !self.is_active() {
+            return None;
+        }
+        let boundary = self.sample(offset, fallback);
+        let mut keyframes: Vec<Keyframe<V>> = self
+            .keyframes
+            .iter()
+            .filter(|k| k.frame >= offset)
+            .map(|k| {
+                Keyframe::with_interpolation(
+                    k.frame.saturating_sub(offset),
+                    k.value.clone(),
+                    k.interpolation_out,
+                )
+            })
+            .collect();
+        if keyframes.first().map(|k| k.frame) != Some(0) {
+            let interpolation = self
+                .keyframes
+                .iter()
+                .rev()
+                .find(|k| k.frame < offset)
+                .map_or(Interpolation::Smooth, |k| k.interpolation_out);
+            keyframes.insert(0, Keyframe::with_interpolation(0, boundary, interpolation));
+        }
+        Some(KeyframeTrack::from_keyframes(keyframes))
+    }
 }
 
 /// Splits a keyframe track at `split_offset` (clip-relative), keeping both halves
 /// continuous by inserting a boundary keyframe sampled at the cut. Returns the
 /// track unchanged on both sides when it is empty/inactive. Model invariant
-/// lifted verbatim from upstream `EditorViewModel.splitKeyframeTrack`.
+/// lifted from upstream `EditorViewModel.splitKeyframeTrack`, whose right half
+/// is [`KeyframeTrack::rebased`].
 pub fn split_keyframe_track<V: KeyframeInterpolatable + Clone>(
     track: Option<&KeyframeTrack<V>>,
     split_offset: i32,
@@ -303,7 +339,7 @@ pub fn split_keyframe_track<V: KeyframeInterpolatable + Clone>(
     let Some(track) = track.filter(|t| t.is_active()) else {
         return (track.cloned(), track.cloned());
     };
-    let boundary = track.sample(split_offset, fallback);
+    let boundary = track.sample(split_offset, fallback.clone());
 
     let mut left_kfs: Vec<Keyframe<V>> = track
         .keyframes
@@ -312,23 +348,7 @@ pub fn split_keyframe_track<V: KeyframeInterpolatable + Clone>(
         .cloned()
         .collect();
     if left_kfs.last().map(|k| k.frame) != Some(split_offset) {
-        left_kfs.push(Keyframe::new(split_offset, boundary.clone()));
-    }
-
-    let mut right_kfs: Vec<Keyframe<V>> = track
-        .keyframes
-        .iter()
-        .filter(|k| k.frame >= split_offset)
-        .map(|k| {
-            Keyframe::with_interpolation(
-                k.frame - split_offset,
-                k.value.clone(),
-                k.interpolation_out,
-            )
-        })
-        .collect();
-    if right_kfs.first().map(|k| k.frame) != Some(0) {
-        right_kfs.insert(0, Keyframe::new(0, boundary));
+        left_kfs.push(Keyframe::new(split_offset, boundary));
     }
 
     (
@@ -337,11 +357,7 @@ pub fn split_keyframe_track<V: KeyframeInterpolatable + Clone>(
         } else {
             Some(KeyframeTrack::from_keyframes(left_kfs))
         },
-        if right_kfs.is_empty() {
-            None
-        } else {
-            Some(KeyframeTrack::from_keyframes(right_kfs))
-        },
+        track.rebased(split_offset, fallback),
     )
 }
 
@@ -688,6 +704,87 @@ mod tests {
         assert!((mid - 0.5).abs() < 1e-6, "{mid}");
         approx(t.sample(i32::MIN, 9.9), 0.0);
         approx(t.sample(i32::MAX, 9.9), 1.0);
+    }
+
+    #[test]
+    fn rebased_boundary_carries_the_cut_segments_interpolation() {
+        let t = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+            Keyframe::with_interpolation(100, 1.0, Interpolation::Linear),
+        ]);
+        let rebased = t.rebased(20, 9.9).unwrap();
+        assert_eq!(
+            rebased
+                .keyframes
+                .iter()
+                .map(|k| (k.frame, k.interpolation_out))
+                .collect::<Vec<_>>(),
+            [(0, Interpolation::Linear), (80, Interpolation::Linear)]
+        );
+        approx(rebased.keyframes[0].value, 0.2);
+        // The linear ramp keeps its shape: original frame 50 == rebased 30.
+        approx(rebased.sample(30, 9.9), t.sample(50, 9.9));
+
+        let hold = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::with_interpolation(0, 0.3, Interpolation::Hold),
+            Keyframe::new(10, 1.0),
+        ])
+        .rebased(4, 9.9)
+        .unwrap();
+        assert_eq!(hold.keyframes[0].interpolation_out, Interpolation::Hold);
+        approx(hold.sample(5, 9.9), 0.3);
+    }
+
+    #[test]
+    fn rebased_keeps_a_keyframe_on_the_offset_and_defaults_before_the_track() {
+        let t = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::new(0, 0.0),
+            Keyframe::with_interpolation(20, 0.5, Interpolation::Hold),
+            Keyframe::new(40, 1.0),
+        ]);
+        let on_keyframe = t.rebased(20, 9.9).unwrap();
+        assert_eq!(
+            on_keyframe
+                .keyframes
+                .iter()
+                .map(|k| (k.frame, k.value, k.interpolation_out))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0.5, Interpolation::Hold),
+                (20, 1.0, Interpolation::Smooth)
+            ]
+        );
+
+        let late = KeyframeTrack::<f64>::from_keyframes(vec![Keyframe::with_interpolation(
+            50,
+            0.7,
+            Interpolation::Linear,
+        )])
+        .rebased(20, 9.9)
+        .unwrap();
+        assert_eq!(
+            late.keyframes
+                .iter()
+                .map(|k| (k.frame, k.value, k.interpolation_out))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0.7, Interpolation::Smooth),
+                (30, 0.7, Interpolation::Linear)
+            ]
+        );
+        assert!(KeyframeTrack::<f64>::new().rebased(20, 9.9).is_none());
+    }
+
+    #[test]
+    fn split_right_half_keeps_the_cut_segments_interpolation() {
+        let track = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+            Keyframe::with_interpolation(10, 1.0, Interpolation::Linear),
+        ]);
+        let (_, right) = split_keyframe_track(Some(&track), 5, 0.0);
+        let right = right.unwrap();
+        assert_eq!(right.keyframes[0].interpolation_out, Interpolation::Linear);
+        approx(right.sample(2, 9.9), track.sample(7, 9.9));
     }
 
     #[test]

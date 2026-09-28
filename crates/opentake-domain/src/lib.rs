@@ -70,7 +70,7 @@ pub use signal::{
     ContextSignal, EditingSkeleton, EditingStage, StageGuidance, TrackHint, TrackRole,
     TrackRoleAssignment, VideoType,
 };
-pub use split::split_clip;
+pub use split::{split_clip, trim_clip_to_window};
 pub use stabilization::{StabilizationKeyframe, StabilizationTrack, StabilizationTransform};
 pub use subtitle_export::{collect_caption_cues, export_srt, export_vtt, SubtitleCue};
 pub use text::{Fill, Rgba, Shadow, TextAlignment, TextLayout, TextStyle};
