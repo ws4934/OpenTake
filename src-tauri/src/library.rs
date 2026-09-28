@@ -2048,7 +2048,7 @@ mod tests {
                     },
                 )
             });
-            let staging_path = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let staging_path = entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             assert!(staging_path.exists());
             let save_destination = destination.clone();
             let saving = scope.spawn(move || {
@@ -2056,7 +2056,10 @@ mod tests {
                     .send(core_ref.save_project(Some(save_destination)).is_ok())
                     .unwrap();
             });
-            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));
+            // The import stays paused until the save has answered, so a save
+            // that waited for the import could never finish in time: the
+            // generous bound only absorbs a slow runner.
+            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_secs(30));
             resume_tx.send(()).unwrap();
             saving.join().unwrap();
             let error = importing
