@@ -456,6 +456,23 @@ export function buildMediaInsertPlan(
   );
 }
 
+/** Ripple-insert a media drop (⌘/Ctrl held) into the timeline shown in the
+ *  editor: the open nested sequence, else the root. `preferredTrackIndex` comes
+ *  from the drop ghost, which resolves tracks on that same timeline, and the
+ *  insert is scoped to it, so the plan (track, duration at its frame rate, fit
+ *  to its canvas) is built from it too. Returns false when it has no compatible
+ *  track, so the caller falls back to the overwrite add. */
+export function rippleInsertMediaAt(
+  item: MediaItem,
+  atFrame: number,
+  preferredTrackIndex: number | null,
+): boolean {
+  const plan = buildMediaInsertPlan(currentTimeline(), item, atFrame, preferredTrackIndex);
+  if (!plan) return false;
+  runTimelineEdit(insertClips(plan.trackIndex, plan.atFrame, plan.entries));
+  return true;
+}
+
 export async function moveClips(moves: ClipMoveReq[]) {
   if (moves.length === 0) return;
   await applyAndRefresh({ type: "moveClips", moves });

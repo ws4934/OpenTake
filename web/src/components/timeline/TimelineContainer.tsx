@@ -2400,18 +2400,7 @@ export function TimelineContainer() {
         !momentRange &&
         plan.trackIndex !== null
       ) {
-        const insertPlan = edit.buildMediaInsertPlan(
-          useProjectStore.getState().timeline,
-          item,
-          plan.startFrame,
-          plan.trackIndex,
-        );
-        if (insertPlan) {
-          edit.runTimelineEdit(
-            edit.insertClips(insertPlan.trackIndex, insertPlan.atFrame, insertPlan.entries),
-          );
-          return;
-        }
+        if (edit.rippleInsertMediaAt(item, plan.startFrame, plan.trackIndex)) return;
       }
       if (plan) {
         const preferredTrackIndex = plan.newTrackIndex !== null ? null : plan.trackIndex;
