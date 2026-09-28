@@ -917,4 +917,120 @@ describe("Inspector completion surface", () => {
       }
     });
   });
+  describe("async section tasks follow their own target", () => {
+    const audioClip = (overrides: Partial<Clip> = {}) =>
+      visualClip({ id: "clip-a", mediaRef: "mix-a", ...overrides });
+
+    function setMedia(...ids: string[]) {
+      useMediaStore.setState({
+        items: ids.map((id) => ({ id, name: `${id}.wav`, type: "video" as const, duration: 5, hasAudio: true })),
+        folders: [],
+        importing: false,
+        error: null,
+      });
+    }
+
+    async function renderAudioTab(clips: Clip[], selected: string) {
+      useProjectStore.setState({
+        timeline: { ...timelineWith(clips[0]!), tracks: [{ ...timelineWith(clips[0]!).tracks[0]!, clips }] },
+        projectPath: "/tmp/demo.opentake",
+      });
+      useEditorUiStore.setState({ selectedClipIds: new Set([selected]), inspectorTab: "audio" });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<Inspector />));
+      return { container, root };
+    }
+
+    const buttonIn = (container: HTMLElement, section: string, label: string) =>
+      [...(container.querySelector(`[data-testid="${section}"]`)?.querySelectorAll("button") ?? [])].find(
+        (button) => button.textContent === label,
+      );
+
+    it("drops a stem result that finishes after the clip's source media changed", async () => {
+      setMedia("mix-a", "mix-b");
+      const listen = vi.spyOn(api, "onStemSeparationProgress").mockResolvedValue(() => {});
+      let finish!: (result: api.StemSeparationResult) => void;
+      const separate = vi.spyOn(api, "separateAudioStems").mockImplementation(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const { container, root } = await renderAudioTab([audioClip()], "clip-a");
+      await act(async () => {
+        buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(separate).toHaveBeenCalledWith("mix-a", "local", null, null, false);
+
+      // Swap Media keeps the clip (and this section instance) but changes its source.
+      await act(async () =>
+        useProjectStore.setState({ timeline: timelineWith(audioClip({ mediaRef: "mix-b" })) }),
+      );
+      await act(async () => {
+        finish({
+          vocalsAssetId: "vocals-a",
+          accompanimentAssetId: "music-a",
+          sourceSha256: "a".repeat(64),
+          execution: "local:opentake-center-v1",
+          modelSha256: "b".repeat(64),
+          vocalSdrImprovementDb: 60,
+        });
+        await Promise.resolve();
+      });
+
+      expect(container.querySelector('[data-testid="stem-separation-result"]')).toBeNull();
+      expect(buttonIn(container, "stem-separation-section", "导入为两条对齐音轨")).toBeUndefined();
+      expect(buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.disabled).toBe(false);
+
+      listen.mockRestore();
+      separate.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("keeps a stem result and a loudness failure on the clip that started them", async () => {
+      setMedia("mix-a", "mix-b");
+      const other = audioClip({ id: "clip-b", mediaRef: "mix-b", startFrame: 90 });
+      vi.spyOn(api, "onStemSeparationProgress").mockResolvedValue(() => {});
+      vi.spyOn(api, "onLoudnessProgress").mockResolvedValue(() => {});
+      let finishStems!: (result: api.StemSeparationResult) => void;
+      vi.spyOn(api, "separateAudioStems").mockImplementation(
+        () => new Promise((resolve) => { finishStems = resolve; }),
+      );
+      let failLoudness!: (reason: Error) => void;
+      vi.spyOn(edit, "analyzeAndApplyLoudness").mockImplementation(
+        () => new Promise((_resolve, reject) => { failLoudness = reject; }),
+      );
+      const { container, root } = await renderAudioTab([audioClip(), other], "clip-a");
+      await act(async () => {
+        buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.click();
+        buttonIn(container, "loudness-section", "分析并应用")?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      await act(async () => useEditorUiStore.setState({ selectedClipIds: new Set([other.id]) }));
+      await act(async () => {
+        finishStems({
+          vocalsAssetId: "vocals-a",
+          accompanimentAssetId: "music-a",
+          sourceSha256: "a".repeat(64),
+          execution: "local:opentake-center-v1",
+          modelSha256: "b".repeat(64),
+          vocalSdrImprovementDb: 60,
+        });
+        failLoudness(new Error("decoder failed"));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(container.querySelector('[data-testid="stem-separation-result"]')).toBeNull();
+      expect(container.querySelector('[data-testid="loudness-section"] [role="alert"]')).toBeNull();
+      // The first clip's failed normalization is still reported, as a toast.
+      expect(useEditorUiStore.getState().toast?.message).toContain("decoder failed");
+
+      vi.restoreAllMocks();
+      await act(async () => root.unmount());
+    });
+  });
 });

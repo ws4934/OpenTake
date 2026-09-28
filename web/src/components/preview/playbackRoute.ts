@@ -135,3 +135,41 @@ export function resolveTimelinePlaybackRoute(
   }
   return { kind: "rust", reasons: [] };
 }
+
+export interface TimelinePlaybackGateInput {
+  /** The timeline shown in the editor: the open nested sequence, else the root. */
+  timeline: Timeline;
+  /** A nested sequence is open; the native engine only plays the root timeline. */
+  nested: boolean;
+  /** `useRustPlaybackCapability`: until the probe answers, the desktop shell is
+   *  assumed to ship the engine. */
+  capability: { checked: boolean; available: boolean };
+  isTauri: boolean;
+  /** Persisted engine preference (`rustEngineEnabled()`). */
+  rustEngineEnabled: boolean;
+  /** Runtime fallback tripped by a failed native start this session. */
+  rustEngineFailed: boolean;
+  /** WebKit failed to decode this exact project revision. */
+  forceRust: boolean;
+}
+
+export interface TimelinePlaybackGate {
+  route: TimelinePlaybackRoute;
+  /** The only obstacle is a failed native start, which the next play retries. */
+  retryableRustFailure: boolean;
+  /** Whether the transport may start timeline playback. */
+  allowed: boolean;
+}
+
+/** The single timeline-playback gate shared by the Preview play button and the
+ *  Space shortcut, so both refuse or start the same timelines. */
+export function resolveTimelinePlaybackGate(input: TimelinePlaybackGateInput): TimelinePlaybackGate {
+  const route = resolveTimelinePlaybackRoute(input.timeline, {
+    rustAvailable:
+      !input.nested && (input.capability.checked ? input.capability.available : input.isTauri),
+    rustEnabled: input.rustEngineEnabled && !input.rustEngineFailed,
+    forceRust: input.forceRust,
+  });
+  const retryableRustFailure = isRetryableRustPlaybackFailure(route, input.rustEngineFailed);
+  return { route, retryableRustFailure, allowed: route.kind !== "unsupported" || retryableRustFailure };
+}

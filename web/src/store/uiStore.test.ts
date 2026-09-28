@@ -285,3 +285,86 @@ describe("timeline playback state", () => {
     expect([...useEditorUiStore.getState().selectedMediaAssetIds]).toEqual([]);
   });
 });
+
+describe("togglePlay inside a nested sequence", () => {
+  it("rewinds from the end of the open sequence, not the root timeline", () => {
+    const nestedClip = { ...timeline.tracks[0].clips[0], id: "n1", durationFrames: 60 };
+    useProjectStore.setState({
+      timeline: {
+        ...timeline,
+        nestedSequences: [
+          {
+            id: "seq-1",
+            name: "Compound",
+            timeline: { ...timeline, tracks: [{ ...timeline.tracks[0], clips: [nestedClip] }] },
+          },
+        ],
+      },
+      timelineVersion: 2,
+    });
+    useEditorUiStore.setState({
+      activeNestedSequenceId: "seq-1",
+      currentFrame: 59,
+      activeFrame: 59,
+      isPlaying: false,
+    });
+
+    useEditorUiStore.getState().togglePlay();
+
+    expect(useEditorUiStore.getState()).toMatchObject({ isPlaying: true, currentFrame: 0, activeFrame: 0 });
+    useEditorUiStore.setState({ activeNestedSequenceId: null, isPlaying: false });
+  });
+});
+
+describe("clearing the clip selection ends crop editing", () => {
+  const region = { x: 0.1, y: 0.1, width: 0.5, height: 0.5 };
+
+  beforeEach(() => {
+    useEditorUiStore.setState({
+      selectedClipIds: new Set(["c1"]),
+      cropEditingActive: true,
+      motionTrackingSelection: { clipId: "c1", region },
+      activeNestedSequenceId: null,
+      focusedPanel: "timeline",
+      selectedGap: null,
+      selectedTimelineRange: null,
+      previewTabIds: [],
+      previewTabHistory: [],
+      previewActiveTabId: "timeline",
+      previewMediaId: null,
+    });
+  });
+
+  it.each([
+    ["focusPanel(media)", () => useEditorUiStore.getState().focusPanel("media")],
+    ["markRangeStart", () => useEditorUiStore.getState().markRangeStart(10)],
+    ["markRangeEnd", () => useEditorUiStore.getState().markRangeEnd(20)],
+    [
+      "selectGap",
+      () => useEditorUiStore.getState().selectGap({ trackIndex: 0, startFrame: 300, endFrame: 320 }),
+    ],
+    ["enterNestedSequence", () => useEditorUiStore.getState().enterNestedSequence("seq-1")],
+    ["exitNestedSequence", () => useEditorUiStore.getState().exitNestedSequence()],
+    ["openPreviewTab", () => useEditorUiStore.getState().openPreviewTab("m1")],
+    ["setPreviewMedia", () => useEditorUiStore.getState().setPreviewMedia("m1")],
+  ])("%s resets crop editing and the motion-tracking selection", (_name, clear) => {
+    clear();
+
+    const state = useEditorUiStore.getState();
+    expect(state.selectedClipIds.size).toBe(0);
+    expect(state.cropEditingActive).toBe(false);
+    expect(state.motionTrackingSelection).toBeNull();
+  });
+
+  it("keeps crop editing when the clip selection survives", () => {
+    const ui = useEditorUiStore.getState();
+    ui.focusPanel("media", true);
+    ui.focusPanel("timeline");
+    ui.selectGap(null);
+
+    const state = useEditorUiStore.getState();
+    expect(state.selectedClipIds).toEqual(new Set(["c1"]));
+    expect(state.cropEditingActive).toBe(true);
+    expect(state.motionTrackingSelection).toEqual({ clipId: "c1", region });
+  });
+});

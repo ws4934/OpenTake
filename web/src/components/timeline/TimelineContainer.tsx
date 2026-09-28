@@ -34,6 +34,7 @@ import {
   audioVolumeKfHit,
   fadeKneeHit,
   fadeFramesForDrag,
+  volumeEnvelopeFrameAt,
   type ClipHit,
   type FadeEdge,
 } from "./hitTest";
@@ -115,6 +116,9 @@ type DragState =
       clipId: string;
       fromFrame: number;
       ghostFrame: number;
+      /** Pointer-down x; the dot stays put until the drag passes the threshold. */
+      grabDocX: number;
+      moved: boolean;
       editContext: edit.ProjectEditContext;
     }
   | {
@@ -1572,6 +1576,8 @@ export function TimelineContainer() {
             clipId: kfHit.clipId,
             fromFrame: kfHit.frame,
             ghostFrame: kfHit.frame,
+            grabDocX: docX,
+            moved: false,
             editContext: edit.captureProjectEditContext(),
           };
           return;
@@ -1583,11 +1589,14 @@ export function TimelineContainer() {
       // existing dot is a no-op (the kf already exists there).
       if (e.metaKey && hit && hit.clip.mediaType === "audio") {
         const onDot = audioVolumeKfHit(timeline, docX, docY, zoomScale, trackHeights) !== null;
-        if (!onDot) {
-          const absoluteFrame = writableVolumeKeyframeAbsoluteFrame(
-            hit.clip,
-            frameAt(docX, zoomScale) - hit.clip.startFrame,
-          );
+        // Stamp at the envelope frame drawn under the cursor.
+        const relativeFrame = volumeEnvelopeFrameAt(
+          clipRect(timeline, hit.trackIndex, hit.clip, zoomScale, trackHeights),
+          hit.clip.durationFrames,
+          docX,
+        );
+        if (!onDot && relativeFrame !== null) {
+          const absoluteFrame = writableVolumeKeyframeAbsoluteFrame(hit.clip, relativeFrame);
           void edit.stampKeyframe(hit.clip.id, "volume", absoluteFrame).catch((error: unknown) => {
             const message = error instanceof Error ? error.message : String(error);
             pushToast(t("inspector.keyframes.stampFailed", { error: message }));
@@ -1762,10 +1771,13 @@ export function TimelineContainer() {
         const leadStart = d.hit.clip.startFrame;
         const probes: number[] = [];
         const probeOffsets: number[] = [];
+        // Earliest start among the dragged clips: the whole group stops there.
+        let groupStart = leadStart;
         for (const id of d.companions) {
           const loc = findClipLoc(timeline, id);
           if (!loc) continue;
           const c = timeline.tracks[loc[0]].clips[loc[1]];
+          groupStart = Math.min(groupStart, c.startFrame);
           const startOff = c.startFrame - leadStart;
           const endOff = startOff + c.durationFrames;
           // Moved absolute frame = lead's moved start + this probe's offset.
@@ -1789,9 +1801,11 @@ export function TimelineContainer() {
         } else {
           snapStateRef.current = null;
         }
-        // Clamp so the clip can't go before frame 0.
-        if (d.hit.clip.startFrame + deltaFrames < 0) {
-          deltaFrames = -d.hit.clip.startFrame;
+        // Clamp at the group floor so no dragged clip goes before frame 0 (the
+        // same floor the drop commits; upstream clamps the drag delta to
+        // -min(originalFrame) of all participants).
+        if (groupStart + deltaFrames < 0) {
+          deltaFrames = -groupStart;
           snapped = null;
           snapStateRef.current = null;
         }
@@ -1825,11 +1839,20 @@ export function TimelineContainer() {
       }
 
       if (d.kind === "audioVolumeKf") {
+        // A click on a dot is not a move: ignore jitter under the drag threshold.
+        if (!d.moved && Math.abs(docX - d.grabDocX) < LAYOUT.dragThreshold) return;
         const loc = findClipLoc(timeline, d.clipId);
         if (!loc) return;
         const clip = timeline.tracks[loc[0]].clips[loc[1]];
-        // Cursor → clip-relative frame, clamped to the clip's span.
-        let ghostFrame = frameAt(docX, zoomScale) - clip.startFrame;
+        // Cursor → the clip-relative frame whose dot is drawn under it (the
+        // envelope lives inside the trim handles), clamped to the clip's span.
+        const cursorFrame = volumeEnvelopeFrameAt(
+          clipRect(timeline, loc[0], clip, zoomScale, trackHeights),
+          clip.durationFrames,
+          docX,
+        );
+        if (cursorFrame === null) return;
+        let ghostFrame = cursorFrame;
         // Snap to the playhead (±5 frames, clip-relative) so a kf can be parked
         // exactly on the playhead for precise editing.
         const playheadRel = activeFrame - clip.startFrame;
@@ -1840,7 +1863,7 @@ export function TimelineContainer() {
           setSnapFrame(null);
         }
         ghostFrame = Math.max(0, Math.min(Math.max(0, clip.durationFrames - 1), ghostFrame));
-        dragRef.current = { ...d, ghostFrame };
+        dragRef.current = { ...d, ghostFrame, moved: true };
         forceTick((n) => n + 1);
         return;
       }
@@ -2082,7 +2105,7 @@ export function TimelineContainer() {
         // click on a dot is a no-op). The backend `moveKeyframe` is idempotent
         // for fromFrame === toFrame, but skipping the round-trip avoids an
         // unnecessary history entry.
-        if (d.ghostFrame !== d.fromFrame) {
+        if (d.moved && d.ghostFrame !== d.fromFrame) {
           const loc = findClipLoc(timeline, d.clipId);
           if (!loc) return;
           const clip = timeline.tracks[loc[0]].clips[loc[1]];

@@ -1257,6 +1257,33 @@ function EffectAmountSlider({
   );
 }
 
+/** Scope a section's async task to the target it started for (the pattern
+ *  AiEditTab follows with an AbortController). A new target or unmount
+ *  retires the running task, so its late progress, result or error never
+ *  lands on another clip or source; `beginTask()` returns the task's
+ *  `isCurrent` check. Backend work keeps running under each section's own
+ *  cancel command, and a retired task's failure is still reported through
+ *  `reportRetiredTaskFailure`. */
+function useTaskScope(target: string): () => () => boolean {
+  const generation = useRef(0);
+  useEffect(
+    () => () => {
+      generation.current += 1;
+    },
+    [target],
+  );
+  return useCallback(() => {
+    const started = ++generation.current;
+    return () => started === generation.current;
+  }, []);
+}
+
+/** A failure of a task whose section moved on is shown as a toast instead of
+ *  being dropped: it may mean an edit the user started was not applied. */
+function reportRetiredTaskFailure(section: string, message: string) {
+  useEditorUiStore.getState().pushToast(`${section}: ${message}`);
+}
+
 function LoudnessSection({ clip, t }: { clip: Clip; t: TFunction }) {
   const normalization = clip.loudnessNormalization;
   const [target, setTarget] = useState(normalization?.targetLufs ?? -16);
@@ -1273,23 +1300,28 @@ function LoudnessSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id, clip.loudnessNormalization]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const analyze = async () => {
+    const isCurrent = beginTask();
     setAnalyzing(true);
     setProgress(0);
     setError(null);
     let unlisten = () => {};
     try {
       unlisten = await api.onLoudnessProgress(clip.id, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       await edit.analyzeAndApplyLoudness(clip.id, target, ceiling);
-      setProgress(1);
+      if (isCurrent()) setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/loudness_cancelled/i.test(message)) setError(message);
+      if (/loudness_cancelled/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.loudness"), message);
     } finally {
       unlisten();
-      setAnalyzing(false);
+      if (isCurrent()) setAnalyzing(false);
     }
   };
 
@@ -1372,23 +1404,28 @@ function DenoiseSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id, clip.audioDenoise]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const apply = async () => {
+    const isCurrent = beginTask();
     setApplying(true);
     setProgress(0);
     setError(null);
     let unlisten = () => {};
     try {
       unlisten = await api.onDenoiseProgress(clip.id, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       await edit.prepareAndApplyAudioDenoise(clip.id, mode, strength, previewEnabled);
-      setProgress(1);
+      if (isCurrent()) setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/denoise_cancelled/i.test(message)) setError(message);
+      if (/denoise_cancelled/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.denoise"), message);
     } finally {
       unlisten();
-      setApplying(false);
+      if (isCurrent()) setApplying(false);
     }
   };
 
@@ -1503,7 +1540,10 @@ function StemSeparationSection({
     setError(null);
   }, [sourceAssetId]);
 
+  const beginTask = useTaskScope(sourceAssetId);
+
   const separate = async () => {
+    const isCurrent = beginTask();
     setRunning(true);
     setProgress(0);
     setResult(null);
@@ -1511,7 +1551,7 @@ function StemSeparationSection({
     let unlisten = () => {};
     try {
       unlisten = await api.onStemSeparationProgress(sourceAssetId, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       const separated = await api.separateAudioStems(
         sourceAssetId,
@@ -1520,23 +1560,23 @@ function StemSeparationSection({
         execution === "hosted" ? model : null,
         execution === "hosted" && uploadConfirmed,
       );
+      if (!isCurrent()) return;
       setResult(separated);
       setImported(false);
       setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/stem_separation_cancelled/i.test(message)) {
-        if (/stem_hosted_privacy_confirmation_required/i.test(message)) {
-          setError(t("inspector.stems.error.confirm"));
-        } else if (/stem_hosted_provider_not_configured/i.test(message)) {
-          setError(t("inspector.stems.error.notConfigured"));
-        } else {
-          setError(message);
-        }
-      }
+      if (/stem_separation_cancelled/i.test(message)) return;
+      const shown = /stem_hosted_privacy_confirmation_required/i.test(message)
+        ? t("inspector.stems.error.confirm")
+        : /stem_hosted_provider_not_configured/i.test(message)
+          ? t("inspector.stems.error.notConfigured")
+          : message;
+      if (isCurrent()) setError(shown);
+      else reportRetiredTaskFailure(t("inspector.section.stems"), shown);
     } finally {
       unlisten();
-      setRunning(false);
+      if (isCurrent()) setRunning(false);
     }
   };
 
@@ -1659,16 +1699,21 @@ function StabilizationSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const analyze = async () => {
+    const isCurrent = beginTask();
     setAnalyzing(true);
     setError(null);
     try {
       await edit.analyzeAndApplyStabilization(clip.id);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/\bcancell?ed\b/i.test(message)) setError(message);
+      if (/\bcancell?ed\b/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.stabilization"), message);
     } finally {
-      setAnalyzing(false);
+      if (isCurrent()) setAnalyzing(false);
     }
   };
 

@@ -17,7 +17,8 @@ import { ZOOM } from "../lib/theme";
 import type { AppView } from "../store/uiStore";
 import { isTauri } from "../lib/api";
 import { isTextEntry } from "../lib/textEntry";
-import { resolveTimelinePlaybackRoute } from "../components/preview/playbackRoute";
+import { resolveTimelinePlaybackGate } from "../components/preview/playbackRoute";
+import { lastRustPlaybackCapability } from "../components/preview/previewEngine";
 import { rustEngineEnabled } from "../components/preview/rustEngine";
 import { runApplicationMenuCommand } from "../components/shell/ViewMenu";
 import {
@@ -431,14 +432,21 @@ export function useKeyboardShortcuts() {
       if (blockDuringUpdateInstallation(e)) return;
       const ui = useEditorUiStore.getState();
       if (resolveDocumentedShortcut(e, context())?.type !== "transport") return;
-      const timeline = useProjectStore.getState().timeline;
-      const route = resolveTimelinePlaybackRoute(timeline, {
-        rustAvailable: isTauri,
-        rustEnabled: rustEngineEnabled(),
+      // The same gate the Preview play button uses, over the timeline it shows.
+      const project = useProjectStore.getState();
+      const gate = resolveTimelinePlaybackGate({
+        timeline: edit.currentTimeline(),
+        nested: Boolean(ui.activeNestedSequenceId),
+        capability: lastRustPlaybackCapability(),
+        isTauri,
+        rustEngineEnabled: rustEngineEnabled(),
+        rustEngineFailed: ui.rustEngineFailed,
+        forceRust:
+          ui.webkitPlaybackFailedRevision === `${project.projectEpoch}:${project.timelineVersion}`,
       });
       handleTransportSpaceKeyDown(e, {
         ...ui,
-        timelinePlaybackAllowed: route.kind !== "unsupported",
+        timelinePlaybackAllowed: gate.allowed,
       });
     };
 

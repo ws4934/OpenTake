@@ -640,11 +640,14 @@ describe("WebKit playback transport", () => {
       currentTime: 0,
       muted: false,
       volume: 1,
+      isConnected: false,
       get paused() {
         return paused;
       },
       play,
       pause,
+      load: vi.fn(),
+      removeAttribute: vi.fn(),
     } as unknown as HTMLMediaElement;
     const rafCallbacks = new Map<number, FrameRequestCallback>();
     let nextRafId = 1;
@@ -698,6 +701,46 @@ describe("WebKit playback transport", () => {
 
     await unmountPlaybackHook(root);
     previewEngine.previewElements.remove(key);
+  });
+});
+
+describe("previewElements release", () => {
+  // This suite runs without a DOM; the registry only needs the media API.
+  function mediaElement(isConnected: boolean) {
+    const attributes = new Map([["src", "asset://clip.mov"]]);
+    return {
+      isConnected,
+      pause: vi.fn(),
+      load: vi.fn(),
+      getAttribute: (name: string) => attributes.get(name) ?? null,
+      removeAttribute: (name: string) => {
+        attributes.delete(name);
+      },
+    };
+  }
+
+  it("drops a removed element's source so its decoder is freed now", async () => {
+    const video = mediaElement(false);
+    previewEngine.previewElements.set("release-key", video as unknown as HTMLMediaElement);
+
+    previewEngine.previewElements.remove("release-key");
+    await Promise.resolve();
+
+    expect(previewEngine.previewElements.get("release-key")).toBeNull();
+    expect(video.pause).toHaveBeenCalled();
+    expect(video.getAttribute("src")).toBeNull();
+    expect(video.load).toHaveBeenCalledOnce();
+  });
+
+  it("leaves an element that is still mounted alone", async () => {
+    const video = mediaElement(true);
+    previewEngine.previewElements.set("mounted-key", video as unknown as HTMLMediaElement);
+
+    previewEngine.previewElements.remove("mounted-key");
+    await Promise.resolve();
+
+    expect(video.getAttribute("src")).toBe("asset://clip.mov");
+    expect(video.load).not.toHaveBeenCalled();
   });
 });
 

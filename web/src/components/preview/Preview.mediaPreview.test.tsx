@@ -106,6 +106,21 @@ describe("MediaPreview media element ref", () => {
   );
 });
 
+describe("MediaPreview media element release", () => {
+  it.each(["audio", "video"] as const)("releases the %s element when the preview closes", async (type) => {
+    await act(async () => root.render(<Harness media={item("a", type)} />));
+    const el = container.querySelector(type)!;
+    const load = vi.spyOn(el, "load").mockImplementation(() => {});
+
+    await act(async () => root.render(<></>));
+    await act(async () => Promise.resolve());
+
+    expect(el.getAttribute("src")).toBeNull();
+    expect(load).toHaveBeenCalledOnce();
+    expect(harnessRef.current).toBeNull();
+  });
+});
+
 describe("Preview media transport", () => {
   it("toggles the current audio element after switching preview items", async () => {
     useMediaStore.setState({ items: [item("a", "audio"), item("b", "audio")] });

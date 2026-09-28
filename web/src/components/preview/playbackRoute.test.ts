@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Clip, ClipType, Timeline, Track } from "../../lib/types";
 import {
   isRetryableRustPlaybackFailure,
+  resolveTimelinePlaybackGate,
   resolveTimelinePlaybackRoute,
 } from "./playbackRoute";
 
@@ -427,5 +428,60 @@ describe("resolveTimelinePlaybackRoute", () => {
     });
     expect(disabled.kind).toBe("unsupported");
     expect(reasonCodes(disabled)).toContain("rust-disabled");
+  });
+});
+
+describe("resolveTimelinePlaybackGate", () => {
+  const text = () => clip({ id: "title", mediaType: "text", sourceClipType: "text" });
+  const gate = (overrides: Partial<Parameters<typeof resolveTimelinePlaybackGate>[0]> = {}) =>
+    resolveTimelinePlaybackGate({
+      timeline: timeline(text()),
+      nested: false,
+      capability: { checked: true, available: true },
+      isTauri: true,
+      rustEngineEnabled: true,
+      rustEngineFailed: false,
+      forceRust: false,
+      ...overrides,
+    });
+
+  it("allows compositor-only timelines on the native engine", () => {
+    expect(gate()).toMatchObject({ allowed: true, retryableRustFailure: false, route: { kind: "rust" } });
+  });
+
+  it("refuses compositor-only content inside a nested sequence", () => {
+    expect(gate({ nested: true })).toMatchObject({
+      allowed: false,
+      route: { kind: "unsupported", reasons: [{ code: "rust-unavailable" }] },
+    });
+    // Plain video inside the nested sequence still plays on WebKit.
+    expect(gate({ nested: true, timeline: timeline(clip()) })).toMatchObject({
+      allowed: true,
+      route: { kind: "webkit" },
+    });
+  });
+
+  it("refuses compositor-only content once the capability probe finds no engine", () => {
+    expect(gate({ capability: { checked: true, available: false } })).toMatchObject({
+      allowed: false,
+      route: { kind: "unsupported", reasons: [{ code: "rust-unavailable" }] },
+    });
+    // Before the probe answers, the desktop shell is assumed to have the engine.
+    expect(gate({ capability: { checked: false, available: false } })).toMatchObject({ allowed: true });
+    expect(
+      gate({ capability: { checked: false, available: false }, isTauri: false }),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it("lets the next play retry a failed native start but not a disabled engine", () => {
+    expect(gate({ rustEngineFailed: true })).toMatchObject({
+      allowed: true,
+      retryableRustFailure: true,
+      route: { kind: "unsupported", reasons: [{ code: "rust-disabled" }] },
+    });
+    expect(gate({ rustEngineEnabled: false })).toMatchObject({
+      allowed: false,
+      retryableRustFailure: false,
+    });
   });
 });

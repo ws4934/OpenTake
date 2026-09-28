@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { trackY } from "../../lib/geometry";
+import { clipRect, trackY } from "../../lib/geometry";
 import type { Clip, Timeline, Track } from "../../lib/types";
-import { audioVolumeKfHit, clipsInRect, fadeFramesForDrag, fadeKneeHit, hitTestClip } from "./hitTest";
+import {
+  audioVolumeKfHit,
+  clipsInRect,
+  fadeFramesForDrag,
+  fadeKneeHit,
+  hitTestClip,
+  volumeEnvelopeFrameAt,
+  volumeEnvelopeMapping,
+} from "./hitTest";
 
 function clip(id: string, overrides: Partial<Clip> = {}): Clip {
   return {
@@ -191,5 +199,39 @@ describe("fade knee drag math", () => {
 
     expect(fadeFramesForDrag(c, "right", 10, 60, 55)).toBe(15);
     expect(fadeFramesForDrag(c, "right", 10, 60, 80)).toBe(0);
+  });
+});
+
+describe("volume envelope mapping", () => {
+  it("maps the cursor back to the frame whose dot is drawn under it at any zoom", () => {
+    for (const pixelsPerFrame of [0.5, 1, 4, 20]) {
+      const audio = clip("a", { mediaType: "audio", startFrame: 100, durationFrames: 120 });
+      const rect = clipRect(timeline([track("a1", false, [audio])]), 0, audio, pixelsPerFrame, {});
+      const mapping = volumeEnvelopeMapping(rect, audio.durationFrames)!;
+      for (let docX = mapping.baseX; docX <= mapping.baseX + 119 * mapping.pixelsPerFrame; docX += 0.37) {
+        const frame = volumeEnvelopeFrameAt(rect, audio.durationFrames, docX)!;
+        const drawnX = mapping.baseX + frame * mapping.pixelsPerFrame;
+        expect(Math.abs(drawnX - docX), `zoom ${pixelsPerFrame} x ${docX}`).toBeLessThan(
+          mapping.pixelsPerFrame,
+        );
+      }
+    }
+  });
+
+  it("hit-tests dots with the same mapping", () => {
+    const audio = clip("a", {
+      mediaType: "audio",
+      startFrame: 100,
+      durationFrames: 120,
+      volumeTrack: { keyframes: [{ frame: 60, value: 0.5, interpolationOut: "linear" }] },
+    });
+    const tl = timeline([track("a1", false, [audio])]);
+    const rect = clipRect(tl, 0, audio, 2, {});
+    const mapping = volumeEnvelopeMapping(rect, audio.durationFrames)!;
+    const y = rect.y + 16 + (rect.height - 16) * 0.5;
+    expect(audioVolumeKfHit(tl, mapping.baseX + 60 * mapping.pixelsPerFrame, y, 2, {})).toEqual({
+      clipId: "a",
+      frame: 60,
+    });
   });
 });

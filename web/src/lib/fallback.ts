@@ -17,6 +17,7 @@ import type {
   Track,
   Transform,
 } from "./types";
+import { roundHalfAwayFromZero } from "./rounding";
 
 function defaultTransform() {
   return {
@@ -160,7 +161,7 @@ function checkedI32Add(left: number, right: number): number | null {
 
 function checkedScaledFrame(value: number, speed: number): number | null {
   if (!isI32(value) || !Number.isFinite(speed) || speed <= 0) return null;
-  const scaled = Math.round(value * speed);
+  const scaled = roundHalfAwayFromZero(value * speed);
   return isI32(scaled) ? scaled : null;
 }
 
@@ -187,7 +188,7 @@ function checkedFrameEnd(
   }
   const endFrame = startFrame + durationFrames;
   const rawSourceExtent = durationFrames + trimStartFrame + trimEndFrame;
-  const consumed = Math.round(durationFrames * speed);
+  const consumed = roundHalfAwayFromZero(durationFrames * speed);
   const sourceExtent = trimStartFrame + consumed + trimEndFrame;
   const trimStartExtent = trimStartFrame + consumed;
   const trimEndExtent = trimEndFrame + consumed;
@@ -241,12 +242,12 @@ function settingsFrameProjectionIsSafe(target: Timeline, fps: number): boolean {
     for (const clip of ordered) {
       const sourceEnd = checkedClipEnd(clip);
       if (sourceEnd === null) return false;
-      const scaledStart = Math.round(clip.startFrame * scale);
-      const scaledEnd = Math.round(sourceEnd * scale);
+      const scaledStart = roundHalfAwayFromZero(clip.startFrame * scale);
+      const scaledEnd = roundHalfAwayFromZero(sourceEnd * scale);
       const startFrame = Math.max(scaledStart, previousEnd ?? scaledStart);
       const durationFrames = Math.max(1, scaledEnd - startFrame);
-      const trimStartFrame = Math.round(clip.trimStartFrame * scale);
-      const trimEndFrame = Math.round(clip.trimEndFrame * scale);
+      const trimStartFrame = roundHalfAwayFromZero(clip.trimStartFrame * scale);
+      const trimEndFrame = roundHalfAwayFromZero(clip.trimEndFrame * scale);
       const endFrame = checkedFrameEnd(
         startFrame,
         durationFrames,
@@ -492,7 +493,7 @@ function rescaleClipKeyframes(clip: Clip, previousDuration: number): void {
     if (!track) return;
     const seen = new Set<number>();
     track.keyframes = track.keyframes.reverse().filter((keyframe) => {
-      keyframe.frame = Math.round(keyframe.frame * scale);
+      keyframe.frame = roundHalfAwayFromZero(keyframe.frame * scale);
       if (keyframe.frame < 0 || keyframe.frame > clip.durationFrames || seen.has(keyframe.frame)) return false;
       seen.add(keyframe.frame);
       return true;
@@ -933,12 +934,12 @@ export function createFallbackStore(initialTimeline?: Timeline) {
                   let previousEnd: number | undefined;
                   for (const clip of ordered) {
                     const sourceEnd = checkedClipEnd(clip)!;
-                    const start = Math.round(clip.startFrame * scale);
-                    const end = Math.round(sourceEnd * scale);
+                    const start = roundHalfAwayFromZero(clip.startFrame * scale);
+                    const end = roundHalfAwayFromZero(sourceEnd * scale);
                     clip.startFrame = Math.max(start, previousEnd ?? start);
                     clip.durationFrames = Math.max(1, end - clip.startFrame);
-                    clip.trimStartFrame = Math.round(clip.trimStartFrame * scale);
-                    clip.trimEndFrame = Math.round(clip.trimEndFrame * scale);
+                    clip.trimStartFrame = roundHalfAwayFromZero(clip.trimStartFrame * scale);
+                    clip.trimEndFrame = roundHalfAwayFromZero(clip.trimEndFrame * scale);
                     previousEnd = checkedClipEnd(clip)!;
                   }
                 }
@@ -1736,7 +1737,7 @@ export function createFallbackStore(initialTimeline?: Timeline) {
             if (clip.speed === cmd.speed) continue;
             const oldDuration = clip.durationFrames;
             const oldEnd = clip.startFrame + oldDuration;
-            const duration = Math.max(1, Math.round(oldDuration * clip.speed / cmd.speed));
+            const duration = Math.max(1, roundHalfAwayFromZero(oldDuration * clip.speed / cmd.speed));
             if (checkedFrameEnd(clip.startFrame, duration, clip.trimStartFrame, clip.trimEndFrame,
               cmd.speed, clip.mediaType === "image" || clip.mediaType === "text") === null) return refused();
             const moving = new Set<string>();
@@ -1794,7 +1795,7 @@ export function createFallbackStore(initialTimeline?: Timeline) {
             const speed = p.speed ?? c.speed;
             let durationFrames = p.durationFrames ?? c.durationFrames;
             if (p.speed !== undefined && p.durationFrames === undefined) {
-              const projectedDuration = Math.round((c.durationFrames * c.speed) / speed);
+              const projectedDuration = roundHalfAwayFromZero((c.durationFrames * c.speed) / speed);
               if (!isI32(projectedDuration) || projectedDuration < 1) {
                 return result(false, "Set Clip Property", []);
               }
@@ -2163,12 +2164,12 @@ export function createFallbackStore(initialTimeline?: Timeline) {
                 let previousEnd: number | undefined;
                 for (const clip of ordered) {
                   const sourceEnd = checkedClipEnd(clip)!;
-                  const scaledStart = Math.round(clip.startFrame * scale);
-                  const scaledEnd = Math.round(sourceEnd * scale);
+                  const scaledStart = roundHalfAwayFromZero(clip.startFrame * scale);
+                  const scaledEnd = roundHalfAwayFromZero(sourceEnd * scale);
                   clip.startFrame = Math.max(scaledStart, previousEnd ?? scaledStart);
                   clip.durationFrames = Math.max(1, scaledEnd - clip.startFrame);
-                  clip.trimStartFrame = Math.round(clip.trimStartFrame * scale);
-                  clip.trimEndFrame = Math.round(clip.trimEndFrame * scale);
+                  clip.trimStartFrame = roundHalfAwayFromZero(clip.trimStartFrame * scale);
+                  clip.trimEndFrame = roundHalfAwayFromZero(clip.trimEndFrame * scale);
                   previousEnd = checkedClipEnd(clip)!;
                 }
               }

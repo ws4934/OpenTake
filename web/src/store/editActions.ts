@@ -16,6 +16,7 @@ import { validRange, type TimelineRange } from "../lib/timelineRange";
 import { planNudge } from "../lib/timelineNudge";
 import { buildInsertPlan, type InsertPlan } from "../lib/timelineInsert";
 import { checkProjectSettings } from "../lib/projectSettings";
+import { roundHalfAwayFromZero } from "../lib/rounding";
 import { expandLinkGroup } from "../components/timeline/hitTest";
 import { useClipboardStore } from "./clipboardStore";
 import { t } from "../i18n";
@@ -1410,8 +1411,8 @@ function timelineAfterSettings(
     const clips = [...track.clips]
       .sort((left, right) => left.startFrame - right.startFrame)
       .map((clip) => {
-        const scaledStart = Math.round(clip.startFrame * scale);
-        const scaledEnd = Math.round((clip.startFrame + clip.durationFrames) * scale);
+        const scaledStart = roundHalfAwayFromZero(clip.startFrame * scale);
+        const scaledEnd = roundHalfAwayFromZero((clip.startFrame + clip.durationFrames) * scale);
         const startFrame = Math.max(scaledStart, previousEnd ?? scaledStart);
         const durationFrames = Math.max(1, scaledEnd - startFrame);
         previousEnd = startFrame + durationFrames;

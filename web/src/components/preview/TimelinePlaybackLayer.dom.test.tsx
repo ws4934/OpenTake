@@ -97,6 +97,15 @@ describe("WebKit video failure handoff", () => {
     await act(async () => video!.dispatchEvent(new Event("error")));
 
     expect(onPlaybackFailure).toHaveBeenCalledWith("main10-clip");
+
+    // Leaving the clip unmounts its element; its decoder is released right away.
+    const load = vi.spyOn(video!, "load").mockImplementation(() => {});
+    vi.spyOn(video!, "pause").mockImplementation(() => {});
+    await act(async () => useEditorUiStore.setState({ activeFrame: 7_000 }));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector("video")).toBeNull();
+    expect(video!.getAttribute("src")).toBeNull();
+    expect(load).toHaveBeenCalledOnce();
     await act(async () => root.unmount());
   });
 });

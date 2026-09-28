@@ -26,6 +26,7 @@ import { formatTimecode, totalFrames } from "../../lib/geometry";
 import { snapFrameToEdge } from "../../lib/snap";
 import { maybeSnapFeedback } from "../../lib/haptic";
 import { assetUrl } from "../../lib/asset";
+import { releaseMediaElement } from "../../lib/mediaElement";
 import {
   derivedResourceKinds,
   derivedResourceScheduler,
@@ -72,8 +73,7 @@ import {
   useNativePlaybackPublication,
 } from "./nativePlaybackSession";
 import {
-  isRetryableRustPlaybackFailure,
-  resolveTimelinePlaybackRoute,
+  resolveTimelinePlaybackGate,
   type UnsupportedPlaybackReason,
 } from "./playbackRoute";
 import { rustEngineEnabled } from "./rustEngine";
@@ -310,33 +310,31 @@ export function Preview() {
     : totalFrames(timeline);
   const activeShownFrame = previewing ? Math.round(mediaTime * fps) : activeFrame;
   const playing = previewing ? mediaPlaying : isPlaying;
-  const playbackRoute = useMemo(
+  const {
+    route: playbackRoute,
+    retryableRustFailure,
+    allowed: timelinePlaybackAllowed,
+  } = useMemo(
     () =>
-      resolveTimelinePlaybackRoute(timeline, {
-        rustAvailable:
-          !activeNestedSequenceId &&
-          (rustPlaybackCapability.checked ? rustPlaybackCapability.available : isTauri),
-        rustEnabled: rustEngineEnabled() && !rustEngineFailed,
-        forceRust:
-          webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
+      resolveTimelinePlaybackGate({
+        timeline,
+        nested: Boolean(activeNestedSequenceId),
+        capability: rustPlaybackCapability,
+        isTauri,
+        rustEngineEnabled: rustEngineEnabled(),
+        rustEngineFailed,
+        forceRust: webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
       }),
     [
       timeline,
       activeNestedSequenceId,
-      rustPlaybackCapability.checked,
-      rustPlaybackCapability.available,
+      rustPlaybackCapability,
       rustEngineFailed,
       webkitPlaybackFailedRevision,
       projectEpoch,
       timelineVersion,
     ],
   );
-  const retryableRustFailure = isRetryableRustPlaybackFailure(
-    playbackRoute,
-    rustEngineFailed,
-  );
-  const timelinePlaybackAllowed =
-    playbackRoute.kind !== "unsupported" || retryableRustFailure;
   const requestCompositeStill = useCallback(
     (request: Parameters<typeof compositeFrame>[0]) =>
       compositeFrame(
@@ -980,10 +978,15 @@ export function MediaPreview({
 
   // Stable ref callback: an inline one is a new function every render, so React
   // would detach (null) and re-attach it on each commit — pausing the element
-  // that is playing whenever onTime/onPlayingChange re-render the parent.
+  // that is playing whenever onTime/onPlayingChange re-render the parent. A
+  // detached element also gives its decoder back right away.
   const attachMedia = useCallback(
     (el: HTMLMediaElement | null) => {
-      if (!el) mediaRef.current?.pause();
+      const previous = mediaRef.current;
+      if (!el && previous) {
+        previous.pause();
+        releaseMediaElement(previous);
+      }
       mediaRef.current = el;
     },
     [mediaRef],
