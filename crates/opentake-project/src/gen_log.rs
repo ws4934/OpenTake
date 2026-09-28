@@ -14,10 +14,23 @@
 //! (`f64`) — upstream's `JSONEncoder` default `Date` encoding. The
 //! project/render layer converts to/from wall-clock time.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use opentake_domain::GenerationJobStatus;
+
+/// Pretty-printed size [`GenerationLog::enforce_retention`] keeps the log
+/// within: half the 16 MiB limit the `generation-log.json` reader enforces, so
+/// the log cannot grow into a component its own reader refuses.
+pub const GENERATION_LOG_RETENTION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Row id and model of the synthetic row that retention folds the oldest
+/// finished rows into. Carrying their billed credits keeps
+/// [`GenerationLog::total_credits`] unchanged.
+const RETENTION_SUMMARY_ID: &str = "opentake:retention-summary";
+const RETENTION_SUMMARY_MODEL: &str = "opentake:retention-summary";
 
 fn default_version() -> i64 {
     1
@@ -57,6 +70,170 @@ impl GenerationLog {
             .iter()
             .map(|e| e.cost_credits.unwrap_or(0))
             .sum()
+    }
+
+    /// Drop the cost-free intermediate lifecycle rows (`generating`,
+    /// `downloading`, `finalizing`) of every generation output whose latest
+    /// recorded status is terminal (`ready`, `failed` or `cancelled`).
+    ///
+    /// Submission (`queued`), outcome and billed rows are kept, as are the
+    /// rows of outputs that are still running and rows without a job identity
+    /// (legacy and upstream audit rows). Returns the number of removed rows.
+    pub fn compact_finished_jobs(&mut self) -> usize {
+        let finished = finished_outputs(&self.entries);
+        let intermediate = self
+            .entries
+            .iter()
+            .map(|row| {
+                row.cost_credits.is_none()
+                    && matches!(
+                        row.status,
+                        Some(
+                            GenerationJobStatus::Generating
+                                | GenerationJobStatus::Downloading
+                                | GenerationJobStatus::Finalizing
+                        )
+                    )
+                    && output_key(row).is_some_and(|key| finished.contains(&key))
+            })
+            .collect::<Vec<_>>();
+        let before = self.entries.len();
+        let mut index = 0;
+        self.entries.retain(|_| {
+            index += 1;
+            !intermediate[index - 1]
+        });
+        before - self.entries.len()
+    }
+
+    /// Keep the pretty-printed log, as it is persisted, within `max_bytes`.
+    ///
+    /// A log within the budget is left untouched. Otherwise finished jobs are
+    /// compacted first ([`Self::compact_finished_jobs`]); if the log is still
+    /// larger than half the budget, the oldest rows of finished outputs and
+    /// legacy rows are folded into one leading summary row that carries their
+    /// billed credits and latest date, so [`Self::total_credits`] does not
+    /// change. Rows of outputs that are still running are never removed.
+    /// Returns the number of removed rows.
+    pub fn enforce_retention(&mut self, max_bytes: usize) -> usize {
+        if pretty_len(self).0 <= max_bytes {
+            return 0;
+        }
+        let mut removed = self.compact_finished_jobs();
+        let target = max_bytes / 2;
+        loop {
+            let size = pretty_len(self).0;
+            if size <= target {
+                break;
+            }
+            let folded = self.fold_oldest_finished_rows(size - target);
+            if folded == 0 {
+                break;
+            }
+            removed += folded;
+        }
+        removed
+    }
+
+    /// Fold the oldest finished or legacy rows, estimated to free at least
+    /// `excess` bytes, into the leading summary row. Returns the number of
+    /// rows folded.
+    fn fold_oldest_finished_rows(&mut self, mut excess: usize) -> usize {
+        let finished = finished_outputs(&self.entries);
+        let candidates = self
+            .entries
+            .iter()
+            .map(|row| output_key(row).is_none_or(|key| finished.contains(&key)))
+            .collect::<Vec<_>>();
+        let mut summary: Option<GenerationLogEntry> = None;
+        let mut kept = Vec::with_capacity(self.entries.len());
+        let mut folded = 0;
+        for (row, candidate) in self.entries.drain(..).zip(candidates) {
+            if row.id == RETENTION_SUMMARY_ID && row.model == RETENTION_SUMMARY_MODEL {
+                summary = Some(row);
+                continue;
+            }
+            if excess == 0 || !candidate {
+                kept.push(row);
+                continue;
+            }
+            let (row_bytes, row_newlines) = pretty_len(&row);
+            // Each row sits two levels deep in the pretty-printed log: every
+            // line gains four spaces of indentation, plus a `,\n` separator.
+            excess = excess.saturating_sub(row_bytes + 4 * (row_newlines + 1) + 2);
+            let summary = summary.get_or_insert_with(|| {
+                GenerationLogEntry::new(RETENTION_SUMMARY_ID, RETENTION_SUMMARY_MODEL, None, None)
+            });
+            if let Some(credits) = row.cost_credits {
+                summary.cost_credits =
+                    Some(summary.cost_credits.unwrap_or(0).saturating_add(credits));
+            }
+            if let Some(created_at) = row.created_at {
+                summary.created_at = Some(
+                    summary
+                        .created_at
+                        .map_or(created_at, |latest| latest.max(created_at)),
+                );
+            }
+            folded += 1;
+        }
+        self.entries = summary.into_iter().chain(kept).collect();
+        folded
+    }
+}
+
+/// Outputs whose latest recorded lifecycle status is terminal.
+fn finished_outputs(entries: &[GenerationLogEntry]) -> HashSet<(&str, &str)> {
+    let mut latest = HashMap::new();
+    for row in entries {
+        if let (Some(key), Some(status)) = (output_key(row), row.status) {
+            latest.insert(key, status);
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, status)| {
+            matches!(
+                status,
+                GenerationJobStatus::Ready
+                    | GenerationJobStatus::Failed
+                    | GenerationJobStatus::Cancelled
+            )
+        })
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// The generation output a lifecycle row belongs to.
+fn output_key(row: &GenerationLogEntry) -> Option<(&str, &str)> {
+    Some((row.job_id.as_deref()?, row.asset_id.as_deref()?))
+}
+
+/// Pretty-printed byte and newline count of `value`, without allocating it.
+fn pretty_len(value: &impl Serialize) -> (usize, usize) {
+    struct Counter {
+        bytes: usize,
+        newlines: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes += buffer.len();
+            self.newlines += buffer.iter().filter(|byte| **byte == b'\n').count();
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter {
+        bytes: 0,
+        newlines: 0,
+    };
+    // Encoding these plain values cannot fail; a failure would resurface as
+    // the save's own encoding error, so measure it as empty here.
+    match serde_json::to_writer_pretty(&mut counter, value) {
+        Ok(()) => (counter.bytes, counter.newlines),
+        Err(_) => (0, 0),
     }
 }
 
@@ -306,6 +483,189 @@ mod tests {
             ],
         };
         assert_eq!(log.total_credits(), 150);
+    }
+
+    fn job_row(
+        id: usize,
+        job: &str,
+        asset: &str,
+        status: GenerationJobStatus,
+        cost_credits: Option<i64>,
+    ) -> GenerationLogEntry {
+        GenerationLogEntry::job_event(
+            format!("row-{id}"),
+            job,
+            "fal:fixture-model",
+            cost_credits,
+            "fal",
+            Some(format!("fal::{job}")),
+            asset,
+            status,
+            None,
+            None,
+            Some(800_000_000.0 + id as f64),
+            None,
+            None,
+        )
+    }
+
+    fn statuses(log: &GenerationLog) -> Vec<(Option<&str>, Option<GenerationJobStatus>)> {
+        log.entries
+            .iter()
+            .map(|row| (row.job_id.as_deref(), row.status))
+            .collect()
+    }
+
+    #[test]
+    fn compaction_keeps_submissions_outcomes_and_billed_rows_of_finished_outputs() {
+        use GenerationJobStatus as Status;
+        let mut log = GenerationLog {
+            version: 1,
+            entries: vec![
+                GenerationLogEntry::new("legacy", "veo-3", Some(40), Some(1.0)),
+                job_row(1, "done", "a", Status::Queued, None),
+                job_row(2, "done", "a", Status::Generating, None),
+                job_row(3, "done", "a", Status::Downloading, Some(7)),
+                job_row(4, "done", "a", Status::Finalizing, None),
+                job_row(5, "done", "a", Status::Ready, None),
+                job_row(6, "retry", "b", Status::Queued, None),
+                job_row(7, "retry", "b", Status::Generating, None),
+                job_row(8, "retry", "b", Status::Failed, None),
+                job_row(9, "retry", "b", Status::Queued, None),
+                job_row(10, "retry", "b", Status::Generating, None),
+            ],
+        };
+        let credits = log.total_credits();
+
+        assert_eq!(log.compact_finished_jobs(), 2);
+
+        assert_eq!(
+            statuses(&log),
+            [
+                (None, None),
+                (Some("done"), Some(Status::Queued)),
+                (Some("done"), Some(Status::Downloading)),
+                (Some("done"), Some(Status::Ready)),
+                (Some("retry"), Some(Status::Queued)),
+                (Some("retry"), Some(Status::Generating)),
+                (Some("retry"), Some(Status::Failed)),
+                (Some("retry"), Some(Status::Queued)),
+                (Some("retry"), Some(Status::Generating)),
+            ]
+        );
+        assert_eq!(log.total_credits(), credits);
+    }
+
+    #[test]
+    fn retention_leaves_a_log_within_its_budget_untouched() {
+        let mut log = GenerationLog {
+            version: 1,
+            entries: vec![
+                job_row(1, "job", "a", GenerationJobStatus::Queued, None),
+                job_row(2, "job", "a", GenerationJobStatus::Generating, None),
+                job_row(3, "job", "a", GenerationJobStatus::Ready, Some(3)),
+            ],
+        };
+        let before = log.clone();
+
+        assert_eq!(log.enforce_retention(GENERATION_LOG_RETENTION_BYTES), 0);
+        assert_eq!(log, before);
+    }
+
+    #[test]
+    fn retention_folds_the_oldest_finished_rows_and_preserves_credits() {
+        use GenerationJobStatus as Status;
+        let mut entries = vec![GenerationLogEntry::new("legacy", "veo-3", Some(40), None)];
+        for job in 0..200 {
+            let name = format!("job-{job}");
+            entries.push(job_row(job * 3, &name, "a", Status::Queued, None));
+            entries.push(job_row(job * 3 + 1, &name, "a", Status::Generating, None));
+            entries.push(job_row(job * 3 + 2, &name, "a", Status::Ready, Some(2)));
+        }
+        entries.push(job_row(9_000, "running", "r", Status::Queued, None));
+        entries.push(job_row(9_001, "running", "r", Status::Generating, None));
+        let mut log = GenerationLog {
+            version: 1,
+            entries,
+        };
+        let credits = log.total_credits();
+        let max_bytes = 32 * 1024;
+        assert!(pretty_len(&log).0 > max_bytes);
+
+        let removed = log.enforce_retention(max_bytes);
+
+        assert!(removed > 200, "compaction alone cannot fit the budget");
+        assert!(pretty_len(&log).0 <= max_bytes / 2);
+        assert_eq!(log.total_credits(), credits);
+        let summary = &log.entries[0];
+        assert_eq!(summary.id, RETENTION_SUMMARY_ID);
+        assert_eq!(summary.job_id, None);
+        // The newest finished job and the running job survive intact.
+        let last_job = log
+            .entries
+            .iter()
+            .filter(|row| row.job_id.as_deref() == Some("job-199"))
+            .map(|row| row.status)
+            .collect::<Vec<_>>();
+        assert_eq!(last_job, [Some(Status::Queued), Some(Status::Ready)]);
+        let running = log
+            .entries
+            .iter()
+            .filter(|row| row.job_id.as_deref() == Some("running"))
+            .count();
+        assert_eq!(running, 2);
+
+        // A second pass merges into the same summary instead of adding one.
+        for job in 200..400 {
+            let name = format!("job-{job}");
+            log.entries
+                .push(job_row(job * 3, &name, "a", Status::Queued, None));
+            log.entries
+                .push(job_row(job * 3 + 2, &name, "a", Status::Ready, Some(2)));
+        }
+        let credits = log.total_credits();
+        log.enforce_retention(max_bytes);
+        assert_eq!(log.total_credits(), credits);
+        assert_eq!(
+            log.entries
+                .iter()
+                .filter(|row| row.id == RETENTION_SUMMARY_ID)
+                .count(),
+            1
+        );
+        assert!(pretty_len(&log).0 <= max_bytes / 2);
+    }
+
+    #[test]
+    fn retention_never_removes_rows_of_running_outputs() {
+        let mut log = GenerationLog {
+            version: 1,
+            entries: (0..400)
+                .map(|row| {
+                    job_row(
+                        row,
+                        &format!("running-{row}"),
+                        "a",
+                        GenerationJobStatus::Generating,
+                        None,
+                    )
+                })
+                .collect(),
+        };
+        let before = log.clone();
+
+        assert_eq!(log.enforce_retention(4 * 1024), 0);
+        assert_eq!(log, before);
+    }
+
+    #[test]
+    fn retention_budget_stays_below_the_reader_limit() {
+        const {
+            assert!(
+                GENERATION_LOG_RETENTION_BYTES
+                    < crate::project_root::GENERATION_LOG_COMPONENT_MAX_BYTES
+            )
+        };
     }
 
     #[test]

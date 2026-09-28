@@ -13,7 +13,7 @@ use crate::error::{ProjectError, Result};
 
 const TIMELINE_COMPONENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MANIFEST_COMPONENT_MAX_BYTES: usize = 32 * 1024 * 1024;
-const GENERATION_LOG_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const GENERATION_LOG_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const THUMBNAIL_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PUBLISH_MARKER_FILE: &str = ".opentake-publish-marker";
 const PUBLISH_MARKER_MAX_BYTES: usize = 256;
@@ -27,6 +27,19 @@ fn project_component_max_bytes(name: &str) -> Option<usize> {
         crate::layout::THUMBNAIL_FILE => Some(THUMBNAIL_COMPONENT_MAX_BYTES),
         PUBLISH_MARKER_FILE => Some(PUBLISH_MARKER_MAX_BYTES),
         _ => None,
+    }
+}
+
+/// Refuse to produce a component its own reader would reject: the write side
+/// enforces exactly the limits [`ProjectRoot::read_optional`] applies.
+pub(crate) fn ensure_component_fits(name: &str, size: usize) -> Result<()> {
+    match project_component_max_bytes(name) {
+        Some(limit) if size > limit => Err(ProjectError::ComponentTooLarge {
+            file: name.to_string(),
+            size: size as u64,
+            limit: limit as u64,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -49,13 +62,14 @@ fn read_bounded_regular_file(
         ));
     }
     if metadata.len() > max_bytes as u64 {
-        return Err(ProjectError::io(
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{description} exceeds the {max_bytes}-byte limit"),
+        return Err(ProjectError::ComponentTooLarge {
+            file: path.file_name().map_or_else(
+                || description.to_string(),
+                |name| name.to_string_lossy().into_owned(),
             ),
-        ));
+            size: metadata.len(),
+            limit: max_bytes as u64,
+        });
     }
     read_bounded_contents(file, path, metadata.len() as usize, max_bytes, description)
 }
@@ -526,6 +540,7 @@ impl ProjectRoot {
 
     pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<()> {
         validate_leaf(name).map_err(|error| ProjectError::io(self.path.join(name), error))?;
+        ensure_component_fits(name, bytes.len())?;
         let tmp_name = unique_temp_name(name);
         let mut tmp = TransactionLeaf::create(&self.dir, &tmp_name)
             .map_err(|error| ProjectError::io(self.path.join(&tmp_name), error))?;
@@ -538,6 +553,73 @@ impl ProjectRoot {
             .sync_all()
             .map_err(|error| ProjectError::io(self.path.join(&tmp_name), error))?;
         commit_leaf(tmp, &self.dir, &self.path, name)
+    }
+
+    /// Rename one configured component aside inside the bundle, as
+    /// `<stem>.<reason>-<unix milliseconds>.<extension>`, so a fresh component
+    /// can take its place without destroying the original bytes. Only a
+    /// no-follow regular file is moved. Returns the new leaf name.
+    pub(crate) fn move_component_aside(&self, name: &str, reason: &str) -> Result<String> {
+        validate_leaf(name).map_err(|error| ProjectError::io(self.path.join(name), error))?;
+        if project_component_max_bytes(name).is_none() {
+            return Err(ProjectError::io(
+                self.path.join(name),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "project component has no configured byte limit",
+                ),
+            ));
+        }
+        let metadata = self
+            .dir
+            .symlink_metadata(name)
+            .map_err(|error| ProjectError::io(self.path.join(name), error))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ProjectError::io(
+                self.path.join(name),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "project component is not a nofollow regular file",
+                ),
+            ));
+        }
+        let (stem, extension) = name
+            .rsplit_once('.')
+            .map_or((name, None), |(stem, extension)| (stem, Some(extension)));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        for attempt in 0..1024_u32 {
+            let mut aside = format!("{stem}.{reason}-{stamp}");
+            if attempt > 0 {
+                aside.push_str(&format!("-{attempt}"));
+            }
+            if let Some(extension) = extension {
+                aside.push('.');
+                aside.push_str(extension);
+            }
+            match self.dir.symlink_metadata(&aside) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ProjectError::io(self.path.join(&aside), error)),
+            }
+            self.dir
+                .rename(name, &self.dir, &aside)
+                .map_err(|error| ProjectError::io(self.path.join(name), error))?;
+            // Moving aside destroys nothing, so the flush is best effort and its
+            // failure affects no data: if a crash reverts an unflushed rename,
+            // the next open finds the component again and moves it once more.
+            let _ = sync_directory(&self.dir);
+            return Ok(aside);
+        }
+        Err(ProjectError::io(
+            self.path.join(name),
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "no free name to move the project component aside",
+            ),
+        ))
     }
 
     /// Remove one configured optional project component through the retained
@@ -2661,9 +2743,46 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("metadata above the configured limit was accepted for {name}"),
             };
+            assert!(
+                matches!(&error, ProjectError::ComponentTooLarge { file, .. } if file == name),
+                "{error:?}"
+            );
             assert!(error.to_string().contains(name), "{error}");
             assert!(error.to_string().contains("byte limit"), "{error}");
+
+            // The write side enforces the same limit.
+            assert!(ensure_component_fits(name, max_bytes).is_ok());
+            assert!(matches!(
+                ensure_component_fits(name, max_bytes + 1),
+                Err(ProjectError::ComponentTooLarge { .. })
+            ));
         }
+    }
+
+    #[test]
+    fn atomic_writes_refuse_a_component_its_reader_would_reject() {
+        let tmp = TmpDir::new("component-write-limit");
+        let bundle = tmp.path().join("Bounded.opentake");
+        let root = ProjectRoot::create(&bundle).unwrap();
+        root.write_atomic(crate::layout::GENERATION_LOG_FILE, b"{}")
+            .unwrap();
+
+        let error = root
+            .write_atomic(
+                crate::layout::GENERATION_LOG_FILE,
+                &vec![b' '; GENERATION_LOG_COMPONENT_MAX_BYTES + 1],
+            )
+            .expect_err("an unreadable component must never be written");
+
+        assert!(
+            matches!(error, ProjectError::ComponentTooLarge { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(bundle.join(crate::layout::GENERATION_LOG_FILE)).unwrap(),
+            b"{}"
+        );
+        assert_eq!(fs::read_dir(&bundle).unwrap().count(), 1);
     }
 
     #[test]

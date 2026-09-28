@@ -825,6 +825,93 @@ fn unflushed_manifest_commit_keeps_the_finalized_output_and_its_media_leaf() {
     assert_eq!(persisted.generation_log.unwrap(), core.generation_log());
 }
 
+#[test]
+fn generation_log_retention_keeps_a_heavily_used_project_editable() {
+    use opentake_project::{GenerationLog, GenerationLogEntry, GENERATION_LOG_RETENTION_BYTES};
+    const READ_LIMIT: u64 = 16 * 1024 * 1024;
+
+    let (_temp, bundle) = saved_project();
+    // A long-lived project whose finished jobs each logged every lifecycle
+    // step: queued -> generating -> downloading -> finalizing -> ready.
+    let mut entries = Vec::new();
+    for job in 0..4_800_u64 {
+        let job_id = format!("{job:08x}-0000-4000-8000-000000000000");
+        let asset_id = format!("{job:08x}-0000-4000-8000-00000000a55e");
+        for (step, status) in [
+            GenerationJobStatus::Queued,
+            GenerationJobStatus::Generating,
+            GenerationJobStatus::Downloading,
+            GenerationJobStatus::Finalizing,
+            GenerationJobStatus::Ready,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            entries.push(GenerationLogEntry::job_event(
+                format!("{job:08x}-{step:04x}-4000-8000-000000000001"),
+                job_id.clone(),
+                "fal:fixture-upscaler",
+                (status == GenerationJobStatus::Ready).then_some(12),
+                "fal",
+                Some(format!("fal::{job_id}")),
+                asset_id.clone(),
+                status,
+                Some(step as f64 / 4.0),
+                None,
+                Some(800_000_000.0 + job as f64),
+                Some("source-image".to_string()),
+                Some("source-clip".to_string()),
+            ));
+        }
+    }
+    let log = GenerationLog {
+        version: 1,
+        entries,
+    };
+    let credits = log.total_credits();
+    let mut project = Project::open(&bundle).unwrap();
+    project.generation_log = Some(log);
+    project.save().unwrap();
+    let seeded = fs::metadata(bundle.join("generation-log.json"))
+        .unwrap()
+        .len();
+    assert!(
+        seeded > GENERATION_LOG_RETENTION_BYTES as u64 && seeded < READ_LIMIT,
+        "fixture log is {seeded} bytes"
+    );
+
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+
+    let retained = fs::metadata(bundle.join("generation-log.json"))
+        .unwrap()
+        .len();
+    assert!(
+        retained <= GENERATION_LOG_RETENTION_BYTES as u64,
+        "retained log is {retained} bytes"
+    );
+    let reopened = Project::open(&bundle).unwrap();
+    assert!(!reopened.compatibility().is_read_only());
+    let reopened_log = reopened.generation_log.unwrap();
+    assert_eq!(reopened_log, core.generation_log());
+    assert_eq!(reopened_log.total_credits(), credits);
+    assert!(reopened_log.entries.iter().any(|row| {
+        row.job_id.as_deref() == Some(job.job_id.as_str())
+            && row.status == Some(GenerationJobStatus::Queued)
+    }));
+
+    let reopened_core = AppCore::new();
+    reopened_core.open_project(&bundle).unwrap();
+    add_history_clip(&reopened_core);
+    reopened_core
+        .save_project(None)
+        .expect("the reopened project stays editable");
+}
+
 /// Acceptance timing for issue #76: with 256 MiB under `media/`, one durable
 /// transition and every concurrent session read stay under 50 ms because no
 /// media byte is copied. Ignored by default because fsync latency on shared

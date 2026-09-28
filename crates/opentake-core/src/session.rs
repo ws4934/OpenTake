@@ -43,7 +43,7 @@ use opentake_ops::command::{self, EditCommand, EditResult};
 use opentake_ops::{EditorState, IdGen};
 use opentake_project::{
     GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectError, ProjectRoot,
-    ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate,
+    ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate, GENERATION_LOG_RETENTION_BYTES,
 };
 use same_file::Handle;
 
@@ -135,7 +135,12 @@ pub(crate) struct GenerationStateCheckpoint {
     manifest: MediaManifest,
     log: GenerationLog,
     component_present: bool,
+    retention_check_at: usize,
 }
+
+/// Rows appended between two generation-log retention checks. A check
+/// measures the whole encoded log, so it does not run on every append.
+const GENERATION_LOG_RETENTION_CHECK_ROWS: usize = 1024;
 
 /// How far one generation mutation must propagate beyond the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +322,10 @@ pub struct EditorSession {
     /// every new empty project create the optional component.
     generation_log_component_present: bool,
 
+    /// Log length at which the next retention check runs (see
+    /// [`Self::enforce_generation_log_retention`]).
+    generation_log_retention_check_at: usize,
+
     /// Persisted fields this build cannot safely write back.
     compatibility: ProjectCompatibility,
 }
@@ -338,6 +347,7 @@ impl EditorSession {
             project_root: None,
             generation_log: GenerationLog::new(),
             generation_log_component_present: false,
+            generation_log_retention_check_at: 0,
             compatibility: ProjectCompatibility::default(),
         }
     }
@@ -367,6 +377,7 @@ impl EditorSession {
             project_root: Some(project_root),
             generation_log,
             generation_log_component_present,
+            generation_log_retention_check_at: 0,
             compatibility,
         })
     }
@@ -1003,6 +1014,7 @@ impl EditorSession {
             placeholder_asset_ids.push(asset_id);
         }
         self.generation_log_component_present = true;
+        self.enforce_generation_log_retention();
         Ok(GenerationJobCommit {
             job_id,
             placeholder_asset_ids,
@@ -1313,6 +1325,7 @@ impl EditorSession {
             manifest: self.state.manifest.clone(),
             log: self.generation_log.clone(),
             component_present: self.generation_log_component_present,
+            retention_check_at: self.generation_log_retention_check_at,
         }
     }
 
@@ -1320,6 +1333,22 @@ impl EditorSession {
         self.state.manifest = checkpoint.manifest;
         self.generation_log = checkpoint.log;
         self.generation_log_component_present = checkpoint.component_present;
+        self.generation_log_retention_check_at = checkpoint.retention_check_at;
+    }
+
+    /// Keep the generation log within [`GENERATION_LOG_RETENTION_BYTES`], half
+    /// the limit its reader enforces, so an audit log that grows with every
+    /// generation can never turn the project read-only. Finished jobs keep
+    /// their submission, outcome and billed rows; the oldest finished rows are
+    /// folded into one credit-preserving summary only when that is not enough.
+    fn enforce_generation_log_retention(&mut self) {
+        if self.generation_log.entries.len() < self.generation_log_retention_check_at {
+            return;
+        }
+        self.generation_log
+            .enforce_retention(GENERATION_LOG_RETENTION_BYTES);
+        self.generation_log_retention_check_at =
+            self.generation_log.entries.len() + GENERATION_LOG_RETENTION_CHECK_ROWS;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1352,6 +1381,7 @@ impl EditorSession {
                 input.source_clip_id.clone(),
             ));
         self.generation_log_component_present = true;
+        self.enforce_generation_log_retention();
     }
 
     /// Compatibility state inherited from the opened project.

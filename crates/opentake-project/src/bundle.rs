@@ -34,6 +34,7 @@ use crate::compatibility;
 use crate::error::{ProjectError, Result};
 use crate::gen_log::{GenerationLog, GenerationLogEntry};
 use crate::layout;
+use crate::project_root::ensure_component_fits;
 use crate::{is_safe_project_asset_relative_path, ProjectRoot};
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -62,10 +63,12 @@ pub mod test_hooks {
     }
 }
 
-/// Persisted schema details this build cannot safely write back.
+/// Persisted schema details this build cannot safely write back, plus notices
+/// about recoverable problems found while opening.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectCompatibility {
     blockers: Vec<String>,
+    warnings: Vec<String>,
 }
 
 fn validate_manifest_paths(manifest: &MediaManifest) -> Result<()> {
@@ -111,6 +114,19 @@ impl ProjectCompatibility {
         self.blockers.extend(blockers);
         self.blockers.sort();
         self.blockers.dedup();
+    }
+
+    /// Sorted, file-qualified notices about recoverable problems handled while
+    /// opening, such as a component moved aside. Unlike blockers they never
+    /// make the project read-only; the UI may surface them.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    fn warn(&mut self, warnings: impl IntoIterator<Item = String>) {
+        self.warnings.extend(warnings);
+        self.warnings.sort();
+        self.warnings.dedup();
     }
 
     /// Refuse a write that would discard unknown persisted data.
@@ -289,6 +305,9 @@ impl Project {
 
         // generation-log.json: lenient read recovery — a parse error degrades
         // to None but records a blocker so no save can overwrite the bytes.
+        // A log beyond the reader's byte limit would keep the project
+        // read-only forever instead, so the complete original is moved aside
+        // inside the bundle and the project continues without a log.
         let generation_log = match root.read_optional(layout::GENERATION_LOG_FILE) {
             Ok(Some(bytes)) => {
                 match decode_component::<GenerationLog>(&bytes, layout::GENERATION_LOG_FILE) {
@@ -306,6 +325,19 @@ impl Project {
                 }
             }
             Ok(None) => None,
+            Err(ProjectError::ComponentTooLarge { .. }) => {
+                match root.move_component_aside(layout::GENERATION_LOG_FILE, "oversized") {
+                    Ok(aside) => compatibility.warn([format!(
+                        "{}:moved-aside:{aside}",
+                        layout::GENERATION_LOG_FILE
+                    )]),
+                    Err(_) => compatibility.extend([format!(
+                        "{}:invalid-or-unreadable",
+                        layout::GENERATION_LOG_FILE
+                    )]),
+                }
+                None
+            }
             Err(_) => {
                 compatibility.extend([format!(
                     "{}:invalid-or-unreadable",
@@ -536,6 +568,9 @@ impl EncodedProject {
                 file: layout::TIMELINE_FILE,
                 reason,
             })?;
+        if let ThumbnailUpdate::Replace(bytes) = &thumbnail {
+            ensure_component_fits(layout::THUMBNAIL_FILE, bytes.len())?;
+        }
         Ok(Self {
             timeline: encode_component(layout::TIMELINE_FILE, &project.timeline)?,
             manifest: encode_component(layout::MANIFEST_FILE, &project.manifest)?,
@@ -646,8 +681,13 @@ fn write_final_manifest(
     writes.write(root, layout::MANIFEST_FILE, manifest)
 }
 
+/// Encode one JSON component and refuse bytes its reader would reject, before
+/// any destination file is touched.
 fn encode_component<T: Serialize>(file_name: &str, value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(value).map_err(|error| ProjectError::json(file_name, error))
+    let bytes =
+        serde_json::to_vec_pretty(value).map_err(|error| ProjectError::json(file_name, error))?;
+    ensure_component_fits(file_name, bytes.len())?;
+    Ok(bytes)
 }
 
 fn decode_component<T: DeserializeOwned>(
@@ -893,6 +933,111 @@ mod tests {
             .filter(|name| name.starts_with(".Copy.opentake.opentake-"))
             .collect::<Vec<_>>();
         assert_eq!(artifacts, [".Copy.opentake.opentake-lock"]);
+    }
+
+    #[test]
+    fn component_larger_than_its_read_limit_is_refused_before_any_write() {
+        let tmp = TmpDir::new("oversized-component");
+        let bundle = tmp.path().join("Oversized.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let before = tree_receipt(&bundle);
+        let mut entry = video_entry("asset-1", "media/asset-1.mp4");
+        // media.json is read with a 32 MiB limit.
+        entry.name = "n".repeat(32 * 1024 * 1024);
+        project.manifest.entries.push(entry);
+        project.timeline.fps = 48;
+
+        let error = project
+            .save()
+            .expect_err("a manifest its reader would refuse must not be written");
+        assert!(
+            matches!(
+                &error,
+                ProjectError::ComponentTooLarge { file, limit, .. }
+                    if file == layout::MANIFEST_FILE && *limit == 32 * 1024 * 1024
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("media.json"), "{error}");
+        assert_eq!(tree_receipt(&bundle), before);
+
+        let root = ProjectRoot::open(&bundle).unwrap();
+        assert!(matches!(
+            project.save_manifest_to_root(&root),
+            Err(ProjectError::ComponentTooLarge { .. })
+        ));
+        assert!(matches!(
+            project.save_manifest_and_generation_log_to_root(&root),
+            Err(ProjectError::ComponentTooLarge { .. })
+        ));
+        assert_eq!(tree_receipt(&bundle), before);
+    }
+
+    #[test]
+    fn oversized_required_component_fails_open_with_a_size_error() {
+        let tmp = TmpDir::new("oversized-manifest-open");
+        let bundle = tmp.path().join("Oversized.opentake");
+        Project::new(&bundle).save().unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(bundle.join(layout::MANIFEST_FILE))
+            .unwrap()
+            .set_len(32 * 1024 * 1024 + 1)
+            .unwrap();
+        let before = tree_receipt(&bundle);
+
+        let error = Project::open(&bundle).expect_err("an unreadable manifest must not open");
+
+        assert!(
+            matches!(
+                &error,
+                ProjectError::ComponentTooLarge { file, .. } if file == layout::MANIFEST_FILE
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains(tmp.path().to_str().unwrap()));
+        assert_eq!(tree_receipt(&bundle), before);
+    }
+
+    #[test]
+    fn oversized_generation_log_is_moved_aside_and_the_project_stays_writable() {
+        let tmp = TmpDir::new("oversized-generation-log");
+        let bundle = tmp.path().join("Log.opentake");
+        Project::new(&bundle).save().unwrap();
+        let log_path = bundle.join(layout::GENERATION_LOG_FILE);
+        let oversized = crate::project_root::GENERATION_LOG_COMPONENT_MAX_BYTES as u64 + 1;
+        fs::File::create(&log_path)
+            .unwrap()
+            .set_len(oversized)
+            .unwrap();
+
+        let mut project = Project::open(&bundle).expect("an oversized log must not block open");
+
+        assert!(!project.compatibility().is_read_only());
+        assert!(project.generation_log.is_none());
+        assert!(!log_path.exists());
+        let [warning] = project.compatibility().warnings() else {
+            panic!("expected one warning: {:?}", project.compatibility());
+        };
+        let aside = warning
+            .strip_prefix("generation-log.json:moved-aside:")
+            .expect("the warning names the moved-aside file")
+            .to_string();
+        assert!(
+            aside.starts_with("generation-log.oversized-") && aside.ends_with(".json"),
+            "{aside}"
+        );
+        assert_eq!(fs::metadata(bundle.join(&aside)).unwrap().len(), oversized);
+
+        project.timeline.fps = 48;
+        project.generation_log = Some(GenerationLog::new());
+        project.save().expect("the recovered project is writable");
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(reopened.timeline.fps, 48);
+        assert!(reopened.compatibility().warnings().is_empty());
+        assert!(!reopened.compatibility().is_read_only());
+        assert_eq!(fs::metadata(bundle.join(&aside)).unwrap().len(), oversized);
     }
 
     fn tree_receipt(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {

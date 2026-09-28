@@ -65,7 +65,7 @@ pub use edl::export_edl;
 pub use error::{ProjectError, Result};
 pub use fcpxml::{export_xmeml, export_xmeml_with_timecodes};
 pub use fcpxml_modern::export_fcpxml;
-pub use gen_log::{GenerationLog, GenerationLogEntry};
+pub use gen_log::{GenerationLog, GenerationLogEntry, GENERATION_LOG_RETENTION_BYTES};
 pub use otio::export_otio;
 pub use path_policy::is_safe_project_asset_relative_path;
 pub use project_root::{ProjectRoot, ProjectRootIdentity, PublishedMediaLeaf, StagedMediaLeaf};

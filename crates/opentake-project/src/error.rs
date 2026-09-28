@@ -54,6 +54,19 @@ pub enum ProjectError {
     #[error("invalid timeline graph in {file}: {reason}")]
     InvalidTimeline { file: &'static str, reason: String },
 
+    /// A bundle component is larger than the byte limit its reader enforces.
+    /// Reads refuse such a file before allocating it; writes refuse to produce
+    /// one, leaving the previous version on disk.
+    #[error("{file} is {size} bytes, which exceeds the {limit}-byte limit")]
+    ComponentTooLarge {
+        /// The component file name (for example `project.json`).
+        file: String,
+        /// The encoded or on-disk size in bytes.
+        size: u64,
+        /// The largest size the reader accepts.
+        limit: u64,
+    },
+
     /// A project-local media/proxy path could escape or change meaning on a
     /// different host platform.
     #[error("invalid media manifest in {file}: {reason}")]
