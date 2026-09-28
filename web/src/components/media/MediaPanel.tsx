@@ -2379,8 +2379,6 @@ export function FolderTile({
   );
 }
 
-/** A failed <img> does not recover when its cached file becomes readable later.
- * Retry only the asset read, not decoding or timeline work. */
 /** Retries after a failed thumbnail load before the card shows its type icon. */
 export const MEDIA_THUMBNAIL_MAX_RETRIES = 6;
 
@@ -2396,6 +2394,8 @@ export function mediaThumbnailRetryDelayMs(attempt: number): number | null {
   return Math.min(250 * 2 ** attempt, 8000);
 }
 
+/** A failed <img> does not recover when its cached file becomes readable later.
+ * Retry only the asset read, not decoding or timeline work. */
 function MediaCardThumbnail({ src, name, type }: { src: string; name: string; type: MediaItem["type"] }) {
   const [attempt, setAttempt] = useState(0);
   const [failed, setFailed] = useState(false);

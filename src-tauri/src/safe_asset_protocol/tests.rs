@@ -309,13 +309,22 @@ fn misbehaving_helper(
 }
 
 fn test_pool(mode: &str, deadline: Duration, extra_env: &[(&str, &Path)]) -> Arc<HelperPool> {
+    test_pool_with_slots(mode, deadline, extra_env, pool::HELPER_POOL_SIZE)
+}
+
+fn test_pool_with_slots(
+    mode: &str,
+    deadline: Duration,
+    extra_env: &[(&str, &Path)],
+    slots: usize,
+) -> Arc<HelperPool> {
     let mut env = vec![(TEST_HELPER_ENV.into(), mode.into())];
     env.extend(
         extra_env
             .iter()
             .map(|(key, value)| ((*key).into(), value.as_os_str().to_owned())),
     );
-    Arc::new(HelperPool::new(
+    Arc::new(HelperPool::with_slots(
         pool::HelperLauncher {
             program: Some(std::env::current_exe().unwrap()),
             args: [
@@ -332,6 +341,7 @@ fn test_pool(mode: &str, deadline: Duration, extra_env: &[(&str, &Path)]) -> Arc
             max_preamble_bytes: 4096,
         },
         deadline,
+        slots,
     ))
 }
 
@@ -1425,7 +1435,7 @@ fn retiring_the_pool_reaps_every_helper_process() {
 }
 
 #[test]
-fn quarantined_slots_fail_fast_without_spawning() {
+fn a_pool_without_slots_fails_fast_without_spawning() {
     let pool = Arc::new(HelperPool::with_slots(
         pool::HelperLauncher {
             program: Some(PathBuf::from("/nonexistent-helper")),
@@ -1444,6 +1454,160 @@ fn quarantined_slots_fail_fast_without_spawning() {
         .block_on(pool.exchange(&request, |_| Ok::<(), ()>(())));
     assert!(matches!(outcome, Err(IsolatedHelperError::Degraded)));
     assert_eq!(pool.spawned(), 0);
+}
+
+#[test]
+fn quarantined_slots_fail_fast_without_spawning() {
+    // A deadline this long would fail the test if the pool waited for a slot.
+    let pool = test_pool("serve", Duration::from_secs(3600), &[]);
+    let _quarantined = pool.quarantine_free_slots_for_test();
+    let request = external_request("degraded", Path::new("/nonexistent.mp4"));
+    let outcome = multi_thread_runtime().block_on(pool.exchange(&request, |_| Ok::<(), ()>(())));
+    assert!(matches!(outcome, Err(IsolatedHelperError::Degraded)));
+    assert_eq!(pool.spawned(), 0);
+}
+
+#[test]
+fn a_request_waits_for_a_slot_held_by_a_busy_helper() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let pool = test_pool_with_slots("serve", Duration::from_secs(30), &[], 1);
+
+    multi_thread_runtime().block_on(async {
+        let busy = pool.hold_slot_for_test();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(busy);
+        });
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await;
+        assert!(
+            matches!(outcome, Ok(HelperOutcome::Served { .. })),
+            "a busy slot is not a degraded pool"
+        );
+        release.await.unwrap();
+    });
+}
+
+#[test]
+fn helpers_in_flight_across_a_project_switch_are_retired_and_replaced() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    // One slot: the replacement must wait for the retiring helper's slot.
+    let pool = test_pool_with_slots("serve", Duration::from_secs(30), &[], 1);
+
+    multi_thread_runtime().block_on(async {
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool
+            .exchange(&request, |_| {
+                // The project changes while this helper serves the request.
+                pool.bump_generation_for_test();
+                Ok::<(), ()>(())
+            })
+            .await;
+        assert!(matches!(outcome, Ok(HelperOutcome::Served { .. })));
+        assert!(
+            pool.idle_helper_ids().is_empty(),
+            "a helper from the previous project is not reused"
+        );
+
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await;
+        let Ok(HelperOutcome::Served { response, .. }) = outcome else {
+            panic!("the next request must get a fresh helper, not a 503");
+        };
+        assert_eq!(response.body, b"clip");
+    });
+    assert_eq!(pool.spawned(), 2);
+}
+
+#[test]
+fn a_shut_down_pool_starts_no_helper() {
+    let pool = serving_pool();
+    pool.shutdown();
+    let request = external_request("after-exit", Path::new("/nonexistent.mp4"));
+    let outcome = multi_thread_runtime().block_on(pool.exchange(&request, |_| Ok::<(), ()>(())));
+    assert!(matches!(outcome, Err(IsolatedHelperError::Degraded)));
+    assert_eq!(pool.spawned(), 0);
+}
+
+#[test]
+fn a_reply_larger_than_the_request_allows_is_rejected_before_allocation() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    let file = File::create(&requested).unwrap();
+    file.set_len(64 * 1024).unwrap();
+    let request = HelperRequest {
+        head_only: true,
+        ..external_request("head-token", &requested)
+    };
+    let (_, served) = helper_exchange(&request);
+    let mut forged = serde_json::to_vec(&helper::HelperReply::Served(
+        helper::HelperResponseMetadata {
+            body_length: 64 * 1024,
+            ..served.metadata
+        },
+    ))
+    .unwrap();
+    let mut framed = (forged.len() as u32).to_be_bytes().to_vec();
+    framed.append(&mut forged);
+    framed.extend(std::iter::repeat_n(0_u8, 64 * 1024));
+    let result = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(helper::read_helper_reply(&mut framed.as_slice(), 1024));
+    assert!(matches!(result, Err(IsolatedHelperError::InvalidResponse)));
+}
+
+/// A final path that is not UTF-8 cannot be authorized lexically. The helper
+/// reports it as an open error and must not wait for a decision that the
+/// parent never sends, or the next request on that helper breaks.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_final_path_is_refused_and_the_helper_serves_the_next_request() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let directory = local_tempdir();
+    let target = directory
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"not-utf8-\xff"));
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("clip.mp4"), b"hidden").unwrap();
+    symlink(&target, directory.path().join("alias")).unwrap();
+    let requested = directory.path().join("alias/clip.mp4");
+    let ordinary = directory.path().join("ordinary.mp4");
+    std::fs::write(&ordinary, b"ordinary").unwrap();
+    let pool = serving_pool();
+
+    multi_thread_runtime().block_on(async {
+        let request = external_request(&pool::random_token(), &requested);
+        let mut authorized = false;
+        let outcome = pool
+            .exchange(&request, |_| {
+                authorized = true;
+                Ok::<(), ()>(())
+            })
+            .await;
+        let Ok(HelperOutcome::OpenFailed(opened)) = outcome else {
+            panic!("a non-UTF-8 final path must be reported as unavailable");
+        };
+        assert!(matches!(
+            opened.error_kind,
+            Some(WireIoErrorKind::PermissionDenied)
+        ));
+        assert!(!authorized);
+
+        let request = external_request(&pool::random_token(), &ordinary);
+        let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await;
+        let Ok(HelperOutcome::Served { response, .. }) = outcome else {
+            panic!("the same helper must still serve the next request");
+        };
+        assert_eq!(response.body, b"ordinary");
+    });
+    assert_eq!(pool.spawned(), 1);
 }
 
 #[test]
@@ -1511,13 +1675,14 @@ fn media_ranges_are_capped_at_the_streaming_budget() {
     );
 }
 
-/// Measurement for the pull request (run with `--release --ignored`): lexical
-/// authorization cost with 5000 external manifest entries and 5000 exact
-/// scope grants.
+/// Measurement for the pull request (run with `--release --ignored`): the
+/// parent's per-request authorization with 5000 external manifest entries and
+/// 5000 exact scope grants, warm and after each kind of cache invalidation.
 #[test]
 #[ignore = "benchmark; run explicitly in release mode"]
 fn benchmark_external_authorization_with_5000_entries() {
     use opentake_core::ProbedMedia;
+    use tauri::Manager;
 
     let directory = local_tempdir();
     let core = AppCore::new();
@@ -1525,6 +1690,7 @@ fn benchmark_external_authorization_with_5000_entries() {
         .unwrap();
     let app = tauri::test::mock_app();
     let scope = app.handle().asset_protocol_scope();
+    std::fs::create_dir_all(directory.path().join("media")).unwrap();
     let paths = (0..5000)
         .map(|index| directory.path().join(format!("media/clip-{index:05}.mp4")))
         .collect::<Vec<_>>();
@@ -1533,34 +1699,72 @@ fn benchmark_external_authorization_with_5000_entries() {
             .unwrap();
         scope.allow_file(path).unwrap();
     }
-    // Warm the scope snapshot and index once, as the first request would.
-    let first = std::time::Instant::now();
-    assert!(non_project_asset_authority(
-        app.handle(),
-        &core,
-        &asset_scope_snapshot(app.handle()),
-        &paths[0]
-    )
-    .is_some());
-    let cold = first.elapsed();
-    let rounds = 10_000;
-    let started = std::time::Instant::now();
-    for index in 0..rounds {
+    std::fs::write(&paths[0], b"clip").unwrap();
+    let request = external_request("bench-token", &paths[0]);
+    let (opened, _) = helper_exchange(&request);
+    app.manage(core);
+    let core = app.state::<AppCore>();
+
+    // Everything the parent does for one request besides the helper I/O:
+    // admission-time authorization, the pre-read identity check and the
+    // final re-check (each takes its own scope snapshot).
+    let request_authorization = |path: &Path| {
         let scope = asset_scope_snapshot(app.handle());
-        let path = &paths[(index * 7919) % paths.len()];
-        assert!(non_project_asset_authority(app.handle(), &core, &scope, path).is_some());
+        let expected = non_project_asset_authority(app.handle(), &core, &scope, path).unwrap();
+        for _ in 0..2 {
+            assert!(authorize_opened_asset(
+                app.handle(),
+                &core,
+                None,
+                Some(&expected),
+                &request.token,
+                &opened
+            )
+            .is_ok());
+        }
+    };
+    let time = |label: &str, run: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        run();
+        eprintln!("{label}: {:?}", started.elapsed());
+    };
+
+    time("first request (builds scope cache and index)", &|| {
+        request_authorization(&paths[0])
+    });
+    let rounds = 10_000_u32;
+    let started = std::time::Instant::now();
+    for _ in 0..rounds {
+        request_authorization(&paths[0]);
     }
-    let warm = started.elapsed() / rounds as u32;
-    let snapshot_started = std::time::Instant::now();
+    eprintln!("steady state: {:?} per request", started.elapsed() / rounds);
+    scope
+        .allow_file(directory.path().join("media/new-grant.mp4"))
+        .unwrap();
+    time(
+        "first request after a scope grant (allowed set rebuilt)",
+        &|| request_authorization(&paths[0]),
+    );
+    core.import_media_file(
+        directory.path().join("media/new-import.mp4"),
+        "clip",
+        &ProbedMedia::default(),
+    )
+    .unwrap();
+    time(
+        "first request after an editor mutation (index rebuilt)",
+        &|| request_authorization(&paths[0]),
+    );
+    let started = std::time::Instant::now();
     for _ in 0..100 {
         std::hint::black_box(core.runtime_snapshot());
     }
-    let old_snapshot = snapshot_started.elapsed() / 100;
     eprintln!(
-        "external authorization, 5000 entries: first {cold:?}, then {warm:?} per request \
-         (one runtime_snapshot() alone: {old_snapshot:?})"
+        "for comparison, one runtime_snapshot(): {:?}",
+        started.elapsed() / 100
     );
 }
+
 #[cfg(unix)]
 #[test]
 fn timed_out_isolated_workers_are_killed_reaped_and_capacity_recovers() {
@@ -1592,7 +1796,13 @@ fn timed_out_isolated_workers_are_killed_reaped_and_capacity_recovers() {
                         .await
                         .is_err()
                 );
-                terminate_or_quarantine(child, None, process_slot).await;
+                terminate_or_quarantine(
+                    child,
+                    None,
+                    process_slot,
+                    &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                )
+                .await;
                 process_id
             }));
         }

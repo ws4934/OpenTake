@@ -16,6 +16,9 @@ use super::*;
 use opentake_media::process_tree::ProcessTree;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// Upper bound for the static text of an error response body.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
 use std::sync::Mutex;
 use std::time::Instant;
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -57,6 +60,11 @@ pub(super) struct HelperPool {
     launcher: HelperLauncher,
     /// One permit per live or quarantined process.
     process_slots: Arc<Semaphore>,
+    slot_count: usize,
+    /// Slots held by helpers that outlived their bounded reap.
+    quarantined: Arc<AtomicUsize>,
+    /// Set by [`HelperPool::shutdown`]: no helper is started afterwards.
+    closed: AtomicBool,
     idle: Mutex<Vec<PooledHelper>>,
     /// Bumped by [`HelperPool::retire_all`]; helpers from an older generation
     /// are killed instead of being returned to `idle`.
@@ -109,6 +117,9 @@ impl HelperPool {
         Self {
             launcher,
             process_slots: Arc::new(Semaphore::new(slots)),
+            slot_count: slots,
+            quarantined: Arc::new(AtomicUsize::new(0)),
+            closed: AtomicBool::new(false),
             idle: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
             spawned: AtomicUsize::new(0),
@@ -145,6 +156,28 @@ impl HelperPool {
         self.retire_idle_helpers(true).await;
     }
 
+    /// Test hook: what a project switch does to helpers still in use.
+    #[cfg(test)]
+    pub(super) fn bump_generation_for_test(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Test hook: occupy a slot as a busy (not quarantined) helper would.
+    #[cfg(test)]
+    pub(super) fn hold_slot_for_test(&self) -> OwnedSemaphorePermit {
+        self.process_slots.clone().try_acquire_owned().unwrap()
+    }
+
+    /// Test hook: account every free slot as quarantined, as unreapable
+    /// helpers would.
+    #[cfg(test)]
+    pub(super) fn quarantine_free_slots_for_test(&self) -> Vec<OwnedSemaphorePermit> {
+        let slots = std::iter::from_fn(|| self.process_slots.clone().try_acquire_owned().ok())
+            .collect::<Vec<_>>();
+        self.quarantined.fetch_add(slots.len(), Ordering::AcqRel);
+        slots
+    }
+
     fn lock_idle(&self) -> std::sync::MutexGuard<'_, Vec<PooledHelper>> {
         self.idle
             .lock()
@@ -170,18 +203,55 @@ impl HelperPool {
                 Ok(outcome)
             }
             Ok(Err(error)) => {
-                retire(helper).await;
+                retire(helper, &self.quarantined).await;
                 Err(error)
             }
             Err(_) => {
-                retire(helper).await;
+                retire(helper, &self.quarantined).await;
                 Err(IsolatedHelperError::TimedOut)
             }
         }
     }
 
     async fn checkout(self: &Arc<Self>) -> Result<PooledHelper, IsolatedHelperError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(IsolatedHelperError::Degraded);
+        }
         let generation = self.generation.load(Ordering::Acquire);
+        if let Some(helper) = self.take_idle(generation).await {
+            return Ok(helper);
+        }
+        // Reserve the quarantine capacity before spawning. Slots held by
+        // helpers that are busy or being retired (a project switch retires
+        // every helper) free up within one request or one bounded reap, so
+        // wait for them; fail fast only when every slot is quarantined.
+        let slot = match self.process_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) if self.quarantined.load(Ordering::Acquire) >= self.slot_count => {
+                return Err(IsolatedHelperError::Degraded);
+            }
+            Err(_) => {
+                match tokio::time::timeout(
+                    self.deadline,
+                    self.process_slots.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(slot)) => slot,
+                    _ => return Err(IsolatedHelperError::Degraded),
+                }
+            }
+        };
+        // A helper may have been checked in while this request waited.
+        if let Some(helper) = self.take_idle(generation).await {
+            drop(slot);
+            return Ok(helper);
+        }
+        self.spawn(slot, generation).await
+    }
+
+    /// Pop a reusable idle helper of `generation`, retiring stale ones.
+    async fn take_idle(&self, generation: u64) -> Option<PooledHelper> {
         let mut expired = Vec::new();
         let reusable = {
             let mut idle = self.lock_idle();
@@ -198,19 +268,9 @@ impl HelperPool {
             reusable
         };
         for helper in expired {
-            retire(helper).await;
+            retire(helper, &self.quarantined).await;
         }
-        if let Some(helper) = reusable {
-            return Ok(helper);
-        }
-        // Reserve the quarantine capacity before spawning. Once every slot is
-        // held by a live or quarantined helper no further process is created.
-        let slot = self
-            .process_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| IsolatedHelperError::Degraded)?;
-        self.spawn(slot, generation).await
+        reusable
     }
 
     async fn spawn(
@@ -243,14 +303,14 @@ impl HelperPool {
             Some(Ok(tree)) => tree,
             _ => {
                 let _ = child.start_kill();
-                terminate_or_quarantine(child, None, slot).await;
+                terminate_or_quarantine(child, None, slot, &self.quarantined).await;
                 return Err(IsolatedHelperError::Io);
             }
         };
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = tree.terminate();
             let _ = child.start_kill();
-            terminate_or_quarantine(child, Some(tree), slot).await;
+            terminate_or_quarantine(child, Some(tree), slot, &self.quarantined).await;
             return Err(IsolatedHelperError::Io);
         };
         let mut helper = PooledHelper {
@@ -269,15 +329,18 @@ impl HelperPool {
         )
         .await;
         if !matches!(handshake, Ok(Ok(()))) {
-            retire(helper).await;
+            retire(helper, &self.quarantined).await;
             return Err(IsolatedHelperError::Io);
         }
         Ok(helper)
     }
 
     fn checkin(self: &Arc<Self>, mut helper: PooledHelper) {
-        if helper.generation != self.generation.load(Ordering::Acquire) {
-            tokio::spawn(retire(helper));
+        if helper.generation != self.generation.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+        {
+            let quarantined = self.quarantined.clone();
+            tokio::spawn(async move { retire(helper, &quarantined).await });
             return;
         }
         helper.idle_since = Instant::now();
@@ -316,7 +379,7 @@ impl HelperPool {
             retired
         };
         for helper in retired {
-            retire(helper).await;
+            retire(helper, &self.quarantined).await;
         }
     }
 
@@ -329,10 +392,13 @@ impl HelperPool {
         tauri::async_runtime::spawn(async move { pool.retire_idle_helpers(true).await });
     }
 
-    /// Synchronous shutdown for application exit: kill every idle helper's
-    /// process tree now. Busy helpers are killed when their exchange returns,
-    /// and `kill_on_drop` plus stdin EOF stop any that outlive the runtime.
+    /// Synchronous shutdown for application exit: refuse new helpers and
+    /// kill every idle helper's process tree now. A busy helper is retired
+    /// when its exchange returns; one that outlives the runtime exits on stdin
+    /// EOF or a broken pipe (and, on Windows, when its kill-on-close job
+    /// handle closes with this process).
     pub(super) fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         let helpers = std::mem::take(&mut *self.lock_idle());
         for mut helper in helpers {
@@ -355,7 +421,7 @@ async fn exchange_with<E>(
         },
     )
     .await?;
-    let (reply, body) = read_helper_reply(&mut helper.stdout).await?;
+    let (reply, body) = read_helper_reply(&mut helper.stdout, 0).await?;
     let HelperReply::Opened(opened) = reply else {
         return Err(IsolatedHelperError::InvalidResponse);
     };
@@ -382,7 +448,7 @@ async fn exchange_with<E>(
         },
     )
     .await?;
-    let (reply, body) = read_helper_reply(&mut helper.stdout).await?;
+    let (reply, body) = read_helper_reply(&mut helper.stdout, max_served_body(request)).await?;
     let HelperReply::Served(metadata) = reply else {
         return Err(IsolatedHelperError::InvalidResponse);
     };
@@ -393,6 +459,20 @@ async fn exchange_with<E>(
         opened,
         response: IsolatedResponse { metadata, body },
     })
+}
+
+/// The largest body `serve_opened_file` can return for `request`, so a reply
+/// claiming more is rejected before anything is allocated. A range with a
+/// mismatched `If-Range` is served as a full body.
+fn max_served_body(request: &HelperRequest) -> usize {
+    if request.head_only {
+        // Headers only; error bodies are short static texts.
+        MAX_ERROR_BODY_BYTES
+    } else if request.range.is_some() && request.if_range.is_none() {
+        (MAX_RANGE_BYTES as usize).max(MAX_ERROR_BODY_BYTES)
+    } else {
+        MAX_HELPER_BODY_BYTES
+    }
 }
 
 async fn read_handshake(
@@ -424,7 +504,7 @@ async fn read_handshake(
 /// Kill one helper's process tree and reap it within [`REAP_DEADLINE`]. A
 /// process stuck in an uninterruptible kernel wait keeps its slot (and its
 /// armed containment) in a background task until it finally exits.
-async fn retire(helper: PooledHelper) {
+async fn retire(helper: PooledHelper, quarantined: &Arc<AtomicUsize>) {
     let PooledHelper {
         child,
         tree,
@@ -436,13 +516,14 @@ async fn retire(helper: PooledHelper) {
     drop(stdin);
     drop(stdout);
     let _ = tree.terminate();
-    terminate_or_quarantine(child, Some(tree), slot).await;
+    terminate_or_quarantine(child, Some(tree), slot, quarantined).await;
 }
 
 pub(super) async fn terminate_or_quarantine(
     mut child: Child,
     tree: Option<ProcessTree>,
     process_slot: OwnedSemaphorePermit,
+    quarantined: &Arc<AtomicUsize>,
 ) {
     let _ = child.start_kill();
     // Never turn the helper deadline into another unbounded wait;
@@ -455,12 +536,15 @@ pub(super) async fn terminate_or_quarantine(
         }
         return;
     }
+    quarantined.fetch_add(1, Ordering::AcqRel);
+    let quarantined = quarantined.clone();
     tokio::spawn(async move {
-        let _process_slot = process_slot;
         let _ = child.wait().await;
         if let Some(mut tree) = tree {
             tree.disarm();
         }
+        quarantined.fetch_sub(1, Ordering::AcqRel);
+        drop(process_slot);
     });
 }
 

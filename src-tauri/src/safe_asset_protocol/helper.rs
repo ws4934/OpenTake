@@ -136,8 +136,10 @@ pub(super) async fn write_helper_frame<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await.map_err(|_| IsolatedHelperError::Io)
 }
 
+/// Read one reply whose body may not exceed `max_body` bytes.
 pub(super) async fn read_helper_reply<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
+    max_body: usize,
 ) -> Result<(HelperReply, Vec<u8>), IsolatedHelperError> {
     let mut metadata_length = [0_u8; 4];
     reader
@@ -160,7 +162,7 @@ pub(super) async fn read_helper_reply<R: tokio::io::AsyncRead + Unpin>(
         HelperReply::Served(metadata) => usize::try_from(metadata.body_length)
             .map_err(|_| IsolatedHelperError::InvalidResponse)?,
     };
-    if body_length > MAX_HELPER_BODY_BYTES {
+    if body_length > max_body.min(MAX_HELPER_BODY_BYTES) {
         return Err(IsolatedHelperError::InvalidResponse);
     }
     let mut body = vec![0_u8; body_length];
@@ -370,14 +372,17 @@ pub(super) fn run_helper_stdio() -> std::io::Result<()> {
         // A reparented helper no longer serves the process that started it.
         ensure_helper_parent(expected_parent)?;
         let opened = open_helper_asset(&request);
-        write_helper_reply(
-            &mut stdout,
-            &HelperReply::Opened(opened_metadata(&request, &opened)),
-            &[],
-        )?;
+        let metadata = opened_metadata(&request, &opened);
+        // The parent answers only an identity reported without an error;
+        // after an error it sends the next request instead of a decision.
+        let decision_follows = metadata.error_kind.is_none();
+        write_helper_reply(&mut stdout, &HelperReply::Opened(metadata), &[])?;
         let Ok(opened) = opened else {
             continue;
         };
+        if !decision_follows {
+            continue;
+        }
         match read_helper_frame(&mut stdin)? {
             Some(HelperFrame::Proceed { token }) if token == request.token => {
                 let response = serve_helper_asset(&request, opened);
