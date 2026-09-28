@@ -1145,9 +1145,16 @@ fn authorization_revoked_between_request_and_response_is_rejected() {
         .expect("authorized at request time")
     };
     let request = external_request("revocation-token", &requested);
+    // Each case retains its own bundle: Windows forbids replacing a bundle
+    // that another live core still holds open.
+    let case_directory = |name: &str| {
+        let path = directory.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        path
+    };
 
     // 1. The scope grant is revoked (deny precedence) during the read.
-    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let (app, core) = external_media_fixture(&case_directory("revoked-scope"), &requested);
     let expected = authorize(&app, &core);
     let (opened, isolated) = helper_exchange(&request);
     app.handle()
@@ -1166,7 +1173,7 @@ fn authorization_revoked_between_request_and_response_is_rejected() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // 2. The media is removed from the manifest during the read.
-    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let (app, core) = external_media_fixture(&case_directory("removed-media"), &requested);
     let expected = authorize(&app, &core);
     let (opened, isolated) = helper_exchange(&request);
     let ids = core
@@ -1189,7 +1196,7 @@ fn authorization_revoked_between_request_and_response_is_rejected() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // 3. Another project that references the same file is opened.
-    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let (app, core) = external_media_fixture(&case_directory("switched-project"), &requested);
     let expected = authorize(&app, &core);
     let (opened, isolated) = helper_exchange(&request);
     let other = AppCore::new();
