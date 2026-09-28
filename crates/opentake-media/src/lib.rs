@@ -184,7 +184,10 @@ pub use thumbnail::{
     ThumbnailSource, VideoThumb, PROJECT_COMPOSITE_COVER_BOUNDS,
 };
 
-pub use timecode::{parse_smpte_timecode, read_start_timecode_frame};
+pub use timecode::{
+    parse_smpte_timecode, parse_start_timecode, read_start_timecode, read_start_timecode_frame,
+    StartTimecode,
+};
 
 pub use waveform::{
     waveform, waveform_cached, waveform_cached_cancellable, waveform_cancellable,

@@ -61,7 +61,7 @@ import {
   derivedResourceKinds,
   derivedResourceScheduler,
 } from "../../lib/derivedResourceScheduler";
-import { folderTrail } from "../../lib/folderTree";
+import { existingFolderId, folderTrail } from "../../lib/folderTree";
 import { useSettingsStore } from "../../store/settingsStore";
 import { useProjectStore } from "../../store/projectStore";
 import {
@@ -654,6 +654,14 @@ function MediaTab({ kind }: { kind: MediaTabKind }) {
   useEffect(() => {
     if (subTab === "mine") void refreshLibrary();
   }, [subTab, refreshLibrary]);
+
+  // A folder deleted or undone while the panel pointed into it: return to its
+  // root so new imports and captures do not target a folder that is gone.
+  useEffect(() => {
+    if (currentFolderId !== existingFolderId(folders, currentFolderId)) {
+      resetFolder.current(null);
+    }
+  }, [folders, currentFolderId]);
 
   // The extract/sound subtabs exist only on the audio tab; if we land on the
   // material tab still pointing at one, fall back to import.

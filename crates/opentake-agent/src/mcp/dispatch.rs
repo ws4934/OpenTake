@@ -111,6 +111,59 @@ impl Drop for ActiveUndoScope {
     }
 }
 
+const PROJECT_CHANGED_ERROR: &str =
+    "The project changed while this tool was running; nothing was changed. Retry in the open project.";
+
+thread_local! {
+    static PINNED_PROJECT_IDENTITY: RefCell<Vec<Option<CoreRevision>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Project identity every commit made on this thread must match while a
+/// deferred body runs outside the host's project lease.
+struct PinnedProjectIdentity;
+
+impl PinnedProjectIdentity {
+    fn enter(identity: Option<CoreRevision>) -> Self {
+        PINNED_PROJECT_IDENTITY.with(|pins| pins.borrow_mut().push(identity));
+        Self
+    }
+
+    /// `Some(identity)` while a deferred body with a known identity runs.
+    fn current() -> Option<CoreRevision> {
+        PINNED_PROJECT_IDENTITY.with(|pins| pins.borrow().last().cloned().flatten())
+    }
+}
+
+impl Drop for PinnedProjectIdentity {
+    fn drop(&mut self) {
+        PINNED_PROJECT_IDENTITY.with(|pins| {
+            pins.borrow_mut().pop();
+        });
+    }
+}
+
+fn same_project(left: &CoreRevision, right: &CoreRevision) -> bool {
+    left.project_epoch == right.project_epoch && left.project_dir == right.project_dir
+}
+
+/// Tools whose bodies decode, transcribe, composite or search media and can
+/// run for minutes. They run outside the host's project-identity lease.
+fn runs_outside_project_lease(tool: ToolName) -> bool {
+    matches!(
+        tool,
+        ToolName::InspectMedia
+            | ToolName::InspectTimeline
+            | ToolName::GetTranscript
+            | ToolName::SearchMedia
+            | ToolName::AddCaptions
+            | ToolName::DetectBeats
+            | ToolName::AutoCutToBeats
+            | ToolName::TightenSilences
+            | ToolName::RemoveFillerWords
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentUndoMarker {
     revision: CoreRevision,
@@ -132,6 +185,17 @@ enum TimelineResultCompletion {
     MotionDocument {
         tool: ToolName,
         operation: Box<dyn AdmittedMotionDocumentOperation>,
+        /// Undo scope of the admitting dispatch. `finish_dispatch` runs
+        /// outside that scope, so a publish is recorded against it explicitly.
+        undo_scope: String,
+    },
+    /// A media-heavy tool body, run by `finish_dispatch` outside the host's
+    /// project-identity lease (see [`runs_outside_project_lease`]).
+    DeferredBody {
+        tool: ToolName,
+        args: Value,
+        undo_scope: String,
+        identity: Option<CoreRevision>,
     },
 }
 
@@ -525,16 +589,48 @@ impl Dispatcher {
             return match bridge.admit(request) {
                 Ok(operation) => DispatchReceipt {
                     result: ToolResult::ok(""),
-                    timeline_result: TimelineResultCompletion::MotionDocument { tool, operation },
+                    timeline_result: TimelineResultCompletion::MotionDocument {
+                        tool,
+                        operation,
+                        undo_scope: ActiveUndoScope::current(),
+                    },
                 },
                 Err(error) => DispatchReceipt::complete(motion_document_error(tool, error)),
             };
         }
 
+        // Media-heavy bodies (decode, transcription, compositing, search) run
+        // from finish_dispatch, after the host released its project-identity
+        // lease, so a project switch never waits for them. They re-snapshot
+        // and commit only into the project admitted here.
+        if runs_outside_project_lease(tool) {
+            return DispatchReceipt {
+                result: ToolResult::ok(""),
+                timeline_result: TimelineResultCompletion::DeferredBody {
+                    tool,
+                    args,
+                    undo_scope: ActiveUndoScope::current(),
+                    identity: self.handle.current_revision(),
+                },
+            };
+        }
+
+        self.run_admitted_body(tool, &args, &before, &manifest, cancel)
+    }
+
+    /// Steps 4-7 of a dispatch for an admitted tool with expanded arguments.
+    fn run_admitted_body(
+        &self,
+        tool: ToolName,
+        args: &Value,
+        before: &Timeline,
+        manifest: &MediaManifest,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> DispatchReceipt {
         // 4 + 5. Decode typed args and run the body. `op` collects what the body
         // did for the rule layer; `result` is the body's neutral output.
         let mut op = OpContext::default();
-        let result = match self.run_body(tool, &args, &before, &manifest, &mut op, cancel) {
+        let result = match self.run_body(tool, args, before, manifest, &mut op, cancel) {
             Ok(r) => r,
             Err(e) => return DispatchReceipt::complete(ToolResult::error(e.message)),
         };
@@ -554,10 +650,49 @@ impl Dispatcher {
             short_id::current_id_universe(&after, &self.handle.media())
         });
         let timeline_result =
-            self.timeline_result_completion(tool, &args, &before, &after, &result, cancel);
+            self.timeline_result_completion(tool, args, before, &after, &result, cancel);
         DispatchReceipt {
             result,
             timeline_result,
+        }
+    }
+
+    /// Run a body deferred by [`Self::dispatch_cancellable_scoped_deferred`]
+    /// without the host's project lease. The snapshots are taken now and must
+    /// belong to the admitted project; every commit is pinned to it as well.
+    fn run_deferred_body(
+        &self,
+        tool: ToolName,
+        args: Value,
+        undo_scope: &str,
+        identity: Option<CoreRevision>,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> ToolResult {
+        let _undo_scope = ActiveUndoScope::enter(undo_scope);
+        let _pin = PinnedProjectIdentity::enter(identity.clone());
+        if cancel.is_cancelled() {
+            return ToolResult::error("Cancelled");
+        }
+        if !self.is_admitted_project(identity.as_ref()) {
+            return ToolResult::error(PROJECT_CHANGED_ERROR);
+        }
+        let before = self.handle.timeline();
+        let manifest = self.handle.media();
+        // Project epochs only grow, so an unchanged identity after both reads
+        // proves the pair came from the admitted project.
+        if !self.is_admitted_project(identity.as_ref()) {
+            return ToolResult::error(PROJECT_CHANGED_ERROR);
+        }
+        let receipt = self.run_admitted_body(tool, &args, &before, &manifest, cancel);
+        self.finish_dispatch(receipt, cancel)
+    }
+
+    fn is_admitted_project(&self, identity: Option<&CoreRevision>) -> bool {
+        match (identity, self.handle.current_revision()) {
+            (Some(admitted), Some(current)) => same_project(admitted, &current),
+            // Handles without revisions (tests) have no project lifecycle.
+            (None, None) => true,
+            _ => false,
         }
     }
 
@@ -586,11 +721,32 @@ impl Dispatcher {
                     insert_timeline_result_warning(&mut receipt.result);
                     return receipt.result;
                 }
-                TimelineResultCompletion::MotionDocument { tool, operation } => {
-                    let result = finish_motion_document_operation(tool, operation, cancel);
+                TimelineResultCompletion::MotionDocument {
+                    tool,
+                    operation,
+                    undo_scope,
+                } => {
+                    let revision_before = self.handle.current_revision();
+                    let (result, commit) =
+                        finish_motion_document_operation(tool, operation, cancel);
+                    if let Some(commit) = commit {
+                        self.record_external_edit_in(
+                            &undo_scope,
+                            commit.action_name,
+                            revision_before,
+                        );
+                    }
                     return short_id::shorten_ids(result, || {
                         short_id::current_id_universe(&self.handle.timeline(), &self.handle.media())
                     });
+                }
+                TimelineResultCompletion::DeferredBody {
+                    tool,
+                    args,
+                    undo_scope,
+                    identity,
+                } => {
+                    return self.run_deferred_body(tool, args, &undo_scope, identity, cancel);
                 }
                 TimelineResultCompletion::Capture(request) => request,
             };
@@ -702,7 +858,7 @@ impl Dispatcher {
                 Ok(ToolResult::ok(json.to_string()))
             }
             ToolName::ListModels => self.list_models_catalog(args),
-            ToolName::InspectMedia => self.inspect_media(args, before, manifest),
+            ToolName::InspectMedia => self.inspect_media(args, before, manifest, cancel),
 
             // --- Editing (wired to EditCommand) ---
             ToolName::AddClips => self.add_clips(args, manifest, op),
@@ -734,18 +890,18 @@ impl Dispatcher {
             ToolName::DeactivateWorkflow => self.deactivate_workflow(),
 
             // --- Analysis-driven edit surface ---
-            ToolName::DetectBeats => self.detect_beats(args, before),
+            ToolName::DetectBeats => self.detect_beats(args, before, cancel),
             ToolName::AutoCutToBeats => self.auto_cut_to_beats(args, before, op, cancel),
             ToolName::SmartReframe => self.smart_reframe(args),
-            ToolName::TightenSilences => self.tighten_silences(args, before),
-            ToolName::RemoveFillerWords => self.remove_filler_words(args, before, manifest),
+            ToolName::TightenSilences => self.tighten_silences(args, before, cancel),
+            ToolName::RemoveFillerWords => self.remove_filler_words(args, before, manifest, cancel),
 
             // --- Render + import + transcript + search (wired to the injected MediaBridge) ---
-            ToolName::InspectTimeline => self.inspect_timeline(args, before),
+            ToolName::InspectTimeline => self.inspect_timeline(args, before, cancel),
             ToolName::ImportMedia => self.import_media(args, manifest, cancel),
-            ToolName::GetTranscript => self.get_transcript(args, before, manifest),
+            ToolName::GetTranscript => self.get_transcript(args, before, manifest, cancel),
             ToolName::AddCaptions => self.add_captions(args, before, manifest, cancel),
-            ToolName::SearchMedia => self.search_media(args, manifest),
+            ToolName::SearchMedia => self.search_media(args, manifest, cancel),
 
             // --- Known but deliberately absent from discovery ---
             // Generation/upscale need the async GenClient + BYOK auth. Motion
@@ -955,6 +1111,7 @@ impl Dispatcher {
         args: &Value,
         timeline: &Timeline,
         manifest: &MediaManifest,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<ToolResult, ToolError> {
         let a: InspectMediaArgs = decode_tool_args(args, "")?;
         let Some(entry) = manifest
@@ -1009,9 +1166,10 @@ impl Dispatcher {
             max_frames,
             overview: a.overview.unwrap_or(false),
         };
-        let inspected = match bridge.inspect_media(&request) {
+        let inspected = match bridge.inspect_media_cancellable(&request, cancel) {
             Ok(inspected) => inspected,
             Err(error) => {
+                ensure_not_cancelled(cancel)?;
                 let kind = match error.kind {
                     BridgeErrorKind::Private => return Err(ToolError::new(error.message)),
                     BridgeErrorKind::NotFound => {
@@ -1041,7 +1199,12 @@ impl Dispatcher {
     /// encode behind the [`MediaBridge`]). Returns MCP image content per frame plus
     /// a trailing meta text block (`fps`/`width`/`height`/`totalFrames`/
     /// `frameNumbers`).
-    fn inspect_timeline(&self, args: &Value, before: &Timeline) -> Result<ToolResult, ToolError> {
+    fn inspect_timeline(
+        &self,
+        args: &Value,
+        before: &Timeline,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> Result<ToolResult, ToolError> {
         let a: InspectTimelineArgs = decode_tool_args(args, "")?;
 
         let total_frames = before.total_frames();
@@ -1094,8 +1257,8 @@ impl Dispatcher {
             width,
             height,
         } = bridge
-            .inspect_timeline(&sampled, INSPECT_TIMELINE_MAX_DIMENSION)
-            .map_err(|e| ToolError::new(e.message))?;
+            .inspect_timeline_cancellable(&sampled, INSPECT_TIMELINE_MAX_DIMENSION, cancel)
+            .map_err(|e| cancelled_or(cancel, e.message))?;
 
         if frames.is_empty() {
             return Ok(ToolResult::error("Failed to render timeline frames."));
@@ -1260,6 +1423,7 @@ impl Dispatcher {
         &self,
         args: &Value,
         manifest: &MediaManifest,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<ToolResult, ToolError> {
         use serde_json::json;
         let a: SearchMediaArgs = decode_tool_args(args, "")?;
@@ -1312,8 +1476,8 @@ impl Dispatcher {
             ));
         };
         let result = bridge
-            .search_media(&candidates, &query, scope, limit)
-            .map_err(|e| ToolError::new(e.message))?;
+            .search_media_cancellable(&candidates, &query, scope, limit, cancel)
+            .map_err(|e| cancelled_or(cancel, e.message))?;
 
         // Shape the upstream JSON. `name` per hit is looked up from the manifest.
         let name_of = |media_ref: &str| -> String {
@@ -1387,6 +1551,7 @@ impl Dispatcher {
         args: &Value,
         before: &Timeline,
         manifest: &MediaManifest,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<ToolResult, ToolError> {
         let a: GetTranscriptArgs = decode_tool_args(args, "")?;
         let fps = before.fps;
@@ -1434,7 +1599,7 @@ impl Dispatcher {
                 "get_transcript: transcription is not available in this build",
             ));
         };
-        let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
+        let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest, cancel)?;
 
         // Assemble via the pure mapper, capped for the model-facing response.
         let assembled = assemble_fragment_transcript(
@@ -1594,8 +1759,8 @@ impl Dispatcher {
             ));
         };
         let source_results = bridge
-            .transcribe_sources(&sources)
-            .map_err(|e| ToolError::new(e.message))?;
+            .transcribe_sources_cancellable(&sources, cancel)
+            .map_err(|e| cancelled_or(cancel, e.message))?;
         ensure_not_cancelled(cancel)?;
         let mut transcripts: BTreeMap<String, opentake_media::TranscriptionResult> =
             BTreeMap::new();
@@ -1984,7 +2149,12 @@ impl Dispatcher {
         Ok(ToolResult::ok(res.summary))
     }
 
-    fn detect_beats(&self, args: &Value, before: &Timeline) -> Result<ToolResult, ToolError> {
+    fn detect_beats(
+        &self,
+        args: &Value,
+        before: &Timeline,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> Result<ToolResult, ToolError> {
         let a: DetectBeatsArgs = decode_tool_args(args, "")?;
         let beats = self.detect_beat_hints(
             before,
@@ -1996,6 +2166,7 @@ impl Dispatcher {
                 sensitivity: a.sensitivity,
                 tool_name: "detect_beats",
             },
+            cancel,
         )?;
         let payload = serde_json::json!({
             "applied": false,
@@ -2034,6 +2205,7 @@ impl Dispatcher {
                 sensitivity: None,
                 tool_name: "auto_cut_to_beats",
             },
+            cancel,
         )?;
         ensure_not_cancelled(cancel)?;
         let min_gap = a.min_clip_frames.unwrap_or(1).max(1);
@@ -2108,7 +2280,12 @@ impl Dispatcher {
         ))
     }
 
-    fn tighten_silences(&self, args: &Value, before: &Timeline) -> Result<ToolResult, ToolError> {
+    fn tighten_silences(
+        &self,
+        args: &Value,
+        before: &Timeline,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> Result<ToolResult, ToolError> {
         let a: TightenSilencesArgs = decode_tool_args(args, "")?;
         let targets = silence_targets(before, &a)?;
         let padding = a.padding_frames.unwrap_or(3);
@@ -2143,13 +2320,16 @@ impl Dispatcher {
         let mut warnings = Vec::new();
         for target in targets {
             let source_range = visible_source_range_secs(target.clip, fps);
-            let pcm = match self.handle.extract_analysis_pcm(
+            ensure_not_cancelled(cancel)?;
+            let pcm = match self.handle.extract_analysis_pcm_cancellable(
                 &target.clip.media_ref,
                 spec,
                 Some(source_range),
+                cancel,
             ) {
                 Ok(pcm) => pcm,
                 Err(e) => {
+                    ensure_not_cancelled(cancel)?;
                     tracing::warn!(
                         target: "opentake::agent::private",
                         clip_id = %target.clip.id,
@@ -2222,6 +2402,7 @@ impl Dispatcher {
         args: &Value,
         before: &Timeline,
         manifest: &MediaManifest,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<ToolResult, ToolError> {
         let a: RemoveFillerWordsArgs = decode_tool_args(args, "")?;
         if a.clip_ids.is_some() && a.track_index.is_some() {
@@ -2329,7 +2510,7 @@ impl Dispatcher {
                     "remove_filler_words: transcription is not available in this build",
                 ));
             };
-            let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
+            let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest, cancel)?;
             let transcript = assemble_fragment_transcript(
                 &frags,
                 &sources,
@@ -2427,6 +2608,7 @@ impl Dispatcher {
         &self,
         timeline: &Timeline,
         request: BeatAnalysisRequest<'_>,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<Vec<BeatHint>, ToolError> {
         let target = analysis_target(
             timeline,
@@ -2440,8 +2622,8 @@ impl Dispatcher {
         let spec = analysis_pcm_spec();
         let pcm = self
             .handle
-            .extract_analysis_pcm(&target.media_ref, spec, target.source_range)
-            .map_err(|e| ToolError::new(format!("{}: {e}", request.tool_name)))?;
+            .extract_analysis_pcm_cancellable(&target.media_ref, spec, target.source_range, cancel)
+            .map_err(|e| cancelled_or(cancel, format!("{}: {e}", request.tool_name)))?;
         let fps = timeline_fps(timeline);
         let mut config = BeatDetectionConfig::with_window(
             pcm.spec.sample_rate,
@@ -3125,10 +3307,16 @@ impl Dispatcher {
     ) -> Result<opentake_ops::command::EditResult, ToolError> {
         ensure_not_cancelled(cancel)?;
         let result = match expected {
-            Some(expected) => self
-                .handle
-                .apply_at_revision(&expected, cmd)
-                .map_err(|error| ToolError::new(error.to_string()))?,
+            Some(expected) => {
+                if PinnedProjectIdentity::current()
+                    .is_some_and(|pinned| !same_project(&pinned, &expected))
+                {
+                    return Err(ToolError::new(PROJECT_CHANGED_ERROR));
+                }
+                self.handle
+                    .apply_at_revision(&expected, cmd)
+                    .map_err(|error| ToolError::new(error.to_string()))?
+            }
             None => self.apply_raw(cmd)?,
         };
         if result.changed {
@@ -3154,6 +3342,15 @@ impl Dispatcher {
     }
 
     fn record_external_edit(&self, action_name: String, before: Option<CoreRevision>) {
+        self.record_external_edit_in(&ActiveUndoScope::current(), action_name, before);
+    }
+
+    fn record_external_edit_in(
+        &self,
+        scope: &str,
+        action_name: String,
+        before: Option<CoreRevision>,
+    ) {
         let (Some(before), Some((revision, head))) = (before, self.handle.revision_and_undo_head())
         else {
             return;
@@ -3167,13 +3364,26 @@ impl Dispatcher {
             return;
         }
         self.agent_undo_stacks()
-            .entry(ActiveUndoScope::current())
+            .entry(scope.to_string())
             .or_default()
             .push(AgentUndoMarker { revision, head });
     }
 
     /// Apply without touching the agent-undo stack (used by `undo` itself).
     fn apply_raw(&self, cmd: EditCommand) -> Result<opentake_ops::command::EditResult, ToolError> {
+        if let Some(pinned) = PinnedProjectIdentity::current() {
+            // Outside the host lease: commit atomically against the admitted
+            // project, never into one opened meanwhile.
+            let current = self
+                .handle
+                .current_revision()
+                .filter(|current| same_project(&pinned, current))
+                .ok_or_else(|| ToolError::new(PROJECT_CHANGED_ERROR))?;
+            return self
+                .handle
+                .apply_at_revision(&current, cmd)
+                .map_err(|e| ToolError::new(e.to_string()));
+        }
         self.handle
             .apply(cmd)
             .map_err(|e| ToolError::new(e.to_string()))
@@ -3203,6 +3413,19 @@ fn ensure_not_cancelled(cancel: &opentake_media::MediaCancelToken) -> Result<(),
         Err(ToolError::new("Cancelled"))
     } else {
         Ok(())
+    }
+}
+
+/// A failure caused by cancellation reports `Cancelled`, not the backend's
+/// incidental error text.
+fn cancelled_or(
+    cancel: &opentake_media::MediaCancelToken,
+    message: impl Into<String>,
+) -> ToolError {
+    if cancel.is_cancelled() {
+        ToolError::new("Cancelled")
+    } else {
+        ToolError::new(message)
     }
 }
 
@@ -3615,10 +3838,13 @@ fn transcribe_fragment_sources(
     bridge: &dyn MediaBridge,
     frags: &[TranscriptFrag<'_>],
     manifest: &MediaManifest,
+    cancel: &opentake_media::MediaCancelToken,
 ) -> Result<FragmentTranscripts, ToolError> {
     let source_results = bridge
-        .transcribe_sources(&unique_transcript_sources(frags))
-        .map_err(|e| ToolError::new(e.message))?;
+        .transcribe_sources_cancellable(&unique_transcript_sources(frags), cancel)
+        .map_err(|e| cancelled_or(cancel, e.message))?;
+    // A cancelled batch fails as a whole; it is never reported as skips.
+    ensure_not_cancelled(cancel)?;
     let mut by_media_ref = BTreeMap::new();
     let mut skipped = Vec::new();
     for r in source_results {
@@ -5453,6 +5679,172 @@ mod tests {
             Ok(Box::new(DeferredDocumentOperation {
                 executed: Arc::new(AtomicUsize::new(0)),
             }))
+        }
+    }
+
+    /// Publishes by moving `clip-1` on the shared handle, standing in for the
+    /// host's single render-and-commit timeline transaction.
+    struct CommittingPublishBridge {
+        handle: Arc<StateHandle>,
+        to_frame: i32,
+        fail: bool,
+    }
+
+    struct CommittingPublishOperation {
+        handle: Arc<StateHandle>,
+        to_frame: i32,
+        fail: bool,
+    }
+
+    impl AdmittedMotionDocumentOperation for CommittingPublishOperation {
+        fn execute(
+            self: Box<Self>,
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<
+            crate::mcp::motion_documents::MotionDocumentResponse,
+            crate::mcp::motion_documents::MotionDocumentBridgeError,
+        > {
+            use crate::mcp::motion_documents::{
+                MotionDocumentBridgeError, MotionDocumentBridgeErrorKind, MotionDocumentPublish,
+                MotionDocumentReference, MotionDocumentResponse,
+            };
+            if self.fail || cancel.is_cancelled() {
+                return Err(MotionDocumentBridgeError::new(
+                    if self.fail {
+                        MotionDocumentBridgeErrorKind::RenderFailed
+                    } else {
+                        MotionDocumentBridgeErrorKind::Cancelled
+                    },
+                    "publish did not commit",
+                ));
+            }
+            let result = self
+                .handle
+                .apply(EditCommand::MoveClips {
+                    moves: vec![ClipMove {
+                        clip_id: "clip-1".into(),
+                        to_track: 0,
+                        to_frame: self.to_frame,
+                    }],
+                })
+                .expect("publish commit");
+            Ok(MotionDocumentResponse::Published(MotionDocumentPublish {
+                clip_id: "clip-1".into(),
+                asset_id: "asset-1".into(),
+                duration_frames: 30,
+                duration_seconds: 1.0,
+                fps: 30.0,
+                width: 640,
+                height: 360,
+                source_document: MotionDocumentReference {
+                    document_id: "0b8f4c2e-6a1d-4e3b-9c7f-5d2a8e1b0c94".into(),
+                    revision_hash: "a".repeat(64),
+                },
+                action_name: result.action_name,
+            }))
+        }
+    }
+
+    impl MotionDocumentBridge for CommittingPublishBridge {
+        fn can_edit_motion_documents(&self) -> bool {
+            true
+        }
+
+        fn admit(
+            &self,
+            _request: crate::mcp::motion_documents::MotionDocumentRequest,
+        ) -> Result<
+            Box<dyn AdmittedMotionDocumentOperation>,
+            crate::mcp::motion_documents::MotionDocumentBridgeError,
+        > {
+            Ok(Box::new(CommittingPublishOperation {
+                handle: self.handle.clone(),
+                to_frame: self.to_frame,
+                fail: self.fail,
+            }))
+        }
+    }
+
+    fn publish_args() -> Value {
+        serde_json::json!({
+            "documentId": "0b8f4c2e-6a1d-4e3b-9c7f-5d2a8e1b0c94",
+            "revisionHash": "a".repeat(64),
+            "width": 640,
+            "height": 360,
+            "fps": 30,
+            "durationFrames": 30,
+            "startFrame": 0,
+        })
+    }
+
+    fn publishing_dispatcher(handle: Arc<StateHandle>, fail: bool) -> Dispatcher {
+        dispatcher_with(handle.clone()).with_motion_document_bridge(Some(Arc::new(
+            CommittingPublishBridge {
+                handle,
+                to_frame: 40,
+                fail,
+            },
+        )))
+    }
+
+    #[test]
+    fn published_motion_document_is_undoable_before_earlier_assistant_edits() {
+        let handle = seeded_handle();
+        let dispatcher = publishing_dispatcher(handle.clone(), false);
+        let moved = scoped_dispatch(
+            &dispatcher,
+            "chat-session-x",
+            "move_clips",
+            serde_json::json!({"moves":[{"clipId":"clip-1","toFrame":10}]}),
+        );
+        assert!(!moved.is_error, "{}", moved.text_joined());
+
+        let cancel = opentake_media::MediaCancelToken::new();
+        let receipt = dispatcher.dispatch_cancellable_scoped_deferred(
+            "chat-session-x",
+            "publish_motion_document",
+            publish_args(),
+            &cancel,
+        );
+        // Hosts finish outside the dispatch's undo scope.
+        let published = dispatcher.finish_dispatch(receipt, &cancel);
+        assert!(!published.is_error, "{}", published.text_joined());
+        assert!(!published.text_joined().contains("actionName"));
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 40);
+
+        let other = scoped_dispatch(&dispatcher, "chat-session-y", "undo", serde_json::json!({}));
+        assert!(other.is_error, "another session must not own the publish");
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 40);
+
+        let first = scoped_dispatch(&dispatcher, "chat-session-x", "undo", serde_json::json!({}));
+        assert!(!first.is_error, "{}", first.text_joined());
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 10);
+
+        let second = scoped_dispatch(&dispatcher, "chat-session-x", "undo", serde_json::json!({}));
+        assert!(!second.is_error, "{}", second.text_joined());
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 0);
+    }
+
+    #[test]
+    fn failed_or_cancelled_motion_publish_records_no_undo_marker() {
+        for fail in [true, false] {
+            let handle = seeded_handle();
+            let dispatcher = publishing_dispatcher(handle.clone(), fail);
+            let cancel = opentake_media::MediaCancelToken::new();
+            let receipt = dispatcher.dispatch_cancellable_scoped_deferred(
+                "chat-session-x",
+                "publish_motion_document",
+                publish_args(),
+                &cancel,
+            );
+            if !fail {
+                cancel.cancel();
+            }
+            let result = dispatcher.finish_dispatch(receipt, &cancel);
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(!dispatcher
+                .agent_undo_stacks()
+                .contains_key("chat-session-x"));
         }
     }
 
@@ -9146,6 +9538,140 @@ mod tests {
             Some(bridge.clone() as Arc<dyn MediaBridge>),
         );
         (d, bridge)
+    }
+
+    /// Cancels the dispatch token mid-batch (as a project transition does) and
+    /// then reports every source as skipped.
+    struct CancellingTranscriptBridge;
+
+    impl MediaBridge for CancellingTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            sources: &[TranscriptSource],
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
+            cancel.cancel();
+            Ok(sources
+                .iter()
+                .map(|source| TranscriptSourceResult {
+                    media_ref: source.media_ref.clone(),
+                    transcript: None,
+                    error: Some("decode interrupted".into()),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn cancelled_transcription_fails_as_a_whole_instead_of_skipping_sources() {
+        let mut tl = Timeline::new();
+        tl.fps = 30;
+        let mut track = opentake_domain::Track::new("track-a", ClipType::Audio);
+        let mut clip = Clip::new("clip-a", "aud", 0, 60);
+        clip.media_type = ClipType::Audio;
+        track.clips.push(clip);
+        tl.tracks.push(track);
+        let mut m = MediaManifest::new();
+        m.entries.push(audio_entry("aud", "Voice"));
+        let handle = Arc::new(StateHandle::new(tl, m));
+        let d = Dispatcher::with_bridge(
+            handle.clone(),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(Arc::new(CancellingTranscriptBridge) as Arc<dyn MediaBridge>),
+        );
+        for tool in ["get_transcript", "add_captions"] {
+            let result = d.dispatch_cancellable(
+                tool,
+                serde_json::json!({}),
+                &opentake_media::MediaCancelToken::new(),
+            );
+            assert!(result.is_error, "{tool}: {}", result.text_joined());
+            assert_eq!(result.text_joined(), "Cancelled", "{tool}");
+        }
+        assert_eq!(handle.timeline().tracks.len(), 1, "no caption track landed");
+    }
+
+    #[test]
+    fn media_heavy_tools_defer_their_body_until_finish_dispatch() {
+        let (d, bridge) = transcript_dispatcher(transcript(vec![word("hi", 0.0, 0.5)]));
+        let cancel = opentake_media::MediaCancelToken::new();
+        let receipt =
+            d.dispatch_cancellable_deferred("get_transcript", serde_json::json!({}), &cancel);
+        assert!(
+            bridge.transcribe_calls.lock().unwrap().is_empty(),
+            "admission must not transcribe"
+        );
+        let result = d.finish_dispatch(receipt, &cancel);
+        assert!(!result.is_error, "{}", result.text_joined());
+        assert!(result.text_joined().contains("hi"));
+        assert_eq!(bridge.transcribe_calls.lock().unwrap().len(), 1);
+    }
+
+    /// Switches the live project while "transcribing", like a user opening a
+    /// new project during a long `add_captions`.
+    struct ProjectSwitchingTranscriptBridge {
+        core: AppCore,
+    }
+
+    impl MediaBridge for ProjectSwitchingTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            sources: &[TranscriptSource],
+            _cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
+            self.core.new_project();
+            Ok(sources
+                .iter()
+                .map(|source| TranscriptSourceResult {
+                    media_ref: source.media_ref.clone(),
+                    transcript: Some(transcript(vec![word("hello", 0.0, 0.5)])),
+                    error: None,
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn deferred_caption_commit_never_lands_in_a_project_opened_meanwhile() {
+        let fixture = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        core.save_project(Some(fixture.path().join("A.opentake")))
+            .unwrap();
+        core.apply(EditCommand::RegisterMediaAndAddClip {
+            media: audio_entry("aud", "Voice"),
+            entry: opentake_ops::command::ClipEntry {
+                media_ref: "aud".into(),
+                media_type: ClipType::Audio,
+                source_clip_type: ClipType::Audio,
+                track_index: 0,
+                start_frame: 0,
+                duration_frames: 60,
+                trim_start_frame: None,
+                trim_end_frame: None,
+                has_audio: true,
+                add_linked_audio: false,
+                transform: None,
+            },
+            auto_track: true,
+        })
+        .unwrap();
+        let d = Dispatcher::with_bridge(
+            Arc::new(crate::mcp::core_handle::AppCoreHandle::new(core.clone())),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(
+                Arc::new(ProjectSwitchingTranscriptBridge { core: core.clone() })
+                    as Arc<dyn MediaBridge>,
+            ),
+        );
+
+        let result = d.dispatch("add_captions", serde_json::json!({}));
+
+        assert!(result.is_error, "{}", result.text_joined());
+        assert!(core.get_timeline().timeline.tracks.is_empty());
+        assert!(
+            core.project_dir().is_none(),
+            "the replacement project is open"
+        );
     }
 
     /// A fixed 30-second talking-head fixture with linked video/audio clips.

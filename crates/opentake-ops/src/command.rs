@@ -514,9 +514,32 @@ mod aligned_stem_track_tests {
         }
     }
 
+    fn stem_media(id: &str) -> MediaManifestEntry {
+        MediaManifestEntry {
+            id: id.into(),
+            name: id.into(),
+            kind: ClipType::Audio,
+            source: opentake_domain::MediaSource::External {
+                absolute_path: format!("/{id}.wav"),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }
+    }
+
     #[test]
     fn aligned_stems_use_separate_tracks_and_one_undo_entry() {
         let mut state = EditorState::default();
+        state.manifest.entries = vec![stem_media("vocals"), stem_media("accompaniment")];
         let ids = SeqIdGen::default();
         let result = apply(
             &mut state,
@@ -1375,12 +1398,15 @@ pub fn apply(
     // Commands inspect clip ends while deriving their transaction plan. Guard
     // the complete persisted graph before even that read. Undo/redo only
     // validate the history snapshot they would restore, and a removal only the
-    // clips it keeps, so a malformed clip can always be undone or removed.
-    if !matches!(
-        command,
-        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. }
-    ) {
-        validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // clips it keeps, so a malformed clip can always be undone or removed. A
+    // nested edit leaves its child timeline to the inner command's own guard,
+    // so a malformed clip can also be removed from inside a compound clip.
+    match &command {
+        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. } => {}
+        EditCommand::EditNestedSequence { sequence_id, .. } => {
+            validate_frame_arithmetic_outside_sequence(&state.timeline, "timeline", sequence_id)?;
+        }
+        _ => validate_timeline_frame_arithmetic(&state.timeline, "timeline")?,
     }
     match command {
         EditCommand::Undo => {
@@ -1911,12 +1937,13 @@ fn edit_nested_sequence(
             "nested-sequence, media-library, and project-settings commands must target the root timeline".into(),
         ));
     }
-    let child = state
+    let (sequence_index, child) = state
         .timeline
         .nested_sequences
         .iter()
-        .find(|sequence| sequence.id == sequence_id)
-        .map(|sequence| sequence.timeline.clone())
+        .enumerate()
+        .find(|(_, sequence)| sequence.id == sequence_id)
+        .map(|(index, sequence)| (index, sequence.timeline.clone()))
         .ok_or_else(|| EditError::Invalid(format!("Nested sequence not found: {sequence_id}")))?;
     transact(
         state,
@@ -1939,7 +1966,16 @@ fn edit_nested_sequence(
                 .expect("sequence was resolved before transaction")
                 .timeline = Timeline::new();
             let mut child_state = EditorState::new(editable, st.manifest.clone());
-            let inner = apply(&mut child_state, command, ids)?;
+            // The inner command names clips by their child-timeline path;
+            // place that under the sequence so it does not read as a root path.
+            let inner = apply(&mut child_state, command, ids).map_err(|error| match error {
+                EditError::Invalid(message) if message.starts_with("timeline.") => {
+                    EditError::Invalid(format!(
+                        "timeline.nestedSequences[{sequence_index}].{message}"
+                    ))
+                }
+                other => other,
+            })?;
             child_state.timeline.nested_sequences.clear();
             let sequence = st
                 .timeline
@@ -2931,25 +2967,17 @@ fn validate_clip_frame_arithmetic(clip: &Clip, label: &str) -> Result<i32, EditE
 }
 
 fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Result<(), EditError> {
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
-        for (clip_index, clip) in track.clips.iter().enumerate() {
-            if validate_clip_frame_arithmetic(clip, "").is_err() {
-                validate_clip_frame_arithmetic(
-                    clip,
-                    &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
-                )?;
-            }
-        }
-    }
-    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        if validate_timeline_frame_arithmetic(&sequence.timeline, "").is_err() {
-            validate_timeline_frame_arithmetic(
-                &sequence.timeline,
-                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-            )?;
-        }
-    }
-    Ok(())
+    validate_frame_arithmetic_except(timeline, label, &|_| false, None)
+}
+
+/// [`validate_timeline_frame_arithmetic`] for everything except the child
+/// timeline of the nested sequence `sequence_id`.
+fn validate_frame_arithmetic_outside_sequence(
+    timeline: &Timeline,
+    label: &str,
+    sequence_id: &str,
+) -> Result<(), EditError> {
+    validate_frame_arithmetic_except(timeline, label, &|_| false, Some(sequence_id))
 }
 
 /// [`validate_timeline_frame_arithmetic`] for every clip except the root clips
@@ -2959,9 +2987,22 @@ fn validate_kept_frame_arithmetic(
     label: &str,
     removed: &HashSet<String>,
 ) -> Result<(), EditError> {
+    validate_frame_arithmetic_except(timeline, label, &|clip| removed.contains(&clip.id), None)
+}
+
+/// Validate the frame arithmetic of every clip in `timeline` and its nested
+/// sequences, except the root clips `skip_clip` selects and the child timeline
+/// of `skip_sequence`. Errors name the clip by its path under `label`, which
+/// is only formatted once a clip fails.
+fn validate_frame_arithmetic_except(
+    timeline: &Timeline,
+    label: &str,
+    skip_clip: &dyn Fn(&Clip) -> bool,
+    skip_sequence: Option<&str>,
+) -> Result<(), EditError> {
     for (track_index, track) in timeline.tracks.iter().enumerate() {
         for (clip_index, clip) in track.clips.iter().enumerate() {
-            if removed.contains(&clip.id) || clip.frame_arithmetic().is_ok() {
+            if skip_clip(clip) || validate_clip_frame_arithmetic(clip, "").is_ok() {
                 continue;
             }
             validate_clip_frame_arithmetic(
@@ -2971,6 +3012,11 @@ fn validate_kept_frame_arithmetic(
         }
     }
     for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        if skip_sequence == Some(sequence.id.as_str())
+            || validate_timeline_frame_arithmetic(&sequence.timeline, "").is_ok()
+        {
+            continue;
+        }
         validate_timeline_frame_arithmetic(
             &sequence.timeline,
             &format!("{label}.nestedSequences[{sequence_index}].timeline"),
@@ -3252,7 +3298,7 @@ fn add_clips_auto_track(
     let entry_ends: Vec<i32> = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| validate_auto_track_entry(entry, index))
+        .map(|(index, entry)| validate_auto_track_entry(state, entry, index))
         .collect::<Result<_, _>>()?;
     // Route by the placed clip's own type, as validation and track
     // compatibility do: the audio part of a video asset (`media_type` audio,
@@ -3327,7 +3373,7 @@ fn add_clips_to_separate_auto_tracks(
         ));
     }
     for (index, entry) in entries.iter().enumerate() {
-        validate_auto_track_entry(entry, index)?;
+        validate_auto_track_entry(state, entry, index)?;
     }
     transact(
         state,
@@ -3673,6 +3719,7 @@ fn insert_clips(
     }
     let target_type = state.timeline.tracks[track_index].kind;
     for (i, e) in entries.iter().enumerate() {
+        validate_entry_media(state, e, i)?;
         if !e.media_type.is_compatible(target_type) {
             return Err(EditError::Invalid(format!(
                 "entries[{i}]: asset type is not compatible with the target track"
@@ -7696,7 +7743,27 @@ fn set_timeline_settings_cmd(
 
 // MARK: - Small local helpers
 
+/// A placed non-text clip must reference an asset in the project manifest;
+/// otherwise the timeline gains a clip that no preview or export can resolve.
+fn validate_entry_media(state: &EditorState, e: &ClipEntry, i: usize) -> Result<(), EditError> {
+    // Only a clip that is text on both sides has no media, as for paste.
+    if (e.media_type == ClipType::Text && e.source_clip_type == ClipType::Text)
+        || state
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.id == e.media_ref)
+    {
+        return Ok(());
+    }
+    Err(EditError::Invalid(format!(
+        "entries[{i}]: media asset not found: {}",
+        e.media_ref
+    )))
+}
+
 fn validate_entry(state: &EditorState, e: &ClipEntry, i: usize) -> Result<i32, EditError> {
+    validate_entry_media(state, e, i)?;
     if e.track_index >= state.timeline.tracks.len() {
         return Err(EditError::Invalid(format!(
             "entries[{i}]: track index {} out of range",
@@ -7723,7 +7790,12 @@ fn validate_entry(state: &EditorState, e: &ClipEntry, i: usize) -> Result<i32, E
     )
 }
 
-fn validate_auto_track_entry(e: &ClipEntry, i: usize) -> Result<i32, EditError> {
+fn validate_auto_track_entry(
+    state: &EditorState,
+    e: &ClipEntry,
+    i: usize,
+) -> Result<i32, EditError> {
+    validate_entry_media(state, e, i)?;
     let target = if e.media_type == ClipType::Audio {
         ClipType::Audio
     } else {

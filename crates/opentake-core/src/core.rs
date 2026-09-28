@@ -2708,6 +2708,7 @@ mod tests {
             let mut tl = Timeline::new();
             tl.tracks.push(Track::new("t1", ClipType::Video));
             session.editor.seed_from_timeline(tl);
+            session.editor.seed_media("asset-1");
         }
         core
     }
@@ -2972,7 +2973,10 @@ mod tests {
         std::fs::write(&manifest_path, &noncanonical_manifest).unwrap();
         let blocked_timeline = block_project_json(&bundle);
 
-        let result = core.apply_at_revision_persisted(core.project_revision(), add_one_clip());
+        let result = core.apply_at_revision_persisted(
+            core.project_revision(),
+            add_one_clip_of(&before.media.entries[0].id),
+        );
         restore_project_json(&bundle, &blocked_timeline);
 
         assert!(
@@ -3220,7 +3224,10 @@ mod tests {
         // media.json is replaced first; its flush fails after the rename.
         opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
         let error = core
-            .apply_at_revision_persisted(core.project_revision(), add_one_clip())
+            .apply_at_revision_persisted(
+                core.project_revision(),
+                add_one_clip_of(&before.media.entries[0].id),
+            )
             .expect_err("the unconfirmed flush must be reported");
 
         assert!(error.is_committed(), "{error:?}");
@@ -3825,9 +3832,13 @@ mod tests {
     }
 
     fn add_one_clip() -> EditCommand {
+        add_one_clip_of("asset-1")
+    }
+
+    fn add_one_clip_of(media_ref: &str) -> EditCommand {
         EditCommand::AddClips {
             entries: vec![ClipEntry {
-                media_ref: "asset-1".into(),
+                media_ref: media_ref.into(),
                 media_type: ClipType::Video,
                 source_clip_type: ClipType::Video,
                 track_index: 0,
@@ -4081,7 +4092,7 @@ mod tests {
                 },
                 CoreEvent::MediaChanged {
                     project_epoch: 0,
-                    count: 0,
+                    count: 1,
                 },
                 CoreEvent::TimelineChanged {
                     project_epoch: 0,
@@ -4089,7 +4100,7 @@ mod tests {
                 },
                 CoreEvent::MediaChanged {
                     project_epoch: 0,
-                    count: 0,
+                    count: 1,
                 },
             ]
         );

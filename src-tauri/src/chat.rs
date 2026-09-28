@@ -541,6 +541,34 @@ impl ChatState {
         Ok(session)
     }
 
+    /// Permanently delete one conversation of the current project. A session
+    /// with a running turn is refused. The file is removed before the cached
+    /// copy, so a failed delete leaves memory and disk unchanged.
+    fn delete_project_session(
+        &self,
+        project: &ChatProjectContext,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let key = project.key(session_id);
+        let turns = self.turns.lock().map_err(|e| e.to_string())?;
+        if turns.running.contains_key(&key) {
+            return Err("finish or cancel the running turn before deleting this chat".into());
+        }
+        let _identity = self.core.lock_project_identity_workflow();
+        self.ensure_project_context(project)?;
+        let _persistence = self.persistence.lock().map_err(|e| e.to_string())?;
+        project
+            .store
+            .delete(session_id)
+            .map_err(|e| e.to_string())?;
+        self.sessions
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&key);
+        drop(turns);
+        Ok(())
+    }
+
     fn reserve_turn(
         &self,
         key: SessionKey,
@@ -869,9 +897,10 @@ impl EmitLoop for AppEmitter {
 }
 
 /// Binds every Context Signal snapshot and complete tool dispatch to the
-/// project accepted by `chat_send`. The read lease makes identity check + tool
-/// side effect one atomic project-lifecycle boundary, including MediaBridge
-/// calls that bypass `CoreHandle`.
+/// project accepted by `chat_send`. Admission runs under the identity read
+/// lease; media-heavy tool bodies and captures run from `finish_dispatch`
+/// after it is released, pinned to the admitted project, and a project
+/// transition cancels them through the turn's token instead of waiting.
 struct ProjectTurnGate {
     state: ChatState,
     project: ChatProjectContext,
@@ -922,6 +951,35 @@ impl ChatTurnGate for ProjectTurnGate {
 
     fn request_dispatch_cancel(&self) {
         self.cancel.media.cancel();
+    }
+}
+
+/// User-facing text for a failed official Codex turn. Only a provider-reported
+/// turn failure (which covers expired sign-ins) points at the login status.
+fn codex_turn_failure_message(error: crate::codex::CodexTurnError) -> &'static str {
+    use crate::codex::CodexTurnError;
+    match error {
+        CodexTurnError::McpStart => {
+            "the OpenTake tool server for official Codex stopped during the turn; try again"
+        }
+        CodexTurnError::Timeout => {
+            "the official Codex turn took too long and was stopped; try a smaller request"
+        }
+        CodexTurnError::Protocol => {
+            "OpenTake could not read the official Codex output; update Codex CLI and try again"
+        }
+        CodexTurnError::CliFailed => {
+            "the official Codex CLI stopped unexpectedly; try again, and update Codex CLI if it keeps failing"
+        }
+        CodexTurnError::ProviderFailed => {
+            "official Codex reported that the turn failed; check the Codex login status and try again"
+        }
+        CodexTurnError::Cancelled => "the official Codex turn was cancelled",
+        CodexTurnError::Unavailable => "official Codex CLI was not found",
+        CodexTurnError::IncompatibleCli | CodexTurnError::StrictConfigRejected => {
+            "the installed official Codex CLI is not compatible with this OpenTake version"
+        }
+        CodexTurnError::NotAuthenticated => "official Codex is not signed in",
     }
 }
 
@@ -1116,14 +1174,14 @@ pub async fn chat_send(
                     codex_final = Some(message);
                     Ok(first_message_id.clone())
                 }
-                Err(crate::codex::CodexTurnError::McpStart)
-                | Err(crate::codex::CodexTurnError::Timeout)
-                | Err(crate::codex::CodexTurnError::Protocol)
-                | Err(crate::codex::CodexTurnError::ProviderFailed) => Err(LoopError::llm(
-                    LlmError::Provider(
-                        "official Codex turn failed; check the Codex login status and try again"
-                            .into(),
-                    ),
+                Err(
+                    error @ (crate::codex::CodexTurnError::McpStart
+                    | crate::codex::CodexTurnError::Timeout
+                    | crate::codex::CodexTurnError::Protocol
+                    | crate::codex::CodexTurnError::ProviderFailed
+                    | crate::codex::CodexTurnError::CliFailed),
+                ) => Err(LoopError::llm(
+                    LlmError::Provider(codex_turn_failure_message(error).into()),
                     &first_message_id,
                     codex_sequence.next(),
                 )),
@@ -1326,6 +1384,25 @@ pub fn chat_session_set_open(
     state.set_project_session_open(&project, &session_id, is_open)
 }
 
+/// `chat_session_delete`: permanently delete a conversation of the expected
+/// project. Refused while that conversation has a running turn.
+#[tauri::command]
+pub async fn chat_session_delete(
+    state: State<'_, ChatState>,
+    session_id: String,
+    expected_project_epoch: u64,
+    expected_project_path: String,
+) -> Result<(), String> {
+    let _activity = crate::updater::begin_mutating_activity(&state.admission)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = state.project_context_for(expected_project_epoch, &expected_project_path)?;
+        state.delete_project_session(&project, &session_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// `chat_cancel`: request a running turn stop at the next boundary. No-op when
 /// no turn is running.
 #[tauri::command]
@@ -1350,6 +1427,31 @@ pub fn chat_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_turn_failures_have_distinct_messages_and_only_provider_failure_blames_login() {
+        use crate::codex::CodexTurnError;
+        let failures = [
+            CodexTurnError::McpStart,
+            CodexTurnError::Timeout,
+            CodexTurnError::Protocol,
+            CodexTurnError::ProviderFailed,
+            CodexTurnError::CliFailed,
+        ];
+        let messages = failures.map(codex_turn_failure_message);
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(
+                messages.iter().filter(|other| other == &message).count(),
+                1,
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("login"),
+                failures[index] == CodexTurnError::ProviderFailed,
+                "{message}"
+            );
+        }
+    }
 
     struct RedactionMediaBridge;
 
@@ -2007,6 +2109,57 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_session_removes_it_but_never_one_with_a_running_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("Delete.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+        let state = ChatState::new(
+            core.clone(),
+            temp.path().join("no-workflows"),
+            temp.path().join("chat-cache"),
+            temp.path().join("chat-models"),
+        );
+        let project = state.project_context().unwrap();
+        for id in ["chat-old", "chat-busy"] {
+            let mut session = ChatSession::new(id);
+            session.messages.push(ChatMessage::user("hello"));
+            state.put_project_session(&project, session).unwrap();
+        }
+
+        let busy = project.key("chat-busy");
+        let _lease = state
+            .reserve_turn(busy.clone(), Arc::new(TurnCancel::new()))
+            .unwrap();
+        let refused = state
+            .delete_project_session(&project, "chat-busy")
+            .expect_err("a running turn keeps its session");
+        assert!(refused.contains("running turn"), "{refused}");
+        state.release_turn(&busy);
+
+        state.delete_project_session(&project, "chat-old").unwrap();
+        assert!(!bundle.join("chat-sessions/chat-old.json").exists());
+        let listed = state
+            .list_project_sessions(&project)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ["chat-busy"]);
+        assert!(state
+            .take_project_session(&project, "chat-old")
+            .unwrap()
+            .messages
+            .is_empty());
+
+        core.new_project();
+        core.save_project(Some(temp.path().join("Other.opentake")))
+            .unwrap();
+        assert!(state.delete_project_session(&project, "chat-busy").is_err());
+        assert!(bundle.join("chat-sessions/chat-busy.json").exists());
+    }
+
+    #[test]
     fn stale_project_turn_cannot_overwrite_the_previous_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("A.opentake");
@@ -2040,6 +2193,127 @@ mod tests {
             .unwrap();
         assert_eq!(disk.messages.len(), 1);
         assert_eq!(disk.messages[0].content, "A baseline");
+    }
+
+    /// Blocks `transcribe_sources_cancellable` until its token is cancelled.
+    struct CancelAwaitingTranscriptBridge {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl opentake_agent::mcp::media_bridge::MediaBridge for CancelAwaitingTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            _sources: &[opentake_agent::mcp::media_bridge::TranscriptSource],
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<
+            Vec<opentake_agent::mcp::media_bridge::TranscriptSourceResult>,
+            opentake_agent::mcp::media_bridge::BridgeError,
+        > {
+            let _ = self.entered.lock().unwrap().send(());
+            let started = std::time::Instant::now();
+            while !cancel.is_cancelled() && started.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(opentake_agent::mcp::media_bridge::cancelled_bridge_error())
+        }
+    }
+
+    #[test]
+    fn byok_turn_transcription_is_cancelled_by_a_project_switch_without_blocking_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        core.save_project(Some(temp.path().join("A.opentake")))
+            .unwrap();
+        core.apply(
+            opentake_ops::command::EditCommand::RegisterMediaAndAddClip {
+                media: opentake_domain::MediaManifestEntry {
+                    id: "talk".into(),
+                    name: "talk.mov".into(),
+                    kind: opentake_domain::ClipType::Video,
+                    source: opentake_domain::MediaSource::Project {
+                        relative_path: "media/talk.mov".into(),
+                    },
+                    duration: 10.0,
+                    generation_input: None,
+                    source_width: Some(1920),
+                    source_height: Some(1080),
+                    source_fps: Some(30.0),
+                    has_audio: Some(true),
+                    color: None,
+                    proxy: None,
+                    folder_id: None,
+                    cached_remote_url: None,
+                    cached_remote_url_expires_at: None,
+                },
+                entry: opentake_ops::command::ClipEntry {
+                    media_ref: "talk".into(),
+                    media_type: opentake_domain::ClipType::Video,
+                    source_clip_type: opentake_domain::ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 300,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: true,
+                    add_linked_audio: false,
+                    transform: None,
+                },
+                auto_track: true,
+            },
+        )
+        .unwrap();
+        let state = ChatState::new(
+            core.clone(),
+            temp.path().join("no-workflows"),
+            temp.path().join("chat-cache"),
+            temp.path().join("chat-models"),
+        );
+        let project = state.project_context().unwrap();
+        let cancel = Arc::new(TurnCancel::new());
+        let _lease = state
+            .reserve_turn(project.key("chat-byok"), cancel.clone())
+            .unwrap();
+        let gate = ProjectTurnGate {
+            state: state.clone(),
+            project,
+            cancel: cancel.clone(),
+            undo_scope: "test:byok-transcript".into(),
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let handle: Arc<dyn CoreHandle> = Arc::new(AppCoreHandle::new(core.clone()));
+        let registry = Arc::new(RwLock::new(crate::mcp::build_registry(
+            &temp.path().join("no-workflows"),
+        )));
+        let dispatcher = Arc::new(Dispatcher::with_bridge(
+            handle,
+            registry,
+            Some(Arc::new(CancelAwaitingTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+            })),
+        ));
+        let dispatch = std::thread::spawn(move || {
+            gate.dispatch(&dispatcher, "get_transcript", serde_json::json!({}))
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("transcription started");
+
+        let started = std::time::Instant::now();
+        core.new_project();
+        let switched_in = started.elapsed();
+        let result = dispatch.join().expect("dispatch thread joined");
+        let finished_in = started.elapsed();
+
+        assert!(cancel.media.is_cancelled());
+        assert!(result.is_none(), "a stale-project result is dropped");
+        assert!(
+            switched_in < std::time::Duration::from_secs(1),
+            "{switched_in:?}"
+        );
+        assert!(
+            finished_in < std::time::Duration::from_secs(1),
+            "{finished_in:?}"
+        );
     }
 
     #[test]

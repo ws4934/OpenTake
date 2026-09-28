@@ -1415,6 +1415,40 @@ impl EditorSession {
     pub(crate) fn seed_from_timeline(&mut self, timeline: Timeline) {
         self.state = EditorState::from_timeline(timeline);
     }
+
+    /// Test-only seam: register a video asset directly, so placement commands
+    /// (which require their media in the manifest) have something to place.
+    #[cfg(test)]
+    pub(crate) fn seed_media(&mut self, id: &str) {
+        self.state.manifest.entries.push(test_media_entry(id));
+    }
+}
+
+/// A registered external video asset for tests that place clips.
+#[cfg(test)]
+pub(crate) fn test_media_entry(id: &str) -> opentake_domain::MediaManifestEntry {
+    opentake_domain::MediaManifestEntry {
+        id: id.into(),
+        name: id.into(),
+        kind: opentake_domain::ClipType::Video,
+        source: opentake_domain::MediaSource::External {
+            absolute_path: std::env::temp_dir()
+                .join(format!("{id}.mp4"))
+                .to_string_lossy()
+                .into_owned(),
+        },
+        duration: 10.0,
+        generation_input: None,
+        source_width: None,
+        source_height: None,
+        source_fps: None,
+        has_audio: None,
+        color: None,
+        proxy: None,
+        folder_id: None,
+        cached_remote_url: None,
+        cached_remote_url_expires_at: None,
+    }
 }
 
 #[cfg(test)]
@@ -1605,6 +1639,7 @@ mod tests {
         // New project with one edit applied.
         let mut s = EditorSession::new_project();
         s.state = EditorState::from_timeline(one_video_track());
+        s.seed_media("asset-1");
         let ids = SeqIdGen::new("c-");
         let res = s.apply(add_one_clip_cmd(), &ids).unwrap();
         assert!(res.changed);
@@ -1638,6 +1673,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut project = Project::new(&bundle);
         project.timeline = one_video_track();
+        project.manifest.entries.push(test_media_entry("asset-1"));
         project.save().unwrap();
         let mut session = EditorSession::open_project(&bundle).unwrap();
 
@@ -1665,6 +1701,7 @@ mod tests {
     fn apply_then_undo_redo_through_session() {
         let mut s = EditorSession::new_project();
         s.state = EditorState::from_timeline(one_video_track());
+        s.seed_media("asset-1");
         let ids = SeqIdGen::new("c-");
 
         let added = s.apply(add_one_clip_cmd(), &ids).unwrap();

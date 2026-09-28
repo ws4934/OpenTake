@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use opentake_core::{AppCore, OwnedUndoResult, ProjectRevision};
 use opentake_domain::{MediaManifest, MediaResolver, Timeline};
-use opentake_media::{extract_pcm, PcmBuffer, PcmSpec};
+use opentake_media::{extract_pcm, extract_pcm_cancellable, MediaCancelToken, PcmBuffer, PcmSpec};
 use opentake_ops::command::{EditCommand, EditResult};
 
 /// Project/document identity captured at a dispatcher commit boundary.
@@ -110,6 +110,22 @@ pub trait CoreHandle: Send + Sync {
             .ok_or_else(|| anyhow::anyhow!("media path not found for mediaRef: {media_ref}"))?;
         extract_pcm(&path, &spec, range).map_err(|e| anyhow::anyhow!("{e}"))
     }
+
+    /// Cancellation-aware [`Self::extract_analysis_pcm`]. The default checks the
+    /// token and delegates, so handles that inject synthetic PCM keep working;
+    /// the production handle stops decoding as soon as `cancel` fires.
+    fn extract_analysis_pcm_cancellable(
+        &self,
+        media_ref: &str,
+        spec: PcmSpec,
+        range: Option<(f64, f64)>,
+        cancel: &MediaCancelToken,
+    ) -> anyhow::Result<PcmBuffer> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Cancelled");
+        }
+        self.extract_analysis_pcm(media_ref, spec, range)
+    }
 }
 
 /// Production [`CoreHandle`] over the authoritative [`AppCore`]. A clone of the
@@ -202,6 +218,19 @@ impl CoreHandle for AppCoreHandle {
 
     fn project_dir(&self) -> Option<PathBuf> {
         self.0.project_dir()
+    }
+
+    fn extract_analysis_pcm_cancellable(
+        &self,
+        media_ref: &str,
+        spec: PcmSpec,
+        range: Option<(f64, f64)>,
+        cancel: &MediaCancelToken,
+    ) -> anyhow::Result<PcmBuffer> {
+        let path = self
+            .media_path(media_ref)
+            .ok_or_else(|| anyhow::anyhow!("media path not found for mediaRef: {media_ref}"))?;
+        extract_pcm_cancellable(&path, &spec, range, cancel).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     fn media_path(&self, media_ref: &str) -> Option<PathBuf> {

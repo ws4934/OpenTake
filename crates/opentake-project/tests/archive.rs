@@ -328,3 +328,60 @@ fn name_collision_gets_suffixed() {
         }
     );
 }
+
+#[test]
+fn refuses_an_unsafe_manifest_path_like_a_save_without_writing_or_reading_outside() {
+    let tmp = TempDir::new("archive-unsafe");
+    let source_bundle = tmp.child("Source.opentake");
+    write_file(&source_bundle.join("media").join("kept.mov"), b"KEPT");
+    // A file outside the source bundle that the unsafe path points at.
+    write_file(&tmp.child("secret.mov"), b"OUTSIDE");
+
+    let timeline = Timeline::new();
+    for (source, proxy) in [
+        ("../secret.mov", None),
+        ("media/kept.mov", Some("../secret.mov")),
+    ] {
+        let mut unsafe_entry = entry(
+            "unsafe",
+            "secret.mov",
+            ClipType::Video,
+            MediaSource::Project {
+                relative_path: source.into(),
+            },
+        );
+        unsafe_entry.proxy = proxy.map(|relative_path| opentake_domain::MediaProxy {
+            relative_path: relative_path.into(),
+            source_sha256: "0".repeat(64),
+            source_stamp: None,
+            width: 64,
+            height: 36,
+        });
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(unsafe_entry);
+
+        let dest_bundle = tmp.child("Dest.opentake");
+        let error = archive(
+            &timeline,
+            &manifest,
+            &GenerationLog::new(),
+            Some(source_bundle.as_path()),
+            &dest_bundle,
+        )
+        .unwrap_err();
+
+        // The same error a save of this manifest reports.
+        let mut project = Project::new(tmp.child("Saved.opentake"));
+        project.manifest = manifest.clone();
+        let save_error = project.save().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                opentake_project::ProjectError::InvalidMediaManifest { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), save_error.to_string());
+        assert!(!dest_bundle.exists(), "nothing may be written");
+    }
+}

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { MediaFolder } from "./types";
-import { childFolders, folderTrail, normalizeFolderId } from "./folderTree";
+import { childFolders, existingFolderId, folderTrail, normalizeFolderId } from "./folderTree";
 
 const f = (id: string, parentFolderId: string | null | undefined): MediaFolder => ({
   id,
@@ -85,5 +85,16 @@ describe("folderTrail", () => {
 
   it("returns an empty trail when the cursor id is unknown", () => {
     expect(folderTrail(folders, "nope")).toEqual([]);
+  });
+});
+
+describe("existingFolderId", () => {
+  const stills = { id: "stills", name: "Stills" };
+
+  it("keeps a folder that exists and returns root for one that is gone", () => {
+    expect(existingFolderId([stills], "stills")).toBe("stills");
+    // Deleted or undone while the panel pointed into it.
+    expect(existingFolderId([], "stills")).toBeNull();
+    expect(existingFolderId([stills], null)).toBeNull();
   });
 });

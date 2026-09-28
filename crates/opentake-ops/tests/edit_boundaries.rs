@@ -1,4 +1,7 @@
-use opentake_domain::{Clip, ClipType, Timeline, Track, Transition, TransitionKind};
+use opentake_domain::{
+    Clip, ClipType, MediaManifest, MediaManifestEntry, MediaSource, Timeline, Track, Transition,
+    TransitionKind,
+};
 use opentake_ops::{apply, ClipEntry, EditCommand, EditorState, FrameRange, SeqIdGen};
 
 fn state(clips: Vec<Clip>) -> EditorState {
@@ -6,7 +9,28 @@ fn state(clips: Vec<Clip>) -> EditorState {
     track.clips = clips;
     let mut timeline = Timeline::new();
     timeline.tracks.push(track);
-    EditorState::from_timeline(timeline)
+    let mut manifest = MediaManifest::new();
+    // Placement commands require their media in the manifest.
+    manifest.entries.push(MediaManifestEntry {
+        id: "still".into(),
+        name: "still".into(),
+        kind: ClipType::Image,
+        source: MediaSource::External {
+            absolute_path: "/still.png".into(),
+        },
+        duration: 1.0,
+        generation_input: None,
+        source_width: None,
+        source_height: None,
+        source_fps: None,
+        has_audio: None,
+        color: None,
+        proxy: None,
+        folder_id: None,
+        cached_remote_url: None,
+        cached_remote_url_expires_at: None,
+    });
+    EditorState::new(timeline, manifest)
 }
 
 fn assert_no_overlap(timeline: &Timeline) {

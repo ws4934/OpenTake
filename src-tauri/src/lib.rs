@@ -473,6 +473,7 @@ pub fn run() {
             chat::chat_history_authoritative,
             chat::chat_sessions,
             chat::chat_session_set_open,
+            chat::chat_session_delete,
             chat::chat_cancel,
             external_mcp::external_mcp_status,
             external_mcp::external_mcp_set_enabled,

@@ -160,6 +160,11 @@ pub struct MotionDocumentPublish {
     pub width: u32,
     pub height: u32,
     pub source_document: MotionDocumentReference,
+    /// Undo action name of the timeline commit that published the clip. It is
+    /// host-internal (the agent records it on its undo stack) and never
+    /// reaches the model.
+    #[serde(skip)]
+    pub action_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -471,17 +476,39 @@ pub(crate) fn decode_request(
     }
 }
 
+/// Timeline commit made by a successful publish, reported so the dispatcher can
+/// record it on the agent undo stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishedTimelineCommit {
+    pub action_name: String,
+}
+
 pub(crate) fn result_from_operation(
     tool: ToolName,
     operation: Box<dyn AdmittedMotionDocumentOperation>,
     cancel: &opentake_media::MediaCancelToken,
-) -> ToolResult {
+) -> (ToolResult, Option<PublishedTimelineCommit>) {
     if cancel.is_cancelled() {
-        return ToolResult::error("Cancelled");
+        return (ToolResult::error("Cancelled"), None);
     }
     match operation.execute(cancel) {
-        Ok(response) => model_safe_response(response),
-        Err(error) => result_from_error(tool, error),
+        Ok(response) => {
+            let commit = match &response {
+                MotionDocumentResponse::Published(published)
+                    if !published.action_name.is_empty() =>
+                {
+                    Some(PublishedTimelineCommit {
+                        action_name: published.action_name.clone(),
+                    })
+                }
+                _ => None,
+            };
+            let result = model_safe_response(response);
+            // A publish whose response failed validation still committed, so
+            // keep the marker: the assistant made that edit and may undo it.
+            (result, commit)
+        }
+        Err(error) => (result_from_error(tool, error), None),
     }
 }
 
@@ -817,11 +844,12 @@ mod tests {
                 Err(MotionDocumentBridgeError::conflict(Some(HASH.into())))
             }
         }
-        let result = result_from_operation(
+        let (result, commit) = result_from_operation(
             ToolName::PatchMotionDocument,
             Box::new(Conflict),
             &opentake_media::MediaCancelToken::new(),
         );
+        assert!(commit.is_none());
         assert!(!result.is_error);
         assert!(result.text_joined().contains("\"status\":\"conflict\""));
         assert!(result.text_joined().contains(HASH));

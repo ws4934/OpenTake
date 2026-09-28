@@ -312,9 +312,12 @@ pub(crate) fn transcribe_with_cache(
         preferred_language: Some(lang.to_string()),
         ..Default::default()
     };
+    // Key the cache by the file that is transcribed, not by whatever replaced
+    // it during a long run.
+    let key = opentake_media::cache_key::file_identity_key(path);
     let result = opentake_media::transcribe::transcribe_file(path, &backend, &opts)
         .map_err(|e| e.to_string())?;
-    persist_full_transcript(cache_root, path, &result);
+    persist_full_transcript_keyed(cache_root, key.as_deref(), &result);
     Ok(result)
 }
 
@@ -326,7 +329,19 @@ pub(crate) fn persist_full_transcript(
     path: &Path,
     result: &TranscriptionResult,
 ) {
-    let Some(key) = opentake_media::cache_key::file_identity_key(path) else {
+    let key = opentake_media::cache_key::file_identity_key(path);
+    persist_full_transcript_keyed(cache_root, key.as_deref(), result);
+}
+
+/// [`persist_full_transcript`] under a file-identity key the caller computed
+/// before transcribing, so a source replaced mid-run never receives the old
+/// transcript.
+pub(crate) fn persist_full_transcript_keyed(
+    cache_root: &Path,
+    key: Option<&str>,
+    result: &TranscriptionResult,
+) {
+    let Some(key) = key else {
         return;
     };
     let dir = cache_root.join(opentake_media::transcribe::cache::CACHE_SUBDIR);

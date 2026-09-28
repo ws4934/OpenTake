@@ -1769,10 +1769,13 @@ enum OwnerDescriptorFixture {
     AceOutOfRange,
 }
 
+// Per thread: each test consumes its fixture on its own thread, so tests
+// running in parallel (CI uses two test threads) never see each other's.
 #[cfg(test)]
-static OWNER_DESCRIPTOR_FIXTURE: std::sync::OnceLock<
-    std::sync::Mutex<Option<OwnerDescriptorFixture>>,
-> = std::sync::OnceLock::new();
+thread_local! {
+    static OWNER_DESCRIPTOR_FIXTURE: std::cell::Cell<Option<OwnerDescriptorFixture>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 struct OwnerDescriptorFixtureGuard;
@@ -1780,10 +1783,7 @@ struct OwnerDescriptorFixtureGuard;
 #[cfg(test)]
 impl Drop for OwnerDescriptorFixtureGuard {
     fn drop(&mut self) {
-        *OWNER_DESCRIPTOR_FIXTURE
-            .get_or_init(Default::default)
-            .lock()
-            .expect("owner descriptor fixture mutex poisoned") = None;
+        OWNER_DESCRIPTOR_FIXTURE.set(None);
     }
 }
 
@@ -1791,25 +1791,16 @@ impl Drop for OwnerDescriptorFixtureGuard {
 fn install_owner_descriptor_fixture(
     fixture: OwnerDescriptorFixture,
 ) -> OwnerDescriptorFixtureGuard {
-    let mut slot = OWNER_DESCRIPTOR_FIXTURE
-        .get_or_init(Default::default)
-        .lock()
-        .expect("owner descriptor fixture mutex poisoned");
     assert!(
-        slot.is_none(),
-        "owner descriptor tests require --test-threads=1"
+        OWNER_DESCRIPTOR_FIXTURE.replace(Some(fixture)).is_none(),
+        "one owner descriptor fixture per test"
     );
-    *slot = Some(fixture);
     OwnerDescriptorFixtureGuard
 }
 
 #[cfg(test)]
 fn take_owner_descriptor_fixture() -> Option<OwnerDescriptorFixture> {
-    OWNER_DESCRIPTOR_FIXTURE
-        .get_or_init(Default::default)
-        .lock()
-        .expect("owner descriptor fixture mutex poisoned")
-        .take()
+    OWNER_DESCRIPTOR_FIXTURE.take()
 }
 
 fn verify_created_owner_only(handle: HANDLE, expected: &OwnerOnlySecurity) -> Result<()> {

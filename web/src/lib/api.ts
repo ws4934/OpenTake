@@ -105,11 +105,14 @@ export type UpdateInstallEvent =
 /** Stable machine-readable error returned by typed core/edit Tauri commands. */
 export class TauriCommandError extends Error {
   readonly code: string;
+  /** Values behind `message` that let the UI rebuild it in its language. */
+  readonly params: Record<string, string>;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, params: Record<string, string> = {}) {
     super(message);
     this.name = "TauriCommandError";
     this.code = code;
+    this.params = params;
   }
 }
 
@@ -122,7 +125,15 @@ function asTauriCommandError(error: unknown): Error {
     "message" in error &&
     typeof error.message === "string"
   ) {
-    return new TauriCommandError(error.code, error.message);
+    const params =
+      "params" in error && typeof error.params === "object" && error.params !== null
+        ? Object.fromEntries(
+            Object.entries(error.params).filter(
+              (entry): entry is [string, string] => typeof entry[1] === "string",
+            ),
+          )
+        : {};
+    return new TauriCommandError(error.code, error.message, params);
   }
   return error instanceof Error ? error : new Error(String(error));
 }
@@ -260,6 +271,7 @@ export async function getTimeline(): Promise<RuntimeTimelineSnapshot> {
     projectPath: browserProjectPath,
     compatibilityReadOnly: false,
     compatibilityBlockers: [],
+    compatibilityWarnings: [],
   };
 }
 
@@ -334,6 +346,7 @@ export async function projectNew(path: string | null = null): Promise<RuntimeTim
     projectPath: browserProjectPath,
     compatibilityReadOnly: false,
     compatibilityBlockers: [],
+    compatibilityWarnings: [],
   };
 }
 
@@ -350,6 +363,7 @@ export async function projectOpen(path: string): Promise<RuntimeTimelineSnapshot
     projectPath: browserProjectPath,
     compatibilityReadOnly: false,
     compatibilityBlockers: [],
+    compatibilityWarnings: [],
   };
 }
 
@@ -2440,6 +2454,23 @@ export async function chatSessionSetOpen(
       expectedProjectPath,
     });
   throw new Error("chat tabs require the desktop app");
+}
+
+/** Permanently delete one project chat session. The backend refuses a
+ *  session whose turn is still running. */
+export async function chatSessionDelete(
+  sessionId: string,
+  expectedProjectEpoch: number,
+  expectedProjectPath: string,
+): Promise<void> {
+  await ensureTauri();
+  if (invokeImpl)
+    return invokeImpl<void>("chat_session_delete", {
+      sessionId,
+      expectedProjectEpoch,
+      expectedProjectPath,
+    });
+  throw new Error("chat sessions require the desktop app");
 }
 
 export async function chatCancel(

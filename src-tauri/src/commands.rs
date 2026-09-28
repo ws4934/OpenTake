@@ -1035,8 +1035,9 @@ pub fn export_xmeml(
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
     let snapshot = core.runtime_snapshot();
     // Resolve each source file's start timecode via ffprobe (upstream reads the
-    // QuickTime `tmcd` track; here `opentake_media::read_start_timecode_frame`
-    // reads `tags.timecode`). Per-file failures are silently dropped -> 0.
+    // QuickTime `tmcd` track; here `opentake_media::read_start_timecode` reads
+    // `tags.timecode` and its drop-frame separator). Per-file failures are
+    // silently dropped -> 0 with the frame-rate drop-frame rule.
     let start_timecodes = resolve_start_timecodes(
         &snapshot.timeline,
         &snapshot.media,
@@ -1051,33 +1052,40 @@ pub fn export_xmeml(
     std::fs::write(&path, xml).map_err(|e| e.to_string())
 }
 
-/// Build the `media_ref -> start-frame` map for [`export_xmeml`]. Iterates the
+/// Build the `media_ref -> start timecode` map for [`export_xmeml`]. Iterates the
 /// manifest, resolves each entry to an on-disk file, and reads its start timecode
 /// via ffprobe at the **same integer timebase** the XMEML `<file>` node uses for
-/// that source (`max(1, round(source_fps ?? timeline.fps))`, the upstream
-/// `rateTags` timebase — so the parsed frame count matches the `<rate>` written
-/// beside it). A missing manifest entry path, an unreadable file, or an absent
+/// that source (the upstream `rateTags` timebase and NTSC flag of
+/// `source_fps ?? timeline.fps` — so the parsed frame count matches the
+/// `<rate>` written beside it). A missing manifest entry path, an unreadable file, or an absent
 /// timecode tag simply yields no map entry, and the exporter falls back to 0
-/// exactly as upstream's `sourceStartFrame(for:) ?? 0` does. Only entries with a
-/// nonzero timecode are inserted (zero is already the exporter default).
+/// exactly as upstream's `sourceStartFrame(for:) ?? 0` does. Every read
+/// timecode is inserted, even at frame 0, because its drop-frame flag replaces
+/// the exporter's frame-rate rule.
 fn resolve_start_timecodes(
     timeline: &opentake_domain::Timeline,
     manifest: &opentake_domain::MediaManifest,
     project_base: Option<&std::path::Path>,
-) -> std::collections::HashMap<String, i32> {
+) -> std::collections::HashMap<String, opentake_project::SourceTimecode> {
     let resolver = opentake_domain::MediaResolver::new(manifest, project_base);
     let mut map = std::collections::HashMap::new();
     for entry in &manifest.entries {
-        // Same per-file timebase the exporter computes (integer FCP7 timebase).
-        let raw_fps = entry.source_fps.unwrap_or(timeline.fps as f64);
-        let timebase = (raw_fps.round() as i32).max(1);
+        // Same per-file timebase and NTSC mode the exporter writes (upstream
+        // `rateTags`), so drop-frame is only read where it can be exported.
+        let (timebase, ntsc) = opentake_project::xmeml_rate_tags(
+            entry.source_fps.unwrap_or(timeline.fps.max(1) as f64),
+        );
         let Some(path) = resolver.expected_path(&entry.id) else {
             continue;
         };
-        if let Some(frame) = opentake_media::read_start_timecode_frame(&path, timebase) {
-            if frame > 0 {
-                map.insert(entry.id.clone(), frame);
-            }
+        if let Some(timecode) = opentake_media::read_start_timecode(&path, timebase, ntsc) {
+            map.insert(
+                entry.id.clone(),
+                opentake_project::SourceTimecode {
+                    start_frame: timecode.frame,
+                    drop_frame: timecode.drop_frame,
+                },
+            );
         }
     }
     map
@@ -1322,6 +1330,7 @@ fn validation_error(message: String) -> CmdError {
     CmdError {
         code: "validation".to_string(),
         message,
+        params: Default::default(),
     }
 }
 
@@ -1329,6 +1338,7 @@ fn internal_error(message: impl Into<String>) -> CmdError {
     CmdError {
         code: "internal".to_string(),
         message: message.into(),
+        params: Default::default(),
     }
 }
 
@@ -4301,10 +4311,18 @@ mod edit_request_serde_tests {
         let err = validate_freeze_frame_request(&core, "nope", 10, 1).unwrap_err();
         assert!(err.contains("Clip not found"));
 
+        // Placement requires registered media.
+        let media = core
+            .import_media_file(
+                std::env::temp_dir().join("freeze-preflight.mp4"),
+                "Freeze preflight",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("register video");
         let added = core
             .apply(EditCommand::AddClips {
                 entries: vec![ClipEntry {
-                    media_ref: "asset-1".into(),
+                    media_ref: media.id,
                     media_type: ClipType::Video,
                     source_clip_type: ClipType::Video,
                     track_index: 0,
@@ -4332,10 +4350,17 @@ mod edit_request_serde_tests {
                 at: None,
             })
             .expect("audio track");
+        let audio_media = audio
+            .import_media_file(
+                std::env::temp_dir().join("freeze-preflight.wav"),
+                "Freeze preflight audio",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("register audio");
         let added = audio
             .apply(EditCommand::AddClips {
                 entries: vec![ClipEntry {
-                    media_ref: "asset-a1".into(),
+                    media_ref: audio_media.id,
                     media_type: ClipType::Audio,
                     source_clip_type: ClipType::Audio,
                     track_index: 0,
@@ -4888,6 +4913,96 @@ mod subtitle_export_tests {
             assert!(
                 blocks.iter().all(|block| block.matches("-->").count() == 1),
                 "got: {written:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod xmeml_timecode_tests {
+    use super::resolve_start_timecodes;
+    use opentake_domain::{Clip, ClipType, MediaManifest, MediaManifestEntry, MediaSource, Track};
+    use opentake_media::ffmpeg_status::{ffmpeg_available, ffmpeg_path};
+
+    fn tagged_source(dir: &std::path::Path, name: &str, timecode: &str) -> MediaManifestEntry {
+        let path = dir.join(format!("{name}.mov"));
+        let status = std::process::Command::new(ffmpeg_path())
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "color=c=black:s=64x36:d=0.2:r=30000/1001"])
+            .args(["-c:v", "mpeg4", "-timecode", timecode])
+            .arg(&path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success(), "generate {name}");
+        MediaManifestEntry {
+            id: name.into(),
+            name: name.into(),
+            kind: ClipType::Video,
+            source: MediaSource::External {
+                absolute_path: path.to_string_lossy().into_owned(),
+            },
+            duration: 0.2,
+            generation_input: None,
+            source_width: Some(64),
+            source_height: Some(36),
+            source_fps: Some(30000.0 / 1001.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn ntsc_sources_export_their_own_drop_frame_mode() {
+        if !ffmpeg_available() {
+            eprintln!("skip: the timecode fixtures need ffmpeg");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let mut manifest = MediaManifest::new();
+        manifest.entries = vec![
+            tagged_source(dir.path(), "ndf", "01:00:00:00"),
+            tagged_source(dir.path(), "df", "01:00:00;00"),
+        ];
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips = vec![Clip::new("a", "ndf", 0, 6), Clip::new("b", "df", 6, 6)];
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.tracks = vec![track];
+
+        let timecodes = resolve_start_timecodes(&timeline, &manifest, None);
+        assert_eq!(
+            timecodes.get("ndf"),
+            Some(&opentake_project::SourceTimecode {
+                start_frame: 108_000,
+                drop_frame: false,
+            })
+        );
+        assert_eq!(
+            timecodes.get("df"),
+            Some(&opentake_project::SourceTimecode {
+                start_frame: 107_892,
+                drop_frame: true,
+            })
+        );
+
+        let xml =
+            opentake_project::export_xmeml_with_timecodes(&timeline, &manifest, None, &timecodes);
+        for (id, label, format) in [
+            ("file-ndf-video", "01:00:00:00", "NDF"),
+            ("file-df-video", "01;00;00;00", "DF"),
+        ] {
+            let start = xml.find(&format!("<file id=\"{id}\">")).expect(id);
+            let file = &xml[start..start + xml[start..].find("</file>").unwrap()];
+            assert!(
+                file.contains(&format!("<string>{label}</string>")),
+                "{file}"
+            );
+            assert!(
+                file.contains(&format!("<displayformat>{format}</displayformat>")),
+                "{file}"
             );
         }
     }

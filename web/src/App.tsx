@@ -6,6 +6,7 @@ import { SaveAsProgress } from "./components/shell/SaveAsProgress";
 import { ProjectSettingsMismatchDialog } from "./components/shell/ProjectSettingsMismatchDialog";
 import { EditorSplit } from "./components/shell/EditorSplit";
 import { CompatibilityBanner } from "./components/shell/CompatibilityBanner";
+import { ProjectOpenNoticesBanner } from "./components/shell/ProjectOpenNoticesBanner";
 import { HomeView } from "./components/home/HomeView";
 import { SettingsView } from "./components/settings/SettingsView";
 import { UpdateCenter } from "./components/settings/UpdateDialog";
@@ -61,6 +62,7 @@ function Toast() {
         color: "var(--text-primary)",
         zIndex: 9999,
         pointerEvents: "none",
+        whiteSpace: "pre-line",
       }}
     >
       {toast.message}
@@ -251,6 +253,7 @@ export default function App() {
     >
       <PlaybackEngineHost />
       <CompatibilityBanner />
+      <ProjectOpenNoticesBanner />
       <ApplicationMenuBridge />
       {PRIMARY_VIEWS.filter((candidate) => mountedPrimaryViews.current.has(candidate)).map(
         (candidate) => {

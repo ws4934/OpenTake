@@ -30,6 +30,26 @@ const zh: Dict = {
   "project.openFailed": "打开失败：{error}",
   "project.saveFailed": "保存失败：{error}",
   "project.unsavedBlocksSwitch": "当前工程的修改未能保存，已取消切换",
+  "projectError.projectStorageFull": "磁盘空间不足，无法保存项目。",
+  "projectError.projectPermissionDenied": "OpenTake 没有写入项目文件夹的权限。",
+  "projectError.projectIo": "无法读取或写入项目文件（{kind}）。",
+  "projectError.projectInvalidManifest":
+    "素材列表中有一个无法再次打开的文件路径，因此项目未保存。",
+  "projectError.projectComponentTooLarge":
+    "{file} 大小为 {sizeMib} MiB，超过了项目文件允许的 {limitMib} MiB。",
+  "projectError.projectPartialCommit": "时间线已保存，但素材列表更新失败。请再次保存以完成。",
+  "projectError.projectDurabilityUnconfirmed":
+    "项目已保存，但磁盘未确认写入。请再次保存，确保断电后修改不会丢失。",
+  "projectError.projectRecoveryRequired":
+    "项目无法安全保存。旧版本已保留在项目旁一个以“.opentake-backup”结尾的隐藏文件夹中；在项目再次成功保存之前请保留它。",
+  "projectOpen.offlineMedia": "以下素材的路径不安全，已作为离线素材打开，可重新链接：{names}",
+  "projectOpen.ignoredProxy": "以下素材的代理文件路径不安全，已忽略代理：{names}",
+  "projectOpen.generationLogMovedAside":
+    "生成记录过大，已移到项目内的 {file}，并以空记录打开。",
+  "projectOpen.otherNotice": "打开项目时已处理：{notice}",
+  "projectOpen.nameSeparator": "、",
+  "projectOpen.title": "打开项目时已处理的问题",
+  "projectOpen.dismiss": "知道了",
   "projectSettingsMismatch.title": "素材与项目设置不一致",
   "projectSettingsMismatch.description":
     "时间线还没有内容。你可以保留当前项目设置，或改为匹配第一个视频素材。",
@@ -880,6 +900,7 @@ const zh: Dict = {
   "preview.jumpEnd": "跳到结尾",
   "preview.captureFrame": "截取当前帧到素材库",
   "preview.captureFrameSaved": "当前帧已存入素材库",
+  "preview.captureFrameSavedToRoot": "当前帧已存入素材库根目录，原文件夹已不存在",
   "preview.captureFrameUnavailable": "当前环境无法生成合成帧",
   "preview.captureFrameFailed": "截帧失败",
   "preview.transformEditFailed": "无法更新画布变换：{error}",
@@ -919,6 +940,13 @@ const zh: Dict = {
   "agent.clear": "新对话",
   "agent.newTab": "新建对话标签",
   "agent.closeTab": "关闭对话标签",
+  "agent.deleteChat": "删除对话",
+  "agent.deleteChatConfirm": "永久删除此对话？此操作无法撤销。",
+  "agent.deleteClosedChats": "删除已关闭的对话",
+  "agent.deleteClosedChatsConfirm": "永久删除所有已关闭的对话？此操作无法撤销。",
+  "agent.deleteChatFailed": "无法删除对话：",
+  "agent.deleteClosedChatsFailed": "部分已关闭的对话未能删除",
+  "agent.dismissError": "关闭提示",
   "agent.tabs": "Agent 对话标签",
   "agent.newChat": "新对话",
   "agent.openSettings": "打开设置",
@@ -1236,6 +1264,28 @@ const en: Dict = {
   "project.openFailed": "Open failed: {error}",
   "project.saveFailed": "Save failed: {error}",
   "project.unsavedBlocksSwitch": "The current project's changes could not be saved, so it was kept open",
+  "projectError.projectStorageFull": "There is not enough disk space to save the project.",
+  "projectError.projectPermissionDenied": "OpenTake is not allowed to write to the project folder.",
+  "projectError.projectIo": "The project files could not be read or written ({kind}).",
+  "projectError.projectInvalidManifest":
+    "The media list contains a file path that could not be opened again, so the project was not saved.",
+  "projectError.projectComponentTooLarge":
+    "{file} is {sizeMib} MiB, more than the {limitMib} MiB a project file may hold.",
+  "projectError.projectPartialCommit":
+    "The timeline was saved, but updating the media list failed. Save again to finish.",
+  "projectError.projectDurabilityUnconfirmed":
+    "The project was saved, but the disk did not confirm the write. Save again to make sure the changes survive a power failure.",
+  "projectError.projectRecoveryRequired":
+    "The project could not be saved safely. The previous version was kept next to the project in a hidden folder ending in \".opentake-backup\"; keep it until the project saves successfully again.",
+  "projectOpen.offlineMedia":
+    "These media files had an unsafe path and were opened offline; relink them to use them: {names}",
+  "projectOpen.ignoredProxy": "These media files had an unsafe proxy path; their proxies were ignored: {names}",
+  "projectOpen.generationLogMovedAside":
+    "The generation log was too large; it was moved to {file} inside the project and a new log was started.",
+  "projectOpen.otherNotice": "Handled while opening the project: {notice}",
+  "projectOpen.nameSeparator": ", ",
+  "projectOpen.title": "Handled while opening this project",
+  "projectOpen.dismiss": "Dismiss",
   "projectSettingsMismatch.title": "Media and project settings differ",
   "projectSettingsMismatch.description":
     "The timeline is still empty. Keep the current project settings or match the first video asset.",
@@ -2077,6 +2127,7 @@ const en: Dict = {
   "preview.jumpEnd": "Jump to End",
   "preview.captureFrame": "Capture Frame to Media",
   "preview.captureFrameSaved": "Frame added to media",
+  "preview.captureFrameSavedToRoot": "Frame added to the media root because its folder no longer exists",
   "preview.captureFrameUnavailable": "Composite frame unavailable",
   "preview.captureFrameFailed": "Capture frame failed",
   "preview.transformEditFailed": "Could not update canvas transform: {error}",
@@ -2115,6 +2166,13 @@ const en: Dict = {
   "agent.clear": "New Chat",
   "agent.newTab": "New chat tab",
   "agent.closeTab": "Close chat tab",
+  "agent.deleteChat": "Delete chat",
+  "agent.deleteChatConfirm": "Permanently delete this chat? This cannot be undone.",
+  "agent.deleteClosedChats": "Delete closed chats",
+  "agent.deleteClosedChatsConfirm": "Permanently delete all closed chats? This cannot be undone.",
+  "agent.deleteChatFailed": "Could not delete the chat:",
+  "agent.deleteClosedChatsFailed": "Some closed chats could not be deleted",
+  "agent.dismissError": "Dismiss",
   "agent.tabs": "Agent chat tabs",
   "agent.newChat": "New chat",
   "agent.openSettings": "Open Settings",
