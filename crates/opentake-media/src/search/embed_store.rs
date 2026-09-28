@@ -160,18 +160,25 @@ pub fn decode(data: &[u8]) -> Result<AssetIndex> {
     })
 }
 
-/// Read just the header from a `.embed` file (cheap currency check).
+/// Largest JSON header accepted when reading only the header prefix.
+const MAX_HEADER_LEN: usize = 64 * 1024;
+
+/// Read just the header from a `.embed` file (cheap currency check). Only the
+/// magic, the length prefix and the JSON header are read, never the vectors.
 pub fn header(cache_root: &Path, key: &str) -> Option<Header> {
-    let data = std::fs::read(embed_path(cache_root, key)).ok()?;
-    if data.len() < MAGIC.len() + 4 || &data[..MAGIC.len()] != MAGIC {
+    let mut file = std::fs::File::open(embed_path(cache_root, key)).ok()?;
+    let mut prefix = [0u8; MAGIC.len() + 4];
+    file.read_exact(&mut prefix).ok()?;
+    if &prefix[..MAGIC.len()] != MAGIC {
         return None;
     }
-    let header_len = LittleEndian::read_u32(&data[MAGIC.len()..MAGIC.len() + 4]) as usize;
-    let start = MAGIC.len() + 4;
-    if data.len() < start + header_len {
+    let header_len = LittleEndian::read_u32(&prefix[MAGIC.len()..]) as usize;
+    if header_len > MAX_HEADER_LEN {
         return None;
     }
-    serde_json::from_slice(&data[start..start + header_len]).ok()
+    let mut json = vec![0u8; header_len];
+    file.read_exact(&mut json).ok()?;
+    serde_json::from_slice(&json).ok()
 }
 
 /// True when an on-disk index matches `(model, model_version, sampler_version)`.
@@ -194,8 +201,11 @@ pub fn is_current(
 
 /// Load a full index from `<cache_root>/Embeddings/<key>.embed`.
 pub fn load(cache_root: &Path, key: &str) -> Result<AssetIndex> {
-    let (index, _) = read_index(&embed_path(cache_root, key))?;
-    Ok(index)
+    match read_index(&embed_path(cache_root, key)) {
+        Ok((index, _)) => Ok(index),
+        Err(ReadIndexError::Corrupt(_)) => Err(MediaError::StoreCorrupt),
+        Err(ReadIndexError::Io(error)) => Err(error),
+    }
 }
 
 /// Upper bound for decoded indexes retained in memory by [`load_cached`].
@@ -205,13 +215,30 @@ pub const INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// `stat`; the file is read and decoded again only when its identity (size,
 /// mtime and, on Unix, device/inode) changed, when [`save`] or [`clear_all`]
 /// invalidated it, or after LRU eviction under [`INDEX_CACHE_BYTES`].
+///
+/// A file that fails to decode ([`MediaError::StoreCorrupt`]) is deleted, as
+/// long as it is still the file that was read, so the asset reports as not
+/// indexed and the next indexing run rebuilds it.
 pub fn load_cached(cache_root: &Path, key: &str) -> Result<Arc<AssetIndex>> {
     let path = embed_path(cache_root, key);
     let current = FileStamp::of(&std::fs::metadata(&path)?);
     if let Some(index) = index_cache().lock_cache().get(&path, &current) {
         return Ok(index);
     }
-    let (index, stamp) = read_index(&path)?;
+    let (index, stamp) = match read_index(&path) {
+        Err(ReadIndexError::Corrupt(stamp)) => {
+            let unchanged = std::fs::metadata(&path)
+                .map(|metadata| FileStamp::of(&metadata) == stamp)
+                .unwrap_or(false);
+            if unchanged {
+                tracing::warn!("search: removing corrupt index {}", path.display());
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(MediaError::StoreCorrupt);
+        }
+        Err(ReadIndexError::Io(error)) => return Err(error),
+        Ok(read) => read,
+    };
     let index = Arc::new(index);
     index_cache()
         .lock_cache()
@@ -233,6 +260,7 @@ pub fn save(
     let bytes = encode(header, rows, vectors)?;
     let dir = cache_root.join(CACHE_SUBDIR);
     std::fs::create_dir_all(&dir)?;
+    sweep_stale_temporaries_once(&dir);
     let final_path = dir.join(format!("{key}.embed"));
     let tmp_path = dir.join(format!("{key}.{}.embed.tmp", unique_suffix()));
     let written = (|| -> Result<()> {
@@ -253,6 +281,47 @@ pub fn save(
     written
 }
 
+/// Temporary index files older than this are leftovers of a crashed writer.
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Once per directory and process, remove `*.embed.tmp` files a crashed
+/// writer left behind. Unique temporary names mean nothing else would ever
+/// replace them; the age threshold keeps live writers in other app
+/// instances safe.
+fn sweep_stale_temporaries_once(dir: &Path) {
+    static SWEPT: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let first = SWEPT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(dir.to_path_buf());
+    if first {
+        sweep_stale_temporaries(dir, STALE_TEMPORARY_AGE);
+    }
+}
+
+fn sweep_stale_temporaries(dir: &Path, older_than: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_temporary = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".embed.tmp"));
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if is_temporary && stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn unique_suffix() -> String {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -269,12 +338,24 @@ fn unique_suffix() -> String {
 /// Read and decode one index file, returning the identity of the exact handle
 /// that was read so a concurrent replacement cannot be cached under a stale
 /// stamp.
-fn read_index(path: &Path) -> Result<(AssetIndex, FileStamp)> {
-    let mut file = std::fs::File::open(path)?;
-    let stamp = FileStamp::of(&file.metadata()?);
+fn read_index(path: &Path) -> std::result::Result<(AssetIndex, FileStamp), ReadIndexError> {
+    let io = |error: std::io::Error| ReadIndexError::Io(error.into());
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let stamp = FileStamp::of(&file.metadata().map_err(io)?);
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    Ok((decode(&data)?, stamp))
+    file.read_to_end(&mut data).map_err(io)?;
+    match decode(&data) {
+        Ok(index) => Ok((index, stamp)),
+        Err(MediaError::StoreCorrupt) => Err(ReadIndexError::Corrupt(stamp)),
+        Err(error) => Err(ReadIndexError::Io(error)),
+    }
+}
+
+enum ReadIndexError {
+    /// The file was read but is not a valid index; carries the identity of
+    /// the exact file that was read.
+    Corrupt(FileStamp),
+    Io(MediaError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,5 +824,50 @@ mod tests {
         assert!(cache.get(Path::new("a"), &stamp).is_some());
         assert!(cache.get(Path::new("c"), &stamp).is_some());
         assert_eq!(cache.bytes, size * 2);
+    }
+
+    #[test]
+    fn corrupt_index_is_removed_so_the_asset_is_reindexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (header, rows, _) = one_row_index(0.0);
+        save(dir.path(), "damaged", &header, &rows, &[f32::NAN, 0.5]).unwrap();
+        assert!(is_current(dir.path(), "damaged", "m", 1, 1));
+
+        assert!(matches!(
+            load_cached(dir.path(), "damaged"),
+            Err(MediaError::StoreCorrupt)
+        ));
+
+        assert!(!dir.path().join(CACHE_SUBDIR).join("damaged.embed").exists());
+        assert!(!is_current(dir.path(), "damaged", "m", 1, 1));
+    }
+
+    #[test]
+    fn header_reads_only_the_prefix_and_rejects_oversized_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (header_value, rows, vectors) = one_row_index(0.5);
+        save(dir.path(), "prefix", &header_value, &rows, &vectors).unwrap();
+        let path = dir.path().join(CACHE_SUBDIR).join("prefix.embed");
+        // Truncating the vector block does not affect the header read.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        assert_eq!(header(dir.path(), "prefix"), Some(header_value));
+
+        let mut oversized = MAGIC.to_vec();
+        oversized.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, oversized).unwrap();
+        assert_eq!(header(dir.path(), "prefix"), None);
+    }
+
+    #[test]
+    fn stale_temporary_files_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("k.1-2-3.embed.tmp");
+        let other = dir.path().join("k.embed");
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(&other, b"kept").unwrap();
+        sweep_stale_temporaries(dir.path(), std::time::Duration::ZERO);
+        assert!(!stale.exists());
+        assert!(other.exists());
     }
 }

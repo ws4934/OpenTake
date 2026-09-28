@@ -178,10 +178,14 @@ struct SharedJob {
     cancel: CancelToken,
     status: Mutex<JobStatus>,
     changed: Condvar,
+    /// The admission slot this job occupies while queued. Released exactly
+    /// once: when the worker dispatches it, or as soon as it is cancelled
+    /// while still queued, so abandoned requests cannot fill the queue.
+    queue_slot: Mutex<Option<Arc<AtomicUsize>>>,
 }
 
 impl SharedJob {
-    fn new(request: JobRequest) -> Self {
+    fn new(request: JobRequest, queue_slot: Arc<AtomicUsize>) -> Self {
         Self {
             request,
             cancel: CancelToken::new(),
@@ -190,6 +194,27 @@ impl SharedJob {
                 result: None,
             }),
             changed: Condvar::new(),
+            queue_slot: Mutex::new(Some(queue_slot)),
+        }
+    }
+
+    fn release_queue_slot(&self) {
+        if let Some(queued) = self
+            .queue_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            queued.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Cancel the job; a job that has not started gives its slot back.
+    fn cancel(&self) {
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel.cancel();
+        if status.state == JobState::Queued {
+            self.release_queue_slot();
         }
     }
 
@@ -231,7 +256,7 @@ struct WorkerInner {
     sender: SyncSender<WorkerMessage>,
     dedupe: Mutex<HashMap<String, Weak<SharedJob>>>,
     capacity: usize,
-    queued: AtomicUsize,
+    queued: Arc<AtomicUsize>,
     sequence: AtomicU64,
     active: AtomicUsize,
     shutdown: AtomicBool,
@@ -274,7 +299,7 @@ where
     }
 
     pub fn cancel(&self) {
-        self.shared.cancel.cancel();
+        self.shared.cancel();
     }
 
     pub fn wait(&self) -> Result<T, WorkerError> {
@@ -344,6 +369,7 @@ where
             .unwrap_or_else(|e| e.into_inner());
         if status.state == JobState::Queued && status.result.is_none() {
             self.shared.cancel.cancel();
+            self.shared.release_queue_slot();
             return Err(WorkerError::QueueTimeout);
         }
         drop(status);
@@ -375,6 +401,7 @@ where
             let elapsed = started.elapsed();
             if elapsed >= max_queue_wait || (elapsed >= min_queue_wait && !keep_waiting()) {
                 self.shared.cancel.cancel();
+                self.shared.release_queue_slot();
                 return Err(WorkerError::QueueTimeout);
             }
             let slice = if elapsed < min_queue_wait {
@@ -423,12 +450,15 @@ impl OrtModelRegistry {
 impl OrtWorker {
     /// Spawn one worker with a hard bounded admission queue.
     pub fn spawn(export_pause: ExportPause, capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
+        // Admission is bounded by `capacity` live (uncancelled) jobs. The
+        // channel has headroom for cancelled requests that still sit in it
+        // until the worker drains them at its next scheduling boundary.
+        let (sender, receiver) = mpsc::sync_channel(capacity.max(1) * 4);
         let inner = Arc::new(WorkerInner {
             sender,
             dedupe: Mutex::new(HashMap::new()),
             capacity: capacity.max(1),
-            queued: AtomicUsize::new(0),
+            queued: Arc::new(AtomicUsize::new(0)),
             sequence: AtomicU64::new(0),
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -456,7 +486,13 @@ impl OrtWorker {
 
         let mut dedupe = self.inner.dedupe.lock().unwrap_or_else(|e| e.into_inner());
         dedupe.retain(|_, weak| weak.strong_count() > 0);
-        if let Some(shared) = dedupe.get(&request.dedupe_key).and_then(Weak::upgrade) {
+        // Never join a job that was already cancelled (for example a query
+        // that timed out in the queue): it would only report `Cancelled`.
+        if let Some(shared) = dedupe
+            .get(&request.dedupe_key)
+            .and_then(Weak::upgrade)
+            .filter(|shared| !shared.cancel.is_cancelled())
+        {
             return Ok(JobHandle {
                 shared,
                 marker: PhantomData,
@@ -475,7 +511,7 @@ impl OrtWorker {
         }
 
         let key = request.dedupe_key.clone();
-        let shared = Arc::new(SharedJob::new(request));
+        let shared = Arc::new(SharedJob::new(request, Arc::clone(&self.inner.queued)));
         dedupe.insert(key.clone(), Arc::downgrade(&shared));
         let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst);
         let erased: JobTask = Box::new(move |models, cancel| {
@@ -492,12 +528,12 @@ impl OrtWorker {
                 marker: PhantomData,
             }),
             Err(TrySendError::Full(_)) => {
-                self.inner.queued.fetch_sub(1, Ordering::SeqCst);
+                shared.release_queue_slot();
                 dedupe.remove(&key);
                 Err(WorkerError::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.inner.queued.fetch_sub(1, Ordering::SeqCst);
+                shared.release_queue_slot();
                 dedupe.remove(&key);
                 Err(WorkerError::Shutdown)
             }
@@ -613,7 +649,7 @@ fn worker_loop(inner: Arc<WorkerInner>, receiver: Receiver<WorkerMessage>, pause
             .map(|(index, _)| index)
             .expect("pending queue is not empty");
         let mut job = pending.swap_remove(index);
-        inner.queued.fetch_sub(1, Ordering::SeqCst);
+        job.shared.release_queue_slot();
         if selected_priority == JobPriority::Interactive {
             high_streak += 1;
         } else {
@@ -840,6 +876,51 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(guard);
         assert_eq!(gated.wait(), Err(WorkerError::Cancelled));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cancelled_queued_jobs_release_admission_and_are_never_joined() {
+        use std::sync::mpsc;
+
+        let worker = OrtWorker::spawn(ExportPause::new(), 2);
+        let request =
+            |key: &str| JobRequest::new(JobKind::Search, "m", key, JobPriority::Interactive);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let blocker = worker
+            .submit(
+                JobRequest::new(JobKind::Index, "m", "asset", JobPriority::Background),
+                move |_, _| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(0usize)
+                },
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Several superseded queries time out while the asset runs; none of
+        // them keeps an admission slot.
+        for key in ["q1", "q2", "q3"] {
+            let expired = worker.submit(request(key), |_, _| Ok(1usize)).unwrap();
+            assert_eq!(
+                expired.wait_with_queue_timeout(Duration::from_millis(5)),
+                Err(WorkerError::QueueTimeout)
+            );
+        }
+        let cancelled = worker.submit(request("q4"), |_, _| Ok(1usize)).unwrap();
+        cancelled.cancel();
+        assert_eq!(worker.queued_jobs(), 0);
+
+        // Retrying the same text starts a fresh job instead of joining the
+        // cancelled one.
+        let retry = worker.submit(request("q1"), |_, _| Ok(2usize)).unwrap();
+        let other = worker.submit(request("q5"), |_, _| Ok(3usize)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(blocker.wait(), Ok(0));
+        assert_eq!(retry.wait(), Ok(2));
+        assert_eq!(other.wait(), Ok(3));
         worker.shutdown().unwrap();
     }
 

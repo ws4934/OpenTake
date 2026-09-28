@@ -411,6 +411,14 @@ pub async fn search_index_start(
         models_dir,
         assets: std::sync::Arc::new(assets),
     };
+    let core = core.inner().clone();
+    let expected_project_path = PathBuf::from(expected_project_path);
+    let stale = move || {
+        !core.project_asset_authority().is_some_and(|authority| {
+            authority.project_epoch == expected_project_epoch
+                && authority.project_path == expected_project_path
+        })
+    };
     tauri::async_runtime::spawn_blocking(move || -> Result<SearchIndexStatusDto, String> {
         let pending = plan.wait().map_err(|error| error.to_string())?;
         let total = pending.len();
@@ -436,6 +444,7 @@ pub async fn search_index_start(
         run_asset_jobs(
             production_index_worker(),
             requests,
+            stale,
             move |position, models, cancel| {
                 per_asset
                     .index_one(pending[position], position, total, models, cancel)
@@ -460,12 +469,15 @@ fn asset_identity(asset: &ResolvedAsset) -> String {
 
 /// Submit one worker job per request, strictly one after another: the next
 /// job is queued only after the previous one finished, so any interactive
-/// request that arrived meanwhile is scheduled first. The first failure
-/// (including cancellation or worker shutdown) stops the run; jobs that were
-/// not submitted yet never start.
+/// request that arrived meanwhile is scheduled first. Before each job the run
+/// stops (as `Cancelled`) once `stale()` reports that the project changed. A
+/// full queue at an asset boundary is retried with backoff for up to
+/// [`ASSET_QUEUE_RETRY_BUDGET`]. Any other failure (including cancellation or
+/// worker shutdown) stops the run; jobs that were not submitted never start.
 fn run_asset_jobs<F>(
     worker: &opentake_media::ort_worker::OrtWorker,
     requests: Vec<opentake_media::ort_worker::JobRequest>,
+    stale: impl Fn() -> bool,
     job: F,
 ) -> Result<(), opentake_media::ort_worker::WorkerError>
 where
@@ -478,15 +490,35 @@ where
         + Sync
         + 'static,
 {
+    use opentake_media::ort_worker::WorkerError;
+
     let job = std::sync::Arc::new(job);
     for (position, request) in requests.into_iter().enumerate() {
-        let job = job.clone();
-        worker
-            .submit(request, move |models, cancel| job(position, models, cancel))?
-            .wait()?;
+        let started = std::time::Instant::now();
+        let mut backoff = std::time::Duration::from_millis(50);
+        let handle = loop {
+            if stale() {
+                return Err(WorkerError::Cancelled);
+            }
+            let job = job.clone();
+            match worker.submit(request.clone(), move |models, cancel| {
+                job(position, models, cancel)
+            }) {
+                Err(WorkerError::QueueFull) if started.elapsed() < ASSET_QUEUE_RETRY_BUDGET => {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+                }
+                submitted => break submitted?,
+            }
+        };
+        handle.wait()?;
     }
     Ok(())
 }
+
+/// How long one asset keeps retrying admission while interactive requests
+/// fill the inference queue.
+const ASSET_QUEUE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Everything one indexing job needs, cheap to clone into each worker task.
 #[derive(Clone)]
@@ -734,8 +766,8 @@ pub(crate) fn visual_hits_by_id(
             .collect::<Vec<_>>())
         })
         .map_err(visual_worker_error)?
-        // Behind one running background asset the query waits for that asset
-        // (bounded); under playback/export pressure it fails fast as BUSY.
+        // Behind a running background asset the query waits briefly for that
+        // asset; under playback/export pressure it fails fast as BUSY.
         .wait_with_queue_policy(
             VISUAL_QUERY_MIN_QUEUE_WAIT,
             VISUAL_QUERY_MAX_QUEUE_WAIT,
@@ -746,8 +778,10 @@ pub(crate) fn visual_hits_by_id(
 
 /// How long an interactive visual query always waits for the inference worker.
 const VISUAL_QUERY_MIN_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-/// Upper bound for waiting behind one background asset job.
-const VISUAL_QUERY_MAX_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Upper bound for waiting behind a running background asset job. Kept short
+/// so the Spoken and Files groups are not held back; the panel re-queries when
+/// indexing finishes, which picks up the Moments a BUSY answer missed.
+const VISUAL_QUERY_MAX_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn visual_worker_error(error: opentake_media::ort_worker::WorkerError) -> String {
     use opentake_media::ort_worker::WorkerError;
@@ -1029,21 +1063,26 @@ mod tests {
                     )
                 })
                 .collect();
-            run_asset_jobs(&index_worker, requests, move |position, _, _| {
-                if position == 0 {
-                    started_tx.send(()).unwrap();
-                    release_rx
+            run_asset_jobs(
+                &index_worker,
+                requests,
+                || false,
+                move |position, _, _| {
+                    if position == 0 {
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    index_order
                         .lock()
                         .unwrap()
-                        .recv_timeout(Duration::from_secs(5))
-                        .unwrap();
-                }
-                index_order
-                    .lock()
-                    .unwrap()
-                    .push(format!("asset-{position}"));
-                Ok(())
-            })
+                        .push(format!("asset-{position}"));
+                    Ok(())
+                },
+            )
         });
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
@@ -1098,6 +1137,46 @@ mod tests {
     }
 
     #[test]
+    fn project_index_run_stops_when_the_project_changes_between_assets() {
+        use opentake_media::ort_worker::{
+            JobKind, JobPriority, JobRequest, OrtWorker, WorkerError,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let worker = OrtWorker::spawn(opentake_media::ExportPause::new(), 4);
+        let switched = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let job_switched = switched.clone();
+        let job_ran = ran.clone();
+        let requests = (0..3)
+            .map(|i| {
+                JobRequest::new(
+                    JobKind::Index,
+                    "model",
+                    format!("switch-asset-{i}"),
+                    JobPriority::Background,
+                )
+            })
+            .collect();
+        let stale_switched = switched.clone();
+        let result = run_asset_jobs(
+            &worker,
+            requests,
+            move || stale_switched.load(Ordering::SeqCst),
+            move |position, _, _| {
+                job_ran.lock().unwrap().push(position);
+                // The project is replaced while the first asset is indexed.
+                job_switched.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(WorkerError::Cancelled));
+        assert_eq!(*ran.lock().unwrap(), vec![0]);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn cancelled_asset_job_stops_the_project_index_run() {
         use opentake_media::ort_worker::{
             JobKind, JobPriority, JobRequest, OrtWorker, WorkerError,
@@ -1117,14 +1196,19 @@ mod tests {
                 )
             })
             .collect();
-        let result = run_asset_jobs(&worker, requests, move |position, _, _| {
-            job_ran.lock().unwrap().push(position);
-            if position == 1 {
-                Err(WorkerError::Cancelled)
-            } else {
-                Ok(())
-            }
-        });
+        let result = run_asset_jobs(
+            &worker,
+            requests,
+            || false,
+            move |position, _, _| {
+                job_ran.lock().unwrap().push(position);
+                if position == 1 {
+                    Err(WorkerError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert_eq!(result, Err(WorkerError::Cancelled));
         // Assets after the cancelled one were never started.
         assert_eq!(*ran.lock().unwrap(), vec![0, 1]);
