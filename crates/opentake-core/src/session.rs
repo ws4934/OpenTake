@@ -379,7 +379,8 @@ impl EditorSession {
     ///
     /// Assembles a fresh [`Project`] from clones of the live timeline/manifest
     /// (so saving never mutates the document) plus the generation log, and lets
-    /// `opentake-project` write the bundle atomically.
+    /// `opentake-project` atomically replace each component in dependency order:
+    /// additions precede the timeline, while removals follow it.
     ///
     /// **Save-as also copies the source bundle's `media/` directory** into the
     /// new bundle (upstream `mediaDirWrapper`, `Project/VideoProject.swift:112-117`):

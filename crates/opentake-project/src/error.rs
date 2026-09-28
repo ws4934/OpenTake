@@ -59,6 +59,16 @@ pub enum ProjectError {
     #[error("invalid media manifest in {file}: {reason}")]
     InvalidMediaManifest { file: &'static str, reason: String },
 
+    /// The timeline was committed, but a trailing media-manifest update failed.
+    /// The live edit must remain applied because the disk timeline already
+    /// reflects it; retrying the save can finish manifest cleanup.
+    #[error("timeline was committed, but media manifest cleanup failed: {source}")]
+    PartialCommit {
+        /// The failed manifest write.
+        #[source]
+        source: Box<ProjectError>,
+    },
+
     /// Publication could not install the staged bundle or restore the prior
     /// target. The retained backup is deliberately left in place and the next
     /// save attempt will recover it before doing new work.
@@ -73,6 +83,17 @@ pub enum ProjectError {
 }
 
 impl ProjectError {
+    /// Whether the save crossed its timeline commit point before failing.
+    pub fn is_partial_commit(&self) -> bool {
+        matches!(self, ProjectError::PartialCommit { .. })
+    }
+
+    pub(crate) fn partial_commit(source: ProjectError) -> Self {
+        ProjectError::PartialCommit {
+            source: Box::new(source),
+        }
+    }
+
     /// Wrap an [`std::io::Error`] with the path it occurred at.
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         ProjectError::Io {
