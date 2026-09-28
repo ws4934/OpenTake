@@ -7,6 +7,8 @@
 //! Built-in + plugin rules both apply (order: built-in → plugin), combined into
 //! one warning list (`agent-SPEC.md` §6.6).
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use opentake_domain::{Timeline, TrackRole, TrackRoleAssignment};
 
 use crate::tools::names::ToolName;
@@ -19,10 +21,14 @@ pub struct OpContext {
     pub track_index: Option<usize>,
     /// Clip ids the operation removed / split / trimmed.
     pub clip_ids: Vec<String>,
-    /// For B-roll checks: mediaRefs being added, paired with whether they
-    /// already exist elsewhere on the timeline.
+    /// For B-roll checks: the mediaRef of every clip entry being added.
     pub added_media_refs: Vec<String>,
-    /// Whether an added clip's destination track is muted (B-roll silence rule).
+    /// Earliest start frame of each added mediaRef on the timeline *before*
+    /// the operation (duplicate-use rule). A linked audio partner created by
+    /// the same operation is therefore never mistaken for a reuse.
+    pub prior_media_first_frames: BTreeMap<String, i32>,
+    /// Whether an added clip's destination track is muted (B-roll silence
+    /// rule). Filled when the destination track is known before the edit.
     pub added_track_muted: Option<bool>,
     /// Whether a split/trim point is known to fall mid-word (None = unknown).
     pub mid_word: Option<bool>,
@@ -74,30 +80,46 @@ pub fn builtin_rules(
         }
         // --- B-roll 匹配 (add_clips / search_media) ---
         ToolName::AddClips => {
-            // 不重复: an added mediaRef already present elsewhere on the timeline.
+            // 不重复: an added mediaRef that the timeline already used before
+            // this operation (the frame names that earlier use), or one added
+            // more than once by this operation (the frame names the first).
+            let mut checked = BTreeSet::new();
             for media_ref in &op.added_media_refs {
-                let count = timeline
-                    .tracks
-                    .iter()
-                    .flat_map(|t| t.clips.iter())
-                    .filter(|c| &c.media_ref == media_ref)
-                    .count();
-                if count > 1 {
-                    // First reuse frame for the message.
-                    let frame = timeline
-                        .tracks
-                        .iter()
-                        .flat_map(|t| t.clips.iter())
-                        .filter(|c| &c.media_ref == media_ref)
-                        .map(|c| c.start_frame)
-                        .min()
-                        .unwrap_or(0);
+                if !checked.insert(media_ref) {
+                    continue;
+                }
+                let frame = op
+                    .prior_media_first_frames
+                    .get(media_ref)
+                    .copied()
+                    .or_else(|| {
+                        let added_again = op
+                            .added_media_refs
+                            .iter()
+                            .filter(|added| *added == media_ref)
+                            .count()
+                            > 1;
+                        added_again
+                            .then(|| {
+                                timeline
+                                    .tracks
+                                    .iter()
+                                    .flat_map(|t| t.clips.iter())
+                                    .filter(|c| &c.media_ref == media_ref)
+                                    .map(|c| c.start_frame)
+                                    .min()
+                            })
+                            .flatten()
+                    });
+                if let Some(frame) = frame {
                     warnings.push(format!(
                         "该素材已于 frame {frame} 处使用。避免同一素材重复出现。"
                     ));
                 }
             }
-            // 静音: a B-roll clip added to a non-muted track.
+            // 静音: a B-roll clip added to a non-muted track. Nothing mutes the
+            // track automatically (that would be an edit the model did not
+            // ask for), so the warning only suggests it.
             if op.added_track_muted == Some(false)
                 && op
                     .track_index
@@ -105,7 +127,7 @@ pub fn builtin_rules(
                     .map(|r| r == TrackRole::BRoll)
                     .unwrap_or(false)
             {
-                warnings.push("B-roll 通常无声，已自动静音该轨。".to_string());
+                warnings.push("B-roll 通常无声，建议静音该轨。".to_string());
             }
         }
         _ => {}
@@ -186,12 +208,40 @@ mod tests {
         tl.tracks.push(t);
         let op = OpContext {
             added_media_refs: vec!["asset-x".into()],
+            prior_media_first_frames: BTreeMap::from([("asset-x".into(), 10)]),
             ..Default::default()
         };
         let w = builtin_rules(ToolName::AddClips, &op, &[], &tl);
         assert_eq!(
             w,
             vec!["该素材已于 frame 10 处使用。避免同一素材重复出现。"]
+        );
+    }
+
+    #[test]
+    fn media_new_to_the_timeline_is_not_a_duplicate_even_with_a_linked_partner() {
+        // A video with audio: the video clip and its linked audio clip share
+        // the mediaRef after the operation, but the timeline had neither.
+        let mut tl = Timeline::new();
+        let mut v = Track::new("v1", ClipType::Video);
+        v.clips.push(Clip::new("c1", "asset-x", 0, 30));
+        let mut a = Track::new("a1", ClipType::Audio);
+        a.clips.push(Clip::new("c2", "asset-x", 0, 30));
+        tl.tracks.extend([v, a]);
+        let op = OpContext {
+            added_media_refs: vec!["asset-x".into()],
+            ..Default::default()
+        };
+        assert!(builtin_rules(ToolName::AddClips, &op, &[], &tl).is_empty());
+
+        // Adding the same mediaRef twice in one call is a reuse.
+        let op = OpContext {
+            added_media_refs: vec!["asset-x".into(), "asset-x".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            builtin_rules(ToolName::AddClips, &op, &[], &tl),
+            vec!["该素材已于 frame 0 处使用。避免同一素材重复出现。"]
         );
     }
 

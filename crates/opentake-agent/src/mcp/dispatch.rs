@@ -861,7 +861,7 @@ impl Dispatcher {
             ToolName::InspectMedia => self.inspect_media(args, before, manifest, cancel),
 
             // --- Editing (wired to EditCommand) ---
-            ToolName::AddClips => self.add_clips(args, manifest, op),
+            ToolName::AddClips => self.add_clips(args, before, manifest, op),
             ToolName::InsertClips => self.insert_clips(args, before, manifest),
             ToolName::MoveClips => self.move_clips(args, before),
             ToolName::RemoveClips => self.remove_clips(args, before, op),
@@ -1859,6 +1859,7 @@ impl Dispatcher {
     fn add_clips(
         &self,
         args: &Value,
+        before: &Timeline,
         manifest: &MediaManifest,
         op: &mut OpContext,
     ) -> Result<ToolResult, ToolError> {
@@ -1903,12 +1904,30 @@ impl Dispatcher {
                 "add_clips: mixing entries with trackIndex and entries without trackIndex is rejected; split into separate calls",
             ));
         }
+        // The duplicate-use rule compares against the timeline before this
+        // edit, so the linked audio partner it creates is not a reuse.
+        op.prior_media_first_frames = before
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| media_refs.contains(&clip.media_ref))
+            .fold(BTreeMap::new(), |mut first, clip| {
+                first
+                    .entry(clip.media_ref.clone())
+                    .and_modify(|frame: &mut i32| *frame = (*frame).min(clip.start_frame))
+                    .or_insert(clip.start_frame);
+                first
+            });
         op.added_media_refs = media_refs;
         let command = if omitted_count > 0 {
             op.track_index = None;
             EditCommand::AddClipsAutoTrack { entries }
         } else {
             op.track_index = entries.first().map(|e| e.track_index);
+            op.added_track_muted = op
+                .track_index
+                .and_then(|index| before.tracks.get(index))
+                .map(|track| track.muted);
             EditCommand::AddClips { entries }
         };
         let res = self.apply(command)?;
@@ -2208,50 +2227,32 @@ impl Dispatcher {
             cancel,
         )?;
         ensure_not_cancelled(cancel)?;
-        let min_gap = a.min_clip_frames.unwrap_or(1).max(1);
-        let max_gap = a.max_clip_frames.unwrap_or(i32::MAX).max(min_gap);
-        let mut cut_frames = Vec::new();
-        let mut last = None;
-        for beat in &beats {
-            if let Some(prev) = last {
-                let gap = beat.frame - prev;
-                if gap < min_gap {
-                    continue;
-                }
-                if gap > max_gap {
-                    cut_frames.push(prev + max_gap);
-                }
-            }
-            cut_frames.push(beat.frame);
-            last = Some(beat.frame);
-        }
-        cut_frames.sort_unstable();
-        cut_frames.dedup();
+        let beat_frames = beats.iter().map(|beat| beat.frame).collect::<Vec<_>>();
+        let cut_frames = plan_beat_cut_frames(
+            &beat_frames,
+            a.min_clip_frames.unwrap_or(1),
+            a.max_clip_frames,
+        );
 
+        // Preview and write share one planner, so `write=false` returns
+        // exactly the placements a `write=true` call would apply.
         let requested_clip_ids = a.clip_ids.unwrap_or_default();
-        let placements = requested_clip_ids
-            .iter()
-            .zip(cut_frames.iter().copied())
-            .map(|(clip_id, to_frame)| {
-                serde_json::json!({
-                    "clipId": clip_id,
-                    "toFrame": to_frame,
-                })
-            })
-            .collect::<Vec<_>>();
+        let (moves, placements) = if requested_clip_ids.is_empty() && !write {
+            (Vec::new(), Vec::new())
+        } else {
+            plan_beat_alignment_moves(before, &requested_clip_ids, &cut_frames)?
+        };
 
-        let (applied, summary, placements) = if write {
-            let (moves, applied_placements) =
-                plan_beat_alignment_moves(before, &requested_clip_ids, &cut_frames)?;
+        let (applied, summary) = if write {
             op.clip_ids = moves
                 .iter()
                 .map(|movement| movement.clip_id.clone())
                 .collect();
             op.track_index = moves.first().map(|movement| movement.to_track);
             let result = self.apply_deferred(EditCommand::MoveClips { moves }, revision, cancel)?;
-            (result.changed, Some(result.summary), applied_placements)
+            (result.changed, Some(result.summary))
         } else {
-            (false, None, placements)
+            (false, None)
         };
 
         let payload = serde_json::json!({
@@ -4024,6 +4025,44 @@ fn clip_location(timeline: &Timeline, clip_id: &str) -> (Option<usize>, Option<i
     (None, None)
 }
 
+/// Turn detected beats into cut frames. Beats closer than `min_clip_frames`
+/// to the previous cut are dropped; a gap longer than `max_clip_frames` is
+/// split into the fewest equal parts that each fit, so every generated cut
+/// length stays within the bound.
+fn plan_beat_cut_frames(
+    beat_frames: &[i32],
+    min_clip_frames: i32,
+    max_clip_frames: Option<i32>,
+) -> Vec<i32> {
+    let min_gap = i64::from(min_clip_frames.max(1));
+    let max_gap = max_clip_frames.map(|max| i64::from(max).max(min_gap));
+    let mut sorted = beat_frames.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut cut_frames: Vec<i32> = Vec::with_capacity(sorted.len());
+    for frame in sorted {
+        let Some(&prev) = cut_frames.last() else {
+            cut_frames.push(frame);
+            continue;
+        };
+        let gap = i64::from(frame) - i64::from(prev);
+        if gap < min_gap {
+            continue;
+        }
+        if let Some(max_gap) = max_gap.filter(|max_gap| gap > *max_gap) {
+            let parts = (gap + max_gap - 1) / max_gap;
+            for part in 1..parts {
+                // `prev + gap * part / parts` lies strictly between `prev` and
+                // `frame`, so it fits in `i32`.
+                let cut = i64::from(prev) + gap * part / parts;
+                cut_frames.push(i32::try_from(cut).unwrap_or(frame));
+            }
+        }
+        cut_frames.push(frame);
+    }
+    cut_frames
+}
+
 /// Build one deterministic [`EditCommand::MoveClips`] payload that aligns each
 /// selected visual root to a beat and expands every linked A/V partner with the
 /// same delta. Validation completes before the caller reaches `CoreHandle::apply`.
@@ -4038,33 +4077,56 @@ fn plan_beat_alignment_moves(
         ));
     }
 
-    let mut roots = Vec::new();
-    let mut seen_roots = BTreeSet::new();
+    // One root per selected link group (or unlinked clip), in selection
+    // order. The root is the group's first selected visual clip; a selected
+    // audio partner rides along with it, but a group with no selected visual
+    // clip is rejected.
+    struct SelectedGroup<'a> {
+        key: String,
+        first_clip_id: &'a str,
+        root: Option<&'a opentake_domain::Clip>,
+    }
+    let mut groups: Vec<SelectedGroup<'_>> = Vec::new();
     for clip_id in clip_ids {
         let clip = find_clip(timeline, clip_id).ok_or_else(|| {
             ToolError::new(format!("auto_cut_to_beats: clip not found: {clip_id}"))
         })?;
-        if !clip.media_type.is_visual() {
-            return Err(ToolError::new(format!(
-                "auto_cut_to_beats: clip is not visual: {clip_id}"
-            )));
-        }
-        let root_key = clip
+        let key = clip
             .link_group_id
             .as_ref()
             .map(|group| format!("link:{group}"))
             .unwrap_or_else(|| format!("clip:{clip_id}"));
-        if seen_roots.insert(root_key) {
-            roots.push((
-                clip.id.clone(),
-                clip.start_frame,
-                clip.link_group_id.clone(),
-            ));
+        let visual = clip.media_type.is_visual().then_some(clip);
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => {
+                if group.root.is_none() {
+                    group.root = visual;
+                }
+            }
+            None => groups.push(SelectedGroup {
+                key,
+                first_clip_id: clip_id,
+                root: visual,
+            }),
         }
+    }
+    let mut roots = Vec::with_capacity(groups.len());
+    for group in groups {
+        let Some(clip) = group.root else {
+            return Err(ToolError::new(format!(
+                "auto_cut_to_beats: clip is not visual: {}",
+                group.first_clip_id
+            )));
+        };
+        roots.push((
+            clip.id.clone(),
+            clip.start_frame,
+            clip.link_group_id.clone(),
+        ));
     }
     if beat_frames.len() < roots.len() {
         return Err(ToolError::new(format!(
-            "auto_cut_to_beats: need at least {} beat frame(s) for write, got {}",
+            "auto_cut_to_beats: need at least {} beat frame(s) for the selected clips, got {}",
             roots.len(),
             beat_frames.len()
         )));
@@ -6315,6 +6377,12 @@ mod tests {
     }
 
     fn linked_beat_handle() -> Arc<WritableAnalysisHandle> {
+        let mut samples = vec![0.0; 1_000];
+        samples[500..530].fill(1.0);
+        linked_beat_handle_with_samples(samples)
+    }
+
+    fn linked_beat_handle_with_samples(samples: Vec<f32>) -> Arc<WritableAnalysisHandle> {
         let mut timeline = Timeline::new();
         timeline.fps = 10;
         let mut video_track = Track::new("video-track", ClipType::Video);
@@ -6331,8 +6399,6 @@ mod tests {
 
         let mut manifest = MediaManifest::new();
         manifest.entries.push(audio_entry("music", "Music"));
-        let mut samples = vec![0.0; 1_000];
-        samples[500..530].fill(1.0);
         Arc::new(WritableAnalysisHandle {
             state: Mutex::new(EditorState::new(timeline, manifest)),
             pcm: pcm(samples, 1_000),
@@ -6898,6 +6964,81 @@ mod tests {
         assert!(video_clip.link_group_id.is_some());
         assert_eq!(video_clip.link_group_id, audio_clip.link_group_id);
         assert_eq!(audio_clip.media_type, ClipType::Audio);
+    }
+
+    fn signal_warnings(result: &ToolResult) -> Vec<String> {
+        crate::signal::engine::extract_signal(result)
+            .and_then(|signal| signal["warnings"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|warning| warning.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn add_clips_duplicate_media_rule_compares_with_the_timeline_before_the_edit() {
+        let h = one_video_track_handle(vec![video_with_audio_entry("asset-1", "A")]);
+        let d = dispatcher_with(h.clone());
+        let add_at = |frame: i32| {
+            d.dispatch(
+                "add_clips",
+                serde_json::json!({
+                    "entries": [
+                        {"mediaRef": "asset-1", "trackIndex": 0, "startFrame": frame, "durationFrames": 30}
+                    ]
+                }),
+            )
+        };
+
+        // The first use creates a video clip and its linked audio clip with
+        // the same mediaRef; that is not a reuse.
+        let first = add_at(0);
+        assert!(!first.is_error, "{}", first.text_joined());
+        assert_eq!(h.timeline().tracks.len(), 2);
+        assert!(
+            !signal_warnings(&first)
+                .iter()
+                .any(|warning| warning.contains("避免同一素材重复出现")),
+            "{:?}",
+            signal_warnings(&first)
+        );
+
+        // A second use names the frame of the existing clip.
+        let second = add_at(90);
+        assert!(!second.is_error, "{}", second.text_joined());
+        assert!(
+            signal_warnings(&second)
+                .contains(&"该素材已于 frame 0 处使用。避免同一素材重复出现。".to_owned()),
+            "{:?}",
+            signal_warnings(&second)
+        );
+    }
+
+    #[test]
+    fn add_clips_to_an_unmuted_b_roll_track_suggests_muting_it() {
+        const SUGGESTION: &str = "B-roll 通常无声，建议静音该轨。";
+        for muted in [false, true] {
+            let h = one_video_track_handle(vec![entry("asset-1", "A")]);
+            h.state.lock().unwrap().timeline.tracks[0].muted = muted;
+            let d = dispatcher_with(h.clone());
+            // A short clip on a video track is detected as B-roll.
+            let result = d.dispatch(
+                "add_clips",
+                serde_json::json!({
+                    "entries": [
+                        {"mediaRef": "asset-1", "trackIndex": 0, "startFrame": 0, "durationFrames": 30}
+                    ]
+                }),
+            );
+            assert!(!result.is_error, "{}", result.text_joined());
+            assert_eq!(
+                signal_warnings(&result).contains(&SUGGESTION.to_owned()),
+                !muted,
+                "muted={muted}: {:?}",
+                signal_warnings(&result)
+            );
+            assert_eq!(h.timeline().tracks[0].muted, muted, "the rule never edits");
+        }
     }
 
     #[test]
@@ -7516,6 +7657,115 @@ mod tests {
 
         assert!(!result.is_error, "{}", result.text_joined());
         assert_eq!(first_json(&result)["applied"], false);
+    }
+
+    #[test]
+    fn beat_cut_planner_splits_long_gaps_within_max_clip_frames() {
+        let cuts = plan_beat_cut_frames(&[0, 100], 1, Some(30));
+        assert_eq!(cuts.first(), Some(&0));
+        assert_eq!(cuts.last(), Some(&100));
+        assert!(
+            cuts.windows(2).all(|pair| pair[1] - pair[0] <= 30),
+            "{cuts:?}"
+        );
+        assert_eq!(cuts, vec![0, 25, 50, 75, 100]);
+
+        // Min spacing still drops close beats; no bound keeps every beat.
+        assert_eq!(plan_beat_cut_frames(&[0, 3, 10], 5, None), vec![0, 10]);
+        assert_eq!(plan_beat_cut_frames(&[0, 100], 1, None), vec![0, 100]);
+        // A gap of exactly the bound is not split.
+        assert_eq!(
+            plan_beat_cut_frames(&[0, 30, 60], 1, Some(30)),
+            vec![0, 30, 60]
+        );
+        // Extreme frames do not overflow.
+        let cuts = plan_beat_cut_frames(&[i32::MIN, i32::MAX], 1, Some(i32::MAX));
+        assert_eq!(cuts.len(), 4, "{cuts:?}");
+        assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// `linked_beat_handle` with two beats and an unlinked second video clip,
+    /// so two roots can be placed.
+    fn two_root_beat_handle() -> Arc<WritableAnalysisHandle> {
+        let mut samples = vec![0.0; 1_000];
+        samples[200..230].fill(1.0);
+        samples[700..730].fill(1.0);
+        let handle = linked_beat_handle_with_samples(samples);
+        {
+            let mut state = handle.state.lock().unwrap();
+            let mut second_track = Track::new("video-track-2", ClipType::Video);
+            second_track
+                .clips
+                .push(Clip::new("video-b", "video-source-b", 40, 5));
+            state.timeline.tracks.push(second_track);
+        }
+        handle
+    }
+
+    #[test]
+    fn auto_cut_to_beats_preview_matches_the_applied_placements() {
+        let handle = two_root_beat_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        // The linked audio partner of video-a is selected too: it rides with
+        // its video instead of taking a cut of its own.
+        let args = |write: bool| {
+            serde_json::json!({
+                "clipIds": ["video-a", "audio-a", "video-b"],
+                "beatMediaRef": "music",
+                "write": write
+            })
+        };
+
+        let preview = dispatcher.dispatch("auto_cut_to_beats", args(false));
+        assert!(!preview.is_error, "{}", preview.text_joined());
+        let preview = first_json(&preview);
+        assert_eq!(preview["applied"], false);
+        assert!(handle.commands.lock().unwrap().is_empty());
+        let placements = preview["placements"].as_array().unwrap().clone();
+        assert_eq!(placements.len(), 2, "{placements:?}");
+        assert_eq!(placements[0]["clipId"], "video-a");
+        assert_eq!(
+            placements[0]["linkedClipIds"],
+            serde_json::json!(["video-a", "audio-a"])
+        );
+        assert_eq!(placements[1]["clipId"], "video-b");
+
+        let written = dispatcher.dispatch("auto_cut_to_beats", args(true));
+        assert!(!written.is_error, "{}", written.text_joined());
+        let written = first_json(&written);
+        assert_eq!(written["applied"], true);
+        assert_eq!(written["placements"].as_array().unwrap(), &placements);
+        let after = handle.timeline();
+        for placement in &placements {
+            let clip = find_clip(&after, placement["clipId"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                i64::from(clip.start_frame),
+                placement["toFrame"].as_i64().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn auto_cut_to_beats_preview_rejects_a_clip_that_write_would_reject() {
+        let handle = linked_beat_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        for write in [false, true] {
+            let result = dispatcher.dispatch(
+                "auto_cut_to_beats",
+                serde_json::json!({
+                    "clipIds": ["audio-a"],
+                    "beatMediaRef": "music",
+                    "write": write
+                }),
+            );
+            assert!(result.is_error, "write={write}");
+            assert!(
+                result.text_joined().contains("clip is not visual"),
+                "{}",
+                result.text_joined()
+            );
+        }
+        assert!(handle.commands.lock().unwrap().is_empty());
     }
 
     #[test]
