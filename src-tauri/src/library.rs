@@ -53,8 +53,25 @@ impl LibraryState {
                 "global library unavailable: storage reconciliation failed: {error}"
             ));
         }
+        let store = Arc::new(store);
+        // Hashing duplicate copies can take long; keep it off the setup thread.
+        let background = Arc::clone(&store);
+        if let Err(error) = std::thread::Builder::new()
+            .name("opentake-library-duplicates".into())
+            .spawn(move || match background.resolve_duplicate_copies() {
+                Ok(0) => {}
+                Ok(resolved) => {
+                    eprintln!("[library] resolved duplicate copies of {resolved} entries")
+                }
+                Err(error) => {
+                    eprintln!("[library] duplicate copy resolution failed: {error}")
+                }
+            })
+        {
+            eprintln!("[library] could not start duplicate resolution: {error}");
+        }
         LibraryState {
-            store: Some(Arc::new(store)),
+            store: Some(store),
             init_error: None,
             workflow_lock: Mutex::new(()),
         }

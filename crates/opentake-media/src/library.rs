@@ -566,6 +566,42 @@ fn stream_hash(reader: &mut impl Read) -> std::io::Result<String> {
     stream_hash_copy(reader, &mut std::io::sink())
 }
 
+/// Number of hard links to the open file.
+#[cfg(unix)]
+fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.nlink())
+}
+
+/// Number of hard links to the open file.
+#[cfg(windows)]
+fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `info` is a properly sized, writable BY_HANDLE_FILE_INFORMATION
+    // and the file handle stays open for this synchronous call.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::from(info.nNumberOfLinks))
+}
+
+/// Make a rename inside `dir` durable before anything refers to it. Windows
+/// (NTFS) journals directory updates and has no directory fsync.
+fn sync_dir(dir: &Dir) -> std::io::Result<()> {
+    // The capability itself may be a path-only descriptor that cannot be
+    // synced; open the directory for reading through it instead.
+    #[cfg(unix)]
+    dir.open(".")?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn read_nofollow(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -1096,16 +1132,16 @@ impl LibraryStore {
         Ok(Some(OwnedLeaf::open(&capabilities.files, name)?))
     }
 
-    /// Hash every leaf claiming `id` through its own retained handle.
+    /// Hash every leaf claiming `id` through its own read-only handle.
     /// Mismatching leaves (bit rot, external edits, a crash-truncated write)
-    /// are quarantined by truncating that exact handle, which hides them from
-    /// [`Self::stored_index`]; they are never adopted. Returns the verified
-    /// leaves, rewound, in name order.
+    /// are quarantined with [`Self::release_stored_leaf`], which hides them
+    /// from [`Self::stored_index`]; they are never adopted. Returns the
+    /// verified leaves, rewound, in name order.
     fn verify_candidates(&self, id: &str, names: &[OsString]) -> Result<Vec<OwnedLeaf>> {
         let files = &self.capabilities()?.files;
         let mut verified = Vec::new();
         for name in names {
-            let mut leaf = match OwnedLeaf::open_writable(files, name) {
+            let mut leaf = match OwnedLeaf::open(files, name) {
                 Ok(leaf) => leaf,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
@@ -1119,10 +1155,62 @@ impl LibraryStore {
                     "library: quarantining stored copy {} (expected {id}, got {actual})",
                     name.to_string_lossy()
                 );
-                leaf.truncate_exact()?;
+                self.release_stored_leaf(leaf)?;
             }
         }
         Ok(verified)
+    }
+
+    /// Keep the first verified leaf and release every other one, so exactly
+    /// one name claims the id afterwards.
+    fn keep_first_verified(&self, id: &str, verified: Vec<OwnedLeaf>) -> Result<Option<OwnedLeaf>> {
+        let mut verified = verified.into_iter();
+        let kept = verified.next();
+        for duplicate in verified {
+            tracing::warn!(
+                "library: releasing duplicate stored copy {} of {id}",
+                duplicate.name.to_string_lossy()
+            );
+            self.release_stored_leaf(duplicate)?;
+        }
+        Ok(kept)
+    }
+
+    /// Stop `leaf` from claiming its content id without destroying data that
+    /// is reachable elsewhere. A file with a single link is truncated through
+    /// a handle proven to be the same file (empty leaves are ignored by
+    /// [`Self::stored_index`]). A file with several links — two names in
+    /// `files/` for one file, or a hard link from outside the library — only
+    /// loses this directory entry, so the other links keep their bytes. A name
+    /// that no longer refers to the verified file is left alone.
+    fn release_stored_leaf(&self, leaf: OwnedLeaf) -> Result<()> {
+        let files = &self.capabilities()?.files;
+        if link_count(leaf.handle.as_file())? <= 1 {
+            match OwnedLeaf::open_writable(files, &leaf.name) {
+                Ok(writable) if writable.handle == leaf.handle => {
+                    return Ok(writable.truncate_exact()?);
+                }
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                // Not writable (for example a read-only file): unlink instead.
+                Err(_) => {}
+            }
+        }
+        match OwnedLeaf::open_identity(files, &leaf.name) {
+            Ok(current) if current.handle == leaf.handle => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let name = leaf.name.clone();
+        // Windows cannot remove a name while this process holds the file
+        // without delete sharing.
+        drop(leaf);
+        match files.remove_file(&name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Validate all retained stored leaves once and return their content ids.
@@ -1224,14 +1312,13 @@ impl LibraryStore {
     /// Validate storage after a crash while leaving unknown mutable names
     /// untouched. A strictly valid manifest is required first; unknown leaves
     /// (staging leftovers, foreign files such as `.DS_Store`, directories)
-    /// stay hidden and never make the library unavailable. When several
-    /// leaves claim one manifest-owned id, each is verified through its own
-    /// handle: mismatching ones are quarantined and verified duplicates beyond
-    /// the first are released, so lookups for that id recover.
+    /// stay hidden and never make the library unavailable. It reads no file
+    /// contents; see [`Self::resolve_duplicate_copies`] for duplicate claims.
     pub fn reconcile_storage(&self) -> Result<()> {
         let _guard = self.lock_writes();
         self.reconcile_manifest_artifacts()?;
-        let manifest = self.load_manifest()?;
+        // A strictly valid manifest is required before anything else.
+        self.load_manifest()?;
         let capabilities = self.capabilities()?;
         let active_stages = self
             .active_stages
@@ -1256,23 +1343,31 @@ impl LibraryStore {
             // directory enumeration, so reconciliation performs no destructive
             // action without an already-retained owner handle.
         }
-        let index = self.stored_index()?;
+        Ok(())
+    }
+
+    /// Resolve manifest-owned ids that several leaves claim (crash leftovers,
+    /// copies restored by hand, hard links). Each candidate is hashed through
+    /// its own handle: mismatching ones are quarantined and verified extras
+    /// released, so lookups for those ids work again. This hashes whole
+    /// files, so it runs without the write lock and is meant for a background
+    /// thread after startup; favoriting such content resolves it the same way.
+    pub fn resolve_duplicate_copies(&self) -> Result<usize> {
+        let (manifest, index) = {
+            let _guard = self.lock_writes();
+            (self.load_manifest()?, self.stored_index()?)
+        };
+        let mut resolved = 0;
         for entry in &manifest.entries {
             let candidates = index.candidates(&entry.id);
             if candidates.len() < 2 {
                 continue;
             }
             let verified = self.verify_candidates(&entry.id, candidates)?;
-            for duplicate in verified.iter().skip(1) {
-                tracing::warn!(
-                    "library: releasing duplicate stored copy {} of {}",
-                    duplicate.name.to_string_lossy(),
-                    entry.id
-                );
-                duplicate.truncate_exact()?;
-            }
+            self.keep_first_verified(&entry.id, verified)?;
+            resolved += 1;
         }
-        Ok(())
+        Ok(resolved)
     }
 
     fn lock_writes(&self) -> WriteLockGuard<'_> {
@@ -1402,11 +1497,12 @@ impl LibraryStore {
             let candidates = self.stored_index()?.candidates(&id).to_vec();
             (existing, candidates)
         };
-        let mut verified = self.verify_candidates(&id, &candidates)?;
+        let verified = self.verify_candidates(&id, &candidates)?;
+        let kept = self.keep_first_verified(&id, verified)?;
 
         if let Some(existing) = existing {
             prepared.entry = existing;
-            if !verified.is_empty() {
+            if kept.is_some() {
                 // The durable copy is intact; nothing to publish.
                 prepared.release_stage();
                 prepared.stored_name = None;
@@ -1415,22 +1511,15 @@ impl LibraryStore {
             return Ok(prepared);
         }
 
-        match verified.len() {
-            0 => Ok(prepared),
-            1 => {
-                // A verified crash orphan: adopt it instead of storing a second
-                // copy. Mismatching orphans were quarantined above.
-                let orphan = verified.pop().expect("one verified orphan");
-                prepared.release_stage();
-                prepared.stored_name = Some(orphan.name.clone());
-                prepared.final_leaf = Some(orphan);
-                Ok(prepared)
-            }
-            _ => Err(MediaError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("multiple stored copies claim library id {id}"),
-            ))),
+        if let Some(orphan) = kept {
+            // A verified crash orphan: adopt it instead of storing a second
+            // copy. Mismatching orphans were quarantined and verified
+            // duplicates released above.
+            prepared.release_stage();
+            prepared.stored_name = Some(orphan.name.clone());
+            prepared.final_leaf = Some(orphan);
         }
+        Ok(prepared)
     }
 
     /// Create a private stage, fill it through `fill` (which returns the
@@ -1473,7 +1562,13 @@ impl LibraryStore {
         let Some(stage) = prepared.stage.as_mut() else {
             return Ok(());
         };
-        if stage.matches_name(&capabilities.staging)? {
+        let bound = match stage.matches_name(&capabilities.staging) {
+            Ok(bound) => bound,
+            // The name was moved away or deleted: re-stage the retained bytes.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if bound {
             return Ok(());
         }
         stage.rewind()?;
@@ -1522,6 +1617,10 @@ impl LibraryStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&staged_name);
         moved?;
+        // The manifest will refer to this name: persist the directory entry
+        // (and the removal from staging) first.
+        sync_dir(&prepared.capabilities.files)?;
+        sync_dir(&prepared.capabilities.staging)?;
         Ok(stage)
     }
 
@@ -1686,7 +1785,7 @@ impl LibraryStore {
         let files = &self.capabilities()?.files;
         let mut stored = Vec::new();
         for name in self.stored_index()?.candidates(id) {
-            match OwnedLeaf::open_writable(files, name) {
+            match OwnedLeaf::open(files, name) {
                 Ok(leaf) => stored.push(leaf),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -1706,8 +1805,8 @@ impl LibraryStore {
                         "injected removed-stored cleanup failure",
                     ));
                 }
-                stored.handle.as_file().set_len(0)?;
-                stored.handle.as_file().sync_all()
+                self.release_stored_leaf(stored)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
             };
             if let Err(error) = cleanup() {
                 // The manifest is already committed, so the removal stands; only
@@ -2210,30 +2309,67 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_crash_orphan_claims_fail_closed() {
+    fn duplicate_crash_orphans_adopt_one_verified_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let source = src_file(tmp.path(), "clip.mp4", b"duplicate orphan bytes");
         let store = LibraryStore::new(tmp.path().join("lib"));
         let id = store.content_id(&source).unwrap();
-        std::fs::write(
-            store.files_dir().join(format!("{id}.first.mp4")),
-            b"duplicate orphan bytes",
-        )
-        .unwrap();
-        std::fs::write(
-            store.files_dir().join(format!("{id}.second.mp4")),
-            b"duplicate orphan bytes",
-        )
-        .unwrap();
+        let first = store.files_dir().join(format!("{id}.first.mp4"));
+        let second = store.files_dir().join(format!("{id}.second.mp4"));
+        std::fs::write(&first, b"duplicate orphan bytes").unwrap();
+        std::fs::write(&second, b"duplicate orphan bytes").unwrap();
 
-        let error = store
-            .favorite(&req(&source, "video", None))
-            .expect_err("duplicate orphan claims must fail closed");
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
 
-        assert!(
-            error.to_string().contains("multiple stored copies"),
-            "{error}"
-        );
+        assert_eq!(entry.id, id);
+        assert_eq!(store.stored_path(&id).unwrap(), Some(first.clone()));
+        assert_eq!(std::fs::read(&first).unwrap(), b"duplicate orphan bytes");
+        assert_eq!(std::fs::metadata(&second).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_duplicates_never_lose_the_kept_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"linked bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let kept = store.stored_path(&entry.id).unwrap().unwrap();
+        // A second name for the same file, sorted after the kept one.
+        let linked = store.files_dir().join(format!("{}.zz.mp4", entry.id));
+        std::fs::hard_link(&kept, &linked).unwrap();
+
+        store.resolve_duplicate_copies().unwrap();
+
+        assert_eq!(std::fs::read(&kept).unwrap(), b"linked bytes");
+        assert!(!linked.exists(), "only the extra name is removed");
+        assert_eq!(store.stored_path(&entry.id).unwrap(), Some(kept.clone()));
+
+        // A hard link from outside the library keeps its bytes on removal.
+        let outside = tmp.path().join("outside-link.mp4");
+        std::fs::hard_link(&kept, &outside).unwrap();
+        assert!(store.remove(&entry.id).unwrap());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"linked bytes");
+        assert!(!kept.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_stored_copy_can_be_refavorited_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"read only bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let stored = store.stored_path(&entry.id).unwrap().unwrap();
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let again = store
+            .favorite_with_outcome(&req(&source, "video", None))
+            .unwrap();
+        assert!(!again.created);
+        assert!(store.remove(&entry.id).unwrap());
         assert!(store.entries().unwrap().is_empty());
     }
 
@@ -2481,8 +2617,9 @@ mod tests {
             .expect_err("duplicate candidates must fail closed");
         assert!(error.to_string().contains("multiple stored copies"));
 
-        // Reconciliation keeps only the copy that verifies.
+        // Duplicate resolution keeps only the copy that verifies.
         store.reconcile_storage().unwrap();
+        assert_eq!(store.resolve_duplicate_copies().unwrap(), 1);
         let paths = store.stored_paths().unwrap();
         assert_eq!(
             std::fs::read(&paths[&entry.id]).unwrap(),
