@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -101,12 +102,19 @@ class ChecksumMismatch(RuntimeError):
 # a fresh download from that source before moving on to the next source.
 DOWNLOAD_CHECKSUM_ATTEMPTS = 3
 DOWNLOAD_NETWORK_ATTEMPTS = 4
-# Client errors that a retry of the same URL cannot fix (404 while the mirror
-# release does not exist yet, 403 from a blocked host).
+# Client errors that a retry of the same mirror URL cannot fix (404 while the
+# mirror release or asset does not exist yet, 403 from a blocked host). The
+# upstream URL keeps retrying them, as it always has.
 PERMANENT_HTTP_STATUS = frozenset(range(400, 500)) - {408, 425, 429}
 
 
-def download(url: str, destination_path: Path) -> None:
+def download(
+    url: str, destination_path: Path, *, retry_client_errors: bool = True
+) -> None:
+    """Download `url` to `destination_path`, retrying network errors (an
+    `OSError`, or an `http.client.HTTPException` such as a body cut short by
+    `IncompleteRead`). With `retry_client_errors=False`, an HTTP 4xx that a
+    retry cannot fix fails at once."""
     last_error: Exception | None = None
     for attempt in range(1, DOWNLOAD_NETWORK_ATTEMPTS + 1):
         try:
@@ -118,12 +126,13 @@ def download(url: str, destination_path: Path) -> None:
                     while chunk := response.read(1024 * 1024):
                         stream.write(chunk)
             return
-        except OSError as error:
+        except (OSError, http.client.HTTPException) as error:
             last_error = error
             if destination_path.exists():
                 destination_path.unlink()
             if (
-                isinstance(error, urllib.error.HTTPError)
+                not retry_client_errors
+                and isinstance(error, urllib.error.HTTPError)
                 and error.code in PERMANENT_HTTP_STATUS
             ):
                 raise RuntimeError(f"download failed: HTTP {error.code}") from error
@@ -139,8 +148,10 @@ def download_sources(record: dict[str, object]) -> list[str]:
     upstream `url`, which stays the provenance and the last fallback."""
     url = record.get("url")
     mirrors = record.get("mirror_urls", [])
-    if not isinstance(url, str) or not isinstance(mirrors, list):
+    if not isinstance(url, str):
         raise RuntimeError("sidecar lock record requires a string url")
+    if not isinstance(mirrors, list):
+        raise RuntimeError("sidecar lock mirror_urls must be a list")
     if not all(isinstance(mirror, str) and mirror for mirror in mirrors):
         raise RuntimeError("sidecar lock mirror_urls must be non-empty strings")
     return [*mirrors, url]
@@ -186,13 +197,17 @@ def fetch_pinned(
     expected_sha: str,
     archive_path: Path,
     destination_path: Path,
+    mirror: bool = False,
 ) -> None:
     """Download `url` into `destination_path` (through its pinned archive when
-    the record has one) and check the pinned SHA-256 of the result."""
-    if record.get("archive") is None:
-        download(url, destination_path)
+    the record has one) and check the pinned SHA-256 of the result. A mirror
+    fails fast on a client error; the upstream URL keeps its retries."""
+    download_path = destination_path if record.get("archive") is None else archive_path
+    if mirror:
+        download(url, download_path, retry_client_errors=False)
     else:
-        download(url, archive_path)
+        download(url, download_path)
+    if record.get("archive") is not None:
         materialize_download(record, archive_path, destination_path)
     actual_sha = sha256(destination_path)
     if actual_sha != expected_sha:
@@ -208,12 +223,15 @@ def fetch_from_source(
     expected_sha: str,
     archive_path: Path,
     destination_path: Path,
+    mirror: bool = False,
 ) -> None:
     """Fetch the pinned file from one source, downloading it again (at most
     DOWNLOAD_CHECKSUM_ATTEMPTS times) while it serves the wrong bytes."""
     for attempt in range(1, DOWNLOAD_CHECKSUM_ATTEMPTS + 1):
         try:
-            fetch_pinned(tool, record, url, expected_sha, archive_path, destination_path)
+            fetch_pinned(
+                tool, record, url, expected_sha, archive_path, destination_path, mirror
+            )
             return
         except ChecksumMismatch as error:
             for partial in (archive_path, destination_path):
@@ -237,10 +255,17 @@ def fetch_from_any_source(
     """Try every source in order and return the one that served the pinned
     file; fail naming each source's error only when all of them failed."""
     failures: list[str] = []
-    for url in download_sources(record):
+    sources = download_sources(record)
+    for index, url in enumerate(sources):
         try:
             fetch_from_source(
-                tool, record, url, expected_sha, archive_path, destination_path
+                tool,
+                record,
+                url,
+                expected_sha,
+                archive_path,
+                destination_path,
+                mirror=index < len(sources) - 1,
             )
             return url
         except (OSError, RuntimeError, zipfile.BadZipFile) as error:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -270,15 +271,25 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
         self.assertEqual(delays, list(range(1, attempts)))
 
     def provision_from_sources(
-        self, record: dict[str, object], responses: dict[str, list[object]]
+        self,
+        record: dict[str, object],
+        responses: dict[str, list[object]],
+        verified: list[tuple[bytes, str, str]] | None = None,
     ) -> tuple[Path, list[str]]:
         """Provision a Linux sidecar where each download of a URL pops the next
-        response for it: bytes are written, an exception is raised. Returns
-        the published path and the downloaded URLs in order."""
+        response for it: bytes are written, an exception is raised. Each call
+        of `verify` appends the checked bytes, SHA-256 and version to
+        `verified`. Returns the published path and the downloaded URLs in
+        order."""
         requested: list[str] = []
+        self.client_error_retries: dict[str, bool] = {}
+        checks = [] if verified is None else verified
 
-        def download_fixture(url: str, path: Path) -> None:
+        def download_fixture(
+            url: str, path: Path, *, retry_client_errors: bool = True
+        ) -> None:
             requested.append(url)
+            self.client_error_retries[url] = retry_client_errors
             response = responses[url].pop(0)
             if isinstance(response, BaseException):
                 raise response
@@ -294,12 +305,21 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             mock.patch.object(provisioner, "ROOT", root),
             mock.patch.object(provisioner, "BIN_DIR", binary_dir),
             mock.patch.object(provisioner, "download", download_fixture),
-            mock.patch.object(provisioner, "verify", lambda *_args: None),
+            mock.patch.object(
+                provisioner,
+                "verify",
+                lambda path, sha, version: checks.append(
+                    (path.read_bytes(), sha, version)
+                ),
+            ),
             mock.patch.object(provisioner.time, "sleep", lambda _delay: None),
             mock.patch.object(provisioner.sys, "stderr", mock.MagicMock()),
         ):
             provisioner.provision("ffmpeg", record, "x86_64-unknown-linux-gnu")
-        return binary_dir / "ffmpeg-x86_64-unknown-linux-gnu", requested
+            return (
+                provisioner.destination("ffmpeg", "x86_64-unknown-linux-gnu"),
+                requested,
+            )
 
     MIRROR = "https://mirror.invalid/ffmpeg-x86_64-unknown-linux-gnu"
     SECOND_MIRROR = "https://second-mirror.invalid/ffmpeg"
@@ -316,12 +336,14 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
 
     def test_mirror_is_downloaded_before_upstream(self) -> None:
         record = self.mirrored_record(self.MIRROR, self.SECOND_MIRROR)
+        verified: list[tuple[bytes, str, str]] = []
         published, requested = self.provision_from_sources(
-            record, {self.MIRROR: [self.PINNED]}
+            record, {self.MIRROR: [self.PINNED]}, verified
         )
 
         self.assertEqual(published.read_bytes(), self.PINNED)
         self.assertEqual(requested, [self.MIRROR])
+        self.assertEqual(verified, [(self.PINNED, digest(self.PINNED), "7.0")])
         self.assertEqual(
             provisioner.download_sources(record),
             [self.MIRROR, self.SECOND_MIRROR, self.UPSTREAM],
@@ -351,8 +373,13 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
 
         self.assertEqual(published.read_bytes(), self.PINNED)
         self.assertEqual(requested, [self.MIRROR, self.UPSTREAM])
+        self.assertEqual(
+            self.client_error_retries, {self.MIRROR: False, self.UPSTREAM: True}
+        )
 
-    def test_http_404_is_not_retried_but_network_errors_are(self) -> None:
+    def test_mirror_404_is_not_retried_but_upstream_and_network_errors_are(
+        self,
+    ) -> None:
         not_found = urllib.error.HTTPError(self.MIRROR, 404, "Not Found", {}, None)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "download"
@@ -363,9 +390,23 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
                 mock.patch.object(provisioner.time, "sleep") as sleep,
             ):
                 with self.assertRaisesRegex(RuntimeError, "HTTP 404"):
-                    provisioner.download(self.MIRROR, path)
+                    provisioner.download(
+                        self.MIRROR, path, retry_client_errors=False
+                    )
             self.assertEqual(urlopen.call_count, 1)
             sleep.assert_not_called()
+
+            with (
+                mock.patch.object(
+                    provisioner.urllib.request, "urlopen", side_effect=not_found
+                ) as urlopen,
+                mock.patch.object(provisioner.time, "sleep"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "after 4 attempts.*404"):
+                    provisioner.download(self.UPSTREAM, path)
+            self.assertEqual(
+                urlopen.call_count, provisioner.DOWNLOAD_NETWORK_ATTEMPTS
+            )
 
             with (
                 mock.patch.object(
@@ -377,6 +418,38 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "after 4 attempts"):
                     provisioner.download(self.MIRROR, path)
+            self.assertEqual(
+                urlopen.call_count, provisioner.DOWNLOAD_NETWORK_ATTEMPTS
+            )
+            self.assertFalse(path.exists())
+
+    def test_body_cut_short_is_retried_and_then_falls_back(self) -> None:
+        class TruncatedResponse:
+            def __enter__(self) -> "TruncatedResponse":
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                raise http.client.IncompleteRead(b"partial", 1024)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "download"
+            with (
+                mock.patch.object(
+                    provisioner.urllib.request,
+                    "urlopen",
+                    side_effect=lambda *_args, **_kwargs: TruncatedResponse(),
+                ) as urlopen,
+                mock.patch.object(provisioner.time, "sleep"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "after 4 attempts.*IncompleteRead"
+                ):
+                    provisioner.download(
+                        self.MIRROR, path, retry_client_errors=False
+                    )
             self.assertEqual(
                 urlopen.call_count, provisioner.DOWNLOAD_NETWORK_ATTEMPTS
             )
@@ -416,6 +489,77 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             f"{self.UPSTREAM}: download checksum mismatch.*after {attempts} downloads",
         )
 
+    def test_mirror_zip_with_a_bad_archive_hash_falls_back(self) -> None:
+        def archive_bytes(*members: tuple[str, bytes]) -> bytes:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "sidecar.zip"
+                with zipfile.ZipFile(path, "w") as archive:
+                    for name, data in members:
+                        archive.writestr(name, data)
+                return path.read_bytes()
+
+        pinned_archive = archive_bytes(("ffmpeg", self.PINNED))
+        # Same pinned member, but not the pinned archive: rejected by the
+        # archive pin before the member is ever extracted.
+        other_archive = archive_bytes(("ffmpeg", self.PINNED), ("extra", b"x"))
+        record = {
+            **self.mirrored_record(self.MIRROR + ".zip"),
+            "url": self.UPSTREAM + ".zip",
+            "archive": {
+                "format": "zip",
+                "member": "ffmpeg",
+                "sha256": digest(pinned_archive),
+            },
+        }
+        attempts = provisioner.DOWNLOAD_CHECKSUM_ATTEMPTS
+        published, requested = self.provision_from_sources(
+            record,
+            {
+                self.MIRROR + ".zip": [other_archive] * attempts,
+                self.UPSTREAM + ".zip": [pinned_archive],
+            },
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(
+            requested, [self.MIRROR + ".zip"] * attempts + [self.UPSTREAM + ".zip"]
+        )
+
+    def test_nonfree_check_runs_on_a_mirror_sourced_file(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        binary_dir = root / "src-tauri" / "binaries"
+        binary_dir.mkdir(parents=True)
+        requested: list[str] = []
+
+        def download_fixture(url: str, path: Path, **_kwargs: object) -> None:
+            requested.append(url)
+            path.write_bytes(self.PINNED)
+
+        with (
+            mock.patch.object(provisioner, "ROOT", root),
+            mock.patch.object(provisioner, "BIN_DIR", binary_dir),
+            mock.patch.object(provisioner, "download", download_fixture),
+            mock.patch.object(
+                provisioner.subprocess,
+                "check_output",
+                return_value="ffmpeg version 7.0\nconfiguration: --enable-nonfree\n",
+            ) as metadata,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "nonfree sidecar"):
+                provisioner.provision(
+                    "ffmpeg",
+                    self.mirrored_record(self.MIRROR),
+                    "x86_64-unknown-linux-gnu",
+                )
+            final_path = provisioner.destination("ffmpeg", "x86_64-unknown-linux-gnu")
+
+        self.assertEqual(requested, [self.MIRROR])
+        metadata.assert_called_once()
+        self.assertFalse(final_path.exists())
+        self.assertEqual(list(binary_dir.iterdir()), [])
+
     def test_record_without_mirrors_downloads_only_upstream(self) -> None:
         record = self.mirrored_record()
         del record["mirror_urls"]
@@ -428,11 +572,22 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
         self.assertEqual(provisioner.download_sources(record), [self.UPSTREAM])
 
     def test_malformed_mirror_urls_are_rejected(self) -> None:
-        for mirrors in ("https://mirror.invalid/ffmpeg", [""], [None]):
+        cases = [
+            ("https://mirror.invalid/ffmpeg", "sidecar lock mirror_urls must be a list"),
+            ([""], "sidecar lock mirror_urls must be non-empty strings"),
+            ([None], "sidecar lock mirror_urls must be non-empty strings"),
+        ]
+        for mirrors, message in cases:
             with self.subTest(mirrors=mirrors):
                 record = {"url": self.UPSTREAM, "mirror_urls": mirrors}
-                with self.assertRaisesRegex(RuntimeError, "mirror_urls|url"):
+                with self.assertRaises(RuntimeError) as raised:
                     provisioner.download_sources(record)
+                self.assertEqual(str(raised.exception), message)
+        with self.assertRaises(RuntimeError) as raised:
+            provisioner.download_sources({"mirror_urls": []})
+        self.assertEqual(
+            str(raised.exception), "sidecar lock record requires a string url"
+        )
 
     def test_rejects_archive_checksum_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
