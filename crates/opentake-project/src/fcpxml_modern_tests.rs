@@ -46,11 +46,27 @@ fn time_value_reduces_rational() {
 }
 
 #[test]
-fn tc_format_drop_for_30_60() {
-    assert_eq!(tc_format(30), "DF");
-    assert_eq!(tc_format(60), "DF");
-    assert_eq!(tc_format(24), "NDF");
-    assert_eq!(tc_format(25), "NDF");
+fn integer_fps_timelines_use_non_drop_timecode() {
+    // `Timeline::fps` is an exact integer rate (`frameDuration="1/30s"`), so even
+    // 30 / 60 fps sequences and clips count in non-drop timecode.
+    for fps in [24, 25, 30, 60] {
+        let mut tl = Timeline::new();
+        tl.fps = fps;
+        let mut vt = Track::new("v", ClipType::Video);
+        vt.clips.push(Clip::new("c1", "v1", 0, 30));
+        tl.tracks.push(vt);
+        let xml = export_fcpxml(
+            &tl,
+            &manifest(vec![entry("v1", "shot.mp4", ClipType::Video, 4.0)]),
+            None,
+        );
+        assert_eq!(
+            xml.matches("tcFormat=\"NDF\"").count(),
+            2,
+            "fps {fps}: {xml}"
+        );
+        assert!(!xml.contains("tcFormat=\"DF\""), "fps {fps}: {xml}");
+    }
 }
 
 #[test]
@@ -299,6 +315,35 @@ fn empty_timeline_has_empty_spine() {
     let tl = Timeline::new();
     let xml = export_fcpxml(&tl, &manifest(vec![]), None);
     assert!(xml.contains("<spine/>") || xml.contains("<spine>\n"));
+}
+
+#[test]
+fn asset_src_is_percent_encoded() {
+    let mut tl = Timeline::new();
+    let mut vt = Track::new("v", ClipType::Video);
+    vt.clips.push(Clip::new("c1", "v1", 0, 30));
+    vt.clips.push(Clip::new("c2", "v2", 30, 30));
+    tl.tracks.push(vt);
+    let xml = export_fcpxml(
+        &tl,
+        &manifest(vec![
+            entry("v1", "Take #1 50% é & 中文.mp4", ClipType::Video, 4.0),
+            entry("v2", "sam's clip (1)!$*+,;=.mov", ClipType::Video, 4.0),
+        ]),
+        None,
+    );
+    assert!(
+        xml.contains(
+            "src=\"file:///media/Take%20%231%2050%25%20%C3%A9%20%26%20%E4%B8%AD%E6%96%87.mp4\""
+        ),
+        "{xml}"
+    );
+    // Upstream `mediaSrc`: Resolve cannot relink sub-delimiters that reach it as
+    // XML entities (`&amp;`, `&apos;`), so they are percent-encoded instead.
+    assert!(
+        xml.contains("src=\"file:///media/sam%27s%20clip%20%281%29%21%24%2A%2B%2C%3B%3D.mov\""),
+        "{xml}"
+    );
 }
 
 #[test]

@@ -13,8 +13,8 @@
 //! * FROM CLIP NAME: shot.mp4
 //! ```
 //!
-//! - `TITLE:` line, then `FCM:` (frame-code mode — `DROP FRAME` for 29.97/59.94,
-//!   else `NON-DROP FRAME`).
+//! - `TITLE:` line, then `FCM:` (frame-code mode), always `NON-DROP FRAME`
+//!   (see *Frame fidelity*).
 //! - One **event** per clip: a 3-digit number, the reel name, the channel
 //!   (`V` / `A` / `AA` / `B` for video+audio), the transition (`C` cut,
 //!   `D` dissolve), then the four timecodes: source-in, source-out, record-in,
@@ -25,8 +25,7 @@
 //!
 //! Preserves: clip ordering, source in/out (trim), record placement, fade →
 //! dissolve transition, the clip's media name, and the reel name. Source and
-//! record timecodes are at the **timeline** fps; drop-frame is signalled per the
-//! fps (29.97 / 59.94 → `DROP FRAME`).
+//! record timecodes are at the **timeline** fps.
 //!
 //! Drops (intrinsic to the EDL format — documented in a `* ` comment in the
 //! output, mirroring how real NLEs emit EDLs):
@@ -43,12 +42,18 @@
 //! ## Frame fidelity
 //!
 //! All timing is integer frames. `HH:MM:SS:FF` is computed at the timeline fps
-//! exactly like the XMEML exporter's `format_timecode` (drop-frame uses `;` and
-//! skips dropped frame numbers). Source timecodes start at frame 0 (OpenTake has
-//! no cross-platform tape/source-timecode reader — see `fcpxml.rs`); the source
-//! window is `[trim_start, trim_start + source_frames_consumed)`.
+//! by the shared [`format_timecode`], always non-drop: drop-frame numbering
+//! belongs to NTSC rates (29.97 / 59.94), and a [`Timeline`] has none. Its
+//! integer `fps` is exported as exactly that rate (video export encodes
+//! `-r {fps}`, the XMEML sequence `<rate>` says `ntsc=FALSE`), so 30 and 60 fps
+//! timelines are non-drop as well. Source timecodes start at frame 0 (OpenTake
+//! has no cross-platform tape/source-timecode reader — see `fcpxml.rs`); the
+//! source window is `[trim_start, trim_start + source_frames_consumed)`.
 
-use opentake_domain::{Clip, ClipType, MediaManifest, MediaResolver, Timeline, Track};
+use opentake_domain::{
+    format_timecode, Clip, ClipType, DropFrameSeparator, MediaManifest, MediaResolver, Timeline,
+    Track,
+};
 
 /// Reel name for every event. Real source-tape names need a tape-timecode
 /// reader OpenTake lacks; `AX` ("auxiliary") is the CMX3600 convention for
@@ -75,15 +80,11 @@ struct Builder<'a> {
 impl Builder<'_> {
     fn build(&self) -> String {
         let fps = self.timeline.fps.max(1);
-        let drop_frame = is_drop_frame(fps);
 
         let mut out = String::new();
         out.push_str("TITLE: Timeline Export\n");
-        out.push_str(if drop_frame {
-            "FCM: DROP FRAME\n"
-        } else {
-            "FCM: NON-DROP FRAME\n"
-        });
+        // Integer-fps timelines are exact rates, never NTSC: always non-drop.
+        out.push_str("FCM: NON-DROP FRAME\n");
         // Document the format's structural limitations, the way NLEs annotate EDLs.
         out.push_str("* CMX3600 EDL — video track only; audio, effects, transforms, and\n");
         out.push_str("* multi-track layering are not representable. Use XMEML / OTIO / FCPXML\n");
@@ -95,7 +96,7 @@ impl Builder<'_> {
         }
 
         for (idx, clip) in clips.iter().enumerate() {
-            self.push_event(&mut out, idx as u32 + 1, clip, fps, drop_frame);
+            self.push_event(&mut out, idx as u32 + 1, clip, fps);
         }
         out
     }
@@ -129,7 +130,7 @@ impl Builder<'_> {
     }
 
     /// Emit one numbered event line + its `FROM CLIP NAME` comment.
-    fn push_event(&self, out: &mut String, event: u32, clip: &Clip, fps: i32, drop: bool) {
+    fn push_event(&self, out: &mut String, event: u32, clip: &Clip, fps: i32) {
         // Source window: trim offset for `source_frames_consumed` frames. Source
         // timecode origin is 0 (no tape-timecode reader). Record window is the
         // clip's timeline placement.
@@ -154,10 +155,10 @@ impl Builder<'_> {
             chan = "V",
             trans = transition,
             dur = dur_col,
-            si = format_timecode(src_in, fps, drop),
-            so = format_timecode(src_out, fps, drop),
-            ri = format_timecode(rec_in, fps, drop),
-            ro = format_timecode(rec_out, fps, drop),
+            si = edl_timecode(src_in, fps),
+            so = edl_timecode(src_out, fps),
+            ri = edl_timecode(rec_in, fps),
+            ro = edl_timecode(rec_out, fps),
         ));
         out.push_str(&format!(
             "* FROM CLIP NAME: {}\n",
@@ -166,34 +167,10 @@ impl Builder<'_> {
     }
 }
 
-/// 29.97 / 59.94 (NTSC rates whose nominal fps is a multiple of 30) use
-/// drop-frame timecode. 23.976 / 24 / 25 / 30 / 50 / 60 are non-drop.
-fn is_drop_frame(fps: i32) -> bool {
-    fps == 30 || fps == 60
-}
-
-/// Frame count → `HH:MM:SS:FF`. Drop-frame (30/60) uses `;` and skips the
-/// dropped frame numbers. 1:1 with the XMEML exporter's `format_timecode` so the
-/// two formats agree on the same timeline.
-fn format_timecode(frame: i32, fps: i32, drop_frame: bool) -> String {
-    let mut f = frame.max(0);
-    if drop_frame {
-        let drop = (fps as f64 * 0.066_666).round() as i32; // 30 → 2, 60 → 4
-        let d = f / (fps * 600);
-        let m = f % (fps * 600);
-        f += drop * 9 * d
-            + if m > drop {
-                drop * ((m - drop) / (fps * 60))
-            } else {
-                0
-            };
-    }
-    let sep = if drop_frame { ";" } else { ":" };
-    let ff = f % fps;
-    let ss = (f / fps) % 60;
-    let mm = (f / (fps * 60)) % 60;
-    let hh = f / (fps * 3600);
-    format!("{hh:02}:{mm:02}:{ss:02}{sep}{ff:02}")
+/// Frame count → non-drop `HH:MM:SS:FF` at the timeline fps (the separator
+/// style only matters for drop-frame, which an EDL here never uses).
+fn edl_timecode(frame: i32, fps: i32) -> String {
+    format_timecode(frame, fps, false, DropFrameSeparator::FramesOnly)
 }
 
 #[cfg(test)]
@@ -233,38 +210,25 @@ mod tests {
 
     #[test]
     fn timecode_non_drop_basic() {
-        assert_eq!(format_timecode(0, 30, false), "00:00:00:00");
-        assert_eq!(format_timecode(30, 30, false), "00:00:01:00");
-        assert_eq!(format_timecode(90, 30, false), "00:00:03:00");
+        assert_eq!(edl_timecode(0, 30), "00:00:00:00");
+        assert_eq!(edl_timecode(30, 30), "00:00:01:00");
+        assert_eq!(edl_timecode(90, 30), "00:00:03:00");
         // 1h 1m 1s 1f at 30fps.
         let f = 30 * 3600 + 30 * 60 + 30 + 1;
-        assert_eq!(format_timecode(f, 30, false), "01:01:01:01");
-    }
-
-    #[test]
-    fn timecode_drop_frame_uses_semicolon() {
-        // Drop-frame separates with `;`.
-        let tc = format_timecode(0, 30, true);
-        assert_eq!(tc, "00:00:00;00");
-        assert!(format_timecode(45, 30, true).contains(';'));
-    }
-
-    #[test]
-    fn drop_frame_classification() {
-        assert!(is_drop_frame(30));
-        assert!(is_drop_frame(60));
-        assert!(!is_drop_frame(24));
-        assert!(!is_drop_frame(25));
+        assert_eq!(edl_timecode(f, 30), "01:01:01:01");
+        // One minute at 30 / 60 fps: plain frame counts, no dropped labels.
+        assert_eq!(edl_timecode(1800, 30), "00:01:00:00");
+        assert_eq!(edl_timecode(3600, 60), "00:01:00:00");
     }
 
     // --- header ---
 
     #[test]
     fn header_has_title_and_fcm() {
-        let tl = Timeline::new(); // 30fps → drop frame
+        let tl = Timeline::new(); // 30fps: an exact rate, so non-drop
         let edl = export_edl(&tl, &manifest(vec![]));
         assert!(edl.starts_with("TITLE: Timeline Export\n"));
-        assert!(edl.contains("FCM: DROP FRAME\n"));
+        assert!(edl.contains("FCM: NON-DROP FRAME\n"));
         // The video-only limitation must be documented in a comment.
         assert!(edl.contains("* CMX3600 EDL — video track only"));
     }
@@ -275,6 +239,39 @@ mod tests {
         tl.fps = 24;
         let edl = export_edl(&tl, &manifest(vec![]));
         assert!(edl.contains("FCM: NON-DROP FRAME\n"));
+    }
+
+    #[test]
+    fn integer_30_and_60_fps_timelines_are_non_drop() {
+        for fps in [30, 60] {
+            let mut tl = Timeline::new();
+            tl.fps = fps;
+            let edl = export_edl(&tl, &manifest(vec![]));
+            assert!(edl.contains("FCM: NON-DROP FRAME\n"), "fps {fps}: {edl}");
+            assert!(!edl.contains("FCM: DROP FRAME"), "fps {fps}: {edl}");
+        }
+    }
+
+    #[test]
+    fn record_timecode_after_one_minute_at_30fps_is_non_drop() {
+        let mut tl = Timeline::new(); // 30 fps
+        let mut vt = Track::new("v", ClipType::Video);
+        vt.clips.push(Clip::new("c1", "v1", 1800, 30)); // rec [1800, 1830)
+        tl.tracks.push(vt);
+        let edl = export_edl(
+            &tl,
+            &manifest(vec![entry("v1", "shot.mp4", ClipType::Video, 4.0)]),
+        );
+        // src [0, 30), rec [1min, 1min 1s): plain `:` timecode, no dropped labels.
+        let event = edl
+            .lines()
+            .find(|l| l.starts_with("001"))
+            .expect("event line");
+        assert!(
+            event.ends_with("00:00:00:00 00:00:01:00 00:01:00:00 00:01:01:00"),
+            "{edl}"
+        );
+        assert!(!event.contains(';'), "{edl}");
     }
 
     // --- events ---

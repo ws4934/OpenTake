@@ -59,10 +59,17 @@ use std::path::Path;
 
 use opentake_domain::{Clip, ClipType, MediaManifest, MediaResolver, Timeline, Track};
 
+use crate::file_url::path_to_file_url;
 use crate::xmlnode::{boolean_attr, el, el_attrs, leaf_text, render_document, XmlNode};
 
 /// FCPXML version we target (FCP 10.5+; supported by current FCP and DaVinci).
 const FCPXML_VERSION: &str = "1.10";
+
+/// `tcFormat` of the sequence and its clips: always non-drop, as upstream
+/// writes it. Drop-frame belongs to NTSC rates (29.97 / 59.94), while a
+/// timeline's integer `fps` is an exact rate (`frameDuration="1/30s"`), so 30
+/// and 60 fps timelines count in non-drop timecode too.
+const TC_FORMAT: &str = "NDF";
 
 /// Export a [`Timeline`] as a native FCPXML 1.10 string. Pure function: takes the
 /// timeline, media manifest, and project base dir (to resolve `Project`-relative
@@ -126,7 +133,7 @@ impl<'a> Builder<'a> {
                 ("format", seq_format_id.as_str()),
                 ("duration", &time_value(total, self.fps)),
                 ("tcStart", "0s"),
-                ("tcFormat", tc_format(self.fps)),
+                ("tcFormat", TC_FORMAT),
                 ("audioLayout", "stereo"),
                 ("audioRate", "48k"),
             ],
@@ -193,9 +200,10 @@ impl<'a> Builder<'a> {
         )
     }
 
-    /// `(<asset>, <format>)` for one media ref. The asset's `src` is a `file://`
-    /// URL (or relative `media/<id>` when unresolved); its `<format>` uses the
-    /// source fps / dimensions when known.
+    /// `(<asset>, <format>)` for one media ref. The asset's `src` is a
+    /// percent-encoded `file://` URL, sub-delimiters included as upstream
+    /// `mediaSrc` requires (or relative `media/<id>` when unresolved); its
+    /// `<format>` uses the source fps / dimensions when known.
     fn asset_nodes(&self, mref: &str, asset_id: &str, format_id: &str) -> (XmlNode, XmlNode) {
         let entry = self.resolver.entry(mref);
         let name = self.resolver.display_name(mref);
@@ -334,7 +342,7 @@ impl<'a> Builder<'a> {
         if !format_ref.is_empty() {
             attrs.push(("format".to_string(), format_ref));
         }
-        attrs.push(("tcFormat".to_string(), tc_format(self.fps).to_string()));
+        attrs.push(("tcFormat".to_string(), TC_FORMAT.to_string()));
         if lane != 0 {
             attrs.push(("lane".to_string(), lane.to_string()));
         }
@@ -464,15 +472,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a.max(1)
 }
 
-/// `NDF` / `DF` for the sequence + clips. Drop-frame for 30/60 (NTSC nominal).
-fn tc_format(fps: i32) -> &'static str {
-    if fps == 30 || fps == 60 {
-        "DF"
-    } else {
-        "NDF"
-    }
-}
-
 /// `seconds * fps`, truncated (matches the rest of the export layer).
 fn seconds_to_frame(seconds: f64, fps: i32) -> i32 {
     (seconds * fps as f64) as i32
@@ -484,16 +483,6 @@ fn linear_to_db(linear: f64) -> f64 {
         (20.0 * linear.log10()).max(-96.0)
     } else {
         -96.0
-    }
-}
-
-/// Absolute path → `file://` URL.
-fn path_to_file_url(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s.starts_with('/') {
-        format!("file://{s}")
-    } else {
-        format!("file:///{s}")
     }
 }
 

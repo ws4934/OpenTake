@@ -43,3 +43,5 @@ windows-sys = { version = "=0.61.2", features = [
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tempfile = "3"
 serde_json = { workspace = true }
+# Independent reader for the exporters' `file:` URLs (round-trip tests).
+url = "2"
