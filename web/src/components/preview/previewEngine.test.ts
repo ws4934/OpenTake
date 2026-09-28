@@ -504,6 +504,47 @@ describe("shouldSyncPausedMediaToFrame", () => {
   });
 });
 
+describe("handleNativePlaybackError", () => {
+  const failure = {
+    projectEpoch: 1,
+    timelineVersion: 2,
+    sessionId: "session-1",
+    frame: 30,
+    code: "videoDecode" as const,
+    message: "clip-1 decode failed",
+    fatal: true,
+  };
+
+  it("stops the transport and tells the user when the engine paused on a fatal error", () => {
+    useEditorUiStore.setState({ isPlaying: true, toast: null });
+    previewEngine.handleNativePlaybackError(failure, { acceptError: () => true });
+
+    const ui = useEditorUiStore.getState();
+    expect(ui.isPlaying).toBe(false);
+    expect(ui.toast?.message).toContain("clip-1 decode failed");
+  });
+
+  it("keeps playing but reports a non-fatal audio error", () => {
+    useEditorUiStore.setState({ isPlaying: true, toast: null });
+    previewEngine.handleNativePlaybackError(
+      { ...failure, code: "audioDecode", fatal: false, message: "audio at 2.0 s" },
+      { acceptError: () => true },
+    );
+
+    const ui = useEditorUiStore.getState();
+    expect(ui.isPlaying).toBe(true);
+    expect(ui.toast?.message).toContain("audio at 2.0 s");
+  });
+
+  it("ignores errors of another or paused session", () => {
+    useEditorUiStore.setState({ isPlaying: true, toast: null });
+    previewEngine.handleNativePlaybackError(failure, { acceptError: () => false });
+
+    expect(useEditorUiStore.getState().isPlaying).toBe(true);
+    expect(useEditorUiStore.getState().toast).toBeNull();
+  });
+});
+
 describe("pausedSeekToleranceSec", () => {
   it("allows sub-frame pause differences without forcing a seek", () => {
     expect(pausedSeekToleranceSec(30)).toBeGreaterThan(0.5 / 30);

@@ -905,6 +905,8 @@ const zh: Dict = {
   "preview.unsupportedPlayback.rust-unavailable": "桌面合成引擎不可用",
   "preview.unsupportedPlayback.rust-disabled": "桌面合成引擎已停用",
   "preview.terminalFrameFailed": "终帧加载失败，已保留最后一帧",
+  "preview.playbackFailed": "播放已暂停：{error}",
+  "preview.playbackAudioFailed": "部分音频无法解码，已按静音播放：{error}",
 
   // Agent panel
   "agent.placeholder": "AI 助手 · 即将推出",
@@ -2100,6 +2102,8 @@ const en: Dict = {
   "preview.unsupportedPlayback.rust-unavailable": "The desktop compositor is unavailable",
   "preview.unsupportedPlayback.rust-disabled": "The desktop compositor is disabled",
   "preview.terminalFrameFailed": "The terminal frame failed; the last good frame was retained",
+  "preview.playbackFailed": "Playback paused: {error}",
+  "preview.playbackAudioFailed": "Some audio could not be decoded and plays as silence: {error}",
 
   "agent.placeholder": "AI assistant · coming soon",
   "agent.title": "Agent",

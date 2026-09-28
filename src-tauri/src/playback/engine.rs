@@ -8,11 +8,10 @@
 //! [`RenderDevice`] and never touches the preview's `RenderState`, so playback and
 //! the paused-frame `composite_frame` path never contend.
 //!
-//! The clock, frame sink, and playhead emitter are traits so the loop logic is
-//! decoupled from cpal / MJPEG / Tauri: PR1 ships an [`InstantClock`] and lets a
-//! gated integration test supply in-memory sink/emitter; PR2 swaps in the cpal
-//! master clock, the MJPEG sink, and the Tauri event emitter without touching the
-//! loop.
+//! The clock, frame sink, and error sink are traits so the loop logic is
+//! decoupled from cpal / the JPEG transport / Tauri: tests supply in-memory
+//! implementations (and a stub renderer), production the cpal master clock, the
+//! off-thread JPEG sink, and the `playback_error` emitter.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -134,19 +133,78 @@ pub trait PlaybackClock: Send + Sync {
     fn frame(&self, fps: i32) -> i32;
     /// Reset the clock so `frame()` resumes counting from `frame`.
     fn seek(&self, frame: i32);
+    /// A non-fatal error of the clock's audio source (for example a window that
+    /// failed to decode and plays as silence), reported at most once until the
+    /// next seek. The render thread forwards it as a `playback_error`.
+    fn take_error(&self) -> Option<String> {
+        None
+    }
 }
 
-/// Receives each composited frame. PR1: an in-memory collector (tests). PR2: the
-/// MJPEG sink (JPEG-encode + broadcast).
+/// Receives each composited frame. Production: [`super::transport::MjpegSink`],
+/// which encodes and publishes on its own thread, so both calls must return
+/// without waiting for encoding.
 pub trait FrameSink: Send + Sync {
-    fn push_frame(&self, frame: &DecodedFrame);
+    /// Hand off the composited image for timeline `frame`.
+    fn push_frame(&self, frame: i32, image: DecodedFrame);
+    /// The final timeline frame failed to render: announce the terminal tick
+    /// without new pixels so the front end can end its transport.
+    fn push_terminal(&self, frame: i32);
 }
 
-/// Broadcasts the current playhead frame so the front end can move its playhead /
-/// timecode while the pixels arrive over a separate channel. PR1: a collector;
-/// PR2: a Tauri event emitter.
-pub trait PlayheadEmitter: Send + Sync {
-    fn emit(&self, frame: i32);
+/// Why playback stopped producing frames or sound (`playback_error.code`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaybackFailureCode {
+    /// A video layer could not be decoded or its decoder stopped early.
+    VideoDecode,
+    /// An image, text, Lottie or LUT layer could not be materialized.
+    Materialization,
+    /// The compositor or GPU readback failed.
+    Render,
+    /// A timeline audio window could not be decoded; it plays as silence.
+    AudioDecode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackFailure {
+    pub frame: i32,
+    pub code: PlaybackFailureCode,
+    /// Names media by asset id; absolute paths are redacted.
+    pub message: String,
+    /// `true` when the engine paused itself and the transport must stop.
+    pub fatal: bool,
+}
+
+/// Reports playback failures after startup. Production emits `playback_error`.
+pub trait PlaybackErrorSink: Send + Sync {
+    fn report(&self, failure: PlaybackFailure);
+}
+
+/// A classified render failure of one frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderFailure {
+    pub code: PlaybackFailureCode,
+    pub message: String,
+}
+
+impl RenderFailure {
+    fn new(code: PlaybackFailureCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// What the render loop drives: the GPU [`RenderLoop`] in production, a stub in
+/// the loop's unit tests.
+trait FrameRenderer {
+    fn total_frames(&self) -> i32;
+    fn fps(&self) -> i32;
+    fn render(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure>;
+    /// Restart decoding at the next rendered position (seek / moved resume).
+    fn seek(&mut self);
 }
 
 /// Control messages to the render thread.
@@ -399,6 +457,13 @@ impl RenderLoop {
     /// Composite a single frame at `target`: reconcile the streams to this frame,
     /// then run the same compositor pixel path as the preview/export.
     pub fn render_frame(&mut self, target: i32) -> Result<DecodedFrame, String> {
+        self.render_classified(target)
+            .map_err(|failure| failure.message)
+    }
+
+    /// [`Self::render_frame`] with the failure classified for `playback_error`
+    /// and absolute media paths redacted from the message.
+    pub fn render_classified(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure> {
         let frame_plan = self.plan.frame(&self.timeline, target);
         let current_video_sources = active_video_sources(&frame_plan);
         self.state.reset_streams(rewound_video_sources(
@@ -407,32 +472,62 @@ impl RenderLoop {
             &self.reversed_clips,
         ));
         let mut resolver = StreamingResolver::new(&self.device, &self.queue, &mut self.state);
-        resolver.sync_active(&frame_plan)?;
-        let composite = self
-            .compositor
-            .render_to_rgba(
-                &self.device,
-                &self.queue,
-                self.render_size,
-                &frame_plan,
-                &mut resolver,
-            )
-            .map_err(|e| format!("composite render failed at frame {target}: {e}"));
+        if let Err(error) = resolver.sync_active(&frame_plan) {
+            drop(resolver);
+            return Err(RenderFailure::new(
+                PlaybackFailureCode::VideoDecode,
+                self.state.redact_media_paths(&error),
+            ));
+        }
+        let composite = self.compositor.render_to_rgba(
+            &self.device,
+            &self.queue,
+            self.render_size,
+            &frame_plan,
+            &mut resolver,
+        );
         drop(resolver);
         if let Some(error) = self.state.take_materialization_error() {
-            return Err(format!(
-                "playback materialization failed at frame {target}: {error}"
+            return Err(RenderFailure::new(
+                PlaybackFailureCode::Materialization,
+                self.state.redact_media_paths(&format!(
+                    "playback materialization failed at frame {target}: {error}"
+                )),
             ));
         }
         self.last_video_sources = current_video_sources;
-        composite
+        composite.map_err(|error| {
+            RenderFailure::new(
+                PlaybackFailureCode::Render,
+                format!("composite render failed at frame {target}: {error}"),
+            )
+        })
     }
 
     /// Restart all decode streams (used on seek): the next `render_frame` re-spawns
-    /// each visible clip's stream at its new target source frame.
+    /// each visible clip's stream at its new target source frame, and clips whose
+    /// decoder failed are retried.
     pub fn seek(&mut self) {
         self.state.clear_streams();
         self.last_video_sources.clear();
+    }
+}
+
+impl FrameRenderer for RenderLoop {
+    fn total_frames(&self) -> i32 {
+        self.plan.total_frames
+    }
+
+    fn fps(&self) -> i32 {
+        self.plan.fps
+    }
+
+    fn render(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure> {
+        self.render_classified(target)
+    }
+
+    fn seek(&mut self) {
+        RenderLoop::seek(self);
     }
 }
 
@@ -444,202 +539,24 @@ fn resume_decode_streams(paused_frame: Option<i32>, requested_frame: i32, mut re
     }
 }
 
-/// Owns the playback render thread and a control channel to it. Dropping (or
-/// `stop`) requests a cooperative shutdown.
-pub struct PlaybackEngine {
+/// A cloneable control endpoint of one render thread. Every call only enqueues
+/// work except [`Self::resume`], which waits for the render thread to adopt the
+/// new position; callers must never hold a lock the main thread needs while
+/// waiting on it (#42).
+#[derive(Clone)]
+pub struct EngineControl {
     control_tx: mpsc::Sender<PlaybackCmd>,
     seek_mailbox: Arc<SeekMailbox>,
     pause_requested: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-    cancel: MediaCancelToken,
 }
 
-impl PlaybackEngine {
-    /// Spawn the render thread. The GPU device is created **inside** the thread
-    /// (so nothing non-`Send` crosses the boundary); on GPU-acquire failure the
-    /// thread logs and exits, leaving this handle inert.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        timeline: Timeline,
-        media: HashMap<String, MediaInfo>,
-        text: HashMap<String, TextInfo>,
-        sizes: HashMap<String, (u32, u32)>,
-        render_size: RenderSize,
-        clock: Arc<dyn PlaybackClock>,
-        sink: Arc<dyn FrameSink>,
-        emitter: Arc<dyn PlayheadEmitter>,
-    ) -> Result<Self, String> {
-        Self::spawn_internal(
-            timeline,
-            media,
-            text,
-            sizes,
-            render_size,
-            clock,
-            sink,
-            emitter,
-            None,
-            None,
-            None,
-            MediaCancelToken::new(),
-        )
-    }
-
-    /// Spawn the GPU thread, render and buffer its first complete frame, then
-    /// return a paused handle. The caller installs the authoritative session
-    /// before `resume` makes that buffered frame observable. Waiting for the
-    /// render-thread handshake is synchronous, so async command callers must run
-    /// this constructor on a blocking worker.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_ready(
-        timeline: Timeline,
-        media: HashMap<String, MediaInfo>,
-        text: HashMap<String, TextInfo>,
-        sizes: HashMap<String, (u32, u32)>,
-        render_size: RenderSize,
-        clock: Arc<dyn PlaybackClock>,
-        sink: Arc<dyn FrameSink>,
-        emitter: Arc<dyn PlayheadEmitter>,
-        start_frame: i32,
-    ) -> Result<Self, String> {
-        Self::spawn_ready_cancellable(
-            timeline,
-            media,
-            text,
-            sizes,
-            render_size,
-            clock,
-            sink,
-            emitter,
-            start_frame,
-            MediaCancelToken::new(),
-        )
-    }
-
-    /// Prepare the first exact frame with a caller-owned session token. The
-    /// playback coordinator keeps this token reachable until installation, so
-    /// project/timeline invalidation can cancel a blocked initial bootstrap
-    /// before a [`PlaybackEngine`] handle exists.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_ready_cancellable(
-        timeline: Timeline,
-        media: HashMap<String, MediaInfo>,
-        text: HashMap<String, TextInfo>,
-        sizes: HashMap<String, (u32, u32)>,
-        render_size: RenderSize,
-        clock: Arc<dyn PlaybackClock>,
-        sink: Arc<dyn FrameSink>,
-        emitter: Arc<dyn PlayheadEmitter>,
-        start_frame: i32,
-        cancel: MediaCancelToken,
-    ) -> Result<Self, String> {
-        Self::spawn_ready_cancellable_with_project(
-            timeline,
-            media,
-            text,
-            sizes,
-            render_size,
-            clock,
-            sink,
-            emitter,
-            start_frame,
-            cancel,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_ready_cancellable_with_project(
-        timeline: Timeline,
-        media: HashMap<String, MediaInfo>,
-        text: HashMap<String, TextInfo>,
-        sizes: HashMap<String, (u32, u32)>,
-        render_size: RenderSize,
-        clock: Arc<dyn PlaybackClock>,
-        sink: Arc<dyn FrameSink>,
-        emitter: Arc<dyn PlayheadEmitter>,
-        start_frame: i32,
-        cancel: MediaCancelToken,
-        project_dir: Option<PathBuf>,
-    ) -> Result<Self, String> {
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let engine = Self::spawn_internal(
-            timeline,
-            media,
-            text,
-            sizes,
-            render_size,
-            clock,
-            sink,
-            emitter,
-            project_dir,
-            Some(start_frame.max(0)),
-            Some(ready_tx),
-            cancel,
-        )?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(engine),
-            Ok(Err(error)) => {
-                engine.stop();
-                Err(error)
-            }
-            Err(_) => {
-                engine.stop();
-                Err("playback thread exited before the first frame".to_string())
-            }
+impl EngineControl {
+    fn new(control_tx: mpsc::Sender<PlaybackCmd>) -> Self {
+        Self {
+            control_tx,
+            seek_mailbox: Arc::new(SeekMailbox::default()),
+            pause_requested: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_internal(
-        timeline: Timeline,
-        media: HashMap<String, MediaInfo>,
-        text: HashMap<String, TextInfo>,
-        sizes: HashMap<String, (u32, u32)>,
-        render_size: RenderSize,
-        clock: Arc<dyn PlaybackClock>,
-        sink: Arc<dyn FrameSink>,
-        emitter: Arc<dyn PlayheadEmitter>,
-        project_dir: Option<PathBuf>,
-        initial_frame: Option<i32>,
-        startup: Option<mpsc::Sender<Result<(), String>>>,
-        cancel: MediaCancelToken,
-    ) -> Result<Self, String> {
-        let (tx, rx) = mpsc::channel();
-        let seek_mailbox = Arc::new(SeekMailbox::default());
-        let render_seek_mailbox = Arc::clone(&seek_mailbox);
-        let pause_requested = Arc::new(AtomicBool::new(false));
-        let render_pause_requested = Arc::clone(&pause_requested);
-        let render_cancel = cancel.clone();
-        let handle = thread::Builder::new()
-            .name("opentake-playback-render".to_string())
-            .spawn(move || {
-                run_render_thread(
-                    timeline,
-                    media,
-                    text,
-                    sizes,
-                    render_size,
-                    clock,
-                    sink,
-                    emitter,
-                    project_dir,
-                    rx,
-                    render_seek_mailbox,
-                    render_pause_requested,
-                    initial_frame,
-                    startup,
-                    render_cancel,
-                );
-            })
-            .map_err(|e| format!("spawn playback thread: {e}"))?;
-        Ok(PlaybackEngine {
-            control_tx: tx,
-            seek_mailbox,
-            pause_requested,
-            handle: Some(handle),
-            cancel,
-        })
     }
 
     /// Seek the running engine to `frame`.
@@ -664,23 +581,276 @@ impl PlaybackEngine {
     }
 
     pub fn resume(&self, frame: i32) -> Result<(), String> {
-        self.barrier(|reply| PlaybackCmd::Resume(frame, reply))
-    }
-
-    fn barrier(&self, command: impl FnOnce(mpsc::Sender<()>) -> PlaybackCmd) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control_tx
-            .send(command(reply_tx))
+            .send(PlaybackCmd::Resume(frame, reply_tx))
             .map_err(|_| "playback render thread exited before control".to_string())?;
         reply_rx
             .recv()
             .map_err(|_| "playback render thread exited during control".to_string())
     }
 
+    fn request_stop(&self) {
+        let _ = self.control_tx.send(PlaybackCmd::Stop);
+    }
+}
+
+/// Ordered transport commands observed by a render-thread test double.
+#[cfg(test)]
+pub(crate) type CommandLog = Arc<Mutex<Vec<String>>>;
+
+/// Owns the playback render thread and a control channel to it. Dropping (or
+/// `stop`) requests a cooperative shutdown.
+pub struct PlaybackEngine {
+    control: EngineControl,
+    handle: Option<JoinHandle<()>>,
+    cancel: MediaCancelToken,
+}
+
+impl PlaybackEngine {
+    /// Spawn the render thread. The GPU device is created **inside** the thread
+    /// (so nothing non-`Send` crosses the boundary); on GPU-acquire failure the
+    /// thread logs and exits, leaving this handle inert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        timeline: Timeline,
+        media: HashMap<String, MediaInfo>,
+        text: HashMap<String, TextInfo>,
+        sizes: HashMap<String, (u32, u32)>,
+        render_size: RenderSize,
+        clock: Arc<dyn PlaybackClock>,
+        sink: Arc<dyn FrameSink>,
+        errors: Arc<dyn PlaybackErrorSink>,
+    ) -> Result<Self, String> {
+        Self::spawn_internal(
+            timeline,
+            media,
+            text,
+            sizes,
+            render_size,
+            clock,
+            sink,
+            errors,
+            None,
+            None,
+            None,
+            MediaCancelToken::new(),
+        )
+    }
+
+    /// Spawn the GPU thread, render and buffer its first complete frame, then
+    /// return a paused handle. The caller installs the authoritative session
+    /// before `resume` makes that buffered frame observable. Waiting for the
+    /// render-thread handshake is synchronous, so async command callers must run
+    /// this constructor on a blocking worker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_ready(
+        timeline: Timeline,
+        media: HashMap<String, MediaInfo>,
+        text: HashMap<String, TextInfo>,
+        sizes: HashMap<String, (u32, u32)>,
+        render_size: RenderSize,
+        clock: Arc<dyn PlaybackClock>,
+        sink: Arc<dyn FrameSink>,
+        errors: Arc<dyn PlaybackErrorSink>,
+        start_frame: i32,
+    ) -> Result<Self, String> {
+        Self::spawn_ready_cancellable(
+            timeline,
+            media,
+            text,
+            sizes,
+            render_size,
+            clock,
+            sink,
+            errors,
+            start_frame,
+            MediaCancelToken::new(),
+        )
+    }
+
+    /// Prepare the first exact frame with a caller-owned session token. The
+    /// playback coordinator keeps this token reachable until installation, so
+    /// project/timeline invalidation can cancel a blocked initial bootstrap
+    /// before a [`PlaybackEngine`] handle exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_ready_cancellable(
+        timeline: Timeline,
+        media: HashMap<String, MediaInfo>,
+        text: HashMap<String, TextInfo>,
+        sizes: HashMap<String, (u32, u32)>,
+        render_size: RenderSize,
+        clock: Arc<dyn PlaybackClock>,
+        sink: Arc<dyn FrameSink>,
+        errors: Arc<dyn PlaybackErrorSink>,
+        start_frame: i32,
+        cancel: MediaCancelToken,
+    ) -> Result<Self, String> {
+        Self::spawn_ready_cancellable_with_project(
+            timeline,
+            media,
+            text,
+            sizes,
+            render_size,
+            clock,
+            sink,
+            errors,
+            start_frame,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_ready_cancellable_with_project(
+        timeline: Timeline,
+        media: HashMap<String, MediaInfo>,
+        text: HashMap<String, TextInfo>,
+        sizes: HashMap<String, (u32, u32)>,
+        render_size: RenderSize,
+        clock: Arc<dyn PlaybackClock>,
+        sink: Arc<dyn FrameSink>,
+        errors: Arc<dyn PlaybackErrorSink>,
+        start_frame: i32,
+        cancel: MediaCancelToken,
+        project_dir: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let engine = Self::spawn_internal(
+            timeline,
+            media,
+            text,
+            sizes,
+            render_size,
+            clock,
+            sink,
+            errors,
+            project_dir,
+            Some(start_frame.max(0)),
+            Some(ready_tx),
+            cancel,
+        )?;
+        engine.await_ready(ready_rx)
+    }
+
+    fn await_ready(self, ready_rx: mpsc::Receiver<Result<(), String>>) -> Result<Self, String> {
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(self),
+            Ok(Err(error)) => {
+                self.stop();
+                Err(error)
+            }
+            Err(_) => {
+                self.stop();
+                Err("playback thread exited before the first frame".to_string())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_internal(
+        timeline: Timeline,
+        media: HashMap<String, MediaInfo>,
+        text: HashMap<String, TextInfo>,
+        sizes: HashMap<String, (u32, u32)>,
+        render_size: RenderSize,
+        clock: Arc<dyn PlaybackClock>,
+        sink: Arc<dyn FrameSink>,
+        errors: Arc<dyn PlaybackErrorSink>,
+        project_dir: Option<PathBuf>,
+        initial_frame: Option<i32>,
+        startup: Option<mpsc::Sender<Result<(), String>>>,
+        cancel: MediaCancelToken,
+    ) -> Result<Self, String> {
+        let render_cancel = cancel.clone();
+        Self::spawn_with(
+            move || {
+                RenderLoop::new_with_cancel(
+                    timeline,
+                    media,
+                    text,
+                    sizes,
+                    render_size,
+                    render_cancel,
+                    project_dir,
+                )
+            },
+            RenderOutputs {
+                clock,
+                sink,
+                errors,
+            },
+            initial_frame,
+            startup,
+            cancel,
+        )
+    }
+
+    /// Spawn the render thread around a renderer built on that thread (the GPU
+    /// device and its `Rc` textures never cross threads).
+    fn spawn_with<R, B>(
+        build: B,
+        outputs: RenderOutputs,
+        initial_frame: Option<i32>,
+        mut startup: Option<mpsc::Sender<Result<(), String>>>,
+        cancel: MediaCancelToken,
+    ) -> Result<Self, String>
+    where
+        R: FrameRenderer,
+        B: FnOnce() -> Result<R, String> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let control = EngineControl::new(tx);
+        let loop_control = LoopControl {
+            rx,
+            seek_mailbox: Arc::clone(&control.seek_mailbox),
+            pause_requested: Arc::clone(&control.pause_requested),
+        };
+        let handle = thread::Builder::new()
+            .name("opentake-playback-render".to_string())
+            .spawn(move || {
+                let renderer = match build() {
+                    Ok(renderer) => renderer,
+                    Err(error) => {
+                        eprintln!("[playback] {error}");
+                        if let Some(tx) = startup.take() {
+                            let _ = tx.send(Err(error));
+                        }
+                        return;
+                    }
+                };
+                run_render_loop(renderer, outputs, loop_control, initial_frame, startup);
+            })
+            .map_err(|e| format!("spawn playback thread: {e}"))?;
+        Ok(PlaybackEngine {
+            control,
+            handle: Some(handle),
+            cancel,
+        })
+    }
+
+    /// A cloneable control endpoint usable without owning the engine.
+    pub fn control(&self) -> EngineControl {
+        self.control.clone()
+    }
+
+    /// Seek the running engine to `frame`.
+    pub fn seek(&self, frame: i32) {
+        self.control.seek(frame);
+    }
+
+    pub fn pause(&self, frame: i32) -> Result<(), String> {
+        self.control.pause(frame)
+    }
+
+    pub fn resume(&self, frame: i32) -> Result<(), String> {
+        self.control.resume(frame)
+    }
+
     /// Stop the engine and join the render thread.
     pub fn stop(mut self) {
         self.cancel.cancel();
-        let _ = self.control_tx.send(PlaybackCmd::Stop);
+        self.control.request_stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -688,8 +858,25 @@ impl PlaybackEngine {
 
     pub fn request_stop(mut self) -> Option<JoinHandle<()>> {
         self.cancel.cancel();
-        let _ = self.control_tx.send(PlaybackCmd::Stop);
+        self.control.request_stop();
         self.handle.take()
+    }
+
+    #[cfg(test)]
+    fn from_test_thread(
+        control_tx: mpsc::Sender<PlaybackCmd>,
+        handle: JoinHandle<()>,
+    ) -> (Self, Arc<SeekMailbox>) {
+        let control = EngineControl::new(control_tx);
+        let mailbox = Arc::clone(&control.seek_mailbox);
+        (
+            Self {
+                control,
+                handle: Some(handle),
+                cancel: MediaCancelToken::new(),
+            },
+            mailbox,
+        )
     }
 
     #[cfg(test)]
@@ -710,16 +897,7 @@ impl PlaybackEngine {
                 }
             }
         });
-        (
-            Self {
-                control_tx,
-                seek_mailbox: Arc::new(SeekMailbox::default()),
-                pause_requested: Arc::new(AtomicBool::new(false)),
-                handle: Some(handle),
-                cancel: MediaCancelToken::new(),
-            },
-            stopped_rx,
-        )
+        (Self::from_test_thread(control_tx, handle).0, stopped_rx)
     }
 
     #[cfg(test)]
@@ -749,13 +927,7 @@ impl PlaybackEngine {
             }
         });
         (
-            Self {
-                control_tx,
-                seek_mailbox: Arc::new(SeekMailbox::default()),
-                pause_requested: Arc::new(AtomicBool::new(false)),
-                handle: Some(handle),
-                cancel: MediaCancelToken::new(),
-            },
+            Self::from_test_thread(control_tx, handle).0,
             resume_rx,
             stopped_rx,
         )
@@ -783,16 +955,58 @@ impl PlaybackEngine {
             }
         });
         (
-            Self {
-                control_tx,
-                seek_mailbox: Arc::new(SeekMailbox::default()),
-                pause_requested: Arc::new(AtomicBool::new(false)),
-                handle: Some(handle),
-                cancel: MediaCancelToken::new(),
-            },
+            Self::from_test_thread(control_tx, handle).0,
             pause_rx,
             release_tx,
         )
+    }
+
+    /// A render-thread stand-in whose `Resume` barrier blocks until released
+    /// (an in-flight 4K frame). It records the ordered transport commands it
+    /// observes: `pause:N`, `resume:N`, and `seek:N` for each consumed seek.
+    #[cfg(test)]
+    pub(crate) fn test_blocking_resume() -> (Self, mpsc::Receiver<i32>, mpsc::Sender<()>, CommandLog)
+    {
+        let (control_tx, control_rx) = mpsc::channel();
+        let (resume_seen_tx, resume_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let thread_log = Arc::clone(&log);
+        let (mailbox_tx, mailbox_rx) = mpsc::channel::<Arc<SeekMailbox>>();
+        let handle = thread::spawn(move || {
+            let Ok(mailbox) = mailbox_rx.recv() else {
+                return;
+            };
+            let record = |entry: String| {
+                thread_log
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(entry);
+            };
+            while let Ok(command) = control_rx.recv() {
+                match command {
+                    PlaybackCmd::Pause(frame, reply) => {
+                        record(format!("pause:{frame}"));
+                        let _ = reply.send(());
+                    }
+                    PlaybackCmd::Resume(frame, reply) => {
+                        let _ = resume_seen_tx.send(frame);
+                        let _ = release_rx.recv();
+                        record(format!("resume:{frame}"));
+                        let _ = reply.send(());
+                    }
+                    PlaybackCmd::Seek => {
+                        if let Some(request) = mailbox.take() {
+                            record(format!("seek:{}", request.frame));
+                        }
+                    }
+                    PlaybackCmd::Stop => break,
+                }
+            }
+        });
+        let (engine, mailbox) = Self::from_test_thread(control_tx, handle);
+        mailbox_tx.send(mailbox).expect("hand mailbox to stub");
+        (engine, resume_seen_rx, release_tx, log)
     }
 }
 
@@ -800,53 +1014,50 @@ impl Drop for PlaybackEngine {
     fn drop(&mut self) {
         // Best-effort cooperative stop if the caller didn't `stop()` explicitly.
         self.cancel.cancel();
-        let _ = self.control_tx.send(PlaybackCmd::Stop);
+        self.control.request_stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
 
-/// The render thread body: build the loop, then render frames paced at the
-/// project fps until the clock reaches the end or a `Stop` arrives.
-#[allow(clippy::too_many_arguments)]
-fn run_render_thread(
-    timeline: Timeline,
-    media: HashMap<String, MediaInfo>,
-    text: HashMap<String, TextInfo>,
-    sizes: HashMap<String, (u32, u32)>,
-    render_size: RenderSize,
+/// Where the render loop sends its time base reads, frames and failures.
+struct RenderOutputs {
     clock: Arc<dyn PlaybackClock>,
     sink: Arc<dyn FrameSink>,
-    emitter: Arc<dyn PlayheadEmitter>,
-    project_dir: Option<PathBuf>,
+    errors: Arc<dyn PlaybackErrorSink>,
+}
+
+/// The render thread's end of [`EngineControl`].
+struct LoopControl {
     rx: mpsc::Receiver<PlaybackCmd>,
     seek_mailbox: Arc<SeekMailbox>,
     pause_requested: Arc<AtomicBool>,
+}
+
+/// The render thread body: render frames paced at the project fps until the
+/// clock reaches the end or a `Stop` arrives. A render failure after startup
+/// pauses the loop and is reported once: as a terminal tick on the final frame
+/// (the front end ends its transport), otherwise as a fatal `playback_error`.
+fn run_render_loop<R: FrameRenderer>(
+    mut renderer: R,
+    outputs: RenderOutputs,
+    control: LoopControl,
     initial_frame: Option<i32>,
     mut startup: Option<mpsc::Sender<Result<(), String>>>,
-    cancel: MediaCancelToken,
 ) {
-    let mut render_loop = match RenderLoop::new_with_cancel(
-        timeline,
-        media,
-        text,
-        sizes,
-        render_size,
-        cancel,
-        project_dir,
-    ) {
-        Ok(rl) => rl,
-        Err(e) => {
-            if let Some(tx) = startup.take() {
-                let _ = tx.send(Err(e.clone()));
-            }
-            eprintln!("[playback] {e}");
-            return;
-        }
-    };
-    let total = render_loop.total_frames();
-    let fps = render_loop.fps();
+    let RenderOutputs {
+        clock,
+        sink,
+        errors,
+    } = outputs;
+    let LoopControl {
+        rx,
+        seek_mailbox,
+        pause_requested,
+    } = control;
+    let total = renderer.total_frames();
+    let fps = renderer.fps();
     if total <= 0 {
         if let Some(tx) = startup.take() {
             let _ = tx.send(Err("playback timeline has no drawable frames".to_string()));
@@ -866,7 +1077,7 @@ fn run_render_thread(
             match rx.recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
                     clock.seek(frame);
-                    resume_decode_streams(paused_frame, frame, || render_loop.seek());
+                    resume_decode_streams(paused_frame, frame, || renderer.seek());
                     if paused_frame != Some(frame) {
                         buffered_first = None;
                     }
@@ -875,10 +1086,9 @@ fn run_render_thread(
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     clock.seek(frame);
-                    resume_decode_streams(paused_frame, frame, || render_loop.seek());
+                    resume_decode_streams(paused_frame, frame, || renderer.seek());
                     if let Some((buffered_frame, image)) = buffered_first.take() {
-                        sink.push_frame(&image);
-                        emitter.emit(buffered_frame);
+                        sink.push_frame(buffered_frame, image);
                     }
                     paused = false;
                     pause_requested.store(false, Ordering::Release);
@@ -887,7 +1097,7 @@ fn run_render_thread(
                 Ok(PlaybackCmd::Seek) => {
                     if let Some(request) = seek_mailbox.take() {
                         clock.seek(request.frame);
-                        render_loop.seek();
+                        renderer.seek();
                         paused_frame = Some(request.frame);
                         buffered_first = None;
                     }
@@ -911,14 +1121,14 @@ fn run_render_thread(
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     let current_frame = clock.frame(fps);
                     clock.seek(frame);
-                    resume_decode_streams(Some(current_frame), frame, || render_loop.seek());
+                    resume_decode_streams(Some(current_frame), frame, || renderer.seek());
                     pause_requested.store(false, Ordering::Release);
                     let _ = reply.send(());
                 }
                 Ok(PlaybackCmd::Seek) => {
                     if let Some(request) = seek_mailbox.take() {
                         clock.seek(request.frame);
-                        render_loop.seek();
+                        renderer.seek();
                     }
                 }
                 Ok(PlaybackCmd::Stop) => return,
@@ -932,8 +1142,16 @@ fn run_render_thread(
         }
 
         let (clamped, done) = loop_step(clock.frame(fps), total);
+        if let Some(message) = clock.take_error() {
+            errors.report(PlaybackFailure {
+                frame: clamped,
+                code: PlaybackFailureCode::AudioDecode,
+                message,
+                fatal: false,
+            });
+        }
         let render_generation = seek_mailbox.generation();
-        let rendered = render_loop.render_frame(clamped);
+        let rendered = renderer.render(clamped);
         if pause_requested.load(Ordering::Acquire) || !seek_mailbox.is_current(render_generation) {
             continue;
         }
@@ -947,16 +1165,30 @@ fn run_render_thread(
                     paused = true;
                     paused_frame = Some(clamped);
                 } else {
-                    sink.push_frame(&frame);
-                    emitter.emit(clamped);
+                    sink.push_frame(clamped, frame);
                 }
             }
-            Err(e) => {
+            Err(failure) => {
                 if let Some(tx) = startup.take() {
-                    let _ = tx.send(Err(e.clone()));
+                    let _ = tx.send(Err(failure.message));
                     return;
                 }
-                eprintln!("[playback] {e}");
+                // Hold the last published frame instead of retrying (and
+                // respawning decoders) every tick. A resume or seek retries.
+                paused = true;
+                paused_frame = Some(clamped);
+                if done {
+                    eprintln!("[playback] final frame {clamped}: {}", failure.message);
+                    sink.push_terminal(clamped);
+                } else {
+                    errors.report(PlaybackFailure {
+                        frame: clamped,
+                        code: failure.code,
+                        message: failure.message,
+                        fatal: true,
+                    });
+                }
+                continue;
             }
         }
 
@@ -982,6 +1214,214 @@ fn run_render_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicI32;
+
+    /// Advances one frame per read, like a clock running at the render rate.
+    struct SteppingClock {
+        next: AtomicI32,
+        audio_errors: Mutex<Vec<String>>,
+    }
+
+    impl SteppingClock {
+        fn new() -> Self {
+            Self {
+                next: AtomicI32::new(0),
+                audio_errors: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PlaybackClock for SteppingClock {
+        fn frame(&self, _fps: i32) -> i32 {
+            self.next.fetch_add(1, Ordering::AcqRel)
+        }
+
+        fn seek(&self, frame: i32) {
+            self.next.store(frame, Ordering::Release);
+        }
+
+        fn take_error(&self) -> Option<String> {
+            self.audio_errors.lock().unwrap().pop()
+        }
+    }
+
+    struct StubRenderer {
+        total: i32,
+        fail_at: Option<i32>,
+        renders: Arc<Mutex<Vec<i32>>>,
+    }
+
+    impl FrameRenderer for StubRenderer {
+        fn total_frames(&self) -> i32 {
+            self.total
+        }
+
+        fn fps(&self) -> i32 {
+            1_000
+        }
+
+        fn render(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure> {
+            self.renders.lock().unwrap().push(target);
+            if self.fail_at == Some(target) {
+                return Err(RenderFailure::new(
+                    PlaybackFailureCode::VideoDecode,
+                    format!("clip-1 decode failed before source frame {target}"),
+                ));
+            }
+            Ok(DecodedFrame::new(1, 1, vec![0, 0, 0, 255], false))
+        }
+
+        fn seek(&mut self) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        frames: Mutex<Vec<i32>>,
+        terminals: Mutex<Vec<i32>>,
+    }
+
+    impl FrameSink for RecordingSink {
+        fn push_frame(&self, frame: i32, _image: DecodedFrame) {
+            self.frames.lock().unwrap().push(frame);
+        }
+
+        fn push_terminal(&self, frame: i32) {
+            self.terminals.lock().unwrap().push(frame);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingErrors(Mutex<Vec<PlaybackFailure>>);
+
+    impl PlaybackErrorSink for RecordingErrors {
+        fn report(&self, failure: PlaybackFailure) {
+            self.0.lock().unwrap().push(failure);
+        }
+    }
+
+    struct StubRun {
+        engine: PlaybackEngine,
+        renders: Arc<Mutex<Vec<i32>>>,
+        sink: Arc<RecordingSink>,
+        errors: Arc<RecordingErrors>,
+        clock: Arc<SteppingClock>,
+    }
+
+    fn run_stub(total: i32, fail_at: Option<i32>) -> StubRun {
+        let renders = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink::default());
+        let errors = Arc::new(RecordingErrors::default());
+        let clock = Arc::new(SteppingClock::new());
+        let renderer = StubRenderer {
+            total,
+            fail_at,
+            renders: Arc::clone(&renders),
+        };
+        let engine = PlaybackEngine::spawn_with(
+            move || Ok(renderer),
+            RenderOutputs {
+                clock: clock.clone(),
+                sink: sink.clone(),
+                errors: errors.clone(),
+            },
+            None,
+            None,
+            MediaCancelToken::new(),
+        )
+        .expect("spawn stub render loop");
+        StubRun {
+            engine,
+            renders,
+            sink,
+            errors,
+            clock,
+        }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn mid_playback_render_failure_pauses_and_reports_exactly_once() {
+        let run = run_stub(100, Some(5));
+        wait_until("the failing render", || {
+            run.renders.lock().unwrap().contains(&5)
+        });
+        // Give a runaway loop time to retry before asserting it did not.
+        thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(*run.renders.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(*run.sink.frames.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        assert!(run.sink.terminals.lock().unwrap().is_empty());
+        let errors = run.errors.0.lock().unwrap().clone();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].frame, 5);
+        assert_eq!(errors[0].code, PlaybackFailureCode::VideoDecode);
+        assert!(errors[0].fatal);
+        assert!(errors[0].message.contains("clip-1"));
+
+        // Resuming is an explicit retry of the same frame.
+        run.engine.resume(5).expect("retry resume");
+        wait_until("the retried render", || {
+            run.errors.0.lock().unwrap().len() == 2
+        });
+        run.engine.stop();
+    }
+
+    #[test]
+    fn final_frame_failure_publishes_one_terminal_tick_instead_of_hanging() {
+        let run = run_stub(6, Some(5));
+        wait_until("the terminal tick", || {
+            !run.sink.terminals.lock().unwrap().is_empty()
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(*run.sink.terminals.lock().unwrap(), vec![5]);
+        assert_eq!(*run.sink.frames.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(*run.renders.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+        assert!(run.errors.0.lock().unwrap().is_empty());
+        run.engine.stop();
+    }
+
+    #[test]
+    fn successful_final_frame_is_pushed_and_the_loop_stops() {
+        let run = run_stub(4, None);
+        wait_until("the final frame", || {
+            run.sink.frames.lock().unwrap().contains(&3)
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(*run.sink.frames.lock().unwrap(), vec![0, 1, 2, 3]);
+        assert!(run.sink.terminals.lock().unwrap().is_empty());
+        run.engine.stop();
+    }
+
+    #[test]
+    fn audio_source_errors_are_forwarded_as_non_fatal_failures() {
+        let run = run_stub(1_000_000, None);
+        run.clock
+            .audio_errors
+            .lock()
+            .unwrap()
+            .push("audio window at 2.0 s failed".to_string());
+        wait_until("the audio report", || {
+            !run.errors.0.lock().unwrap().is_empty()
+        });
+        let failure = run.errors.0.lock().unwrap()[0].clone();
+        assert_eq!(failure.code, PlaybackFailureCode::AudioDecode);
+        assert!(!failure.fatal);
+        let rendered = run.renders.lock().unwrap().len();
+        wait_until("rendering to continue", || {
+            run.renders.lock().unwrap().len() > rendered + 5
+        });
+        assert_eq!(run.errors.0.lock().unwrap().len(), 1);
+        run.engine.stop();
+    }
 
     #[test]
     fn pause_request_does_not_wait_for_an_inflight_render_to_finish() {

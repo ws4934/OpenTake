@@ -26,6 +26,25 @@ pub struct MediaInfo {
     pub path: PathBuf,
 }
 
+/// Replace every authorized media path in `message` with its file name, so
+/// errors shown to the user (and playback events) never carry absolute paths.
+pub fn redact_media_paths(media: &HashMap<String, MediaInfo>, message: &str) -> String {
+    let mut redacted = message.to_string();
+    for info in media.values() {
+        let full = info.path.to_string_lossy();
+        if full.is_empty() || !redacted.contains(full.as_ref()) {
+            continue;
+        }
+        let name = info
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<media>".to_string());
+        redacted = redacted.replace(full.as_ref(), &name);
+    }
+    redacted
+}
+
 /// A text clip projected from the timeline, keyed by clip id. The box's width /
 /// height drive the rasterized texture size; position rides the layer affine, so
 /// x/y are kept only for completeness (matching the preview/export projection).

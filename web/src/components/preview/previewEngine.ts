@@ -37,13 +37,15 @@ import {
   flushPendingInteractiveSeek,
   interactiveToleranceSec,
 } from "./interactiveSeek";
-import type { Timeline } from "../../lib/types";
-import { getPreviewEndpoint, isTauri, onPlaybackFrame } from "../../lib/api";
+import type { PlaybackErrorEvent, Timeline } from "../../lib/types";
+import { getPreviewEndpoint, isTauri, onPlaybackError, onPlaybackFrame } from "../../lib/api";
+import { t } from "../../i18n";
 import {
   clearNativePlaybackPublication,
   getNativePlaybackPublication,
   nativePlaybackController,
   subscribeNativePlaybackPublication,
+  type NativePlaybackController,
 } from "./nativePlaybackSession";
 import { rustEngineEnabled } from "./rustEngine";
 import { resolveTimelinePlaybackGate, type TimelinePlaybackRoute } from "./playbackRoute";
@@ -200,6 +202,23 @@ function acquireNativeFrameListener(): NativeFrameListenerLease {
       });
     },
   };
+}
+
+/** Surface a native `playback_error` for the running session: a fatal failure
+ *  (the engine already paused itself) stops the transport; either kind is
+ *  shown to the user instead of leaving a frozen frame or silent audio. */
+export function handleNativePlaybackError(
+  event: PlaybackErrorEvent,
+  controller: Pick<NativePlaybackController, "acceptError"> = nativePlaybackController,
+): void {
+  if (!controller.acceptError(event)) return;
+  const ui = useEditorUiStore.getState();
+  if (event.fatal) {
+    if (ui.isPlaying) ui.setPlaying(false);
+    ui.pushToast(t("preview.playbackFailed", { error: event.message }));
+  } else {
+    ui.pushToast(t("preview.playbackAudioFailed", { error: event.message }));
+  }
 }
 
 export async function startNativePlaybackAfterListener<T>(
@@ -590,9 +609,19 @@ export function useTimelinePlaybackEngine(): void {
         ui.setActiveFrame(current.frame);
       });
 
+      let unlistenError: (() => void) | null = null;
+      void onPlaybackError((event) => handleNativePlaybackError(event)).then(
+        (unlisten) => {
+          if (disposed) unlisten();
+          else unlistenError = unlisten;
+        },
+        () => {},
+      );
+
       const startFrame = Math.max(0, Math.floor(useEditorUiStore.getState().activeFrame));
       const listenerReady = nativeFrameListenerLeaseRef.current?.ensureReady();
       if (!listenerReady) {
+        disposed = true;
         unsubscribePublication();
         setEngineFailed(true);
         return;
@@ -628,6 +657,7 @@ export function useTimelinePlaybackEngine(): void {
       return () => {
         disposed = true;
         unsubscribePublication();
+        unlistenError?.();
         const current = identity ?? activeNativeIdentityRef.current;
         if (!current) return;
         const project = useProjectStore.getState();

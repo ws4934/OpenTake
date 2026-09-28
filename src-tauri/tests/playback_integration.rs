@@ -26,7 +26,7 @@ use opentake_render::{DecodedFrame, RenderSize};
 use opentake_tauri_lib::playback::engine::BoundedReaper;
 use opentake_tauri_lib::playback::{
     project_media, project_text, FrameSink, InstantClock, PlaybackClock, PlaybackEngine,
-    PlayheadEmitter, RenderLoop,
+    PlaybackErrorSink, PlaybackFailure, RenderLoop,
 };
 
 /// Warm-up budget: the decode worker is a separate thread/process, so the first
@@ -418,11 +418,12 @@ fn cancelling_initial_ready_bootstrap_releases_the_readiness_worker() {
 
     struct NoopSink;
     impl FrameSink for NoopSink {
-        fn push_frame(&self, _frame: &DecodedFrame) {}
+        fn push_frame(&self, _frame: i32, _image: DecodedFrame) {}
+        fn push_terminal(&self, _frame: i32) {}
     }
-    struct NoopEmitter;
-    impl PlayheadEmitter for NoopEmitter {
-        fn emit(&self, _frame: i32) {}
+    struct NoopErrors;
+    impl PlaybackErrorSink for NoopErrors {
+        fn report(&self, _failure: PlaybackFailure) {}
     }
 
     let cancel = MediaCancelToken::new();
@@ -437,7 +438,7 @@ fn cancelling_initial_ready_bootstrap_releases_the_readiness_worker() {
             RenderSize::new(2, 2),
             Arc::new(ManualClock::new(0)),
             Arc::new(NoopSink),
-            Arc::new(NoopEmitter),
+            Arc::new(NoopErrors),
             0,
             ready_cancel,
         );
@@ -504,11 +505,12 @@ fn stopping_running_engine_cancels_blocked_cold_bootstrap() {
 
     struct NoopSink;
     impl FrameSink for NoopSink {
-        fn push_frame(&self, _frame: &DecodedFrame) {}
+        fn push_frame(&self, _frame: i32, _image: DecodedFrame) {}
+        fn push_terminal(&self, _frame: i32) {}
     }
-    struct NoopEmitter;
-    impl PlayheadEmitter for NoopEmitter {
-        fn emit(&self, _frame: i32) {}
+    struct NoopErrors;
+    impl PlaybackErrorSink for NoopErrors {
+        fn report(&self, _failure: PlaybackFailure) {}
     }
 
     let clock = Arc::new(ManualClock::new(0));
@@ -520,7 +522,7 @@ fn stopping_running_engine_cancels_blocked_cold_bootstrap() {
         RenderSize::new(2, 2),
         clock.clone(),
         Arc::new(NoopSink),
-        Arc::new(NoopEmitter),
+        Arc::new(NoopErrors),
         0,
     )
     .expect("frame zero prepares before the clip becomes visible");
@@ -739,34 +741,38 @@ fn playback_engine_thread_streams_frames_to_sink_and_emitter() {
     struct CountingSink {
         count: Arc<AtomicUsize>,
         first_frame: Arc<Mutex<Option<Vec<u8>>>>,
+        last_frame: Arc<AtomicI32>,
     }
     impl FrameSink for CountingSink {
-        fn push_frame(&self, frame: &DecodedFrame) {
+        fn push_frame(&self, frame: i32, image: DecodedFrame) {
             self.count.fetch_add(1, Ordering::Relaxed);
+            self.last_frame.store(frame, Ordering::Relaxed);
             let mut first = self
                 .first_frame
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if first.is_none() {
-                *first = Some(frame.rgba.clone());
+                *first = Some(image.rgba);
             }
         }
-    }
-    struct RecordingEmitter(Arc<AtomicI32>);
-    impl PlayheadEmitter for RecordingEmitter {
-        fn emit(&self, frame: i32) {
-            self.0.store(frame, Ordering::Relaxed);
+        fn push_terminal(&self, frame: i32) {
+            self.last_frame.store(frame, Ordering::Relaxed);
         }
+    }
+    struct NoopErrors;
+    impl PlaybackErrorSink for NoopErrors {
+        fn report(&self, _failure: PlaybackFailure) {}
     }
 
     let clock: Arc<dyn PlaybackClock> = Arc::new(InstantClock::new(0));
     let sink: Arc<dyn FrameSink> = Arc::new(CountingSink {
         count: frame_count.clone(),
         first_frame: first_frame.clone(),
+        last_frame: last_emitted.clone(),
     });
-    let emitter: Arc<dyn PlayheadEmitter> = Arc::new(RecordingEmitter(last_emitted.clone()));
+    let errors: Arc<dyn PlaybackErrorSink> = Arc::new(NoopErrors);
 
-    let engine = PlaybackEngine::spawn_ready(tl, media, text, sizes, size, clock, sink, emitter, 0)
+    let engine = PlaybackEngine::spawn_ready(tl, media, text, sizes, size, clock, sink, errors, 0)
         .expect("engine prepares first frame");
     assert_eq!(frame_count.load(Ordering::Relaxed), 0);
     engine.resume(0).expect("install publishes buffered frame");

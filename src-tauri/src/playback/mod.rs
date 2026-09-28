@@ -4,8 +4,8 @@
 //!
 //! Structure: continuous per-clip decode ([`resolver`]) feeding the
 //! same-pixel-path compositor on a dedicated render thread ([`engine`]), behind
-//! clock / frame-sink / playhead-emitter traits, with the timeline→render
-//! projections in [`project`]. The cpal master clock ([`audio`]) + MJPEG
+//! clock / frame-sink / error-sink traits, with the timeline→render
+//! projections in [`project`]. The cpal master clock ([`audio`]) + loopback JPEG
 //! transport ([`transport`]) realise those traits, and [`commands`] registers the
 //! `playback_*` Tauri commands the front end drives during PLAY.
 //!
@@ -22,11 +22,11 @@ pub mod session;
 pub mod transport;
 
 pub use engine::{
-    FrameSink, InstantClock, PlaybackClock, PlaybackCmd, PlaybackEngine, PlayheadEmitter,
-    RenderLoop,
+    FrameSink, InstantClock, PlaybackClock, PlaybackCmd, PlaybackEngine, PlaybackErrorSink,
+    PlaybackFailure, PlaybackFailureCode, RenderLoop,
 };
 pub use project::{project_media, project_text, ManifestMetrics, MediaInfo, TextInfo};
 pub use resolver::{PlaybackResolverState, StreamingResolver};
 
 pub use commands::PlaybackState;
-pub use transport::{MjpegSink, PreviewServer, TauriPlayheadEmitter};
+pub use transport::{MjpegSink, PreviewServer, TauriPlaybackErrorEmitter};

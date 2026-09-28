@@ -738,6 +738,18 @@ export interface PlaybackFrameEvent extends PlaybackIdentity {
   terminal: boolean;
 }
 
+/** Why native playback stopped producing frames or sound (`playback_error`). */
+export type PlaybackFailureCode = "videoDecode" | "materialization" | "render" | "audioDecode";
+
+/** Mirror of Rust `PlaybackErrorEvent`: a failure after playback started. A
+ *  fatal failure paused the engine; a non-fatal one (audio) keeps playing. */
+export interface PlaybackErrorEvent extends PlaybackIdentity {
+  frame: number;
+  code: PlaybackFailureCode;
+  message: string;
+  fatal: boolean;
+}
+
 export type PlaybackCommandErrorCode = "superseded" | "cancelled" | "busy" | "engine";
 
 export interface PlaybackCommandError {

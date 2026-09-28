@@ -223,6 +223,10 @@ struct AudioStreamControl {
     stopped: AtomicBool,
     underruns: AtomicU64,
     active_decode: Mutex<Option<MediaCancelToken>>,
+    /// The first window failure of the current generation, awaiting report.
+    pending_error: Mutex<Option<String>>,
+    /// Generation whose failure was already recorded (reported once per seek).
+    reported_generation: AtomicU64,
 }
 
 impl AudioStreamControl {
@@ -233,7 +237,28 @@ impl AudioStreamControl {
             stopped: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             active_decode: Mutex::new(None),
+            pending_error: Mutex::new(None),
+            reported_generation: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Record a window failure. Only the first failure of each generation is
+    /// kept, so a broken clip is reported once rather than every window.
+    fn record_error(&self, generation: u64, message: String) {
+        if self.reported_generation.swap(generation, Ordering::AcqRel) == generation {
+            return;
+        }
+        *self
+            .pending_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.pending_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn request_seek(&self, start_frame: u64) {
@@ -297,8 +322,9 @@ impl AudioStreamConsumer {
                     break;
                 }
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    eprintln!("[audio] streaming decode failed: {error}");
+                // Producer failures are reported through `AudioStreamControl`;
+                // the real-time callback must not log or block.
+                Ok(Err(_)) => {
                     self.terminated = true;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -345,6 +371,10 @@ enum PlaybackSamples {
     Streaming(AudioStreamConsumer),
 }
 
+/// Time source of [`AudioClock`]; injectable so stall/recovery tests run on
+/// virtual time.
+type ClockNow = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Audio master clock: the playhead derives from the device frame position
 /// (`pos`, in output audio frames), which the cpal callback advances in lock-step
 /// with the sound the user hears — so video genuinely follows audio.
@@ -357,6 +387,7 @@ pub struct AudioClock {
     fps: i32,
     stream: Option<Arc<AudioStreamControl>>,
     progress: Mutex<AudioClockProgress>,
+    now: ClockNow,
 }
 
 struct AudioClockProgress {
@@ -374,11 +405,22 @@ impl AudioClock {
         fps: i32,
         stream: Option<Arc<AudioStreamControl>>,
     ) -> Self {
+        Self::with_time_source(pos, rate, fps, stream, Arc::new(Instant::now))
+    }
+
+    fn with_time_source(
+        pos: Arc<AtomicU64>,
+        rate: u32,
+        fps: i32,
+        stream: Option<Arc<AudioStreamControl>>,
+        now: ClockNow,
+    ) -> Self {
         let observed_pos = pos.load(Ordering::Acquire);
         let observed_underruns = stream
             .as_ref()
             .map_or(0, |control| control.underruns.load(Ordering::Acquire));
         let initial_frame = audio_position_frame(observed_pos, rate, fps);
+        let observed_at = now();
         Self {
             pos,
             rate,
@@ -387,10 +429,11 @@ impl AudioClock {
             progress: Mutex::new(AudioClockProgress {
                 observed_pos,
                 observed_underruns,
-                observed_at: Instant::now(),
+                observed_at,
                 fallback: None,
                 last_frame: initial_frame,
             }),
+            now,
         }
     }
 }
@@ -400,12 +443,20 @@ fn audio_position_frame(pos: u64, rate: u32, fps: i32) -> i32 {
     ((pos as f64 / rate.max(1) as f64) * fps as f64) as i32
 }
 
+/// Output-frame position of timeline `frame`. Rounds (consistent with the clip
+/// placement in `project_clip_audio_stereo`) so it round-trips through
+/// [`audio_position_frame`] even when the device rate isn't a multiple of fps
+/// (e.g. 44100 Hz @ 24 fps) — plain truncation would land a half-sample short.
+fn frame_audio_position(frame: i32, rate: u32, fps: i32) -> u64 {
+    ((frame.max(0) as f64 / fps.max(1) as f64) * rate as f64).round() as u64
+}
+
 impl PlaybackClock for AudioClock {
     fn frame(&self, fps: i32) -> i32 {
         let fps = if fps > 0 { fps } else { self.fps.max(1) };
         let pos = self.pos.load(Ordering::Acquire);
         let audio_frame = audio_position_frame(pos, self.rate, fps);
-        let now = Instant::now();
+        let now = (self.now)();
         let mut progress = self
             .progress
             .lock()
@@ -414,8 +465,36 @@ impl PlaybackClock for AudioClock {
             .stream
             .as_ref()
             .map_or(0, |control| control.underruns.load(Ordering::Acquire));
+        let wall_frame = |origin: Instant, base_frame: i32| {
+            let elapsed_frames =
+                (now.saturating_duration_since(origin).as_secs_f64() * fps as f64) as i32;
+            base_frame.saturating_add(elapsed_frames.max(0))
+        };
 
         if pos != progress.observed_pos {
+            if let Some((origin, base_frame)) = progress.fallback.take() {
+                // Callbacks resumed after a stall. While they were silent the
+                // video followed wall time, so the device position now trails
+                // it by the stall length — and, both advancing at the same
+                // rate, would never catch up (permanent A/V drift). Move audio
+                // to the video position instead, dropping the stalled span.
+                let target_frame = wall_frame(origin, base_frame).max(progress.last_frame);
+                progress.observed_underruns = underruns;
+                progress.observed_at = now;
+                if audio_frame >= target_frame {
+                    progress.observed_pos = pos;
+                    progress.last_frame = audio_frame;
+                    return audio_frame;
+                }
+                let target_pos = frame_audio_position(target_frame, self.rate, fps);
+                self.pos.store(target_pos, Ordering::Release);
+                if let Some(stream) = &self.stream {
+                    stream.request_seek(target_pos);
+                }
+                progress.observed_pos = target_pos;
+                progress.last_frame = target_frame;
+                return target_frame;
+            }
             progress.observed_pos = pos;
             progress.observed_underruns = underruns;
             progress.observed_at = now;
@@ -433,30 +512,16 @@ impl PlaybackClock for AudioClock {
             progress.fallback = Some((progress.observed_at, progress.last_frame.max(audio_frame)));
         }
 
-        let candidate = if let Some((origin, base_frame)) = progress.fallback {
-            let elapsed_frames =
-                (now.saturating_duration_since(origin).as_secs_f64() * fps as f64) as i32;
-            let wall_frame = base_frame.saturating_add(elapsed_frames.max(0));
-            if audio_frame >= wall_frame {
-                progress.fallback = None;
-                audio_frame
-            } else {
-                wall_frame
-            }
-        } else {
-            audio_frame
+        let candidate = match progress.fallback {
+            Some((origin, base_frame)) => wall_frame(origin, base_frame),
+            None => audio_frame,
         };
         progress.last_frame = progress.last_frame.max(candidate);
         progress.last_frame
     }
 
     fn seek(&self, frame: i32) {
-        let fps = self.fps.max(1);
-        // Round (consistent with the clip placement in project_clip_audio_stereo)
-        // so a seek round-trips back to the same frame even when the device rate
-        // isn't a multiple of fps (e.g. 44100 Hz @ 24 fps) — plain truncation would
-        // land a half-sample short and frame() would report frame-1.
-        let pos = ((frame.max(0) as f64 / fps as f64) * self.rate as f64).round() as u64;
+        let pos = frame_audio_position(frame, self.rate, self.fps);
         let moved = self.pos.load(Ordering::Acquire) != pos;
         if moved {
             // Release pairs with the callback's AcqRel fetch_add so it observes the seek.
@@ -472,7 +537,7 @@ impl PlaybackClock for AudioClock {
                 .stream
                 .as_ref()
                 .map_or(0, |control| control.underruns.load(Ordering::Acquire)),
-            observed_at: Instant::now(),
+            observed_at: (self.now)(),
             fallback: None,
             last_frame: frame.max(0),
         };
@@ -483,14 +548,67 @@ impl PlaybackClock for AudioClock {
             }
         }
     }
+
+    fn take_error(&self) -> Option<String> {
+        self.stream
+            .as_ref()
+            .and_then(|control| control.take_error())
+    }
+}
+
+/// A cloneable transport endpoint of one audio output thread. `pause` and
+/// `mute` never wait; only `prepare_resume` blocks (for callback liveness or a
+/// device rebuild), so callers run it without holding the playback slot lock.
+#[derive(Clone)]
+pub struct AudioControl {
+    control_tx: Sender<AudioCmd>,
+    paused: Arc<AtomicBool>,
+}
+
+impl AudioControl {
+    /// Mute output immediately. The hardware stream keeps running silently so
+    /// a later resume can prove callback liveness without trusting an
+    /// asynchronous backend play/pause acknowledgement.
+    pub fn pause(&self) -> Result<(), String> {
+        self.paused.store(true, Ordering::Release);
+        let (reply, _acknowledgement) = mpsc::channel();
+        self.control_tx
+            .send(AudioCmd::Pause(reply))
+            .map_err(|_| "audio thread exited before transport control".to_string())
+    }
+
+    /// Prove that callbacks continue while output remains logically muted,
+    /// rebuilding the stream first when the default output device changed or
+    /// the stream reported an error. The caller can then seek/resume the video
+    /// clock before committing audible output.
+    pub fn prepare_resume(&self) -> Result<(), String> {
+        self.paused.store(true, Ordering::Release);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.control_tx
+            .send(AudioCmd::Resume(reply_tx))
+            .map_err(|_| "audio thread exited before transport control".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "audio thread exited during transport control".to_string())?
+    }
+
+    /// Commit a successfully prepared resume after the render clock has been
+    /// positioned. The already-running callback begins consuming at `pos` on
+    /// its next block.
+    pub fn commit_resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+
+    pub fn mute(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
 }
 
 /// Owns the cpal output thread for a playback session. The cpal `Stream` is
 /// `!Send` on macOS, so it lives entirely on that thread; this handle drives a
 /// cooperative stop. Dropping it stops audio and joins the thread.
 pub struct AudioPlayback {
-    control_tx: Sender<AudioCmd>,
-    paused: Arc<AtomicBool>,
+    control: AudioControl,
     handle: Option<JoinHandle<()>>,
     stream_control: Option<Arc<AudioStreamControl>>,
     stream_producer: Option<JoinHandle<()>>,
@@ -502,6 +620,49 @@ enum AudioCmd {
     Stop,
 }
 
+/// Samples shared by successive output streams of one session: a stream
+/// rebuilt for a new default device continues from the same consumer state.
+type SharedSamples = Arc<Mutex<PlaybackSamples>>;
+
+/// What one output stream needs from the session.
+#[derive(Clone)]
+struct OutputShared {
+    samples: SharedSamples,
+    pos: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
+    callback_epoch: Arc<AtomicU64>,
+    /// Set by the backend's error callback (device removed / invalidated).
+    stream_error: Arc<AtomicBool>,
+    /// Sample rate the session's audio was mixed at; a rebuilt stream on a new
+    /// device must play at the same rate or pitch and clock would drift.
+    rate: u32,
+}
+
+/// Opens output streams on the system's default device. Abstracted so device
+/// changes can be simulated in tests.
+trait OutputBackend {
+    type Stream;
+    /// Identity of the current default output device, when one exists.
+    fn default_device_id(&self) -> Option<String>;
+    /// Build and start a stream on the current default device, proving
+    /// callback liveness, and return it with that device's identity.
+    fn open(&self, shared: &OutputShared) -> Result<(Self::Stream, Option<String>), String>;
+}
+
+struct CpalBackend;
+
+impl OutputBackend for CpalBackend {
+    type Stream = cpal::Stream;
+
+    fn default_device_id(&self) -> Option<String> {
+        cpal::default_host().default_output_device()?.name().ok()
+    }
+
+    fn open(&self, shared: &OutputShared) -> Result<(cpal::Stream, Option<String>), String> {
+        build_and_play(shared)
+    }
+}
+
 impl AudioPlayback {
     /// Start playing `buffer` (interleaved stereo, at the device rate) from `pos`.
     /// Returns `Err` if the device/stream can't be set up (caller falls back to
@@ -509,132 +670,73 @@ impl AudioPlayback {
     /// synchronously.
     fn start(
         buffer: Arc<Vec<f32>>,
+        rate: u32,
         pos: Arc<AtomicU64>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let (control_tx, control_rx) = mpsc::channel::<AudioCmd>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        let thread_paused = paused.clone();
-        let callback_epoch = Arc::new(AtomicU64::new(0));
-        let thread_callback_epoch = Arc::clone(&callback_epoch);
-        let handle = thread::Builder::new()
-            .name("opentake-audio".to_string())
-            .spawn(move || {
-                audio_thread(
-                    PlaybackSamples::Buffered(buffer),
-                    pos,
-                    thread_paused,
-                    thread_callback_epoch,
-                    control_rx,
-                    ready_tx,
-                )
-            })
-            .map_err(|e| format!("spawn audio thread: {e}"))?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(AudioPlayback {
-                control_tx,
-                paused,
-                handle: Some(handle),
-                stream_control: None,
-                stream_producer: None,
-            }),
-            Ok(Err(e)) => {
-                let _ = handle.join();
-                Err(e)
-            }
-            Err(_) => Err("audio thread exited before init".to_string()),
-        }
+        let (control_tx, handle) = spawn_output(
+            || CpalBackend,
+            PlaybackSamples::Buffered(buffer),
+            rate,
+            pos,
+            &paused,
+        )?;
+        Ok(AudioPlayback {
+            control: AudioControl { control_tx, paused },
+            handle: Some(handle),
+            stream_control: None,
+            stream_producer: None,
+        })
     }
 
     fn start_stream(
         consumer: AudioStreamConsumer,
         stream_control: Arc<AudioStreamControl>,
         stream_producer: JoinHandle<()>,
+        rate: u32,
         pos: Arc<AtomicU64>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let (control_tx, control_rx) = mpsc::channel::<AudioCmd>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        let thread_paused = Arc::clone(&paused);
-        let callback_epoch = Arc::new(AtomicU64::new(0));
-        let thread_callback_epoch = Arc::clone(&callback_epoch);
-        let handle = match thread::Builder::new()
-            .name("opentake-audio".to_string())
-            .spawn(move || {
-                audio_thread(
-                    PlaybackSamples::Streaming(consumer),
-                    pos,
-                    thread_paused,
-                    thread_callback_epoch,
-                    control_rx,
-                    ready_tx,
-                )
-            }) {
-            Ok(handle) => handle,
-            Err(error) => {
-                stream_control.stop();
-                let _ = stream_producer.join();
-                return Err(format!("spawn audio thread: {error}"));
-            }
-        };
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                control_tx,
-                paused,
+        match spawn_output(
+            || CpalBackend,
+            PlaybackSamples::Streaming(consumer),
+            rate,
+            pos,
+            &paused,
+        ) {
+            Ok((control_tx, handle)) => Ok(Self {
+                control: AudioControl { control_tx, paused },
                 handle: Some(handle),
                 stream_control: Some(stream_control),
                 stream_producer: Some(stream_producer),
             }),
-            Ok(Err(error)) => {
+            Err(error) => {
                 stream_control.stop();
-                let _ = handle.join();
                 let _ = stream_producer.join();
                 Err(error)
-            }
-            Err(_) => {
-                stream_control.stop();
-                let _ = stream_producer.join();
-                Err("audio thread exited before init".to_string())
             }
         }
     }
 
+    /// A cloneable endpoint for transport control outside the owner.
+    pub fn control(&self) -> AudioControl {
+        self.control.clone()
+    }
+
     pub fn pause(&self) -> Result<(), String> {
-        self.paused.store(true, Ordering::Release);
-        self.control(AudioCmd::Pause)
+        self.control.pause()
     }
 
-    /// Prove that callbacks continue while output remains logically muted. The
-    /// hardware stream stays running for the whole retained session, avoiding
-    /// asynchronous backend play/pause acknowledgement races. The caller can
-    /// then seek/resume the video clock before committing audible output.
     pub fn prepare_resume(&self) -> Result<(), String> {
-        self.paused.store(true, Ordering::Release);
-        self.control(AudioCmd::Resume)
+        self.control.prepare_resume()
     }
 
-    /// Commit a successfully prepared resume after the render clock has been
-    /// positioned. The already-running callback begins consuming at `pos` on
-    /// its next block.
     pub fn commit_resume(&self) {
-        self.paused.store(false, Ordering::Release);
-    }
-
-    fn control(
-        &self,
-        command: impl FnOnce(Sender<Result<(), String>>) -> AudioCmd,
-    ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.control_tx
-            .send(command(reply_tx))
-            .map_err(|_| "audio thread exited before transport control".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "audio thread exited during transport control".to_string())?
+        self.control.commit_resume();
     }
 
     pub fn mute(&self) {
-        self.paused.store(true, Ordering::Release);
+        self.control.mute();
     }
 
     pub fn request_stop(mut self) -> Option<JoinHandle<()>> {
@@ -642,7 +744,7 @@ impl AudioPlayback {
         if let Some(control) = &self.stream_control {
             control.stop();
         }
-        let _ = self.control_tx.send(AudioCmd::Stop);
+        let _ = self.control.control_tx.send(AudioCmd::Stop);
         let audio = self.handle.take();
         let producer = self.stream_producer.take();
         match (audio, producer) {
@@ -682,6 +784,23 @@ impl AudioPlayback {
     }
 
     #[cfg(test)]
+    fn from_test_thread(
+        control_tx: Sender<AudioCmd>,
+        paused: &Arc<AtomicBool>,
+        handle: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            control: AudioControl {
+                control_tx,
+                paused: Arc::clone(paused),
+            },
+            handle: Some(handle),
+            stream_control: None,
+            stream_producer: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_stub() -> (Self, Arc<AtomicBool>, Receiver<()>) {
         let (control_tx, control_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
@@ -700,13 +819,7 @@ impl AudioPlayback {
             }
         });
         (
-            Self {
-                control_tx,
-                paused: Arc::clone(&paused),
-                handle: Some(handle),
-                stream_control: None,
-                stream_producer: None,
-            },
+            Self::from_test_thread(control_tx, &paused, handle),
             paused,
             stopped_rx,
         )
@@ -729,15 +842,37 @@ impl AudioPlayback {
                 }
             }
         });
+        (Self::from_test_thread(control_tx, &paused, handle), paused)
+    }
+
+    /// An output thread whose resume liveness check blocks until released (a
+    /// Bluetooth device that stopped calling back).
+    #[cfg(test)]
+    pub(crate) fn test_blocking_resume() -> (Self, Arc<AtomicBool>, Receiver<()>, Sender<()>) {
+        let (control_tx, control_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let paused = Arc::new(AtomicBool::new(true));
+        let handle = thread::spawn(move || {
+            while let Ok(command) = control_rx.recv() {
+                match command {
+                    AudioCmd::Pause(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    AudioCmd::Resume(reply) => {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        let _ = reply.send(Ok(()));
+                    }
+                    AudioCmd::Stop => break,
+                }
+            }
+        });
         (
-            Self {
-                control_tx,
-                paused: Arc::clone(&paused),
-                handle: Some(handle),
-                stream_control: None,
-                stream_producer: None,
-            },
+            Self::from_test_thread(control_tx, &paused, handle),
             paused,
+            entered_rx,
+            release_tx,
         )
     }
 
@@ -762,13 +897,7 @@ impl AudioPlayback {
             }
         });
         (
-            Self {
-                control_tx,
-                paused: Arc::clone(&paused),
-                handle: Some(handle),
-                stream_control: None,
-                stream_producer: None,
-            },
+            Self::from_test_thread(control_tx, &paused, handle),
             paused,
             stopped_rx,
             release_tx,
@@ -781,7 +910,7 @@ impl Drop for AudioPlayback {
         if let Some(control) = &self.stream_control {
             control.stop();
         }
-        let _ = self.control_tx.send(AudioCmd::Stop);
+        let _ = self.control.control_tx.send(AudioCmd::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -791,80 +920,147 @@ impl Drop for AudioPlayback {
     }
 }
 
-/// The audio thread: build + play the output stream, report the result, then park
-/// (holding the `!Send` stream alive) until a stop is requested.
-fn audio_thread(
+/// Spawn the output thread for `samples` and wait until its first stream is
+/// live. `backend` is constructed on that thread (cpal handles may be `!Send`).
+fn spawn_output<B, F>(
+    backend: F,
     samples: PlaybackSamples,
+    rate: u32,
     pos: Arc<AtomicU64>,
-    paused: Arc<AtomicBool>,
-    callback_epoch: Arc<AtomicU64>,
-    control_rx: Receiver<AudioCmd>,
-    ready_tx: Sender<Result<(), String>>,
-) {
-    match build_and_play(samples, &pos, &paused, &callback_epoch) {
-        Ok(stream) => {
-            let _ = ready_tx.send(Ok(()));
-            while let Ok(command) = control_rx.recv() {
-                match command {
-                    AudioCmd::Pause(reply) => {
-                        // Logical pause is established by `paused=true` before
-                        // this barrier. Keep the hardware stream running muted
-                        // so a later resume can prove current callback liveness
-                        // without trusting an asynchronous backend play ack.
-                        let _ = reply.send(Ok(()));
-                    }
-                    AudioCmd::Resume(reply) => {
-                        let before = callback_epoch.load(Ordering::Acquire);
-                        let result =
-                            require_callback_after(&callback_epoch, before, CALLBACK_START_TIMEOUT);
-                        let _ = reply.send(result);
-                    }
-                    AudioCmd::Stop => break,
-                }
-            }
-            drop(stream);
+    paused: &Arc<AtomicBool>,
+) -> Result<(Sender<AudioCmd>, JoinHandle<()>), String>
+where
+    B: OutputBackend,
+    F: FnOnce() -> B + Send + 'static,
+{
+    let (control_tx, control_rx) = mpsc::channel::<AudioCmd>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let shared = OutputShared {
+        samples: Arc::new(Mutex::new(samples)),
+        pos,
+        paused: Arc::clone(paused),
+        callback_epoch: Arc::new(AtomicU64::new(0)),
+        stream_error: Arc::new(AtomicBool::new(false)),
+        rate,
+    };
+    let handle = thread::Builder::new()
+        .name("opentake-audio".to_string())
+        .spawn(move || audio_thread(backend(), shared, control_rx, ready_tx))
+        .map_err(|e| format!("spawn audio thread: {e}"))?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((control_tx, handle)),
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            Err(error)
         }
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
+        Err(_) => {
+            let _ = handle.join();
+            Err("audio thread exited before init".to_string())
         }
     }
 }
 
+/// The audio thread: build + play the output stream, report the result, then park
+/// (holding the `!Send` stream alive) until a stop is requested. A resume
+/// rebuilds the stream on the current default device when the device changed
+/// or the stream failed, so a retained session follows the system output.
+fn audio_thread<B: OutputBackend>(
+    backend: B,
+    shared: OutputShared,
+    control_rx: Receiver<AudioCmd>,
+    ready_tx: Sender<Result<(), String>>,
+) {
+    let (mut stream, mut device_id) = match backend.open(&shared) {
+        Ok((stream, device_id)) => (Some(stream), device_id),
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+    let _ = ready_tx.send(Ok(()));
+    while let Ok(command) = control_rx.recv() {
+        match command {
+            AudioCmd::Pause(reply) => {
+                // Logical pause is established by `paused=true` before this
+                // message. Keep the hardware stream running muted so a later
+                // resume can prove current callback liveness without trusting
+                // an asynchronous backend play ack.
+                let _ = reply.send(Ok(()));
+            }
+            AudioCmd::Resume(reply) => {
+                let current_device = backend.default_device_id();
+                let device_changed = current_device.is_some() && current_device != device_id;
+                let result = if stream.is_none()
+                    || device_changed
+                    || shared.stream_error.load(Ordering::Acquire)
+                {
+                    // Release the old device before opening the new one.
+                    drop(stream.take());
+                    shared.stream_error.store(false, Ordering::Release);
+                    backend.open(&shared).map(|(rebuilt, rebuilt_device)| {
+                        stream = Some(rebuilt);
+                        device_id = rebuilt_device;
+                    })
+                } else {
+                    let before = shared.callback_epoch.load(Ordering::Acquire);
+                    require_callback_after(&shared.callback_epoch, before, CALLBACK_START_TIMEOUT)
+                };
+                let _ = reply.send(result);
+            }
+            AudioCmd::Stop => break,
+        }
+    }
+    drop(stream);
+}
+
 /// Acquire the default output device + config, build the typed output stream, and
 /// start it. The returned `Stream` must stay alive on the calling thread.
-fn build_and_play(
-    samples: PlaybackSamples,
-    pos: &Arc<AtomicU64>,
-    paused: &Arc<AtomicBool>,
-    callback_epoch: &Arc<AtomicU64>,
-) -> Result<cpal::Stream, String> {
+fn build_and_play(shared: &OutputShared) -> Result<(cpal::Stream, Option<String>), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| "no default audio output device".to_string())?;
-    let supported = device
-        .default_output_config()
-        .map_err(|e| format!("default output config: {e}"))?;
+    let device_id = device.name().ok();
+    let supported = output_config_at_rate(&device, shared.rate)?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
-    let stream = build_stream(
-        sample_format,
-        &device,
-        &config,
-        samples,
-        pos.clone(),
-        paused.clone(),
-        Arc::clone(callback_epoch),
-    )?;
+    let stream = build_stream(sample_format, &device, &config, shared.clone())?;
     // A successful backend `play()` request does not guarantee that the output
     // callback is live. Installing an AudioClock before sustained callbacks can
     // freeze the playhead at frame zero forever. Prepared sessions start muted
     // for this handshake and keep the hardware stream running silently, so
     // resume never depends on an asynchronous backend play/pause transition.
-    let before = callback_epoch.load(Ordering::Acquire);
+    let before = shared.callback_epoch.load(Ordering::Acquire);
     stream.play().map_err(|e| format!("stream play: {e}"))?;
-    require_callback_after(callback_epoch, before, CALLBACK_START_TIMEOUT)?;
-    Ok(stream)
+    require_callback_after(&shared.callback_epoch, before, CALLBACK_START_TIMEOUT)?;
+    Ok((stream, device_id))
+}
+
+/// The device's default output config, or — when the device (for example one
+/// the user just switched to) defaults to another rate — a supported config at
+/// the rate the session's audio was mixed at.
+fn output_config_at_rate(
+    device: &cpal::Device,
+    rate: u32,
+) -> Result<cpal::SupportedStreamConfig, String> {
+    let default = device
+        .default_output_config()
+        .map_err(|e| format!("default output config: {e}"))?;
+    if default.sample_rate().0 == rate {
+        return Ok(default);
+    }
+    device
+        .supported_output_configs()
+        .map_err(|e| format!("supported output configs: {e}"))?
+        .filter(|range| range.min_sample_rate().0 <= rate && rate <= range.max_sample_rate().0)
+        .max_by_key(|range| {
+            (
+                range.channels() == default.channels(),
+                range.sample_format() == default.sample_format(),
+            )
+        })
+        .map(|range| range.with_sample_rate(cpal::SampleRate(rate)))
+        .ok_or_else(|| format!("the default output device does not support {rate} Hz"))
 }
 
 fn require_callback_after(epoch: &AtomicU64, before: u64, timeout: Duration) -> Result<(), String> {
@@ -886,45 +1082,22 @@ fn build_stream(
     format: cpal::SampleFormat,
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: PlaybackSamples,
-    pos: Arc<AtomicU64>,
-    paused: Arc<AtomicBool>,
-    callback_epoch: Arc<AtomicU64>,
+    shared: OutputShared,
 ) -> Result<cpal::Stream, String> {
     // Cover every fixed-size cpal format (all satisfy SizedSample + FromSample<f32>)
     // so a non-F32 default device (I32 is common on Linux/Windows) still gets audio
     // instead of silently falling back to the wall clock.
     match format {
-        cpal::SampleFormat::F32 => {
-            out_stream::<f32>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::F64 => {
-            out_stream::<f64>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::I8 => {
-            out_stream::<i8>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::I16 => {
-            out_stream::<i16>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::I32 => {
-            out_stream::<i32>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::I64 => {
-            out_stream::<i64>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::U8 => {
-            out_stream::<u8>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::U16 => {
-            out_stream::<u16>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::U32 => {
-            out_stream::<u32>(device, config, samples, pos, paused, callback_epoch)
-        }
-        cpal::SampleFormat::U64 => {
-            out_stream::<u64>(device, config, samples, pos, paused, callback_epoch)
-        }
+        cpal::SampleFormat::F32 => out_stream::<f32>(device, config, shared),
+        cpal::SampleFormat::F64 => out_stream::<f64>(device, config, shared),
+        cpal::SampleFormat::I8 => out_stream::<i8>(device, config, shared),
+        cpal::SampleFormat::I16 => out_stream::<i16>(device, config, shared),
+        cpal::SampleFormat::I32 => out_stream::<i32>(device, config, shared),
+        cpal::SampleFormat::I64 => out_stream::<i64>(device, config, shared),
+        cpal::SampleFormat::U8 => out_stream::<u8>(device, config, shared),
+        cpal::SampleFormat::U16 => out_stream::<u16>(device, config, shared),
+        cpal::SampleFormat::U32 => out_stream::<u32>(device, config, shared),
+        cpal::SampleFormat::U64 => out_stream::<u64>(device, config, shared),
         other => Err(format!("unsupported cpal sample format: {other}")),
     }
 }
@@ -952,27 +1125,50 @@ fn write_frame<T: cpal::Sample + FromSample<f32>>(frame: &mut [T], left: f32, ri
 fn out_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut samples: PlaybackSamples,
-    pos: Arc<AtomicU64>,
-    paused: Arc<AtomicBool>,
-    callback_epoch: Arc<AtomicU64>,
+    shared: OutputShared,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = (config.channels as usize).max(1);
-    let err_fn = |e| eprintln!("[audio] stream error: {e}");
+    let OutputShared {
+        samples,
+        pos,
+        paused,
+        callback_epoch,
+        stream_error,
+        rate: _,
+    } = shared;
+    let err_fn = move |e| {
+        // Not the real-time callback: record the failure so the next resume
+        // rebuilds the stream on the current default device.
+        stream_error.store(true, Ordering::Release);
+        eprintln!("[audio] stream error: {e}");
+    };
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 callback_epoch.fetch_add(1, Ordering::Release);
+                // Only one stream of a session is ever alive (a rebuild drops
+                // the old one first), so this lock is uncontended; never wait.
+                let mut samples = match samples.try_lock() {
+                    Ok(samples) => samples,
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        for sample in data.iter_mut() {
+                            *sample = T::from_sample(0.0f32);
+                        }
+                        return;
+                    }
+                };
+                let samples = &mut *samples;
                 let out_frames = data.len() / channels;
                 // Atomically claim this block's start frame and advance the master
                 // clock. A concurrent `seek` (store) is honored on the next
                 // callback; within a block we play from the claimed start.
                 if paused.load(Ordering::Acquire) {
-                    if let PlaybackSamples::Streaming(consumer) = &mut samples {
+                    if let PlaybackSamples::Streaming(consumer) = samples {
                         consumer.discard_stale();
                     }
                     for sample in data.iter_mut() {
@@ -983,7 +1179,7 @@ where
                 let mut written = 0;
                 while written < out_frames {
                     let Some((start, count)) =
-                        claim_ready_audio_block(&mut samples, &pos, out_frames - written)
+                        claim_ready_audio_block(samples, &pos, out_frames - written)
                     else {
                         for sample in &mut data[written * channels..] {
                             *sample = T::from_sample(0.0f32);
@@ -995,7 +1191,7 @@ where
                         .enumerate()
                     {
                         let audio_frame = start.saturating_add(i as u64);
-                        let (left, right) = match &mut samples {
+                        let (left, right) = match &mut *samples {
                             PlaybackSamples::Buffered(buffer) => {
                                 let base = usize::try_from(audio_frame)
                                     .ok()
@@ -1460,6 +1656,99 @@ fn send_stream_chunk(
     }
 }
 
+/// Window geometry of one streaming audio producer.
+struct ProducerWindows {
+    rate: u32,
+    /// First output frame after the synchronously prefilled window.
+    next_frame: u64,
+    total_frames: u64,
+    window_frames: usize,
+}
+
+/// The `opentake-audio-fill` loop: mix consecutive windows into the bounded
+/// channel, restarting at the requested position on every seek generation.
+/// A window that fails to decode is reported once per generation and played
+/// as silence, so one broken clip neither stops the producer (silencing the
+/// rest of the session) nor freezes the audio master clock.
+fn run_audio_producer(
+    control: &AudioStreamControl,
+    sender: &ChunkSender<Result<AudioStreamChunk, MediaError>>,
+    windows: ProducerWindows,
+    mut mix_window: impl FnMut(u64, usize, &MediaCancelToken) -> Result<Vec<f32>, MediaError>,
+) {
+    let ProducerWindows {
+        rate,
+        mut next_frame,
+        total_frames,
+        window_frames,
+    } = windows;
+    let mut generation = 0_u64;
+    loop {
+        if control.stopped.load(Ordering::Acquire) {
+            break;
+        }
+        let observed = control.generation.load(Ordering::Acquire);
+        if observed != generation {
+            generation = observed;
+            next_frame = control.requested_start.load(Ordering::Acquire);
+        }
+        if next_frame >= total_frames {
+            thread::sleep(STREAM_SEND_POLL);
+            continue;
+        }
+        let len = (total_frames - next_frame).min(window_frames as u64) as usize;
+        let window_cancel = MediaCancelToken::new();
+        *control
+            .active_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(window_cancel.clone());
+        if control.generation.load(Ordering::Acquire) != generation {
+            window_cancel.cancel();
+            control
+                .active_decode
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            continue;
+        }
+        let result = mix_window(next_frame, len, &window_cancel);
+        control
+            .active_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if control.generation.load(Ordering::Acquire) != generation {
+            continue;
+        }
+        let samples = match result {
+            Ok(samples) => samples,
+            Err(MediaError::Cancelled) => continue,
+            Err(error) => {
+                control.record_error(
+                    generation,
+                    format!(
+                        "audio at {:.1} s could not be decoded and plays as silence: {error}",
+                        next_frame as f64 / rate.max(1) as f64
+                    ),
+                );
+                vec![0.0; len * MIX_CHANNELS]
+            }
+        };
+        if send_stream_chunk(
+            sender,
+            Ok(AudioStreamChunk {
+                generation,
+                start_frame: next_frame,
+                samples,
+            }),
+            control,
+            generation,
+        ) {
+            next_frame = next_frame.saturating_add(len as u64);
+        }
+    }
+}
+
 /// Prepare bounded timeline-audio scheduling at `rate`. The initial window is
 /// mixed synchronously so decode failures surface before playback ownership is
 /// published; all subsequent windows are produced on one bounded worker.
@@ -1511,76 +1800,33 @@ fn mix_timeline_stereo(
     let producer = thread::Builder::new()
         .name("opentake-audio-fill".to_string())
         .spawn(move || {
-            let mut generation = 0_u64;
-            let mut next_frame = start_frame.saturating_add(first_len as u64);
-            loop {
-                if producer_control.stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let observed = producer_control.generation.load(Ordering::Acquire);
-                if observed != generation {
-                    generation = observed;
-                    next_frame = producer_control.requested_start.load(Ordering::Acquire);
-                }
-                if next_frame >= total_frames {
-                    thread::sleep(STREAM_SEND_POLL);
-                    continue;
-                }
-                let len = (total_frames - next_frame).min(window_frames as u64) as usize;
-                let window_cancel = MediaCancelToken::new();
-                *producer_control
-                    .active_decode
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(window_cancel.clone());
-                if producer_control.generation.load(Ordering::Acquire) != generation {
-                    window_cancel.cancel();
-                    producer_control
-                        .active_decode
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    continue;
-                }
-                let result = mix_timeline_window(
-                    &producer_timeline,
-                    &producer_media,
+            run_audio_producer(
+                &producer_control,
+                &sender,
+                ProducerWindows {
                     rate,
-                    next_frame,
-                    len,
-                    &window_cancel,
-                );
-                producer_control
-                    .active_decode
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if producer_control.generation.load(Ordering::Acquire) != generation {
-                    continue;
-                }
-                match result {
-                    Ok(samples) => {
-                        if !send_stream_chunk(
-                            &sender,
-                            Ok(AudioStreamChunk {
-                                generation,
-                                start_frame: next_frame,
-                                samples,
-                            }),
-                            &producer_control,
-                            generation,
-                        ) {
-                            continue;
-                        }
-                        next_frame = next_frame.saturating_add(len as u64);
-                    }
-                    Err(MediaError::Cancelled) => continue,
-                    Err(error) => {
-                        let _ =
-                            send_stream_chunk(&sender, Err(error), &producer_control, generation);
-                        break;
-                    }
-                }
-            }
+                    next_frame: start_frame.saturating_add(first_len as u64),
+                    total_frames,
+                    window_frames,
+                },
+                |start, len, cancel| {
+                    mix_timeline_window(
+                        &producer_timeline,
+                        &producer_media,
+                        rate,
+                        start,
+                        len,
+                        cancel,
+                    )
+                    .map_err(|error| match error {
+                        MediaError::Cancelled => MediaError::Cancelled,
+                        error => MediaError::Decode(super::project::redact_media_paths(
+                            &producer_media,
+                            &error.to_string(),
+                        )),
+                    })
+                },
+            )
         })
         .map_err(|error| MediaError::Decode(format!("spawn audio fill worker: {error}")))?;
     Ok(Some(PreparedTimelineAudio {
@@ -1660,6 +1906,7 @@ fn build_clock_with_state(
         prepared.consumer,
         prepared.control,
         prepared.producer,
+        rate,
         pos,
         paused,
     ) {
@@ -2287,25 +2534,311 @@ mod tests {
         );
     }
 
+    /// Virtual time for [`AudioClock`] tests.
+    #[derive(Clone)]
+    struct TestTime(Arc<Mutex<Instant>>);
+
+    impl TestTime {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+
+        fn source(&self) -> ClockNow {
+            let now = Arc::clone(&self.0);
+            Arc::new(move || *now.lock().unwrap())
+        }
+    }
+
+    /// Simulate the cpal callback: `ms` of linear output at `rate`, in 10 ms
+    /// blocks, reading the clock after each block like the render loop does.
+    fn play_linear(
+        clock: &AudioClock,
+        time: &TestTime,
+        pos: &AtomicU64,
+        rate: u64,
+        ms: u64,
+        frames: &mut Vec<i32>,
+    ) {
+        for _ in 0..ms / 10 {
+            time.advance(Duration::from_millis(10));
+            pos.fetch_add(rate / 100, Ordering::AcqRel);
+            frames.push(clock.frame(30));
+        }
+    }
+
+    fn stall(clock: &AudioClock, time: &TestTime, ms: u64, frames: &mut Vec<i32>) {
+        for _ in 0..ms / 10 {
+            time.advance(Duration::from_millis(10));
+            frames.push(clock.frame(30));
+        }
+    }
+
     #[test]
     fn recovered_audio_callbacks_and_explicit_seeks_never_rewind_accidentally() {
+        let time = TestTime::new();
         let pos = Arc::new(AtomicU64::new(0));
-        let clock = AudioClock::new(Arc::clone(&pos), 48_000, 100, None);
-        let _ = clock.frame(100);
-        std::thread::sleep(AUDIO_CLOCK_STALL_TIMEOUT + Duration::from_millis(20));
+        let clock =
+            AudioClock::with_time_source(Arc::clone(&pos), 48_000, 100, None, time.source());
+        let mut frames = vec![clock.frame(100)];
+        time.advance(AUDIO_CLOCK_STALL_TIMEOUT + Duration::from_millis(20));
         let fallback_frame = clock.frame(100);
         assert!(fallback_frame >= 1);
 
-        // A recovering device may initially report a position behind the wall
-        // fallback. It must catch up without pulling the timeline backwards.
-        pos.store(4_800, Ordering::Release);
-        assert!(clock.frame(100) >= fallback_frame);
-        pos.store(48_000, Ordering::Release);
-        assert!(clock.frame(100) >= 100);
+        // A recovering device advances linearly from where it stalled, behind
+        // the wall fallback. It must neither pull the timeline backwards nor
+        // stay on wall time forever.
+        for _ in 0..10 {
+            time.advance(Duration::from_millis(10));
+            pos.fetch_add(480, Ordering::AcqRel);
+            frames.push(clock.frame(100));
+        }
+        assert!(
+            frames.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{frames:?}"
+        );
+        let fallback_left = clock.progress.lock().unwrap().fallback.is_none();
+        assert!(
+            fallback_left,
+            "linear recovery must exit the wall-clock fallback"
+        );
+        let audio_frame = audio_position_frame(pos.load(Ordering::Acquire), 48_000, 100);
+        assert!((clock.frame(100) - audio_frame).abs() <= 1);
 
         // A user/transport seek is authoritative and intentionally may move back.
         clock.seek(7);
         assert_eq!(clock.frame(100), 7);
+    }
+
+    #[test]
+    fn stalled_then_linearly_recovered_callback_realigns_audio_to_video() {
+        let time = TestTime::new();
+        let pos = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(AudioStreamControl::new(0));
+        let clock = AudioClock::with_time_source(
+            Arc::clone(&pos),
+            48_000,
+            30,
+            Some(Arc::clone(&control)),
+            time.source(),
+        );
+        let mut frames = Vec::new();
+
+        play_linear(&clock, &time, &pos, 48_000, 1_000, &mut frames);
+        assert_eq!(*frames.last().unwrap(), 30);
+        stall(&clock, &time, 300, &mut frames);
+        assert!(
+            *frames.last().unwrap() >= 38,
+            "wall fallback keeps video moving during the stall: {frames:?}"
+        );
+        assert_eq!(control.generation.load(Ordering::Acquire), 0);
+
+        // One callback block after recovery (one clock tick) the clock and the
+        // audio position agree again, via exactly one stream seek.
+        play_linear(&clock, &time, &pos, 48_000, 10, &mut frames);
+        let audio_frame = audio_position_frame(pos.load(Ordering::Acquire), 48_000, 30);
+        let video_frame = *frames.last().unwrap();
+        assert!(
+            (video_frame - audio_frame).abs() <= 1,
+            "video {video_frame} vs audio {audio_frame}"
+        );
+        assert_eq!(control.generation.load(Ordering::Acquire), 1);
+        assert_eq!(
+            control.requested_start.load(Ordering::Acquire),
+            pos.load(Ordering::Acquire)
+        );
+
+        // Afterwards audio drives the clock again, with no residual offset.
+        play_linear(&clock, &time, &pos, 48_000, 500, &mut frames);
+        let audio_frame = audio_position_frame(pos.load(Ordering::Acquire), 48_000, 30);
+        assert_eq!(*frames.last().unwrap(), audio_frame);
+        assert_eq!(control.generation.load(Ordering::Acquire), 1);
+        assert!(
+            frames.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the playhead never moves backwards: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn producer_reports_a_failed_window_once_and_recovers_after_seek() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        let failing = Arc::new(AtomicBool::new(true));
+        let producer_control = Arc::clone(&control);
+        let producer_failing = Arc::clone(&failing);
+        let producer = thread::spawn(move || {
+            run_audio_producer(
+                &producer_control,
+                &sender,
+                ProducerWindows {
+                    rate: 100,
+                    next_frame: 0,
+                    total_frames: 10_000,
+                    window_frames: 100,
+                },
+                |start, len, _cancel| {
+                    // Every window from 100 on hits a broken clip.
+                    if start >= 100 && producer_failing.load(Ordering::Acquire) {
+                        return Err(MediaError::Decode("clip-2 decode failed".to_string()));
+                    }
+                    Ok(vec![0.5; len * MIX_CHANNELS])
+                },
+            )
+        });
+
+        let next_chunk = || {
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("producer keeps producing")
+                .expect("failures are silence, not stream errors")
+        };
+        let mut chunks = Vec::new();
+        for _ in 0..3 {
+            chunks.push(next_chunk());
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.start_frame)
+                .collect::<Vec<_>>(),
+            vec![0, 100, 200]
+        );
+        assert!(chunks[0].samples.iter().all(|sample| *sample == 0.5));
+        assert!(chunks[1].samples.iter().all(|sample| *sample == 0.0));
+        let error = control.take_error().expect("failure reported");
+        assert!(error.contains("clip-2 decode failed"), "{error}");
+        assert!(error.contains("1.0 s"), "{error}");
+        assert_eq!(control.take_error(), None, "reported once per generation");
+
+        // The source becomes decodable; a seek restarts the producer there and
+        // the consumer plays real samples without underruns.
+        failing.store(false, Ordering::Release);
+        control.request_seek(500);
+        let mut consumer = AudioStreamConsumer {
+            receiver: receiver.clone(),
+            control: Arc::clone(&control),
+            current: None,
+            terminated: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !consumer.ready_at(500) {
+            assert!(Instant::now() < deadline, "post-seek window arrives");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let underruns = control.underruns.load(Ordering::Acquire);
+        for frame in 500..600 {
+            assert_eq!(consumer.sample_frame(frame), (0.5, 0.5));
+        }
+        assert_eq!(control.underruns.load(Ordering::Acquire), underruns);
+        assert_eq!(control.take_error(), None);
+
+        control.stop();
+        drop(consumer);
+        drop(receiver);
+        producer.join().expect("producer exits on stop");
+    }
+
+    /// Output backend double: a "stream" is a thread that ticks the callback
+    /// epoch until dropped; the default device id can change between resumes.
+    struct FakeBackend {
+        default_device: Arc<Mutex<String>>,
+        opened: Arc<Mutex<Vec<String>>>,
+        stream_error: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    }
+
+    struct FakeStream {
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    impl OutputBackend for FakeBackend {
+        type Stream = FakeStream;
+
+        fn default_device_id(&self) -> Option<String> {
+            Some(self.default_device.lock().unwrap().clone())
+        }
+
+        fn open(&self, shared: &OutputShared) -> Result<(FakeStream, Option<String>), String> {
+            let device = self.default_device.lock().unwrap().clone();
+            self.opened.lock().unwrap().push(device.clone());
+            *self.stream_error.lock().unwrap() = Some(Arc::clone(&shared.stream_error));
+            let stop = Arc::new(AtomicBool::new(false));
+            let ticking = Arc::clone(&stop);
+            let epoch = Arc::clone(&shared.callback_epoch);
+            thread::spawn(move || {
+                while !ticking.load(Ordering::Acquire) {
+                    epoch.fetch_add(1, Ordering::Release);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let before = shared.callback_epoch.load(Ordering::Acquire);
+            require_callback_after(&shared.callback_epoch, before, CALLBACK_START_TIMEOUT)?;
+            Ok((FakeStream { stop }, Some(device)))
+        }
+    }
+
+    #[test]
+    fn retained_resume_rebuilds_the_stream_only_when_the_default_device_changes() {
+        let default_device = Arc::new(Mutex::new("speakers".to_string()));
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let stream_error = Arc::new(Mutex::new(None));
+        let backend = FakeBackend {
+            default_device: Arc::clone(&default_device),
+            opened: Arc::clone(&opened),
+            stream_error: Arc::clone(&stream_error),
+        };
+        let paused = Arc::new(AtomicBool::new(true));
+        let (control_tx, handle) = spawn_output(
+            move || backend,
+            PlaybackSamples::Buffered(Arc::new(vec![0.0; 96_000])),
+            48_000,
+            Arc::new(AtomicU64::new(0)),
+            &paused,
+        )
+        .expect("fake output starts");
+        let audio = AudioPlayback::from_test_thread(control_tx, &paused, handle);
+        assert_eq!(*opened.lock().unwrap(), vec!["speakers"]);
+
+        audio.pause().expect("pause");
+        audio.prepare_resume().expect("resume on the same device");
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            1,
+            "unchanged device keeps its stream"
+        );
+
+        audio.pause().expect("pause");
+        *default_device.lock().unwrap() = "headphones".to_string();
+        audio
+            .prepare_resume()
+            .expect("resume follows the new default device");
+        assert_eq!(*opened.lock().unwrap(), vec!["speakers", "headphones"]);
+
+        audio
+            .prepare_resume()
+            .expect("resume again on the same new device");
+        assert_eq!(opened.lock().unwrap().len(), 2);
+
+        // A stream error (device invalidated) forces a rebuild on next resume.
+        stream_error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("backend saw the error flag")
+            .store(true, Ordering::Release);
+        audio
+            .prepare_resume()
+            .expect("resume rebuilds after a stream error");
+        assert_eq!(opened.lock().unwrap().len(), 3);
+        drop(audio);
     }
 
     #[test]

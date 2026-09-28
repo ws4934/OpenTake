@@ -111,6 +111,75 @@ pub(crate) struct TimelineResultPng {
 /// cache still helps repeated seeks to the same frame.
 const TEXTURE_CACHE_CAP: usize = 64;
 const LUT_CACHE_CAP: usize = 16;
+/// Image textures kept on the preview device between composite calls (#14).
+const IMAGE_TEXTURE_CAP: usize = 32;
+const IMAGE_TEXTURE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A still image's texture identity: its content hash (revalidated against the
+/// file's path, length, modification time and file id by [`ContentHashCache`])
+/// and the decode box it was downscaled into.
+type ImageTextureKey = (String, (u32, u32));
+
+/// Image textures reused across still-frame composites. Values are owned
+/// `GpuTexture`s (wgpu resources are `Send`); a composite call moves a texture
+/// into its per-call `Rc` cache and moves it back once the call has released
+/// every reference, so no `Rc` outlives the call or crosses threads.
+#[derive(Default)]
+struct ImageTextureStore {
+    entries: HashMap<ImageTextureKey, GpuTexture>,
+    /// Oldest first.
+    order: std::collections::VecDeque<ImageTextureKey>,
+    bytes: u64,
+    #[cfg(test)]
+    uploads: u64,
+}
+
+impl ImageTextureStore {
+    fn texture_bytes(texture: &GpuTexture) -> u64 {
+        u64::from(texture.width) * u64::from(texture.height) * 4
+    }
+
+    fn take(&mut self, key: &ImageTextureKey) -> Option<GpuTexture> {
+        let texture = self.entries.remove(key)?;
+        self.order.retain(|entry| entry != key);
+        self.bytes = self.bytes.saturating_sub(Self::texture_bytes(&texture));
+        Some(texture)
+    }
+
+    fn insert(&mut self, key: ImageTextureKey, texture: GpuTexture) {
+        let bytes = Self::texture_bytes(&texture);
+        if bytes > IMAGE_TEXTURE_BUDGET_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.order.retain(|entry| entry != &key);
+            self.bytes = self.bytes.saturating_sub(Self::texture_bytes(&previous));
+        }
+        while self.entries.len() >= IMAGE_TEXTURE_CAP
+            || self.bytes + bytes > IMAGE_TEXTURE_BUDGET_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(Self::texture_bytes(&evicted));
+            }
+        }
+        self.bytes += bytes;
+        self.order.push_back(key.clone());
+        self.entries.insert(key, texture);
+    }
+
+    /// Return textures lent to a finished composite. A texture still shared
+    /// elsewhere (which a finished call should never do) is dropped instead.
+    fn restore(&mut self, lent: Vec<(ImageTextureKey, Rc<GpuTexture>)>) {
+        for (key, texture) in lent {
+            if let Ok(texture) = Rc::try_unwrap(texture) {
+                self.insert(key, texture);
+            }
+        }
+    }
+}
 
 /// Binary preview envelope: `OTF1`, little-endian width and height, JPEG bytes.
 const STILL_FRAME_MAGIC: &[u8; 4] = b"OTF1";
@@ -138,13 +207,16 @@ struct GpuContext {
     /// Text rasterizer (system fonts discovered once on first composite).
     text_rasterizer: CosmicTextRasterizer,
     /// Vector pipelines are discarded when the GPU context is rebuilt, so they
-    /// never cross a device-loss boundary. Rc image caches remain local to a
-    /// composite call because Tauri managed state must be Send + Sync.
+    /// never cross a device-loss boundary. The per-call `Rc` texture cache stays
+    /// local to a composite call because Tauri managed state must be Send +
+    /// Sync; still images persist in `image_textures` as owned textures.
     lottie: LottieMaterializer,
     /// Image content hashes, revalidated by file identity on every lookup.
     content_hashes: ContentHashCache,
     /// Immutable content-addressed LUTs survive seek requests on this device.
     lut_cache: HashMap<String, Arc<GpuLutTexture>>,
+    /// Decoded still images survive seek requests on this device.
+    image_textures: ImageTextureStore,
 }
 
 /// Tauri managed state holding the (lazily created) GPU context. `None` until the
@@ -831,11 +903,29 @@ struct MediaResolver<'d> {
     cancel: &'d MediaCancelToken,
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
+    image_textures: &'d mut ImageTextureStore,
+    /// Store textures lent to this call, returned after it finishes.
+    lent_images: Vec<(ImageTextureKey, Rc<GpuTexture>)>,
     materialization_error: Option<String>,
     strict_materialization: bool,
 }
 
 impl MediaResolver<'_> {
+    /// Put a persistent image texture into this call's cache and remember to
+    /// return it to the store afterwards.
+    fn lend_image(
+        &mut self,
+        cache_key: String,
+        image_key: Option<ImageTextureKey>,
+        texture: GpuTexture,
+    ) -> Rc<GpuTexture> {
+        let texture = self.cache.insert(cache_key, texture);
+        if let Some(image_key) = image_key {
+            self.lent_images.push((image_key, texture.clone()));
+        }
+        texture
+    }
+
     fn fail_materialization<T>(&mut self, message: impl Into<String>) -> Option<T> {
         // A missing or corrupt source is never a valid preview frame. The
         // strict flag only controls retained-handle authority and the
@@ -1037,6 +1127,13 @@ impl TextureResolver for MediaResolver<'_> {
         if let Some(tex) = self.cache.get(&key) {
             return Some(tex);
         }
+        let image_key = is_image.then(|| (key.clone(), self.preview_box));
+        if let Some(texture) = image_key
+            .as_ref()
+            .and_then(|image_key| self.image_textures.take(image_key))
+        {
+            return Some(self.lend_image(key, image_key, texture));
+        }
 
         let time_secs = if is_image {
             0.0
@@ -1065,6 +1162,13 @@ impl TextureResolver for MediaResolver<'_> {
             false,
             Some("preview-src"),
         );
+        if image_key.is_some() {
+            #[cfg(test)]
+            {
+                self.image_textures.uploads += 1;
+            }
+            return Some(self.lend_image(key, image_key, tex));
+        }
         Some(self.cache.insert(key, tex))
     }
 
@@ -1217,25 +1321,15 @@ fn encode_png_bytes(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
 }
 
 /// Pack a preview frame into a binary IPC response. The preview and playback
-/// stages both paint onto an opaque canvas, so JPEG follows the same RGB path
-/// used by the live playback transport.
+/// stages both paint onto an opaque canvas, so the still is JPEG-encoded by the
+/// same RGBA encoder as the live playback transport.
 fn encode_still_frame(frame: &DecodedFrame) -> Result<Vec<u8>, String> {
-    let mut rgb = Vec::with_capacity(frame.rgba.len() / 4 * 3);
-    for pixel in frame.rgba.as_chunks::<4>().0 {
-        rgb.extend_from_slice(&pixel[..3]);
-    }
     let mut response = Vec::with_capacity(12);
     response.extend_from_slice(STILL_FRAME_MAGIC);
     response.extend_from_slice(&frame.width.to_le_bytes());
     response.extend_from_slice(&frame.height.to_le_bytes());
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut response, 75)
-        .encode(
-            &rgb,
-            frame.width,
-            frame.height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|error| format!("still jpeg encode: {error}"))?;
+    crate::jpeg::encode_rgba_jpeg(frame, &mut response)
+        .map_err(|error| format!("still {error}"))?;
     Ok(response)
 }
 
@@ -1361,6 +1455,7 @@ fn composite_empty_timeline_canvas(
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
             lut_cache: HashMap::new(),
+            image_textures: ImageTextureStore::default(),
             device: dev.device,
             queue: dev.queue,
         });
@@ -1655,6 +1750,7 @@ fn composite_timeline_frame_with_authority(
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
             lut_cache: HashMap::new(),
+            image_textures: ImageTextureStore::default(),
         });
     }
     let (result, device_failed) = {
@@ -1674,6 +1770,8 @@ fn composite_timeline_frame_with_authority(
             cancel,
             project_root: project_root.as_ref(),
             lut_cache: &mut ctx.lut_cache,
+            image_textures: &mut ctx.image_textures,
+            lent_images: Vec::new(),
             materialization_error: None,
             strict_materialization,
         };
@@ -1694,6 +1792,10 @@ fn composite_timeline_frame_with_authority(
             Some(error) => Err(format!("layer materialization failed: {error}")),
             None => composite.map_err(|error| format!("composite render failed: {error}")),
         };
+        let lent_images = std::mem::take(&mut resolver.lent_images);
+        drop(resolver);
+        drop(texture_cache);
+        ctx.image_textures.restore(lent_images);
         (result, device_failed)
     };
     if device_failed {
@@ -2471,6 +2573,106 @@ mod tests {
             &MediaCancelToken::new(),
         )
         .expect("the next frame still renders on the same device");
+        assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_still_frames_reuse_the_image_texture_until_the_file_changes() {
+        if RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("image fixture");
+        let path = tmp.path().join("still.png");
+        let write_png = |rgb: [u8; 3]| {
+            image::RgbImage::from_pixel(16, 16, image::Rgb(rgb))
+                .save(&path)
+                .expect("write png fixture");
+        };
+        write_png([200, 40, 40]);
+        let mut timeline = Timeline {
+            width: 32,
+            height: 32,
+            fps: 30,
+            ..Timeline::new()
+        };
+        let mut clip = Clip::new("still-clip", "still-image", 0, 30);
+        clip.media_type = ClipType::Image;
+        clip.source_clip_type = ClipType::Image;
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(clip);
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(MediaManifestEntry {
+            id: "still-image".into(),
+            name: "still.png".into(),
+            kind: ClipType::Image,
+            source: MediaSource::External {
+                absolute_path: path.display().to_string(),
+            },
+            duration: 0.0,
+            generation_input: None,
+            source_width: Some(16),
+            source_height: Some(16),
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+
+        let render = RenderState::new();
+        let composite = |frame| {
+            composite_timeline_frame(
+                &timeline,
+                &manifest,
+                &None,
+                &render,
+                frame,
+                32,
+                &MediaCancelToken::new(),
+            )
+            .expect("image still composites")
+        };
+        let uploads = || {
+            render
+                .ctx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .image_textures
+                .uploads
+        };
+        let first = composite(0);
+        let second = composite(12);
+        assert_eq!(uploads(), 1, "the second seek reuses the uploaded image");
+        assert_eq!(first.rgba, second.rgba);
+        assert_eq!(
+            render
+                .ctx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .image_textures
+                .entries
+                .len(),
+            1
+        );
+
+        // Rewriting the file changes its length/mtime/identity stamp, so the
+        // content hash is recomputed and the stale texture is not reused.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_png([40, 40, 200]);
+        let third = composite(0);
+        assert_eq!(uploads(), 2);
+        assert_ne!(first.rgba, third.rgba);
         assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
     }
 

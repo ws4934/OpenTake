@@ -37,7 +37,8 @@ use opentake_domain::{
 use opentake_render::{DecodedFrame, RenderSize};
 use opentake_tauri_lib::playback::project::source_preview_timeline;
 use opentake_tauri_lib::playback::{
-    audio::build_clock_paused, project_media, FrameSink, MediaInfo, PlaybackEngine, PlayheadEmitter,
+    audio::build_clock_paused, project_media, FrameSink, MediaInfo, PlaybackEngine,
+    PlaybackErrorSink, PlaybackFailure,
 };
 
 #[derive(Clone, Debug)]
@@ -60,12 +61,15 @@ impl Default for FrameQuality {
 /// Collects frames and quality facts across the complete playback run.
 struct ProbeSink {
     frames: AtomicI32,
+    last_frame: AtomicI32,
     last: Mutex<Option<DecodedFrame>>,
     quality: Mutex<FrameQuality>,
 }
 
 impl FrameSink for ProbeSink {
-    fn push_frame(&self, frame: &DecodedFrame) {
+    fn push_frame(&self, playhead: i32, frame: DecodedFrame) {
+        self.last_frame.store(playhead, Ordering::SeqCst);
+        let frame = &frame;
         let frame_index = self.frames.fetch_add(1, Ordering::SeqCst);
         let nonblack = nonblack_ratio(frame);
         let neon_green = neon_green_ratio(frame);
@@ -77,15 +81,18 @@ impl FrameSink for ProbeSink {
         }
         *self.last.lock().unwrap() = Some(frame.clone());
     }
+
+    fn push_terminal(&self, playhead: i32) {
+        self.last_frame.store(playhead, Ordering::SeqCst);
+    }
 }
 
-struct ProbeEmitter {
-    last_frame: AtomicI32,
-}
+/// Render failures fail the probe loudly instead of stalling silently.
+struct ProbeErrors;
 
-impl PlayheadEmitter for ProbeEmitter {
-    fn emit(&self, frame: i32) {
-        self.last_frame.store(frame, Ordering::SeqCst);
+impl PlaybackErrorSink for ProbeErrors {
+    fn report(&self, failure: PlaybackFailure) {
+        eprintln!("[probe] playback failure: {failure:?}");
     }
 }
 
@@ -120,11 +127,9 @@ fn run_engine_from(
     let audio_active = audio.is_some();
     let sink = Arc::new(ProbeSink {
         frames: AtomicI32::new(0),
+        last_frame: AtomicI32::new(-1),
         last: Mutex::new(None),
         quality: Mutex::new(FrameQuality::default()),
-    });
-    let emitter = Arc::new(ProbeEmitter {
-        last_frame: AtomicI32::new(-1),
     });
     let engine = PlaybackEngine::spawn_ready(
         timeline,
@@ -134,7 +139,7 @@ fn run_engine_from(
         RenderSize::new(640, 360),
         clock,
         sink.clone(),
-        emitter.clone(),
+        Arc::new(ProbeErrors),
         start_frame,
     )
     .expect("engine ready (GPU acquire + first frame)");
@@ -153,7 +158,7 @@ fn run_engine_from(
     }
     engine.stop();
     let n = sink.frames.load(Ordering::SeqCst);
-    let head = emitter.last_frame.load(Ordering::SeqCst);
+    let head = sink.last_frame.load(Ordering::SeqCst);
     let last = sink.last.lock().unwrap().clone();
     let quality = sink.quality.lock().unwrap().clone();
     (n, head, last, audio_active, quality)

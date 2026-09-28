@@ -111,6 +111,26 @@ describe("native playback identity", () => {
     await pausing;
   });
 
+  it("accepts playback errors only for the running session", async () => {
+    const { controller } = harness();
+    const identity = await controller.start(revision(2, 3), 0);
+    const failure = {
+      ...identity,
+      frame: 9,
+      code: "videoDecode" as const,
+      message: "clip-1 decode failed",
+      fatal: true,
+    };
+    expect(controller.acceptError(failure)).toBe(true);
+    expect(controller.acceptError({ ...failure, sessionId: "session-other" })).toBe(false);
+    expect(controller.acceptError({ ...failure, timelineVersion: 4 })).toBe(false);
+
+    await controller.pause(identity, 9);
+    expect(controller.acceptError(failure)).toBe(false);
+    await controller.stop(identity);
+    expect(controller.acceptError(failure)).toBe(false);
+  });
+
   it("does not let a late pause completion re-freeze a resumed session", async () => {
     let finishPause!: () => void;
     const api = {

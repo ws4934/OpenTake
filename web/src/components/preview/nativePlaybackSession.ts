@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import * as api from "../../lib/api";
 import type {
   PlaybackCommandError,
+  PlaybackErrorEvent,
   PlaybackFrameEvent,
   PlaybackIdentity,
   ProjectRevision,
@@ -106,6 +107,8 @@ export interface NativePlaybackController {
   stopCurrent(): Promise<void>;
   currentIdentity(): PlaybackIdentity | null;
   acceptFrame(event: PlaybackFrameEvent): void;
+  /** Whether a `playback_error` concerns the running (not paused) session. */
+  acceptError(event: PlaybackErrorEvent): boolean;
   shouldFallback(error: unknown): boolean;
 }
 
@@ -257,6 +260,9 @@ export function createNativePlaybackController(
       if (event.sequence <= lastSequence) return;
       lastSequence = event.sequence;
       publishNativePlaybackFrame(event);
+    },
+    acceptError(event) {
+      return !paused && samePlaybackIdentity(current, event);
     },
     shouldFallback(error) {
       return (
