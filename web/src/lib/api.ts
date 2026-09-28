@@ -151,6 +151,33 @@ async function ensureTauri(): Promise<void> {
 
 // MARK: - Commands
 
+/** What a native save-dialog result will be written as; the backend grants the
+ *  chosen path for this purpose only, once. */
+export type SavePurpose = "project" | "interchange" | "subtitles" | "video" | "extractAudio";
+
+export interface SaveDialogRequest {
+  title?: string;
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
+
+/** Show the native save dialog through the backend, which records the chosen
+ *  path as a single-use write grant for `purpose`. Returns the path exactly as
+ *  the dialog returned it, or null when cancelled or outside Tauri. */
+export async function pickSavePath(
+  purpose: SavePurpose,
+  request: SaveDialogRequest,
+): Promise<string | null> {
+  await ensureTauri();
+  if (!invokeImpl) return null;
+  return invokeImpl<string | null>("pick_save_path", {
+    purpose,
+    title: request.title ?? null,
+    defaultPath: request.defaultPath ?? null,
+    filters: request.filters ?? null,
+  });
+}
+
 const externalMcpBrowserStatus: ExternalMcpStatus = {
   revision: 0,
   enabled: false,

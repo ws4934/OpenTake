@@ -538,6 +538,7 @@ describe("openProjectPath", () => {
 
     await newProjectAndEnter();
 
+    expect(srv.saveDialog).toHaveBeenCalledWith("project");
     expect(srv.projectNew).toHaveBeenCalledWith("/home/qa/Videos/Vlog");
     expect(useProjectStore.getState().projectPath).toBe("/home/qa/Videos/Vlog.opentake");
     expect(useRecentStore.getState().recents[0]?.path).toBe("/home/qa/Videos/Vlog.opentake");
@@ -930,6 +931,7 @@ describe("saveCurrentProjectAs", () => {
 
     await saveCurrentProjectAs();
 
+    expect(srv.saveDialog).toHaveBeenCalledWith("project");
     expect(srv.projectSave).toHaveBeenCalledWith(
       "/home/qa/Videos/Copy",
       1,

@@ -237,6 +237,7 @@ describe("ExportDialog control acceptance", () => {
       }),
     );
     expect(mocks.save.mock.calls[0]?.[0]).not.toHaveProperty("filters");
+    expect(mocks.saveDialog).toHaveBeenCalledWith("video");
     expect(mocks.exportVideo).toHaveBeenCalledWith(
       { outPath: "/tmp/render", codec: "prores", quality: "1080p" },
       "video-operation-1",

@@ -2044,7 +2044,11 @@ impl TauriMediaBridge {
                 Err(opentake_media::MediaError::Cancelled) => {
                     return Err(BridgeError::new("source.path import was cancelled"));
                 }
-                Err(_) => ProbedMedia::default(),
+                Err(error) => crate::media::probe_result_for_import(
+                    importable_clip_type(&file_url),
+                    Err(error),
+                )
+                .map_err(|reason| BridgeError::new(format!("MCP_MEDIA_PROBE_FAILED: {reason}")))?,
             }
         };
         cancelled_checkpoint(cancel)?;
@@ -2240,7 +2244,11 @@ impl TauriMediaBridge {
                 Err(opentake_media::MediaError::Cancelled) => {
                     return Err(BridgeError::new("source.bytes import was cancelled"));
                 }
-                Err(_) => ProbedMedia::default(),
+                Err(error) => crate::media::probe_result_for_import(
+                    importable_clip_type(staged.path()),
+                    Err(error),
+                )
+                .map_err(|reason| BridgeError::new(format!("MCP_MEDIA_PROBE_FAILED: {reason}")))?,
             }
         };
         cancelled_checkpoint(cancel)?;
@@ -4076,11 +4084,52 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_video_path_import_is_refused_without_manifest_change() {
+        let tmp = tempfile::tempdir().expect("create temp root");
+        let bundle = tmp.path().join("UnreadablePath.opentake");
+        let source = tmp.path().join("broken.mp4");
+        std::fs::write(&source, b"not a movie").expect("write path fixture");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone()))
+            .expect("save path-import fixture");
+        let bridge = TauriMediaBridge::new(
+            core.clone(),
+            tmp.path().join("cache"),
+            tmp.path().join("models"),
+        );
+        let before_disk = std::fs::read(bundle.join("media.json")).expect("read media manifest");
+        let cancel = opentake_media::MediaCancelToken::new();
+
+        let error = bridge
+            .import_from_path_cancellable_with_hook(
+                &source.to_string_lossy(),
+                None,
+                None,
+                &cancel,
+                || {},
+            )
+            .expect_err("an unreadable video must not become a 0-second asset");
+
+        assert!(
+            error.message.contains("MCP_MEDIA_PROBE_FAILED"),
+            "{}",
+            error.message
+        );
+        assert!(core.media().entries.is_empty());
+        assert_eq!(
+            std::fs::read(bundle.join("media.json")).expect("reread media manifest"),
+            before_disk
+        );
+    }
+
+    #[test]
     fn cancelled_path_import_before_commit_changes_neither_manifest() {
         let tmp = tempfile::tempdir().expect("create temp root");
         let bundle = tmp.path().join("CancelledPath.opentake");
-        let source = tmp.path().join("incoming.mp4");
-        std::fs::write(&source, b"video fixture").expect("write path fixture");
+        // An image fixture: arbitrary bytes still pass the probe step (unlike
+        // unreadable video, #63), so the cancellation hook before commit runs.
+        let source = tmp.path().join("incoming.png");
+        std::fs::write(&source, b"image fixture").expect("write path fixture");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone()))
             .expect("save path-import fixture");

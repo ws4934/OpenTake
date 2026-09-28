@@ -16,7 +16,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../i18n", () => ({
-  useT: () => (key: string) => key,
+  useT: () => (key: string, params?: { error?: string }) =>
+    params?.error ? `${key}: ${params.error}` : key,
 }));
 
 vi.mock("../../lib/api", () => ({
@@ -283,6 +284,7 @@ describe("TitleBar interchange export", () => {
     }));
     expect(mocks.save.mock.calls[0]?.[0]).not.toHaveProperty("filters");
     expect(run).toHaveBeenCalledTimes(1);
+    expect(mocks.saveDialog).toHaveBeenCalledWith("interchange");
     expect(run).toHaveBeenCalledWith("/tmp/interchange");
     expect(useEditorUiStore.getState().toast?.message).toBe("title.exportInterchangeDone");
   });
@@ -300,7 +302,9 @@ describe("TitleBar interchange export", () => {
       xmeml?.click();
       await Promise.resolve();
     });
-    expect(useEditorUiStore.getState().toast?.message).toBe("title.exportInterchangeFailed");
+    expect(useEditorUiStore.getState().toast?.message).toBe(
+      "title.exportInterchangeFailed: write failed",
+    );
   });
 
   it("control-0d98e5e5a0c417ed export XMEML/FCPXML/OTIO/EDL preserves cancel and default-directory behavior", async () => {
@@ -376,6 +380,7 @@ describe("TitleBar subtitle export", () => {
       }),
     );
     expect(mocks.exportSubtitles).toHaveBeenCalledTimes(1);
+    expect(mocks.saveDialog).toHaveBeenCalledWith("subtitles");
     expect(mocks.exportSubtitles).toHaveBeenCalledWith("/tmp/captions", format);
     expect(useEditorUiStore.getState().toast?.message).toBe("title.exportSubtitlesDone");
   });
@@ -407,7 +412,9 @@ describe("TitleBar subtitle export", () => {
       vtt?.click();
       await Promise.resolve();
     });
-    expect(useEditorUiStore.getState().toast?.message).toBe("title.exportSubtitlesFailed");
+    expect(useEditorUiStore.getState().toast?.message).toBe(
+      "title.exportSubtitlesFailed: write failed",
+    );
   });
 
   it("control-f54f4037ab7bffbe export SRT or VTT subtitles preserves cancel and default-directory behavior", async () => {

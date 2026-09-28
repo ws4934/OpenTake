@@ -267,6 +267,7 @@ pub fn run() {
             app.manage(core);
             app.manage(motion_document_store);
             app.manage(commands::ProjectLifecycleCoordinator::default());
+            app.manage(dialog_output::SaveGrants::default());
             app.manage(generation_bridge);
             let motion_state =
                 motion::MotionCommandState::new(motion_bridge, install_admission.clone());
@@ -380,6 +381,7 @@ pub fn run() {
             commands::project_open,
             commands::project_save,
             commands::get_default_project_dir,
+            dialog_output::pick_save_path,
             commands::export_xmeml,
             commands::export_fcpxml,
             commands::export_fcpxml_modern,

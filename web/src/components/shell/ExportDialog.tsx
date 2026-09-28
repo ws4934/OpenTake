@@ -258,7 +258,7 @@ export function ExportDialog() {
     if (busy) return;
     setError(null);
 
-    const save = await saveDialog();
+    const save = await saveDialog("video");
     if (!save) {
       // No native save panel (outside Tauri) — the export can't run here.
       pushToast(t("export.unavailable"));
@@ -358,7 +358,7 @@ export function ExportDialog() {
     setError(null);
     setBundleMissing(null);
 
-    const save = await saveDialog();
+    const save = await saveDialog("project");
     if (!save) {
       // No native save panel (outside Tauri) — the export can't run here.
       pushToast(t("export.bundle.unavailable"));

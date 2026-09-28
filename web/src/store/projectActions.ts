@@ -75,7 +75,7 @@ async function unusedDefaultProjectPath(defaultDir: string): Promise<string | un
  */
 export async function newProjectAndEnter(): Promise<void> {
   try {
-    const save = await saveDialog();
+    const save = await saveDialog("project");
     if (!save) {
       await flushMotionStudioBeforeProjectBoundary();
       await saveCurrentProjectBeforeBoundary();
@@ -288,7 +288,7 @@ async function runSaveCurrentProjectAs(): Promise<void> {
     );
   };
   try {
-    const save = await saveDialog();
+    const save = await saveDialog("project");
     if (!save || !requestIsExactCurrent()) return;
     const selected = await save({
       title: t("menu.saveAs"),

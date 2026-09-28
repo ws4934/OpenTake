@@ -648,11 +648,15 @@ fn run_ffprobe(
     if cancel.checkpoint() {
         return Err(crate::error::MediaError::Cancelled);
     }
+    let queued_at = Instant::now();
     let _admission = if admission_wait.is_zero() {
         ProbeAdmission::acquire()?
     } else {
         ProbeAdmission::acquire_waiting(cancel, admission_wait)?
     };
+    // Time spent queueing counts against `timeout`, so a queued probe never
+    // takes longer than its caller's bound.
+    let timeout = timeout.saturating_sub(queued_at.elapsed());
     let (operation_deadline, api_deadline) = probe_deadlines(timeout)?;
     let input = match (input_path, input_file) {
         (Some(path), None) => ProbeInput::Path(path.to_path_buf()),
@@ -896,19 +900,42 @@ pub(crate) fn ffprobe_json_queued(
 /// ffprobe's `fd:` protocol keeps normal file seek semantics (unlike `pipe:`),
 /// which is required by containers whose metadata lives near the end.
 pub fn ffprobe_json_file(file: &std::fs::File) -> crate::error::Result<serde_json::Value> {
-    ffprobe_json_file_cancellable(file, &crate::MediaCancelToken::new(), FFPROBE_TIMEOUT)
+    // Uncancellable callers must not block on the queue: a saturated limit
+    // fails at once with `MediaError::Busy`.
+    ffprobe_json_file_with_wait(
+        file,
+        &crate::MediaCancelToken::new(),
+        FFPROBE_TIMEOUT,
+        Duration::ZERO,
+    )
 }
 
 /// Cancellable probe of an open file, used by imports and proxy builds that
 /// run off the UI thread: a saturated admission limit is waited out
-/// (cancellably, for at most `timeout`) instead of failing at once (#63).
+/// (cancellably, for up to half of `timeout`) instead of failing at once (#63).
 pub fn ffprobe_json_file_cancellable(
     file: &std::fs::File,
     cancel: &crate::MediaCancelToken,
     timeout: Duration,
 ) -> crate::error::Result<serde_json::Value> {
+    ffprobe_json_file_with_wait(file, cancel, timeout, timeout / 2)
+}
+
+fn ffprobe_json_file_with_wait(
+    file: &std::fs::File,
+    cancel: &crate::MediaCancelToken,
+    timeout: Duration,
+    admission_wait: Duration,
+) -> crate::error::Result<serde_json::Value> {
     let executable = ffprobe_path();
-    let out = run_ffprobe(&executable, None, Some(file), cancel, timeout, timeout)?;
+    let out = run_ffprobe(
+        &executable,
+        None,
+        Some(file),
+        cancel,
+        timeout,
+        admission_wait,
+    )?;
     if !out.status.success() {
         return Err(crate::error::MediaError::Ffmpeg(format!(
             "ffprobe fd input exited {}",

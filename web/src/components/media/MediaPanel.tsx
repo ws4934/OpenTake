@@ -2573,7 +2573,7 @@ export function MediaCard({
   const onExtractAudio = async (e: React.MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
-    const save = await saveDialog();
+    const save = await saveDialog("extractAudio");
     if (!save) return; // non-Tauri / dialog unavailable
     const chosen = await save({
       title: t("media.extractAudio"),

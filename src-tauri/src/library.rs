@@ -485,8 +485,9 @@ fn library_import_to_project_with_hook(
     }
 
     hook(ImportHookPhase::BeforeProbe, &staged.path);
-    let probe = probe_or_default_file(media.engine(), staged.handle.as_file());
+    let probe = probe_import_file(media.engine(), staged.handle.as_file(), &staged.path);
     hook(ImportHookPhase::AfterProbe, &staged.path);
+    let probe = probe?;
     if !staged.owns_name() || !project_media.matches_namespace()? {
         return Err("project import staging identity changed during probe".to_string());
     }
@@ -1076,24 +1077,23 @@ fn delete_project_import_by_handle(guard: &ProjectImportGuard) -> std::io::Resul
     }
 }
 
-/// Probe a stored library file, degrading to defaults on any probe failure (no
-/// ffprobe / unreadable) so importing never fails on metadata alone — mirrors the
-/// best-effort import path in [`crate::media`].
-fn probe_or_default_file(
+/// Probe a stored library file for import. Video and audio whose media
+/// information cannot be read are refused rather than imported as 0-second
+/// assets without audio (#63); images import without dimensions.
+fn probe_import_file(
     engine: &opentake_media::MediaEngine,
     file: &std::fs::File,
-) -> ProbedMedia {
-    match engine.probe_file(file) {
-        Ok(p) => ProbedMedia {
-            duration_secs: p.duration_secs,
-            width: p.width.map(|w| w as i32),
-            height: p.height.map(|h| h as i32),
-            fps: p.fps,
-            has_audio: p.has_audio,
-            color: p.color,
-        },
-        Err(_) => ProbedMedia::default(),
-    }
+    path: &std::path::Path,
+) -> Result<ProbedMedia, String> {
+    let probed = engine.probe_file(file).map(|p| ProbedMedia {
+        duration_secs: p.duration_secs,
+        width: p.width.map(|w| w as i32),
+        height: p.height.map(|h| h as i32),
+        fps: p.fps,
+        has_audio: p.has_audio,
+        color: p.color,
+    });
+    crate::media::probe_result_for_import(opentake_core::importable_clip_type(path), probed)
 }
 
 /// Display name for an imported file: its stem, or the full file name when there
@@ -1155,6 +1155,46 @@ mod tests {
                 thumb: None,
             })
             .unwrap()
+    }
+
+    /// Fixtures with arbitrary bytes are images: an image whose probe fails
+    /// still imports, while unreadable video and audio are refused (#63).
+    fn favorite_image(library: &LibraryState, source: &Path) -> LibraryEntry {
+        library
+            .store()
+            .unwrap()
+            .favorite(&FavoriteRequest {
+                source,
+                kind: "image",
+                category: None,
+                favorited_at: 1.0,
+                thumb: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn unreadable_library_video_is_refused_without_a_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"not a movie").unwrap();
+        let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
+        let entry = favorite_video(&library, &source);
+        let bundle = tmp.path().join("Unreadable.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+        let before_disk = std::fs::read(bundle.join("media.json")).unwrap();
+
+        let error =
+            library_import_to_project_impl(&core, &engine_for(tmp.path()), &library, &entry.id)
+                .expect_err("an unreadable video must not become a 0-second asset");
+
+        assert!(error.contains("cannot read media information"), "{error}");
+        assert!(core.media().entries.is_empty());
+        assert_eq!(
+            std::fs::read(bundle.join("media.json")).unwrap(),
+            before_disk
+        );
     }
 
     #[cfg(unix)]
@@ -1233,7 +1273,7 @@ mod tests {
     #[test]
     fn library_import_marks_and_persists_the_new_project_asset() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
         let entry = library
@@ -1241,7 +1281,7 @@ mod tests {
             .unwrap()
             .favorite(&FavoriteRequest {
                 source: &source,
-                kind: "video",
+                kind: "image",
                 category: None,
                 favorited_at: 1.0,
                 thumb: None,
@@ -1294,10 +1334,10 @@ mod tests {
         let _reset = AllowHardLinks;
 
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let bundle = tmp.path().join("NoHardLinks.opentake");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone())).unwrap();
@@ -1333,12 +1373,12 @@ mod tests {
     #[test]
     fn deferred_import_events_allow_core_and_library_reentry() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"library bytes").unwrap();
         let library = Arc::new(LibraryState::new(LibraryStore::new(
             tmp.path().join("library"),
         )));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let core = Arc::new(AppCore::new());
         core.save_project(Some(tmp.path().join("Reentrant.opentake")))
             .unwrap();
@@ -1432,10 +1472,10 @@ mod tests {
     #[test]
     fn postcommit_stored_cleanup_failure_still_persists_project_mapping_removal() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let bundle = tmp.path().join("CleanupFailure.opentake");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone())).unwrap();
@@ -1513,10 +1553,10 @@ mod tests {
     #[test]
     fn capability_manifest_publish_ignores_a_temporary_ambient_project_rebind() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let projects = tmp.path().join("projects");
         let retained_projects = tmp.path().join("projects-retained");
         let replacement_projects = tmp.path().join("projects-replacement");
@@ -1568,7 +1608,7 @@ mod tests {
     #[test]
     fn import_leaf_replacement_rolls_back_while_identity_lease_blocks_replacement() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
         let entry = library
@@ -1576,7 +1616,7 @@ mod tests {
             .unwrap()
             .favorite(&FavoriteRequest {
                 source: &source,
-                kind: "video",
+                kind: "image",
                 category: None,
                 favorited_at: 1.0,
                 thumb: None,
@@ -1647,12 +1687,12 @@ mod tests {
     #[test]
     fn postcondition_rollback_does_not_erase_an_intervening_unrelated_import() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
-        let unrelated = tmp.path().join("unrelated.mp4");
+        let source = tmp.path().join("clip.png");
+        let unrelated = tmp.path().join("unrelated.png");
         std::fs::write(&source, b"trusted library bytes").unwrap();
         std::fs::write(&unrelated, b"unrelated media bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let bundle = tmp.path().join("ConcurrentRollback.opentake");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone())).unwrap();
@@ -1718,10 +1758,10 @@ mod tests {
     #[test]
     fn failed_postcommit_rollback_reports_the_durable_import_as_committed() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let projects = tmp.path().join("projects");
         let retained_projects = tmp.path().join("projects-retained");
         let replacement_projects = tmp.path().join("projects-replacement");
@@ -1889,7 +1929,7 @@ mod tests {
     #[test]
     fn failed_library_import_restores_manifest_and_retry_does_not_duplicate() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
         let entry = library
@@ -1897,7 +1937,7 @@ mod tests {
             .unwrap()
             .favorite(&FavoriteRequest {
                 source: &source,
-                kind: "video",
+                kind: "image",
                 category: None,
                 favorited_at: 1.0,
                 thumb: None,
@@ -1946,10 +1986,10 @@ mod tests {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source.mp4");
+        let source = tmp.path().join("source.png");
         std::fs::write(&source, b"source bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let core = AppCore::new();
         core.save_project(Some(tmp.path().join("Original.opentake")))
             .unwrap();
@@ -2009,7 +2049,7 @@ mod tests {
     #[test]
     fn library_import_type_comes_from_manifest_metadata_not_stored_leaf_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"video bytes with renamed leaf").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
         let entry = library
@@ -2017,7 +2057,7 @@ mod tests {
             .unwrap()
             .favorite(&FavoriteRequest {
                 source: &source,
-                kind: "video",
+                kind: "image",
                 category: None,
                 favorited_at: 1.0,
                 thumb: None,
@@ -2045,10 +2085,10 @@ mod tests {
             .find(|item| item.id == imported.id)
             .unwrap();
 
-        assert_eq!(manifest_entry.kind, opentake_domain::ClipType::Video);
+        assert_eq!(manifest_entry.kind, opentake_domain::ClipType::Image);
         match manifest_entry.source {
             opentake_domain::MediaSource::Project { relative_path } => {
-                assert!(relative_path.ends_with(".mp4"), "{relative_path}");
+                assert!(relative_path.ends_with(".png"), "{relative_path}");
             }
             other => panic!("expected project source, got {other:?}"),
         }
@@ -2061,10 +2101,10 @@ mod tests {
     #[test]
     fn idempotent_import_rejects_a_wrong_typed_existing_mapping() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted video bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let bundle = tmp.path().join("WrongKind.opentake");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone())).unwrap();
@@ -2094,10 +2134,10 @@ mod tests {
     #[test]
     fn idempotent_import_rejects_a_wrong_extension_existing_mapping() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"trusted video bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
-        let entry = favorite_video(&library, &source);
+        let entry = favorite_image(&library, &source);
         let bundle = tmp.path().join("WrongExtension.opentake");
         let core = AppCore::new();
         core.save_project(Some(bundle.clone())).unwrap();
@@ -2135,7 +2175,7 @@ mod tests {
     #[test]
     fn library_import_does_not_rewrite_an_unrelated_generation_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("clip.mp4");
+        let source = tmp.path().join("clip.png");
         std::fs::write(&source, b"library bytes").unwrap();
         let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
         let entry = library
@@ -2143,7 +2183,7 @@ mod tests {
             .unwrap()
             .favorite(&FavoriteRequest {
                 source: &source,
-                kind: "video",
+                kind: "image",
                 category: None,
                 favorited_at: 1.0,
                 thumb: None,

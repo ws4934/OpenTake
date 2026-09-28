@@ -40,6 +40,11 @@ function projectStem(projectPath: string | null): string {
   return base.replace(/\.opentake$/i, "") || "Timeline";
 }
 
+/** The backend's message for a failed export (a string over IPC). */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * The four standard timeline-interchange formats. `key` drives the i18n labels
  * (`title.export<Cap>` / `…Dialog` / `…Filter`), `ext` is the file extension,
@@ -93,7 +98,7 @@ export function TitleBar() {
    */
   async function onExportInterchange(format: InterchangeFormat): Promise<void> {
     setExportMenuOpen(false);
-    const save = await saveDialog();
+    const save = await saveDialog("interchange");
     if (!save) return; // outside Tauri — no save panel / file system
     const dir = projectPath
       ? projectPath.replace(/[\\/][^\\/]*$/, "")
@@ -115,8 +120,8 @@ export function TitleBar() {
     try {
       await format.run(chosen);
       pushToast(t("title.exportInterchangeDone"));
-    } catch {
-      pushToast(t("title.exportInterchangeFailed"));
+    } catch (error) {
+      pushToast(t("title.exportInterchangeFailed", { error: errorText(error) }));
     }
   }
 
@@ -128,7 +133,7 @@ export function TitleBar() {
    */
   async function onExportSubtitles(format: SubtitleFormat): Promise<void> {
     setSubMenuOpen(false);
-    const save = await saveDialog();
+    const save = await saveDialog("subtitles");
     if (!save) return; // outside Tauri — no save panel / file system
     const dir = projectPath
       ? projectPath.replace(/[\\/][^\\/]*$/, "")
@@ -158,8 +163,8 @@ export function TitleBar() {
           ? t("title.exportSubtitlesDone", { count: summary.cueCount })
           : t("title.exportSubtitlesEmpty"),
       );
-    } catch {
-      pushToast(t("title.exportSubtitlesFailed"));
+    } catch (error) {
+      pushToast(t("title.exportSubtitlesFailed", { error: errorText(error) }));
     }
   }
 

@@ -1713,15 +1713,20 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
 /// `req.out_path` must be the exact path a native save dialog returned (#95);
 /// the codec's container extension is appended when the user typed none.
 fn authorize_export_output(
-    scope: &tauri::scope::fs::Scope,
+    grants: &crate::dialog_output::SaveGrants,
     req: &ExportRequest,
 ) -> Result<String, String> {
     let extension = match req.codec {
         ExportCodec::H264 | ExportCodec::H265 => "mp4",
         ExportCodec::Prores | ExportCodec::Prores4444 => "mov",
     };
-    crate::dialog_output::authorize_dialog_output(scope, &req.out_path, &[extension])
-        .map(|path| path.to_string_lossy().into_owned())
+    crate::dialog_output::authorize_dialog_output(
+        grants,
+        &req.out_path,
+        crate::dialog_output::SavePurpose::Video,
+        &[extension],
+    )
+    .map(|output| output.path.to_string_lossy().into_owned())
 }
 
 /// `export_video`: render the whole timeline to a video file on disk.
@@ -1748,7 +1753,10 @@ pub async fn export_video(
     mut req: ExportRequest,
     operation_id: String,
 ) -> Result<ExportSummary, String> {
-    req.out_path = authorize_export_output(&tauri::Manager::asset_protocol_scope(&app), &req)?;
+    req.out_path = authorize_export_output(
+        &tauri::Manager::state::<crate::dialog_output::SaveGrants>(&app),
+        &req,
+    )?;
     let guard = control.try_begin(&operation_id)?;
     let owned_control = control.inner().clone();
     // Snapshot the session up front; no session lock is held during GPU/encode.
@@ -4294,10 +4302,9 @@ mod tests {
 
     #[test]
     fn export_output_requires_a_dialog_grant_and_codec_extension() {
-        use tauri::Manager as _;
+        use crate::dialog_output::{SaveGrants, SavePurpose};
         let dir = tempfile::tempdir().expect("tempdir");
-        let app = tauri::test::mock_app();
-        let scope = app.handle().asset_protocol_scope();
+        let scope = SaveGrants::default();
         let existing = dir.path().join("film.mp4");
         std::fs::write(&existing, b"keep").expect("seed movie");
         let request = |out: &Path, codec| ExportRequest {
@@ -4312,12 +4319,19 @@ mod tests {
         );
         assert_eq!(std::fs::read(&existing).expect("read"), b"keep");
 
+        // An imported original holds only read grants; a save grant for
+        // another purpose does not authorize replacing it either.
+        scope.issue(&existing, SavePurpose::ExtractAudio);
+        assert!(authorize_export_output(&scope, &request(&existing, ExportCodec::H264)).is_err());
+        assert_eq!(std::fs::read(&existing).expect("read"), b"keep");
+
         let raw = dir.path().join("master");
-        scope.allow_file(&raw).expect("dialog grant");
+        scope.issue(&raw, SavePurpose::Video);
         assert_eq!(
             authorize_export_output(&scope, &request(&raw, ExportCodec::Prores)),
             Ok(dir.path().join("master.mov").to_string_lossy().into_owned())
         );
+        scope.issue(&raw, SavePurpose::Video);
         assert_eq!(
             authorize_export_output(&scope, &request(&raw, ExportCodec::H265)),
             Ok(dir.path().join("master.mp4").to_string_lossy().into_owned())
