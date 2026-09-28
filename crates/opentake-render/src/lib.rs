@@ -19,9 +19,10 @@ pub use plan::{
     RenderPlan, RenderSize, TextureSource,
 };
 pub use size::{even, export_render_size, ExportResolution};
-pub use source::{DecodedFrame, FrameProvider, SourceMetrics};
+pub use source::{unpremultiply_rgba, DecodedFrame, FrameProvider, SourceMetrics};
 
 pub use gpu::{
-    Compositor, CosmicTextRasterizer, GpuLutTexture, GpuTexture, NullTextRasterizer, RenderDevice,
-    RenderError, TextRasterRequest, TextRasterizer, TextureCache, TextureResolver,
+    is_blank_text, rasterize_text_layer, text_clip_raster_input, text_draws_glyphs, Compositor,
+    CosmicTextRasterizer, GpuLutTexture, GpuTexture, NullTextRasterizer, RenderDevice, RenderError,
+    TextLayerError, TextRasterRequest, TextRasterizer, TextureCache, TextureResolver,
 };

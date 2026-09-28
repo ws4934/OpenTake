@@ -741,6 +741,81 @@ fn export_with_text_clip_respects_font_availability() {
     }
 }
 
+/// Every decoded frame of `path` as packed RGB24, in presentation order.
+fn decoded_rgb_frames(path: &Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        .output()
+        .expect("decode exported frames");
+    assert!(output.status.success(), "decode {}", path.display());
+    output.stdout
+}
+
+/// A text clip with empty content, or whitespace-only content and no
+/// background or border, draws nothing: the export succeeds and every frame
+/// matches the same timeline exported without the clip (#180). Neither needs
+/// fonts, so this runs on fontless hosts.
+#[test]
+fn export_with_blank_text_clip_matches_export_without_it() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src_blank_text.mp4");
+    let (sw, sh, sfps, frames) = (320, 240, 10, 6);
+    if !make_video(&src, sw, sh, sfps, frames) {
+        eprintln!("skip: could not generate fixture media");
+        return;
+    }
+    let base = build_timeline(frames as i32, sw as i32, sh as i32, sfps as f64);
+    let manifest = build_manifest(&src, sw as i32, sh as i32, sfps as f64);
+    let export = |timeline: &Timeline, name: &str| {
+        let out = dir.path().join(name);
+        let req = ExportRequest {
+            out_path: out.to_string_lossy().into_owned(),
+            codec: Default::default(), // H.264
+            quality: ExportQuality::P720,
+        };
+        match run_export(timeline, &manifest, &None, &req) {
+            Ok(summary) => {
+                assert_eq!(summary.frame_count, frames as i32);
+                assert_summary_matches_real_probe(&summary, &out);
+                Some(out)
+            }
+            Err(error) if error.contains("no GPU device") => None,
+            Err(error) => panic!("export {name} failed: {error}"),
+        }
+    };
+    let Some(reference) = export(&base, "without_text.mp4") else {
+        eprintln!("skip: no GPU adapter available");
+        return;
+    };
+    let reference_frames = decoded_rgb_frames(&reference);
+
+    for (label, content) in [("empty", ""), ("whitespace", "  \n\t ")] {
+        let mut timeline = base.clone();
+        let mut text_track = Track::new("t-text", ClipType::Video);
+        let mut text = Clip::new("clip-blank-text", "", 0, frames as i32);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = Some(content.to_string());
+        text.text_style = Some(TextStyle::default());
+        text_track.clips.push(text);
+        timeline.tracks.push(text_track);
+
+        let out = export(&timeline, &format!("{label}_text.mp4"))
+            .expect("the GPU was available for the reference export");
+        assert!(
+            decoded_rgb_frames(&out) == reference_frames,
+            "{label} text clip must not change any exported pixel"
+        );
+    }
+}
+
 /// Transparent delivery must preserve the alpha plane through the full GPU →
 /// raw-RGBA → ProRes 4444 path. The text glyph gives the frame a non-zero alpha
 /// island while the transparent clear color leaves the surrounding canvas at 0.
@@ -795,4 +870,190 @@ fn export_prores_4444_preserves_transparent_text_alpha() {
     let (minimum, maximum) = decoded_alpha_range(&out).expect("decode alpha plane");
     assert_eq!(minimum, 0, "transparent canvas should retain zero alpha");
     assert!(maximum > 0, "text glyph should contribute non-zero alpha");
+}
+
+/// First decoded frame of `path` as straight RGBA8 (FFmpeg's `rgba`).
+fn decoded_rgba_first_frame(path: &Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        .output()
+        .expect("decode the first exported frame");
+    assert!(output.status.success(), "decode {}", path.display());
+    output.stdout
+}
+
+/// ProRes 4444 carries straight alpha: a 50%-opaque pure white layer must
+/// decode as white with alpha near 128 instead of the compositor's
+/// premultiplied gray, while the uncovered canvas stays fully transparent
+/// (#21).
+#[test]
+fn export_prores_4444_delivers_straight_alpha_for_translucent_white() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let white = dir.path().join("white.png");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:s=64x64",
+            "-frames:v",
+            "1",
+            "-y",
+        ])
+        .arg(&white)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !generated {
+        eprintln!("skip: could not generate the white image fixture");
+        return;
+    }
+
+    let frames = 3;
+    let mut timeline = Timeline::new();
+    timeline.fps = 10;
+    timeline.width = 320;
+    timeline.height = 240;
+    let mut track = Track::new("t-white", ClipType::Video);
+    let mut layer = Clip::new("clip-white", "white-image", 0, frames);
+    layer.media_type = ClipType::Image;
+    layer.source_clip_type = ClipType::Image;
+    layer.opacity = 0.5;
+    layer.transform.width = 0.5;
+    layer.transform.height = 0.5;
+    track.clips.push(layer);
+    timeline.tracks.push(track);
+    let mut manifest = build_manifest(&white, 64, 64, 10.0);
+    manifest.entries[0].id = "white-image".into();
+    manifest.entries[0].name = "white.png".into();
+    manifest.entries[0].kind = ClipType::Image;
+    manifest.entries[0].source_fps = None;
+
+    let out = dir.path().join("translucent-white.mov");
+    let req = ExportRequest {
+        out_path: out.to_string_lossy().into_owned(),
+        codec: opentake_tauri_lib::export::ExportCodec::Prores4444,
+        quality: ExportQuality::P720,
+    };
+    match run_export(&timeline, &manifest, &None, &req) {
+        Ok(summary) => assert_eq!(summary.frame_count, frames),
+        Err(error) if error.contains("no GPU device") => {
+            eprintln!("skip: {error}");
+            return;
+        }
+        Err(error) => panic!("translucent ProRes 4444 export failed: {error}"),
+    }
+
+    let (minimum, maximum) = decoded_alpha_range(&out).expect("decode alpha plane");
+    assert_eq!(minimum, 0, "the uncovered canvas stays transparent");
+    assert!(maximum > 0, "the white layer contributes alpha");
+    let rgba = decoded_rgba_first_frame(&out);
+    let translucent = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| (126..=130).contains(&pixel[3]))
+        .collect::<Vec<_>>();
+    assert!(
+        !translucent.is_empty(),
+        "the 50% white layer must decode with alpha near 128"
+    );
+    let darkest = translucent
+        .iter()
+        .map(|pixel| pixel[0].min(pixel[1]).min(pixel[2]))
+        .min()
+        .unwrap();
+    assert!(
+        darkest >= 250,
+        "straight-alpha white must stay white (darkest channel {darkest})"
+    );
+}
+
+/// A whole export starts helper processes per clip, never per frame or per
+/// audio window (#3). Each export has a fixed set: the preflight probe, color
+/// probe and first-frame decode of each source, one audibility probe per
+/// source, the encoder, the output probe, and the audio mux when the export
+/// has sound. On top of that each clip adds one video decoder, plus one PCM
+/// decoder when it is audible.
+#[test]
+fn export_starts_helper_processes_per_clip_not_per_frame() {
+    use opentake_media::ffmpeg_status::HelperProcessCount;
+
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let frames = 300_u32;
+    let silent = dir.path().join("silent.mp4");
+    let voiced = dir.path().join("voiced.mp4");
+    if !make_video(&silent, 64, 64, 30, frames)
+        || !make_video_with_audio(&voiced, 64, 64, 30, frames)
+    {
+        eprintln!("skip: could not generate fixture media");
+        return;
+    }
+    let count_export = |timeline: &Timeline, manifest: &MediaManifest, name: &str| {
+        let out = dir.path().join(name);
+        let req = ExportRequest {
+            out_path: out.to_string_lossy().into_owned(),
+            codec: Default::default(),
+            quality: ExportQuality::P720,
+        };
+        let processes = HelperProcessCount::start();
+        match run_export(timeline, manifest, &None, &req) {
+            Ok(summary) => {
+                let spawned = processes.count();
+                assert_eq!(summary.frame_count, frames as i32);
+                eprintln!("{name}: {spawned} helper processes");
+                Some(spawned)
+            }
+            Err(error) if error.contains("no GPU device") => None,
+            Err(error) => panic!("export {name} failed: {error}"),
+        }
+    };
+    let mut timeline = build_timeline(frames as i32, 64, 64, 30.0);
+    timeline.width = 64;
+    timeline.height = 64;
+
+    let silent_manifest = build_manifest(&silent, 64, 64, 30.0);
+    let Some(single) = count_export(&timeline, &silent_manifest, "single.mp4") else {
+        eprintln!("skip: no GPU adapter available");
+        return;
+    };
+    // Lower bounds too, so a count that silently stops counting fails: at
+    // least the preflight probe, one decoder, the encoder and the output probe.
+    assert!(
+        (4..=1 + 6).contains(&single),
+        "one silent clip started {single} helpers"
+    );
+
+    let mut dual = timeline.clone();
+    let mut overlay = Track::new("t2", ClipType::Video);
+    overlay
+        .clips
+        .push(Clip::new("clip-2", "asset-1", 0, frames as i32));
+    dual.tracks.push(overlay);
+    let two = count_export(&dual, &silent_manifest, "dual.mp4").unwrap();
+    assert!(
+        (single..=2 + 6).contains(&two),
+        "two silent video tracks started {two} helpers"
+    );
+
+    let voiced_manifest = build_manifest_with_audio(&voiced, 64, 64, 30.0, true);
+    let audible = count_export(&timeline, &voiced_manifest, "voiced.mp4").unwrap();
+    // The audible clip adds its one PCM decoder and the audio mux.
+    assert!(
+        (single + 2..=2 + 7).contains(&audible),
+        "one audible clip over five audio windows started {audible} helpers"
+    );
 }

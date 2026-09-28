@@ -31,6 +31,37 @@ impl DecodedFrame {
             premultiplied,
         }
     }
+
+    /// The same pixels with straight (non-premultiplied) alpha, for consumers
+    /// such as FFmpeg's `rgba` input that read color independently of alpha.
+    /// The compositor blends and reads back premultiplied color; convert only
+    /// at that boundary. A straight frame is returned unchanged.
+    pub fn into_straight_alpha(mut self) -> Self {
+        if self.premultiplied {
+            unpremultiply_rgba(&mut self.rgba);
+            self.premultiplied = false;
+        }
+        self
+    }
+}
+
+/// Undo premultiplication in place: `c = min(255, round(c * 255 / a))`, and a
+/// fully transparent pixel becomes transparent black. Opaque pixels keep their
+/// bytes, and color that rounding pushed above its alpha saturates at 255.
+pub fn unpremultiply_rgba(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        match px[3] {
+            0 => px[..3].fill(0),
+            u8::MAX => {}
+            alpha => {
+                let alpha = u32::from(alpha);
+                for channel in &mut px[..3] {
+                    let straight = (u32::from(*channel) * 255 + alpha / 2) / alpha;
+                    *channel = straight.min(255) as u8;
+                }
+            }
+        }
+    }
 }
 
 /// Source intrinsic size / orientation, queried once while building the plan
@@ -70,6 +101,38 @@ pub trait FrameProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpremultiply_restores_straight_color_without_overflow() {
+        let mut rgba = [
+            128, 128, 128, 128, // 50% white
+            7, 3, 1, 0, // transparent: color is meaningless
+            10, 20, 30, 255, // opaque: unchanged
+            64, 0, 32, 64, // 25% (255, 0, 128)
+            200, 130, 129, 128, // rounding put color above alpha
+        ];
+        unpremultiply_rgba(&mut rgba);
+        assert_eq!(
+            rgba,
+            [
+                255, 255, 255, 128, //
+                0, 0, 0, 0, //
+                10, 20, 30, 255, //
+                255, 0, 128, 64, //
+                255, 255, 255, 128,
+            ]
+        );
+    }
+
+    #[test]
+    fn straight_alpha_conversion_only_touches_premultiplied_frames() {
+        let premultiplied = DecodedFrame::new(1, 1, vec![128, 128, 128, 128], true);
+        let straight = premultiplied.into_straight_alpha();
+        assert_eq!(straight.rgba, vec![255, 255, 255, 128]);
+        assert!(!straight.premultiplied);
+        // Already straight: returned as is, never divided a second time.
+        assert_eq!(straight.clone().into_straight_alpha(), straight);
+    }
 
     #[test]
     fn decoded_frame_holds_shape() {

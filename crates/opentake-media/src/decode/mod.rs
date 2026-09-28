@@ -19,7 +19,7 @@ pub use frame::{
 };
 pub use pcm::{
     extract_pcm, extract_pcm_cancellable, extract_pcm_cancellable_with_progress, PcmBuffer,
-    PcmFormat, PcmProgressCallback, PcmSpec,
+    PcmFormat, PcmProgressCallback, PcmSpec, PcmStream,
 };
 pub use source_color::ColorHint;
 pub use stream::{

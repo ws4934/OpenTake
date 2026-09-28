@@ -15,8 +15,10 @@
 //! unit-tested; the extraction itself requires ffmpeg.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,6 +26,7 @@ use std::time::Duration;
 use crate::cancel::MediaCancelToken;
 use crate::error::{MediaError, Result};
 use crate::ff;
+use crate::ff::SpawnCounted;
 use crate::probe;
 
 /// On-wire PCM sample format requested from ffmpeg.
@@ -622,7 +625,7 @@ fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
     let sink = make_sink(limit.expected / frame_bytes)?;
     let mut child = ff::ffmpeg()
         .args(args)
-        .spawn()
+        .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
     let stdout = match child.take_stdout() {
@@ -670,6 +673,295 @@ fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
     validate_pcm_output(path, status, stdout, stderr, limit.cap)
 }
 
+/// Converted chunks queued between a [`PcmStream`]'s stdout reader and its
+/// consumer. Each holds at most one stdout read, so this bounds the decoded
+/// audio held ahead of the consumer; FFmpeg then blocks on its full pipe.
+const PCM_STREAM_QUEUE_CHUNKS: usize = 4;
+
+/// Hands converted f32 chunks to a [`PcmStream`] consumer through a bounded
+/// queue, blocking while the consumer is behind. [`PcmStream::shutdown`]
+/// drops the receiver before joining, which fails a blocked send.
+struct QueueSink {
+    format: PcmFormat,
+    sender: SyncSender<Vec<f32>>,
+    stop: Arc<AtomicBool>,
+    cancel: MediaCancelToken,
+}
+
+impl PcmSink for QueueSink {
+    fn push_frames(&mut self, frames: &[u8]) -> Result<()> {
+        let bps = self.format.bytes_per_sample();
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(frames.len() / bps)
+            .map_err(|error| allocation_error(format!("PCM stream chunk: {error}")))?;
+        chunk.extend(
+            frames
+                .chunks_exact(bps)
+                .map(|sample| self.format.sample(sample)),
+        );
+        if self.stop.load(Ordering::Acquire) || self.cancel.is_cancelled() {
+            return Err(MediaError::Cancelled);
+        }
+        // Fails only once the consumer has shut the stream down.
+        self.sender.send(chunk).map_err(|_| MediaError::Cancelled)
+    }
+}
+
+/// One forward decode of a bounded source range, read incrementally: a single
+/// FFmpeg process serves the whole range however many reads the caller makes,
+/// so a caller that walks a long range in windows does not start a decoder
+/// (and re-seek) per window. Samples are interleaved f32 in the requested
+/// channel layout and rate.
+///
+/// Unlike [`extract_pcm`] this does not probe the input: the caller must know
+/// the file has an audio track (without one, the decode fails). The caller's
+/// token cancels the decode and counts its process; dropping the stream stops
+/// and reaps the decoder.
+pub struct PcmStream {
+    path: PathBuf,
+    channels: usize,
+    cancel: MediaCancelToken,
+    stop: Arc<AtomicBool>,
+    child: Option<ffmpeg_sidecar::child::FfmpegChild>,
+    stdout_reader: Option<JoinHandle<Result<(bool, usize)>>>,
+    stderr_reader: Option<JoinHandle<Result<Vec<u8>>>>,
+    /// `None` once shut down, which unblocks the stdout reader's send.
+    receiver: Option<Receiver<Vec<f32>>>,
+    pending: Vec<f32>,
+    pending_offset: usize,
+    reader_cap: usize,
+    ended: bool,
+}
+
+impl PcmStream {
+    /// Start decoding `range` (absolute source seconds, `[lo, hi)`) of
+    /// `path`'s first audio track. The output is trimmed to the range's frame
+    /// budget at the requested rate, as for a ranged [`extract_pcm`].
+    pub fn open(
+        path: &Path,
+        spec: &PcmSpec,
+        range: (f64, f64),
+        cancel: &MediaCancelToken,
+    ) -> Result<Self> {
+        if cancel.is_cancelled() {
+            return Err(MediaError::Cancelled);
+        }
+        validate_spec(spec)?;
+        let channels = usize::from(spec.channels);
+        let frame_bytes = channels
+            .checked_mul(spec.format.bytes_per_sample())
+            .ok_or_else(|| audio_buffer_too_large("PCM frame byte count overflow"))?;
+        let expected = expected_pcm_bytes_for_range(range, spec)?;
+        let cap = expected
+            .checked_add(frame_bytes)
+            .ok_or_else(|| audio_buffer_too_large("PCM reader cap overflow"))?;
+        let limit = ReadLimit { cap, expected };
+        let mut child = ff::ffmpeg()
+            .args(bounded_pcm_args(
+                path,
+                spec,
+                Some(range),
+                expected / frame_bytes,
+            ))
+            .spawn_counted()
+            .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
+        cancel.child_spawned();
+        let Some(stdout) = child.take_stdout() else {
+            terminate_child(&mut child);
+            return Err(MediaError::Ffmpeg("FFmpeg stdout pipe missing".to_string()));
+        };
+        let Some(stderr) = child.take_stderr() else {
+            terminate_child(&mut child);
+            return Err(MediaError::Ffmpeg("FFmpeg stderr pipe missing".to_string()));
+        };
+        let (sender, receiver) = sync_channel(PCM_STREAM_QUEUE_CHUNKS);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sink = QueueSink {
+            format: spec.format,
+            sender,
+            stop: Arc::clone(&stop),
+            cancel: cancel.clone(),
+        };
+        let stdout_cancel = cancel.clone();
+        let stdout_reader = match thread::Builder::new()
+            .name("opentake-pcm-stream".to_string())
+            .spawn(move || {
+                // Return only the summary: the sink, and with it the queue's
+                // sender, drops here so the consumer sees the end of stream.
+                read_stdout(stdout, sink, frame_bytes, limit, stdout_cancel, None)
+                    .map(|read| (read.exceeded_cap, read.total_read))
+            }) {
+            Ok(reader) => reader,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(MediaError::Ffmpeg(format!("spawn stdout reader: {error}")));
+            }
+        };
+        let stderr_cancel = cancel.clone();
+        let stderr_reader = match thread::Builder::new()
+            .name("opentake-pcm-stderr".to_string())
+            .spawn(move || read_stderr(stderr, stderr_cancel))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                terminate_child(&mut child);
+                let _ = join_reader(stdout_reader, "stdout");
+                return Err(MediaError::Ffmpeg(format!("spawn stderr reader: {error}")));
+            }
+        };
+        Ok(PcmStream {
+            path: path.to_path_buf(),
+            channels,
+            cancel: cancel.clone(),
+            stop,
+            child: Some(child),
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            receiver: Some(receiver),
+            pending: Vec::new(),
+            pending_offset: 0,
+            reader_cap: cap,
+            ended: false,
+        })
+    }
+
+    /// Interleaved channels per frame.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Append up to `frames` decoded frames to `out`, waiting until that many
+    /// are available or the decode ends. Returns the number appended; fewer
+    /// than requested means the range is exhausted and FFmpeg exited cleanly.
+    /// A failed or cancelled decode is an error.
+    pub fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> Result<usize> {
+        let wanted = frames.saturating_mul(self.channels);
+        out.try_reserve(wanted)
+            .map_err(|error| allocation_error(format!("PCM stream read: {error}")))?;
+        let mut appended = 0_usize;
+        while appended < wanted {
+            let available = self.pending.len() - self.pending_offset;
+            if available > 0 {
+                let take = available.min(wanted - appended);
+                out.extend_from_slice(
+                    &self.pending[self.pending_offset..self.pending_offset + take],
+                );
+                self.pending_offset += take;
+                appended += take;
+                continue;
+            }
+            if self.ended {
+                break;
+            }
+            // Checked before every chunk: a fast decoder keeps the queue full,
+            // so the timeout below may never fire.
+            if self.cancel.is_cancelled() {
+                self.shutdown();
+                return Err(MediaError::Cancelled);
+            }
+            let Some(receiver) = self.receiver.as_ref() else {
+                break;
+            };
+            match receiver.recv_timeout(CHILD_POLL_INTERVAL) {
+                Ok(chunk) => {
+                    self.pending = chunk;
+                    self.pending_offset = 0;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.cancel.checkpoint() {
+                        self.shutdown();
+                        return Err(MediaError::Cancelled);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => self.finish()?,
+            }
+        }
+        Ok(appended / self.channels)
+    }
+
+    /// The stdout reader is done: reap FFmpeg and check how the decode ended.
+    fn finish(&mut self) -> Result<()> {
+        self.ended = true;
+        let stdout = match self.stdout_reader.take() {
+            Some(reader) => join_reader(reader, "stdout"),
+            None => Ok((false, 0)),
+        };
+        let Some(mut child) = self.child.take() else {
+            return Err(MediaError::Ffmpeg("PCM stream decoder missing".to_string()));
+        };
+        let status = loop {
+            if self.cancel.checkpoint() {
+                terminate_child(&mut child);
+                self.join_stderr();
+                return Err(MediaError::Cancelled);
+            }
+            match child.as_inner_mut().try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(CHILD_POLL_INTERVAL),
+                Err(error) => {
+                    terminate_child(&mut child);
+                    self.join_stderr();
+                    return Err(MediaError::Io(error));
+                }
+            }
+        };
+        let stderr = match self.stderr_reader.take() {
+            Some(reader) => join_reader(reader, "stderr"),
+            None => Ok(Vec::new()),
+        };
+        let (exceeded_cap, total_read) = stdout?;
+        let stderr = stderr?;
+        if exceeded_cap {
+            return Err(audio_buffer_too_large(format!(
+                "FFmpeg PCM output exceeded the {}-byte limit after {total_read} bytes",
+                self.reader_cap
+            )));
+        }
+        if !status.success() {
+            let detail = String::from_utf8_lossy(&stderr);
+            let suffix = if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", detail.trim())
+            };
+            return Err(MediaError::Ffmpeg(format!(
+                "decode of {} exited {status}{suffix}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn join_stderr(&mut self) {
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = join_reader(reader, "stderr");
+        }
+    }
+
+    /// Stop the decoder and join both pipe readers.
+    fn shutdown(&mut self) {
+        self.ended = true;
+        self.stop.store(true, Ordering::Release);
+        // Fails a send the stdout reader is blocked in.
+        self.receiver = None;
+        if let Some(mut child) = self.child.take() {
+            terminate_child(&mut child);
+        }
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = join_reader(reader, "stdout");
+        }
+        self.join_stderr();
+    }
+}
+
+impl Drop for PcmStream {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +998,88 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(44 + data_len as usize, 0);
         std::fs::write(path, wav).expect("write wav fixture");
+    }
+
+    /// Mono s16 WAV whose sample `i` is `(i % 1000) * 16 - 8000`.
+    fn write_ramp_wav(path: &Path, sample_rate: u32, samples: usize) {
+        write_silence_wav(path, sample_rate, samples);
+        let mut wav = std::fs::read(path).expect("read wav fixture");
+        for (index, sample) in wav[44..].as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let value = ((index % 1000) as i16) * 16 - 8000;
+            sample.copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, wav).expect("write ramp wav fixture");
+    }
+
+    #[test]
+    fn pcm_stream_reads_a_range_incrementally_with_one_decoder() {
+        assert!(crate::ff::ffmpeg_available(), "requires runnable FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("ramp.wav");
+        write_ramp_wav(&input, 48_000, 96_000);
+        let spec = f32_mono_spec();
+        let range = (0.25, 1.75);
+        let whole = extract_pcm(&input, &spec, Some(range)).unwrap().samples_f32;
+        assert_eq!(whole.len(), 72_000);
+
+        let cancel = MediaCancelToken::new();
+        let before = crate::ff::test_seams::probe_requests();
+        let mut stream = PcmStream::open(&input, &spec, range, &cancel).unwrap();
+        let mut streamed = Vec::new();
+        for frames in [1, 999, 4_096, 17, 30_000].into_iter().cycle() {
+            if stream.read(frames, &mut streamed).unwrap() < frames {
+                break;
+            }
+        }
+        assert_eq!(streamed, whole, "streamed reads equal one ranged decode");
+        assert_eq!(
+            stream.read(10, &mut streamed).unwrap(),
+            0,
+            "range exhausted"
+        );
+        drop(stream);
+        assert_eq!(cancel.spawned_child_count(), 1, "one decoder for the range");
+        assert_eq!(
+            crate::ff::test_seams::probe_requests(),
+            before,
+            "the caller already knows the source has audio"
+        );
+        assert_eq!(cancel.active_reader_count(), 0);
+    }
+
+    #[test]
+    fn dropping_or_cancelling_a_pcm_stream_reaps_its_decoder() {
+        assert!(crate::ff::ffmpeg_available(), "requires runnable FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("long.wav");
+        write_ramp_wav(&input, 48_000, 48_000 * 20);
+        let spec = f32_mono_spec();
+
+        let cancel = MediaCancelToken::new();
+        let mut stream = PcmStream::open(&input, &spec, (0.0, 20.0), &cancel).unwrap();
+        let mut first = Vec::new();
+        assert_eq!(stream.read(1_000, &mut first).unwrap(), 1_000);
+        let started = Instant::now();
+        drop(stream);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(cancel.active_reader_count(), 0, "readers joined on drop");
+
+        let cancel = MediaCancelToken::new();
+        let mut stream = PcmStream::open(&input, &spec, (0.0, 20.0), &cancel).unwrap();
+        let mut samples = Vec::new();
+        assert_eq!(stream.read(1_000, &mut samples).unwrap(), 1_000);
+        cancel.cancel();
+        let result = loop {
+            // Queued chunks may still drain before the cancellation lands.
+            match stream.read(48_000, &mut samples) {
+                Ok(0) => break Ok(0),
+                Ok(_) => continue,
+                Err(error) => break Err(error),
+            }
+        };
+        assert!(matches!(result, Err(MediaError::Cancelled)), "{result:?}");
+        drop(stream);
+        assert_eq!(cancel.active_reader_count(), 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod account;
 mod advanced;
 mod captions;
 mod chat;
+mod clip_audio;
 mod close_coordinator;
 mod codex;
 mod commands;

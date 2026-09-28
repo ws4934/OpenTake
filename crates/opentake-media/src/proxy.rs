@@ -319,6 +319,7 @@ pub fn create_proxy(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| MediaError::Ffmpeg(format!("proxy spawn: {error}")))?;
+    ff::record_helper_process();
     cancel.child_spawned();
 
     loop {

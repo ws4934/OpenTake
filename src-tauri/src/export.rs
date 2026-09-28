@@ -33,6 +33,7 @@
 //! preview path in `render.rs` is not touched). A later refactor can hoist the
 //! shared projection into a `pub(crate)` helper once both paths are stable.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -50,6 +51,9 @@ use same_file::Handle as FileIdentity;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
+#[cfg(test)]
+use crate::clip_audio::clip_source_window_secs;
+use crate::clip_audio::{self, ClipAudioLayout, ClipAudioReader};
 use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
@@ -59,12 +63,15 @@ use opentake_media::decode::spawn_video_stream;
 use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
-    decode_frame_at, decode_frame_at_cancellable, extract_pcm,
-    extract_pcm_cancellable_with_progress, interpolate_frame_pair, source_frame_pair,
+    decode_frame_at, decode_frame_at_cancellable, interpolate_frame_pair, source_frame_pair,
     ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
-    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer,
-    PcmFormat, PcmProgressCallback, PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder,
-    VideoStream, VideoStreamRequest,
+    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmFormat,
+    PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder, VideoStream,
+    VideoStreamRequest,
+};
+#[cfg(test)]
+use opentake_media::{
+    extract_pcm, extract_pcm_cancellable_with_progress, PcmBuffer, PcmProgressCallback,
 };
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::compositor::{
@@ -78,6 +85,7 @@ use opentake_render::{
     GpuLutTexture, GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest,
     TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
+use opentake_render::{rasterize_text_layer, text_clip_raster_input, text_draws_glyphs};
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
 /// hit rate is low; a small cache still helps text/image layers re-used across
@@ -98,6 +106,14 @@ pub enum ExportCodec {
     Prores,
     /// Apple ProRes 4444 with an alpha plane / `.mov`.
     Prores4444,
+}
+
+impl ExportCodec {
+    /// Whether the delivery keeps an alpha plane (composited over a
+    /// transparent canvas and encoded with straight alpha).
+    fn preserves_alpha(self) -> bool {
+        self == ExportCodec::Prores4444
+    }
 }
 
 /// Requested output short-edge resolution, projected from the front-end.
@@ -489,11 +505,25 @@ fn resolve_preset(
 }
 
 fn export_clear_rgba(codec: ExportCodec) -> [f64; 4] {
-    if codec == ExportCodec::Prores4444 {
+    if codec.preserves_alpha() {
         [0.0, 0.0, 0.0, 0.0]
     } else {
         [0.0, 0.0, 0.0, 1.0]
     }
+}
+
+/// The encoder input for one composited frame. The compositor blends and reads
+/// back premultiplied RGBA, while the encoder's `-pix_fmt rgba` input (and
+/// ProRes 4444's alpha) is straight, so an alpha-preserving delivery converts
+/// at this boundary (#21). Opaque deliveries pass the compositor bytes through
+/// untouched: their alpha is 255 everywhere, where both conventions agree.
+fn encoder_frame(codec: ExportCodec, composite: DecodedFrame) -> RgbaFrame {
+    let frame = if codec.preserves_alpha() {
+        composite.into_straight_alpha()
+    } else {
+        composite
+    };
+    RgbaFrame::new(frame.width, frame.height, frame.rgba)
 }
 
 /// Resolvable info for one media asset, projected from the manifest.
@@ -533,7 +563,7 @@ struct MediaResolver<'d> {
     content_hashes: &'d mut ContentHashCache,
     media: &'d HashMap<String, MediaInfo>,
     text: &'d HashMap<String, TextInfo>,
-    text_rasterizer: &'d CosmicTextRasterizer,
+    text_rasterizer: &'d dyn TextRasterizer,
     /// Decode/raster box for source frames (matches the export render size).
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
@@ -729,17 +759,13 @@ impl MediaResolver<'_> {
             box_norm: info.box_norm,
             canvas: self.render_box,
         };
-        let frame = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.text_rasterizer.rasterize(&req)
-        })) {
+        // A blank text clip draws nothing; only a non-blank one that yields no
+        // pixels fails the export (#180).
+        let frame = match rasterize_text_layer(self.text_rasterizer, &req) {
             Ok(Some(frame)) => frame,
-            Ok(None) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization failed"));
-            }
-            Err(_) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization panicked"));
+            Ok(None) => return None,
+            Err(error) => {
+                return self.fail_materialization(format!("text clip {clip_id} {error}"));
             }
         };
         let tex = upload_rgba(self.device, self.queue, &frame, false, Some("export-text"));
@@ -977,15 +1003,15 @@ fn project_text(timeline: &opentake_domain::Timeline) -> HashMap<String, TextInf
                 if clip.media_type != ClipType::Text {
                     continue;
                 }
-                let (Some(content), Some(style)) = (&clip.text_content, &clip.text_style) else {
+                let Some((content, style)) = text_clip_raster_input(clip) else {
                     continue;
                 };
                 let tl = clip.transform.top_left();
                 text.insert(
                     clip.id.clone(),
                     TextInfo {
-                        content: content.clone(),
-                        style: style.clone(),
+                        content: content.to_string(),
+                        style: style.into_owned(),
                         box_norm: (tl.x, tl.y, clip.transform.width, clip.transform.height),
                     },
                 );
@@ -1143,6 +1169,7 @@ const VIDEO_AUDIO_END: i32 = 800;
 const VIDEO_FINALIZE_END: i32 = 980;
 const VIDEO_EXPORT_END: i32 = 990;
 
+#[cfg(test)]
 fn decode_pcm_with_export_control<F>(
     control: &ExportControl,
     path: &Path,
@@ -1196,6 +1223,7 @@ fn retime_pcm_to_len_with_control(
     retime_pcm_to_len_with_external(samples, target_len, control, None)
 }
 
+#[cfg(test)]
 fn retime_pcm_to_len_with_external(
     samples: &[f32],
     target_len: usize,
@@ -1380,6 +1408,7 @@ fn apply_export_denoise(
     apply_export_denoise_with_external(samples, channels, config, control, None)
 }
 
+#[cfg(test)]
 fn apply_export_denoise_with_external(
     samples: &[f32],
     channels: usize,
@@ -1440,6 +1469,7 @@ fn mix_timeline_audio(
             control,
             external_cancel: None,
             on_progress,
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             samples_f32
@@ -1455,6 +1485,28 @@ fn mix_timeline_audio(
     }))
 }
 
+/// Export's mono 48 kHz mix of a whole timeline from media paths, for the
+/// preview parity tests in `playback::audio`.
+#[cfg(test)]
+pub(crate) fn mix_timeline_audio_for_paths(
+    timeline: &opentake_domain::Timeline,
+    paths: &HashMap<String, PathBuf>,
+) -> Result<Option<Vec<f32>>, String> {
+    let media = paths
+        .iter()
+        .map(|(id, path)| {
+            (
+                id.clone(),
+                MediaInfo {
+                    path: path.clone(),
+                    source_fps: None,
+                },
+            )
+        })
+        .collect();
+    Ok(mix_timeline_audio(timeline, &media, None, None)?.map(|pcm| pcm.samples_f32))
+}
+
 struct AudioStreamOptions<'a> {
     timeline_fps: i32,
     start_frame: i32,
@@ -1462,6 +1514,40 @@ struct AudioStreamOptions<'a> {
     control: Option<&'a ExportControl>,
     external_cancel: Option<&'a MediaCancelToken>,
     on_progress: Option<AudioExportProgress>,
+    /// Minimum spacing between progress reports ([`PROGRESS_INTERVAL`]).
+    progress_interval: Duration,
+}
+
+/// Rate limit for progress reports that can arrive far more often than the UI
+/// wants them: a value is reported only when it changed, and at most once per
+/// `interval`, except the first value and `last`, which always go out.
+struct ProgressThrottle {
+    interval: Duration,
+    last: i32,
+    reported: Option<(Instant, i32)>,
+}
+
+impl ProgressThrottle {
+    fn new(interval: Duration, last: i32) -> Self {
+        ProgressThrottle {
+            interval,
+            last,
+            reported: None,
+        }
+    }
+
+    fn admit(&mut self, value: i32, now: Instant) -> bool {
+        let admit = match self.reported {
+            None => true,
+            Some((_, reported)) if reported == value => false,
+            Some(_) if value == self.last => true,
+            Some((at, _)) => now.saturating_duration_since(at) >= self.interval,
+        };
+        if admit {
+            self.reported = Some((now, value));
+        }
+        admit
+    }
 }
 
 fn stream_flattened_audio<T: AudioPlanLike>(
@@ -1477,131 +1563,182 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         control,
         external_cancel,
         on_progress,
+        progress_interval,
     } = options;
     if timeline_fps <= 0 || start_frame >= end_frame {
         return Ok(false);
     }
-    let mut audible_media = HashSet::new();
-    for plan in clips {
-        let clip = plan.clip();
-        let clip_end = clip.start_frame.saturating_add(clip.duration_frames);
-        if clip.duration_frames <= 0 || clip_end <= start_frame || clip.start_frame >= end_frame {
-            continue;
-        }
-        let Some(info) = media.get(&clip.media_ref) else {
-            continue;
-        };
-        let metadata = opentake_media::probe(&info.path)
-            .map_err(|error| format!("audio probe failed for {}: {error}", clip.media_ref))?;
-        if metadata.has_audio {
-            audible_media.insert(clip.media_ref.clone());
-        }
-    }
-    if audible_media.is_empty() {
-        return Ok(false);
-    }
-
+    let cancel = control
+        .map(ExportControl::media_cancel_token)
+        .or_else(|| external_cancel.cloned())
+        .unwrap_or_default();
+    let decode_failure = |media_ref: &str, error: opentake_media::MediaError| match error {
+        opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
+        error => format!("audio decode failed for {media_ref}: {error}"),
+    };
     let sample_at_frame = |frame: i32| {
-        ((frame.max(0) as f64 / timeline_fps as f64) * MIX_SAMPLE_RATE as f64).round() as usize
+        ((frame.max(0) as f64 / timeline_fps as f64) * MIX_SAMPLE_RATE as f64).round() as u64
     };
     let range_start = sample_at_frame(start_frame);
     let range_end = sample_at_frame(end_frame);
+
+    // Audibility is probed once per source file, not per clip or window.
+    let mut source_has_audio: HashMap<&str, bool> = HashMap::new();
+    let mut layouts = Vec::with_capacity(clips.len());
+    for plan in clips {
+        let clip = plan.clip();
+        let layout = ClipAudioLayout::new(clip, timeline_fps, MIX_SAMPLE_RATE).filter(|layout| {
+            let (clip_start, clip_end) = layout.span();
+            clip_start < range_end && clip_end > range_start
+        });
+        let audible = match (&layout, media.get(&clip.media_ref)) {
+            (Some(_), Some(info)) => match source_has_audio.get(clip.media_ref.as_str()) {
+                Some(audible) => *audible,
+                None => {
+                    check_audio_cancel_with_external(control, external_cancel)?;
+                    let audible =
+                        clip_audio::source_has_audio(&info.path, &cancel).map_err(|error| {
+                            match error {
+                                opentake_media::MediaError::Cancelled => {
+                                    CANCELLED_SENTINEL.to_string()
+                                }
+                                error => {
+                                    format!("audio probe failed for {}: {error}", clip.media_ref)
+                                }
+                            }
+                        })?;
+                    source_has_audio.insert(&clip.media_ref, audible);
+                    audible
+                }
+            },
+            _ => false,
+        };
+        layouts.push(layout.filter(|_| audible));
+    }
+    if layouts.iter().all(Option::is_none) {
+        return Ok(false);
+    }
+
     let total_samples = range_end.saturating_sub(range_start);
     let true_peak_ceiling_dbtp = clips
         .iter()
         .filter_map(AudioPlanLike::true_peak_ceiling_dbtp)
         .min_by(f64::total_cmp);
-    let cancel = control
-        .map(ExportControl::media_cancel_token)
-        .or_else(|| external_cancel.cloned())
-        .unwrap_or_default();
 
+    // Noise profiles first: a denoised clip's profile covers the whole clip,
+    // even when the range covers only part of it, so its pass can take longer
+    // than the range's own mix. Progress spans the passes and the mix.
+    let pending_profile_frames: u64 = clips
+        .iter()
+        .zip(&layouts)
+        .filter_map(|(plan, layout)| {
+            let layout = layout.as_ref()?;
+            let path = &media[&plan.clip().media_ref].path;
+            clip_audio::denoise_profile_pending(plan.audio_denoise(), layout, path, 1)
+                .then_some(layout.len() as u64)
+        })
+        .sum();
+    let total_work = pending_profile_frames.saturating_add(total_samples).max(1);
+    // A profile pass reports every few thousand frames; the throttle keeps a
+    // long clip from flooding the UI with progress events.
+    let throttle = std::cell::RefCell::new(ProgressThrottle::new(progress_interval, AUDIO_MIX_END));
+    let report_work = |done: u64| {
+        if let Some(report) = &on_progress {
+            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
+            let mapped = AUDIO_MIX_START + (done.min(total_work) * span / total_work) as i32;
+            if throttle.borrow_mut().admit(mapped, Instant::now()) {
+                report(mapped, AUDIO_PROGRESS_TOTAL);
+            }
+        }
+    };
+    let mut profile_done = 0_u64;
+    let mut denoise = Vec::with_capacity(clips.len());
+    for (plan, layout) in clips.iter().zip(&layouts) {
+        let Some(layout) = layout else {
+            denoise.push(None);
+            continue;
+        };
+        check_audio_cancel_with_external(control, external_cancel)?;
+        let media_ref = &plan.clip().media_ref;
+        let path = &media[media_ref].path;
+        let pending = clip_audio::denoise_profile_pending(plan.audio_denoise(), layout, path, 1);
+        let progress = |frames: usize| report_work(profile_done + frames as u64);
+        let input = clip_audio::clip_denoise(
+            plan.audio_denoise(),
+            layout,
+            path,
+            1,
+            &cancel,
+            Some(&progress),
+        )
+        .map_err(|error| decode_failure(media_ref, error))?;
+        if pending {
+            profile_done += layout.len() as u64;
+        }
+        denoise.push(input);
+    }
+
+    // One forward decoder per audible clip, opened when the clip enters the
+    // range and reaped as soon as it ends (#3). At most
+    // `MAX_OPEN_CLIP_READERS` are open at once: a clip beyond the ones kept
+    // open reads each window through a reader opened for that window only.
+    let mut readers: HashMap<usize, ClipAudioReader> = HashMap::new();
+    let mut samples = Vec::new();
     for relative_start in (0..total_samples).step_by(AUDIO_STREAM_WINDOW_SAMPLES) {
         check_audio_cancel_with_external(control, external_cancel)?;
-        let window_len = AUDIO_STREAM_WINDOW_SAMPLES.min(total_samples - relative_start);
-        let window_start = range_start.saturating_add(relative_start);
-        let window_end = window_start.saturating_add(window_len);
-        let mut mixed = vec![0.0_f32; window_len];
-        for plan in clips {
-            let clip = plan.clip();
-            if !audible_media.contains(&clip.media_ref) || clip.duration_frames <= 0 {
+        let window_len = (AUDIO_STREAM_WINDOW_SAMPLES as u64).min(total_samples - relative_start);
+        let window_start = range_start + relative_start;
+        let window_end = window_start + window_len;
+        let mut mixed = vec![0.0_f32; window_len as usize];
+        for (index, plan) in clips.iter().enumerate() {
+            let Some(layout) = layouts[index] else {
                 continue;
-            }
-            let clip_start = sample_at_frame(clip.start_frame);
-            let clip_end = sample_at_frame(clip.start_frame.saturating_add(clip.duration_frames));
+            };
+            let (clip_start, clip_end) = layout.span();
             let overlap_start = window_start.max(clip_start);
             let overlap_end = window_end.min(clip_end);
-            if overlap_start >= overlap_end || clip_end <= clip_start {
+            if overlap_start >= overlap_end {
                 continue;
             }
-            let Some(info) = media.get(&clip.media_ref) else {
-                continue;
-            };
-            let Some((source_lo, source_hi)) = clip_source_window_secs(clip, timeline_fps) else {
-                continue;
-            };
-            let source_span = source_hi - source_lo;
-            let relative_lo = (overlap_start - clip_start) as f64 / (clip_end - clip_start) as f64;
-            let relative_hi = (overlap_end - clip_start) as f64 / (clip_end - clip_start) as f64;
-            let source_range = (
-                source_lo + source_span * relative_lo,
-                source_lo + source_span * relative_hi,
-            );
-            let decoded = match control {
-                Some(control) => decode_pcm_with_export_control(
-                    control,
-                    &info.path,
-                    Some(source_range),
-                    None,
-                    extract_pcm_cancellable_with_progress,
-                ),
-                None => match external_cancel {
-                    Some(cancel) => extract_pcm_cancellable_with_progress(
-                        &info.path,
-                        &AUDIO_DECODE_SPEC,
-                        Some(source_range),
-                        cancel,
-                        None,
-                    ),
-                    None => extract_pcm(&info.path, &AUDIO_DECODE_SPEC, Some(source_range)),
-                },
-            };
-            let pcm = match decoded {
-                Ok(pcm) => pcm,
-                Err(opentake_media::MediaError::NoTrack(_, _)) => continue,
-                Err(opentake_media::MediaError::Cancelled) => {
-                    return Err(CANCELLED_SENTINEL.to_string());
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "audio decode failed for {}: {error}",
-                        clip.media_ref
-                    ));
+            let media_ref = &plan.clip().media_ref;
+            let mut transient = None;
+            let open_readers = readers.len();
+            let reader = match readers.entry(index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let reader = ClipAudioReader::open(
+                        layout,
+                        &media[media_ref].path,
+                        1,
+                        layout.offset_of(overlap_start),
+                        denoise[index].clone(),
+                        &cancel,
+                    )
+                    .map_err(|error| decode_failure(media_ref, error))?;
+                    if overlap_end < clip_end && clip_audio::keep_clip_reader(open_readers) {
+                        entry.insert(reader)
+                    } else {
+                        transient.insert(reader)
+                    }
                 }
             };
-            let target_len = overlap_end - overlap_start;
-            let retimed = retime_pcm_to_len_with_external(
-                &pcm.samples_f32,
-                target_len,
-                control,
-                external_cancel,
-            )?;
-            let processed = apply_export_denoise_with_external(
-                &retimed,
-                1,
-                plan.audio_denoise(),
-                control,
-                external_cancel,
-            )?;
-            let output_start = overlap_start - window_start;
-            for (offset, sample) in processed.into_iter().take(target_len).enumerate() {
+            samples.clear();
+            reader
+                .read((overlap_end - overlap_start) as usize, &mut samples)
+                .map_err(|error| decode_failure(media_ref, error))?;
+            if overlap_end == clip_end {
+                readers.remove(&index);
+            }
+            let output_start = (overlap_start - window_start) as usize;
+            for (offset, sample) in samples.iter().enumerate() {
                 if offset.is_multiple_of(AUDIO_CANCEL_CHUNK_SAMPLES) {
                     check_audio_cancel_with_external(control, external_cancel)?;
                 }
-                let absolute_sample = overlap_start.saturating_add(offset);
-                let timeline_frame = ((absolute_sample as f64 / MIX_SAMPLE_RATE as f64)
-                    * timeline_fps as f64)
-                    .floor() as i32;
+                let timeline_frame = clip_audio::timeline_frame_at(
+                    overlap_start + offset as u64,
+                    timeline_fps,
+                    MIX_SAMPLE_RATE,
+                );
                 mixed[output_start + offset] += sample * plan.volume_at(timeline_frame) as f32;
             }
         }
@@ -1610,13 +1747,7 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         }
         mix::apply_true_peak_ceiling(&mut mixed, true_peak_ceiling_dbtp);
         emit(&mixed)?;
-        if let Some(report) = &on_progress {
-            let completed = relative_start.saturating_add(window_len);
-            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as usize;
-            let mapped =
-                AUDIO_MIX_START + (completed.saturating_mul(span) / total_samples.max(1)) as i32;
-            report(mapped, AUDIO_PROGRESS_TOTAL);
-        }
+        report_work(profile_done + relative_start.saturating_add(window_len));
         if cancel.checkpoint() || external_cancel.is_some_and(MediaCancelToken::is_cancelled) {
             return Err(CANCELLED_SENTINEL.to_string());
         }
@@ -1664,6 +1795,7 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
             control: Some(control),
             external_cancel: None,
             on_progress: on_progress.clone(),
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             if written_samples == 0 {
@@ -2121,7 +2253,10 @@ pub(crate) fn run_export_with_control(
     // Fail closed: a text-bearing export with no font faces would complete
     // "successfully" with invisible text. Reject it before the encoder starts;
     // the preview path (render.rs) deliberately stays lenient.
-    ensure_text_export_fonts(!plan.text_plans.is_empty(), &text_rasterizer)?;
+    ensure_text_export_fonts(
+        plan_draws_text(&plan, &text, (render_size.width, render_size.height)),
+        &text_rasterizer,
+    )?;
 
     // Declare this before the encoder so Rust drops the encoder first (which
     // reaps ffmpeg) and only then removes an error/cancelled partial output.
@@ -2211,11 +2346,7 @@ pub(crate) fn run_export_with_control(
             ));
         }
         encoder
-            .push_frame(&RgbaFrame::new(
-                composite.width,
-                composite.height,
-                composite.rgba,
-            ))
+            .push_frame(&encoder_frame(req.codec, composite))
             .map_err(|e| format!("encode frame {f} failed: {e}"))?;
 
         if let Some(emit) = &on_progress {
@@ -2260,6 +2391,7 @@ pub(crate) fn run_export_with_control(
             control,
             external_cancel: external_cancel.as_ref(),
             on_progress: audio_progress,
+            progress_interval: PROGRESS_INTERVAL,
         },
         |samples| {
             encoder
@@ -2473,6 +2605,28 @@ fn validate_export_probe(
         ));
     }
     Ok(())
+}
+
+/// Whether any text clip in `plan` has glyphs to draw at `render_box`. Blank
+/// text draws nothing (#180) and whitespace-only text draws only its box, so
+/// neither needs fonts; a text clip without a raster input counts as drawing
+/// so the font guard stays fail-closed (the resolver reports that clip later).
+fn plan_draws_text(
+    plan: &RenderPlan,
+    text: &HashMap<String, TextInfo>,
+    render_box: (u32, u32),
+) -> bool {
+    plan.text_plans.iter().any(|clip_plan| {
+        text.get(&clip_plan.clip_id).is_none_or(|info| {
+            text_draws_glyphs(&TextRasterRequest {
+                clip_id: &clip_plan.clip_id,
+                content: &info.content,
+                style: &info.style,
+                box_norm: info.box_norm,
+                canvas: render_box,
+            })
+        })
+    })
 }
 
 /// Fail-closed guard for text-bearing exports: an export whose plan contains
@@ -3593,19 +3747,6 @@ fn project_frame_time_secs(source_frame: i64, timeline_fps: i32) -> f64 {
     (source_frame.max(0) as f64) / fps
 }
 
-fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)> {
-    if clip.duration_frames <= 0 || timeline_fps <= 0 {
-        return None;
-    }
-    let fps = timeline_fps as f64;
-    let lo = clip.trim_start_frame.max(0) as f64 / fps;
-    let consumed = clip.source_frames_consumed().max(0);
-    if consumed == 0 {
-        return None;
-    }
-    Some((lo, lo + consumed as f64 / fps))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4431,6 +4572,35 @@ mod tests {
     }
 
     #[test]
+    fn prores_4444_encodes_straight_alpha_while_opaque_codecs_keep_composite_bytes() {
+        // Premultiplied compositor output: 50% white, transparent, opaque red,
+        // 25% (255, 0, 128).
+        let composite = DecodedFrame::new(
+            4,
+            1,
+            vec![
+                128, 128, 128, 128, 0, 0, 0, 0, 255, 0, 0, 255, 64, 0, 32, 64,
+            ],
+            true,
+        );
+        for codec in [ExportCodec::H264, ExportCodec::H265, ExportCodec::Prores] {
+            assert!(!codec.preserves_alpha());
+            let frame = encoder_frame(codec, composite.clone());
+            assert_eq!(
+                frame.rgba, composite.rgba,
+                "{codec:?} must receive the compositor bytes unchanged"
+            );
+            assert_eq!((frame.width, frame.height), (4, 1));
+        }
+        assert!(ExportCodec::Prores4444.preserves_alpha());
+        let straight = encoder_frame(ExportCodec::Prores4444, composite);
+        assert_eq!(
+            straight.rgba,
+            vec![255, 255, 255, 128, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 128, 64]
+        );
+    }
+
+    #[test]
     fn resolve_preset_rejects_wrong_extension_for_prores() {
         let err = resolve_preset(
             ExportCodec::Prores,
@@ -5228,6 +5398,445 @@ mod tests {
     }
 
     #[test]
+    fn range_export_reports_progress_through_the_whole_clip_profile_pass() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("speech.wav");
+        write_wav(&source, &noisy_tone(20.0, 300.0, 9));
+        let media = HashMap::from([(
+            "speech".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        let mut clip = Clip::new("speech", "speech", 0, 600);
+        clip.media_type = ClipType::Audio;
+        clip.audio_denoise = Some(AudioDenoise {
+            mode: opentake_domain::DenoiseMode::Voice,
+            strength: 0.5,
+            preview_enabled: true,
+        });
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&reports);
+        let progress: AudioExportProgress = Arc::new(move |done, total| {
+            assert_eq!(total, AUDIO_PROGRESS_TOTAL);
+            recorder.lock().unwrap().push(done);
+        });
+        // Two seconds of a twenty-second denoised clip: the profile pass
+        // decodes all twenty and dominates the work.
+        let mut streamed = Vec::new();
+        stream_flattened_audio(
+            &[clip],
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 60,
+                control: None,
+                external_cancel: Some(&MediaCancelToken::new()),
+                on_progress: Some(progress),
+                progress_interval: Duration::ZERO,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the range audio");
+        assert_eq!(streamed.len(), 2 * MIX_SAMPLE_RATE as usize);
+        let reports = reports.lock().unwrap();
+        assert!(
+            reports.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress never goes back or repeats a value: {reports:?}"
+        );
+        assert_eq!(reports.last(), Some(&AUDIO_MIX_END));
+        let during_profile = reports
+            .iter()
+            .filter(|done| **done > AUDIO_MIX_START && **done < AUDIO_MIX_END - 20)
+            .count();
+        assert!(
+            during_profile >= 10,
+            "the profile pass reports progress ({during_profile} reports)"
+        );
+    }
+
+    #[test]
+    fn audio_progress_throttle_limits_reports_to_the_interval() {
+        // A ten-minute denoised clip reports ~7,000 profile steps; replay
+        // them over 1.5 s of wall time.
+        let start = Instant::now();
+        let steps = 7_000_u64;
+        let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL, AUDIO_MIX_END);
+        let mut admitted = Vec::new();
+        for step in 1..=steps {
+            let now = start + Duration::from_micros(step * 1_500_000 / steps);
+            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
+            let value = AUDIO_MIX_START + (step * span / steps) as i32;
+            if throttle.admit(value, now) {
+                admitted.push((now, value));
+            }
+        }
+        // The first value, one per 200 ms, and the final value.
+        assert!(admitted.len() <= 1 + 7 + 1, "{} reports", admitted.len());
+        assert_eq!(
+            admitted.last().map(|(_, value)| *value),
+            Some(AUDIO_MIX_END)
+        );
+        for pair in admitted[..admitted.len() - 1].windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= PROGRESS_INTERVAL);
+            assert!(pair[0].1 < pair[1].1);
+        }
+
+        // Without an interval, only repeated values are dropped.
+        let mut unthrottled = ProgressThrottle::new(Duration::ZERO, AUDIO_MIX_END);
+        let values = [850, 850, 851, 851, 852, 980, 980];
+        let admitted = values
+            .iter()
+            .filter(|value| unthrottled.admit(**value, start))
+            .count();
+        assert_eq!(admitted, 4);
+    }
+
+    #[test]
+    fn export_audio_caps_open_clip_decoders_without_changing_the_mix() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+        use crate::clip_audio::MAX_OPEN_CLIP_READERS;
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.wav");
+        write_wav(&source, &noisy_tone(8.0, 440.0, 5));
+        let media = HashMap::from([(
+            "tone".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        // Four more clips than the cap, all playing through three windows.
+        let extra = 4;
+        let clips = (0..MAX_OPEN_CLIP_READERS + extra)
+            .map(|index| {
+                let mut clip = Clip::new(format!("c{index}"), "tone", 0, 180);
+                clip.media_type = ClipType::Audio;
+                clip.trim_start_frame = index as i32;
+                clip.volume = 0.05;
+                clip
+            })
+            .collect::<Vec<_>>();
+        let cancel = MediaCancelToken::new();
+        let census = crate::clip_audio::reader_census::start();
+        let processes = opentake_media::ffmpeg_status::HelperProcessCount::start();
+        let mut streamed = Vec::new();
+        let has_audio = stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 180,
+                control: None,
+                external_cancel: Some(&cancel),
+                on_progress: None,
+                progress_interval: Duration::ZERO,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let spawned = processes.count();
+        drop(processes);
+        assert!(has_audio);
+        assert_eq!(streamed.len(), 6 * MIX_SAMPLE_RATE as usize);
+        // One probe, one decoder for each clip kept open (one slot under the
+        // cap), and one decoder per window for each other clip.
+        let windows = 3;
+        let kept = MAX_OPEN_CLIP_READERS - 1;
+        assert_eq!(spawned, 1 + kept + (clips.len() - kept) * windows);
+        assert_eq!(
+            census.peak(),
+            MAX_OPEN_CLIP_READERS,
+            "decoders open at once"
+        );
+        assert_eq!(census.live(), 0);
+
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 1.0e-6, "max difference {max_difference}");
+    }
+
+    #[test]
+    fn export_audio_beyond_the_decoder_cap_matches_whole_clips_for_aac() {
+        use crate::clip_audio::fixtures::{encode_sine, ffmpeg_ready};
+        use crate::clip_audio::MAX_OPEN_CLIP_READERS;
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.m4a");
+        if !encode_sine(&source, "aac", 44_100, 8) {
+            eprintln!("skip: ffmpeg could not encode the AAC fixture");
+            return;
+        }
+        let media = HashMap::from([(
+            "tone".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        // Clips past the cap read every 2 s window through a fresh 44.1 kHz
+        // AAC decode, resampled to 48 kHz; the pre-roll keeps each window
+        // edge on the continuous decode.
+        let extra = 4;
+        let clips = (0..MAX_OPEN_CLIP_READERS + extra)
+            .map(|index| {
+                let mut clip = Clip::new(format!("c{index}"), "tone", 0, 180);
+                clip.media_type = ClipType::Audio;
+                clip.trim_start_frame = index as i32;
+                clip.volume = 0.05;
+                clip
+            })
+            .collect::<Vec<_>>();
+        let mut streamed = Vec::new();
+        stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 180,
+                control: None,
+                external_cancel: Some(&MediaCancelToken::new()),
+                on_progress: None,
+                progress_interval: Duration::ZERO,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        assert_eq!(streamed.len(), reference.len());
+        // Without the pre-roll the window edges of the four late clips step
+        // by about 0.01.
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 2.0e-3, "max difference {max_difference}");
+    }
+
+    #[test]
+    fn export_audio_decodes_each_clip_once_and_matches_whole_clip_processing() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        write_wav(&first, &noisy_tone(40.0, 440.0, 1));
+        write_wav(&second, &noisy_tone(40.0, 660.0, 2));
+
+        // 60 s timeline: A covers 0-30 s, B covers 25-60 s from its 2 s trim,
+        // at half volume and denoised, so the two overlap for five seconds.
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        let mut a = Clip::new("a", "first", 0, 900);
+        a.media_type = ClipType::Audio;
+        let mut b = Clip::new("b", "second", 750, 1_050);
+        b.media_type = ClipType::Audio;
+        b.trim_start_frame = 60;
+        b.volume = 0.5;
+        b.audio_denoise = Some(AudioDenoise {
+            mode: opentake_domain::DenoiseMode::Voice,
+            strength: 0.6,
+            preview_enabled: false,
+        });
+        for (id, clip) in [("a1", a), ("a2", b)] {
+            let mut track = opentake_domain::Track::new(id, ClipType::Audio);
+            track.clips.push(clip);
+            timeline.tracks.push(track);
+        }
+        assert_eq!(timeline.total_frames(), 1_800);
+        let media = HashMap::from([
+            (
+                "first".to_string(),
+                MediaInfo {
+                    path: first,
+                    source_fps: None,
+                },
+            ),
+            (
+                "second".to_string(),
+                MediaInfo {
+                    path: second,
+                    source_fps: None,
+                },
+            ),
+        ]);
+        let clips = timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.clone())
+            .collect::<Vec<_>>();
+
+        let cancel = MediaCancelToken::new();
+        let processes = opentake_media::ffmpeg_status::HelperProcessCount::start();
+        let mut streamed = Vec::new();
+        let has_audio = stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 1_800,
+                control: None,
+                external_cancel: Some(&cancel),
+                on_progress: None,
+                progress_interval: Duration::ZERO,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let spawned = processes.count();
+        drop(processes);
+
+        assert!(has_audio);
+        assert_eq!(streamed.len(), 60 * MIX_SAMPLE_RATE as usize);
+        // Thirty two-second windows, yet one probe per source file, one
+        // decoder per clip and one noise-profile pass for the denoised clip.
+        assert_eq!(spawned, 5, "helper processes for 2 clips over 30 windows");
+        assert_eq!(cancel.spawned_child_count(), 5);
+
+        // The pre-streaming projection decoded and denoised each clip whole;
+        // the streamed windows reproduce it sample for sample.
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        assert_eq!(reference.len(), streamed.len());
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 1.0e-6, "max difference {max_difference}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_export_audio_reaps_the_clip_decoder_promptly() {
+        use std::sync::mpsc;
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            eprintln!("skip: ffmpeg not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("blocking.wav");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(created.success(), "mkfifo must create a blocking input");
+        let cancel = MediaCancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut clip = Clip::new("a", "fifo", 0, 300);
+            clip.media_type = ClipType::Audio;
+            let media = HashMap::from([(
+                "fifo".to_string(),
+                MediaInfo {
+                    path: fifo,
+                    source_fps: None,
+                },
+            )]);
+            let result = stream_flattened_audio(
+                &[clip],
+                &media,
+                AudioStreamOptions {
+                    timeline_fps: 30,
+                    start_frame: 0,
+                    end_frame: 300,
+                    control: None,
+                    external_cancel: Some(&worker_cancel),
+                    on_progress: None,
+                    progress_interval: Duration::ZERO,
+                },
+                |_| Ok(()),
+            );
+            done_tx.send(result).expect("publish audio result");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cancel.spawned_child_count() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(cancel.spawned_child_count(), 1, "the clip decoder started");
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancelled export audio must return");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "cancellation took {:?}",
+            cancelled_at.elapsed()
+        );
+        assert_eq!(result.unwrap_err(), CANCELLED_SENTINEL);
+        worker.join().expect("audio worker joins");
+        assert_eq!(cancel.active_reader_count(), 0, "decoder pipes are reaped");
+    }
+
+    #[test]
     fn project_clip_audio_skips_clip_with_no_media_entry() {
         // No matching manifest entry → no audio contribution, no decode attempt.
         let clip = Clip::new("c1", "missing-asset", 0, 30);
@@ -5528,6 +6137,112 @@ mod tests {
     fn text_export_allows_fontless_run_without_text_clips() {
         let headless = CosmicTextRasterizer::without_system_fonts();
         assert!(ensure_text_export_fonts(false, &headless).is_ok());
+    }
+
+    fn text_timeline(content: Option<&str>) -> opentake_domain::Timeline {
+        let mut timeline = opentake_domain::Timeline::new();
+        let mut text = Clip::new("text", "", 0, 10);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = content.map(str::to_string);
+        text.text_style = Some(TextStyle::default());
+        let mut track = opentake_domain::Track::new("text", ClipType::Text);
+        track.clips.push(text);
+        timeline.tracks.push(track);
+        timeline
+    }
+
+    #[test]
+    fn blank_text_clips_do_not_require_fonts() {
+        let render_size = opentake_render::RenderSize::new(64, 64);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::new(),
+        };
+        let draws_text = |content: Option<&str>| {
+            let timeline = text_timeline(content);
+            let plan = try_build_render_plan(&timeline, render_size, &metrics).unwrap();
+            assert_eq!(plan.text_plans.len(), 1);
+            plan_draws_text(&plan, &project_text(&timeline), (64, 64))
+        };
+        assert!(!draws_text(None));
+        assert!(!draws_text(Some("")));
+        // Whitespace paints only its box, which needs no fonts.
+        assert!(!draws_text(Some("  \n ")));
+        assert!(draws_text(Some("visible")));
+
+        let headless = CosmicTextRasterizer::without_system_fonts();
+        for blank in [None, Some(""), Some("  \n ")] {
+            assert!(ensure_text_export_fonts(draws_text(blank), &headless).is_ok());
+        }
+        assert!(
+            ensure_text_export_fonts(draws_text(Some("visible")), &headless).is_err(),
+            "visible text without fonts still fails the export"
+        );
+    }
+
+    #[test]
+    fn export_resolver_skips_blank_text_but_fails_a_missing_raster() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "export resolver qualification requires a GPU adapter"
+            );
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let info = |content: &str, box_norm| TextInfo {
+            content: content.to_string(),
+            style: TextStyle::default(),
+            box_norm,
+        };
+        let full = (0.0, 0.0, 1.0, 1.0);
+        let text = HashMap::from([
+            ("empty".to_string(), info("", full)),
+            ("flat".to_string(), info("hidden", (0.0, 0.0, 0.0, 1.0))),
+            ("spaces".to_string(), info("   ", full)),
+            ("visible".to_string(), info("visible", full)),
+        ]);
+        let media = HashMap::new();
+        let video_frames = HashMap::new();
+        let mut cache = TextureCache::new(4);
+        let mut lottie = LottieMaterializer::new();
+        let mut content_hashes = ContentHashCache::new();
+        let mut lut_cache = HashMap::new();
+        let mut resolver = MediaResolver {
+            device: &dev.device,
+            queue: &dev.queue,
+            cache: &mut cache,
+            lottie: &mut lottie,
+            content_hashes: &mut content_hashes,
+            media: &media,
+            text: &text,
+            // Returns `None` for every request, like a broken text backend.
+            text_rasterizer: &opentake_render::NullTextRasterizer,
+            render_box: (64, 64),
+            project_root: None,
+            lut_cache: &mut lut_cache,
+            video_frames: &video_frames,
+            materialization_error: None,
+        };
+        let source = |clip_id: &str| TextureSource::Text {
+            clip_id: clip_id.to_string(),
+        };
+        for blank in ["empty", "flat"] {
+            assert!(resolver.resolve(&source(blank), 0).is_none());
+        }
+        assert_eq!(resolver.materialization_error, None);
+        // Whitespace still paints its box, so it reaches the rasterizer.
+        for drawn in ["spaces", "visible"] {
+            assert!(resolver.resolve(&source(drawn), 0).is_none());
+            let error = resolver
+                .materialization_error
+                .take()
+                .expect("a missing raster for drawn text must fail the export");
+            assert!(
+                error.contains(&format!("text clip {drawn} rasterization failed")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

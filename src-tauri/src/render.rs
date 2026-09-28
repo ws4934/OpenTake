@@ -48,9 +48,10 @@ use opentake_render::gpu::compositor::{
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::wgpu;
 use opentake_render::{
-    even, try_build_render_plan, Compositor, CosmicTextRasterizer, DecodedFrame, FramePlan,
-    GpuLutTexture, GpuTexture, LayerDraw, RenderDevice, RenderError, RenderPlan, RenderSize,
-    SourceMetrics, TextRasterRequest, TextRasterizer, TextureCache, TextureResolver, TextureSource,
+    even, is_blank_text, rasterize_text_layer, text_clip_raster_input, try_build_render_plan,
+    Compositor, CosmicTextRasterizer, DecodedFrame, FramePlan, GpuLutTexture, GpuTexture,
+    LayerDraw, RenderDevice, RenderError, RenderPlan, RenderSize, SourceMetrics, TextRasterRequest,
+    TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
 
 /// Cap (longest canvas side, px) for a composite when the caller passes no
@@ -897,7 +898,7 @@ struct MediaResolver<'d> {
     /// Text clips by id (content + style + box) for on-demand rasterization.
     text: &'d HashMap<String, TextInfo>,
     /// cosmic-text rasterizer (system fonts) for text layers.
-    text_rasterizer: &'d CosmicTextRasterizer,
+    text_rasterizer: &'d dyn TextRasterizer,
     /// Downscale box for decoded source frames (matches the preview render size).
     preview_box: (u32, u32),
     cancel: &'d MediaCancelToken,
@@ -949,9 +950,6 @@ impl MediaResolver<'_> {
         let Some(info) = self.text.get(clip_id) else {
             return self.fail_materialization(format!("text clip {clip_id} has no raster input"));
         };
-        if !text_style_is_finite(&info.style) {
-            return self.fail_materialization(format!("text clip {clip_id} has invalid style"));
-        }
         let req = TextRasterRequest {
             clip_id,
             content: &info.content,
@@ -959,17 +957,18 @@ impl MediaResolver<'_> {
             box_norm: info.box_norm,
             canvas: self.preview_box,
         };
-        let frame = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.text_rasterizer.rasterize(&req)
-        })) {
+        // A blank text clip draws nothing whatever its style (#180).
+        if is_blank_text(&req) {
+            return None;
+        }
+        if !text_style_is_finite(&info.style) {
+            return self.fail_materialization(format!("text clip {clip_id} has invalid style"));
+        }
+        let frame = match rasterize_text_layer(self.text_rasterizer, &req) {
             Ok(Some(frame)) => frame,
-            Ok(None) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization failed"));
-            }
-            Err(_) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization panicked"));
+            Ok(None) => return None,
+            Err(error) => {
+                return self.fail_materialization(format!("text clip {clip_id} {error}"));
             }
         };
         let tex = upload_rgba(self.device, self.queue, &frame, false, Some("preview-text"));
@@ -1665,15 +1664,15 @@ fn composite_timeline_frame_with_authority(
                 if clip.media_type != ClipType::Text {
                     continue;
                 }
-                let (Some(content), Some(style)) = (&clip.text_content, &clip.text_style) else {
+                let Some((content, style)) = text_clip_raster_input(clip) else {
                     continue;
                 };
                 let tl = clip.transform.top_left();
                 text.insert(
                     clip.id.clone(),
                     TextInfo {
-                        content: content.clone(),
-                        style: style.clone(),
+                        content: content.to_string(),
+                        style: style.into_owned(),
                         box_norm: (tl.x, tl.y, clip.transform.width, clip.transform.height),
                     },
                 );
@@ -2794,6 +2793,177 @@ mod tests {
         fs::remove_file(bundle.join(reference.relative_path())).unwrap();
         composite().expect("second preview reuses the already validated LUT");
         assert_eq!(render.gpu_acquisitions.load(Ordering::Relaxed), 1);
+    }
+
+    fn text_timeline(content: Option<&str>, style: Option<TextStyle>) -> Timeline {
+        let mut timeline = Timeline {
+            width: 64,
+            height: 64,
+            fps: 30,
+            ..Timeline::new()
+        };
+        let mut text = Clip::new("blank-text", "", 0, 30);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = content.map(str::to_string);
+        text.text_style = style;
+        let mut track = Track::new("text", ClipType::Text);
+        track.clips.push(text);
+        timeline.tracks.push(track);
+        timeline
+    }
+
+    #[test]
+    fn paused_preview_draws_nothing_for_blank_text_without_failing() {
+        if RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
+            return;
+        }
+        let render = RenderState::new();
+        let composite = |timeline: &Timeline| {
+            composite_timeline_frame(
+                timeline,
+                &MediaManifest::new(),
+                &None,
+                &render,
+                0,
+                64,
+                &MediaCancelToken::new(),
+            )
+        };
+        let mut empty = text_timeline(None, None);
+        empty.tracks.clear();
+        let reference = composite(&empty).expect("empty timeline composites");
+        let boxed = TextStyle {
+            background: opentake_domain::Fill::new(
+                true,
+                opentake_domain::Rgba::new(1.0, 0.0, 0.0, 1.0),
+            ),
+            border: opentake_domain::Fill::new(
+                true,
+                opentake_domain::Rgba::new(0.0, 0.0, 1.0, 1.0),
+            ),
+            ..TextStyle::default()
+        };
+        // As upstream, empty text draws nothing even with a background box.
+        for (content, style) in [
+            (Some(""), Some(TextStyle::default())),
+            (Some(""), Some(boxed.clone())),
+            (Some(" \n\t "), Some(TextStyle::default())),
+            (None, Some(TextStyle::default())),
+            (None, Some(boxed.clone())),
+            (None, None),
+        ] {
+            let frame = composite(&text_timeline(content, style.clone())).unwrap_or_else(|error| {
+                panic!(
+                    "blank text {content:?} (style {}) failed: {error}",
+                    style.is_some()
+                )
+            });
+            assert_eq!(frame, reference, "blank text {content:?} must draw nothing");
+        }
+        // Whitespace-only text has no glyphs but paints its background box.
+        let mut spaces = text_timeline(Some("   "), Some(boxed));
+        spaces.tracks[0].clips[0].transform.width = 0.5;
+        spaces.tracks[0].clips[0].transform.height = 0.5;
+        let frame = composite(&spaces).expect("whitespace text composites");
+        assert_ne!(frame, reference, "whitespace text paints its background");
+    }
+
+    #[test]
+    fn paused_preview_resolver_skips_blank_text_but_fails_a_missing_raster() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let style = TextStyle::default();
+        let text = HashMap::from([
+            (
+                "blank".to_string(),
+                TextInfo {
+                    content: String::new(),
+                    style: style.clone(),
+                    box_norm: (0.0, 0.0, 1.0, 1.0),
+                },
+            ),
+            (
+                "flat".to_string(),
+                TextInfo {
+                    content: "hidden".to_string(),
+                    style: style.clone(),
+                    box_norm: (0.0, 0.0, 0.0, 1.0),
+                },
+            ),
+            (
+                "spaces".to_string(),
+                TextInfo {
+                    content: "   ".to_string(),
+                    style: style.clone(),
+                    box_norm: (0.0, 0.0, 1.0, 1.0),
+                },
+            ),
+            (
+                "visible".to_string(),
+                TextInfo {
+                    content: "visible".to_string(),
+                    style,
+                    box_norm: (0.0, 0.0, 1.0, 1.0),
+                },
+            ),
+        ]);
+        let media = HashMap::new();
+        let cancel = MediaCancelToken::new();
+        let mut cache = TextureCache::new(4);
+        let mut lottie = LottieMaterializer::new();
+        let mut content_hashes = ContentHashCache::new();
+        let mut lut_cache = HashMap::new();
+        let mut image_textures = ImageTextureStore::default();
+        let mut resolver = MediaResolver {
+            device: &dev.device,
+            queue: &dev.queue,
+            cache: &mut cache,
+            lottie: &mut lottie,
+            content_hashes: &mut content_hashes,
+            media: &media,
+            timeline_fps: 30,
+            text: &text,
+            // Returns `None` for every request, like a broken text backend.
+            text_rasterizer: &opentake_render::NullTextRasterizer,
+            preview_box: (64, 64),
+            cancel: &cancel,
+            project_root: None,
+            lut_cache: &mut lut_cache,
+            image_textures: &mut image_textures,
+            lent_images: Vec::new(),
+            materialization_error: None,
+            strict_materialization: false,
+        };
+        let text_source = |clip_id: &str| TextureSource::Text {
+            clip_id: clip_id.to_string(),
+        };
+
+        assert!(resolver.resolve(&text_source("blank"), 0).is_none());
+        assert!(resolver.resolve(&text_source("flat"), 0).is_none());
+        assert_eq!(resolver.materialization_error, None);
+        // Whitespace still paints its box, so it reaches the rasterizer.
+        for drawn in ["spaces", "visible"] {
+            assert!(resolver.resolve(&text_source(drawn), 0).is_none());
+            let error = resolver
+                .materialization_error
+                .take()
+                .expect("a missing raster for drawn text must fail the preview");
+            assert!(
+                error.contains(&format!("text clip {drawn} rasterization failed")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

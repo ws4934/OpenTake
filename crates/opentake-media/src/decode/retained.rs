@@ -58,6 +58,7 @@ pub(super) fn decode_retained_frame(
     let mut child = command
         .spawn()
         .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
+    crate::ff::record_helper_process();
     // Windows starts the configured child suspended until it is attached.
     let mut tree = match ProcessTree::attach(child.id()) {
         Ok(tree) => tree,

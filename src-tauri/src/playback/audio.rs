@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,6 +36,12 @@ use opentake_media::{
     decode_pcm_interleaved_cancellable, encode::mix::apply_true_peak_ceiling, MediaCancelToken,
     MediaError, PcmFormat, PcmSpec,
 };
+
+use crate::clip_audio::{
+    clip_source_window_secs, keep_clip_reader, ClipAudioLayout, ClipAudioReader, PreviewDenoise,
+};
+
+pub(crate) use crate::clip_audio::ProfileScope;
 
 use super::engine::{InstantClock, PlaybackClock};
 use super::project::MediaInfo;
@@ -1428,21 +1435,6 @@ fn query_default_output_rate() -> Option<u32> {
     Some(config.sample_rate().0)
 }
 
-/// Source-media window `[lo, hi)` seconds a clip consumes (trim + speed). Mirrors
-/// `export::clip_source_window_secs`.
-fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)> {
-    if clip.duration_frames <= 0 || timeline_fps <= 0 {
-        return None;
-    }
-    let fps = timeline_fps as f64;
-    let lo = clip.trim_start_frame.max(0) as f64 / fps;
-    let consumed = clip.source_frames_consumed().max(0);
-    if consumed == 0 {
-        return None;
-    }
-    Some((lo, lo + consumed as f64 / fps))
-}
-
 /// One clip's decoded audio, placed on the output timeline as interleaved stereo
 /// at the device rate, with its per-output-frame `volume_at` gain envelope.
 struct StereoClip {
@@ -1640,35 +1632,6 @@ fn mix_stereo(clips: &[StereoClip], cancel: &MediaCancelToken) -> Result<Vec<f32
     Ok(out)
 }
 
-fn retime_interleaved_stereo(samples: &[f32], target_frames: usize) -> Vec<f32> {
-    let source_frames = samples.len() / MIX_CHANNELS;
-    if source_frames == 0 || target_frames == 0 {
-        return Vec::new();
-    }
-    if source_frames == target_frames {
-        return samples[..source_frames * MIX_CHANNELS].to_vec();
-    }
-    let mut output = Vec::with_capacity(target_frames * MIX_CHANNELS);
-    let source_span = source_frames.saturating_sub(1) as f64;
-    let target_span = target_frames.saturating_sub(1).max(1) as f64;
-    for frame in 0..target_frames {
-        let source = if target_frames == 1 {
-            0.0
-        } else {
-            frame as f64 * source_span / target_span
-        };
-        let lo = source.floor() as usize;
-        let hi = source.ceil() as usize;
-        let fraction = (source - lo as f64) as f32;
-        for channel in 0..MIX_CHANNELS {
-            let a = samples[lo * MIX_CHANNELS + channel];
-            let b = samples[hi * MIX_CHANNELS + channel];
-            output.push(a + (b - a) * fraction);
-        }
-    }
-    output
-}
-
 fn timeline_audio_frames(timeline: &Timeline, rate: u32) -> Result<u64, MediaError> {
     if timeline.fps <= 0 || rate == 0 {
         return Ok(0);
@@ -1683,92 +1646,283 @@ fn timeline_audio_frames(timeline: &Timeline, rate: u32) -> Result<u64, MediaErr
         .ok_or_else(|| audio_buffer_too_large("streaming timeline frame rounding overflow"))
 }
 
+/// Per-session preview audio state reused across mix windows: which sources
+/// have audio (probed once per source, not once per window), the clip
+/// readers of the window just mixed, which the next window continues so a
+/// clip keeps one decoder and one resampler while it plays, and the owner of
+/// the background profile passes the session asks for.
+#[derive(Default)]
+struct PreviewAudioSources {
+    has_audio: HashMap<PathBuf, bool>,
+    readers: Vec<PreviewReader>,
+    profiles: ProfileScope,
+}
+
+/// An open clip reader, and the clip and source it reads.
+struct PreviewReader {
+    clip_id: String,
+    path: PathBuf,
+    layout: ClipAudioLayout,
+    reader: ClipAudioReader,
+}
+
+impl PreviewAudioSources {
+    fn new(profiles: ProfileScope) -> Self {
+        PreviewAudioSources {
+            profiles,
+            ..PreviewAudioSources::default()
+        }
+    }
+
+    fn has_audio(&mut self, path: &Path, cancel: &MediaCancelToken) -> Result<bool, MediaError> {
+        if let Some(audible) = self.has_audio.get(path) {
+            return Ok(*audible);
+        }
+        let audible = crate::clip_audio::source_has_audio(path, cancel)?;
+        self.has_audio.insert(path.to_path_buf(), audible);
+        Ok(audible)
+    }
+
+    /// Take the open reader that continues `clip` at clip frame `from` with
+    /// the requested denoise, if there is one. Any other reader of the clip
+    /// (an old layout, or a denoise that changed) is closed.
+    fn take_reader(
+        &mut self,
+        clip_id: &str,
+        path: &Path,
+        layout: &ClipAudioLayout,
+        from: usize,
+        denoised: bool,
+    ) -> Option<ClipAudioReader> {
+        let mut taken = None;
+        let mut index = 0;
+        while index < self.readers.len() {
+            let open = &self.readers[index];
+            if open.clip_id != clip_id {
+                index += 1;
+                continue;
+            }
+            let open = self.readers.swap_remove(index);
+            if taken.is_none()
+                && open.path == path
+                && open.layout == *layout
+                && open.reader.position() == from
+                && open.reader.is_denoised() == denoised
+            {
+                taken = Some(open.reader);
+            }
+        }
+        taken
+    }
+
+    /// Close the readers a window over mix frames `[start, end)` cannot
+    /// continue: their clip does not play there, or the reader is not at
+    /// the window's first frame of the clip.
+    fn close_readers_outside(&mut self, start: u64, end: u64) {
+        self.readers.retain(|open| {
+            let (clip_start, clip_end) = open.layout.span();
+            let overlap_start = start.max(clip_start);
+            overlap_start < end.min(clip_end)
+                && open.reader.position() == open.layout.offset_of(overlap_start)
+        });
+    }
+
+    /// Close every open reader (after a seek or a failed window).
+    fn close_readers(&mut self) {
+        self.readers.clear();
+    }
+}
+
+/// How a mix window gets the noise profile of a denoised clip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileWait {
+    /// Playback: never wait; play the clip undenoised until the background
+    /// worker has its profile.
+    Background,
+    /// Compute (or wait for) the profile before mixing, as export does.
+    #[cfg(test)]
+    Block,
+}
+
 fn mix_timeline_window(
     timeline: &Timeline,
     media: &HashMap<String, MediaInfo>,
     rate: u32,
     window_start: u64,
     window_frames: usize,
+    sources: &mut PreviewAudioSources,
+    cancel: &MediaCancelToken,
+) -> Result<Vec<f32>, MediaError> {
+    mix_timeline_window_channels(
+        timeline,
+        media,
+        rate,
+        MIX_CHANNELS,
+        window_start,
+        window_frames,
+        sources,
+        ProfileWait::Background,
+        cancel,
+    )
+}
+
+/// Mix timeline mix frames `[window_start, window_start + window_frames)`.
+/// Every clip is rendered through the export's clip-audio path (placement,
+/// resampling and denoise are functions of the absolute clip position), so a
+/// window's samples do not depend on where playback started (#16). A clip
+/// that continues from the previous window keeps its reader, so consecutive
+/// windows read one continuous decode, as export does. `channels` is the
+/// preview's stereo except in the export-parity test.
+#[allow(clippy::too_many_arguments)]
+fn mix_timeline_window_channels(
+    timeline: &Timeline,
+    media: &HashMap<String, MediaInfo>,
+    rate: u32,
+    channels: usize,
+    window_start: u64,
+    window_frames: usize,
+    sources: &mut PreviewAudioSources,
+    profiles: ProfileWait,
+    cancel: &MediaCancelToken,
+) -> Result<Vec<f32>, MediaError> {
+    let result = mix_window_with_readers(
+        timeline,
+        media,
+        rate,
+        channels,
+        window_start,
+        window_frames,
+        sources,
+        profiles,
+        cancel,
+    );
+    if result.is_err() {
+        // A failed or cancelled read leaves its reader mid-chunk.
+        sources.close_readers();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mix_window_with_readers(
+    timeline: &Timeline,
+    media: &HashMap<String, MediaInfo>,
+    rate: u32,
+    channels: usize,
+    window_start: u64,
+    window_frames: usize,
+    sources: &mut PreviewAudioSources,
+    profiles: ProfileWait,
     cancel: &MediaCancelToken,
 ) -> Result<Vec<f32>, MediaError> {
     let sample_count = window_frames
-        .checked_mul(MIX_CHANNELS)
+        .checked_mul(channels)
         .ok_or_else(|| audio_buffer_too_large("streaming window sample count overflow"))?;
     let mut mixed = vec![0.0_f32; sample_count];
-    let mut true_peak_ceiling_dbtp: Option<f64> = None;
     let window_end = window_start.saturating_add(window_frames as u64);
-    for track in &timeline.tracks {
-        if track.muted {
+    let audible_clips = || {
+        timeline
+            .tracks
+            .iter()
+            .filter(|track| !track.muted)
+            .flat_map(|track| &track.clips)
+            .filter(|clip| {
+                matches!(clip.media_type, ClipType::Audio | ClipType::Video)
+                    && clip.duration_frames > 0
+            })
+    };
+    // Like export, the strictest ceiling of any clip applies to the whole
+    // timeline, so it cannot change with the window alignment.
+    let true_peak_ceiling_dbtp = audible_clips()
+        .filter_map(|clip| {
+            clip.loudness_normalization
+                .map(|normalization| normalization.true_peak_ceiling_dbtp)
+        })
+        .min_by(f64::total_cmp);
+    let mut samples = Vec::new();
+    // Readers this window leaves mid-clip; they replace `sources.readers` at
+    // the end, which closes the previous window's readers nothing continued.
+    // At most `MAX_OPEN_CLIP_READERS` readers are open at any moment: the
+    // previous window's (`sources.readers`), the continuing ones and one
+    // reader of a clip beyond the cap, closed right after it is read.
+    let mut continuing = Vec::new();
+    sources.close_readers_outside(window_start, window_end);
+    for clip in audible_clips() {
+        if cancel.checkpoint() {
+            return Err(MediaError::Cancelled);
+        }
+        let Some(info) = media.get(&clip.media_ref) else {
+            continue;
+        };
+        let Some(layout) = ClipAudioLayout::new(clip, timeline.fps, rate) else {
+            continue;
+        };
+        let (clip_start, clip_end) = layout.span();
+        let overlap_start = window_start.max(clip_start);
+        let overlap_end = window_end.min(clip_end);
+        if overlap_start >= overlap_end || !sources.has_audio(&info.path, cancel)? {
             continue;
         }
-        for clip in &track.clips {
-            if cancel.checkpoint() {
-                return Err(MediaError::Cancelled);
+        let config = clip.audio_denoise.filter(|config| config.preview_enabled);
+        let denoise = match profiles {
+            ProfileWait::Background => {
+                match crate::clip_audio::preview_clip_denoise(
+                    config,
+                    &clip.id,
+                    &layout,
+                    &info.path,
+                    channels,
+                    &sources.profiles,
+                )? {
+                    PreviewDenoise::Ready(profile, config) => Some((profile, config)),
+                    PreviewDenoise::Off | PreviewDenoise::Pending => None,
+                }
             }
-            if !matches!(clip.media_type, ClipType::Audio | ClipType::Video)
-                || clip.duration_frames <= 0
-            {
-                continue;
-            }
-            let Some(info) = media.get(&clip.media_ref) else {
-                continue;
+            #[cfg(test)]
+            ProfileWait::Block => crate::clip_audio::clip_denoise(
+                config, &layout, &info.path, channels, cancel, None,
+            )?,
+        };
+        let from = layout.offset_of(overlap_start);
+        let (mut reader, keep) =
+            match sources.take_reader(&clip.id, &info.path, &layout, from, denoise.is_some()) {
+                Some(reader) => (reader, true),
+                None => {
+                    let keep = keep_clip_reader(sources.readers.len() + continuing.len());
+                    let reader =
+                        ClipAudioReader::open(layout, &info.path, channels, from, denoise, cancel)?;
+                    (reader, keep)
+                }
             };
-            let clip_start = ((clip.start_frame.max(0) as f64 / timeline.fps as f64) * rate as f64)
-                .round() as u64;
-            let clip_frames = ((clip.duration_frames as f64 / timeline.fps as f64) * rate as f64)
-                .round()
-                .max(0.0) as u64;
-            let clip_end = clip_start.saturating_add(clip_frames);
-            let overlap_start = window_start.max(clip_start);
-            let overlap_end = window_end.min(clip_end);
-            if overlap_start >= overlap_end || clip_frames == 0 {
-                continue;
-            }
-            let Some((source_lo, source_hi)) = clip_source_window_secs(clip, timeline.fps) else {
-                continue;
-            };
-            let source_span = source_hi - source_lo;
-            let relative_start = (overlap_start - clip_start) as f64 / clip_frames as f64;
-            let relative_end = (overlap_end - clip_start) as f64 / clip_frames as f64;
-            let range = (
-                source_lo + source_span * relative_start,
-                source_lo + source_span * relative_end,
+        let frames = (overlap_end - overlap_start) as usize;
+        samples.clear();
+        reader.read(frames, &mut samples)?;
+        if overlap_end < clip_end && keep {
+            continuing.push(PreviewReader {
+                clip_id: clip.id.clone(),
+                path: info.path.clone(),
+                layout,
+                reader,
+            });
+        } else {
+            drop(reader);
+        }
+        let output_start = (overlap_start - window_start) as usize;
+        for frame in 0..frames {
+            let timeline_frame = crate::clip_audio::timeline_frame_at(
+                overlap_start + frame as u64,
+                timeline.fps,
+                rate,
             );
-            let spec = PcmSpec {
-                sample_rate: rate,
-                channels: MIX_CHANNELS as u16,
-                format: PcmFormat::F32,
-            };
-            let decoded =
-                match decode_pcm_interleaved_cancellable(&info.path, &spec, Some(range), cancel) {
-                    Ok(decoded) => decoded,
-                    Err(MediaError::NoTrack(_, _)) => continue,
-                    Err(error) => return Err(error),
-                };
-            let target_frames = (overlap_end - overlap_start) as usize;
-            let retimed = retime_interleaved_stereo(&decoded, target_frames);
-            let retimed =
-                apply_preview_denoise(&retimed, MIX_CHANNELS, rate, clip.audio_denoise, cancel)?;
-            let frames_per_timeline_frame = rate as f64 / timeline.fps as f64;
-            for frame in 0..target_frames.min(retimed.len() / MIX_CHANNELS) {
-                let timeline_sample = overlap_start.saturating_add(frame as u64);
-                let timeline_frame =
-                    (timeline_sample as f64 / frames_per_timeline_frame).floor() as i32;
-                let gain = clip.volume_at(timeline_frame) as f32;
-                let output = (overlap_start - window_start) as usize + frame;
-                let output = output * MIX_CHANNELS;
-                mixed[output] += retimed[frame * MIX_CHANNELS] * gain;
-                mixed[output + 1] += retimed[frame * MIX_CHANNELS + 1] * gain;
-            }
-            if let Some(ceiling) = clip
-                .loudness_normalization
-                .map(|normalization| normalization.true_peak_ceiling_dbtp)
-            {
-                true_peak_ceiling_dbtp =
-                    Some(true_peak_ceiling_dbtp.map_or(ceiling, |current| current.min(ceiling)));
+            let gain = clip.volume_at(timeline_frame) as f32;
+            let output = (output_start + frame) * channels;
+            for channel in 0..channels {
+                mixed[output + channel] += samples[frame * channels + channel] * gain;
             }
         }
     }
+    // Keep the readers the next window continues; close the rest.
+    sources.readers = continuing;
     for sample in &mut mixed {
         *sample = sample.clamp(-1.0, 1.0);
     }
@@ -1832,6 +1986,7 @@ fn run_audio_producer(
         window_frames,
     } = windows;
     let mut generation = 0_u64;
+    let mut window_cancel = MediaCancelToken::new();
     loop {
         if control.stopped.load(Ordering::Acquire) {
             break;
@@ -1846,7 +2001,11 @@ fn run_audio_producer(
             continue;
         }
         let len = (total_frames - next_frame).min(window_frames as u64) as usize;
-        let window_cancel = MediaCancelToken::new();
+        // Clip readers stay open from window to window, so the windows of one
+        // generation share a token; a seek or stop cancels it.
+        if window_cancel.is_cancelled() {
+            window_cancel = MediaCancelToken::new();
+        }
         *control
             .active_decode
             .lock()
@@ -1904,6 +2063,7 @@ fn mix_timeline_stereo(
     media: &HashMap<String, MediaInfo>,
     rate: u32,
     start_frame: u64,
+    profiles: &ProfileScope,
     cancel: &MediaCancelToken,
 ) -> Result<Option<PreparedTimelineAudio>, MediaError> {
     if timeline.fps <= 0 || rate == 0 {
@@ -1931,7 +2091,16 @@ fn mix_timeline_stereo(
         .checked_mul(STREAM_WINDOW_SECONDS)
         .ok_or_else(|| audio_buffer_too_large("streaming window frame overflow"))?;
     let first_len = (total_frames - start_frame).min(window_frames as u64) as usize;
-    let first_samples = mix_timeline_window(timeline, media, rate, start_frame, first_len, cancel)?;
+    let mut sources = PreviewAudioSources::new(profiles.clone());
+    let first_samples = mix_timeline_window(
+        timeline,
+        media,
+        rate,
+        start_frame,
+        first_len,
+        &mut sources,
+        cancel,
+    )?;
     let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
     sender
         .send(Ok(AudioStreamChunk {
@@ -1964,6 +2133,7 @@ fn mix_timeline_stereo(
                         rate,
                         start,
                         len,
+                        &mut sources,
                         cancel,
                     )
                     .map_err(|error| match error {
@@ -2002,6 +2172,7 @@ pub fn try_build_clock(
         fps,
         start_frame,
         false,
+        &ProfileScope::new(),
         &MediaCancelToken::new(),
     )
 }
@@ -2014,17 +2185,27 @@ pub fn build_clock_paused(
     fps: i32,
     start_frame: i32,
 ) -> Result<(Arc<dyn PlaybackClock>, Option<AudioPlayback>), MediaError> {
-    build_clock_paused_cancellable(timeline, media, fps, start_frame, &MediaCancelToken::new())
+    build_clock_paused_cancellable(
+        timeline,
+        media,
+        fps,
+        start_frame,
+        &ProfileScope::new(),
+        &MediaCancelToken::new(),
+    )
 }
 
-pub fn build_clock_paused_cancellable(
+/// [`build_clock_paused`] for a playback state: `profiles` owns the
+/// background denoise-profile passes the preview asks for.
+pub(crate) fn build_clock_paused_cancellable(
     timeline: &Timeline,
     media: &HashMap<String, MediaInfo>,
     fps: i32,
     start_frame: i32,
+    profiles: &ProfileScope,
     cancel: &MediaCancelToken,
 ) -> Result<(Arc<dyn PlaybackClock>, Option<AudioPlayback>), MediaError> {
-    build_clock_with_state(timeline, media, fps, start_frame, true, cancel)
+    build_clock_with_state(timeline, media, fps, start_frame, true, profiles, cancel)
 }
 
 fn build_clock_with_state(
@@ -2033,12 +2214,14 @@ fn build_clock_with_state(
     fps: i32,
     start_frame: i32,
     start_paused: bool,
+    profiles: &ProfileScope,
     cancel: &MediaCancelToken,
 ) -> Result<(Arc<dyn PlaybackClock>, Option<AudioPlayback>), MediaError> {
     let rate = default_output_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     let start_audio_frame =
         ((start_frame.max(0) as f64 / fps.max(1) as f64) * rate as f64).round() as u64;
-    let Some(prepared) = mix_timeline_stereo(timeline, media, rate, start_audio_frame, cancel)?
+    let Some(prepared) =
+        mix_timeline_stereo(timeline, media, rate, start_audio_frame, profiles, cancel)?
     else {
         return Ok((Arc::new(InstantClock::new(start_frame)), None));
     };
@@ -2158,6 +2341,7 @@ mod tests {
                     &media,
                     48_000,
                     0,
+                    &ProfileScope::new(),
                     &worker_cancel,
                 ))
                 .expect("publish audio prepare result");
@@ -2487,11 +2671,17 @@ mod tests {
             },
         )]);
 
-        let error =
-            match mix_timeline_stereo(&timeline, &media, 48_000, 0, &MediaCancelToken::new()) {
-                Err(error) => error,
-                Ok(_) => panic!("decode failure must propagate instead of producing an empty mix"),
-            };
+        let error = match mix_timeline_stereo(
+            &timeline,
+            &media,
+            48_000,
+            0,
+            &ProfileScope::new(),
+            &MediaCancelToken::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("decode failure must propagate instead of producing an empty mix"),
+        };
 
         assert!(!matches!(error, MediaError::Cancelled));
     }
@@ -3257,11 +3447,16 @@ mod tests {
     fn mix_timeline_stereo_empty_when_no_audio_clips() {
         let timeline = Timeline::new();
         let media: HashMap<String, MediaInfo> = HashMap::new();
-        assert!(
-            mix_timeline_stereo(&timeline, &media, 48_000, 0, &MediaCancelToken::new())
-                .expect("empty timeline")
-                .is_none()
-        );
+        assert!(mix_timeline_stereo(
+            &timeline,
+            &media,
+            48_000,
+            0,
+            &ProfileScope::new(),
+            &MediaCancelToken::new()
+        )
+        .expect("empty timeline")
+        .is_none());
     }
 
     #[test]
@@ -3331,6 +3526,477 @@ mod tests {
             opentake_media::analysis::denoise_interleaved(&input, 2, 48_000, config, &cancel, None)
                 .expect("shared denoise");
         assert_eq!(preview, shared);
+    }
+
+    /// Two noisy tones, the second denoised and faded in, over eight seconds.
+    fn denoised_timeline(dir: &std::path::Path) -> (Timeline, HashMap<String, PathBuf>) {
+        use crate::clip_audio::fixtures::{noisy_tone, write_wav};
+
+        let first = dir.join("first.wav");
+        let second = dir.join("second.wav");
+        write_wav(&first, &noisy_tone(6.0, 440.0, 3));
+        write_wav(&second, &noisy_tone(8.0, 550.0, 4));
+        let mut speech = audio_clip("speech", "second", 60, 180);
+        speech.trim_start_frame = 15;
+        speech.fade_in_frames = 20;
+        speech.audio_denoise = Some(AudioDenoise {
+            mode: opentake_domain::DenoiseMode::Voice,
+            strength: 0.8,
+            preview_enabled: true,
+        });
+        let mut timeline = audio_timeline(vec![audio_clip("music", "first", 0, 150)]);
+        let mut track = Track::new("a2", ClipType::Audio);
+        track.clips.push(speech);
+        timeline.tracks.push(track);
+        let paths = HashMap::from([("first".to_string(), first), ("second".to_string(), second)]);
+        (timeline, paths)
+    }
+
+    fn media_for(paths: &HashMap<String, PathBuf>) -> HashMap<String, MediaInfo> {
+        paths
+            .iter()
+            .map(|(id, path)| (id.clone(), MediaInfo { path: path.clone() }))
+            .collect()
+    }
+
+    #[test]
+    fn preview_windows_render_the_same_samples_whatever_the_playback_start() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (timeline, paths) = denoised_timeline(dir.path());
+        let media = media_for(&paths);
+        // Seeks inside the plain clip (0.7 s), inside the denoised clip
+        // (2.08 s), and in the middle of an STFT hop (3.96 s), at the usual
+        // device rate and at a Bluetooth hands-free rate, where the denoiser's
+        // hop (128) and warm-up (2,560 frames) are shorter than the reader's
+        // pre-roll.
+        for (rate, starts) in [
+            (48_000_u32, [33_600_u64, 100_000, 190_003]),
+            (16_000, [11_200, 33_333, 63_335]),
+        ] {
+            let total = timeline_audio_frames(&timeline, rate).unwrap();
+            assert_eq!(total, 8 * u64::from(rate));
+            let window = rate as usize * STREAM_WINDOW_SECONDS;
+            let cancel = MediaCancelToken::new();
+            // Stream the whole timeline in two-second windows from `start`,
+            // as the audio producer does after a play or seek there.
+            let stream_from = |start: u64| {
+                let mut sources = PreviewAudioSources::default();
+                let mut out = Vec::new();
+                let mut position = start;
+                while position < total {
+                    let len = (total - position).min(window as u64) as usize;
+                    out.extend(
+                        mix_timeline_window_channels(
+                            &timeline,
+                            &media,
+                            rate,
+                            MIX_CHANNELS,
+                            position,
+                            len,
+                            &mut sources,
+                            ProfileWait::Block,
+                            &cancel,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{rate} Hz window at {position} failed: {error}")
+                        }),
+                    );
+                    position += len as u64;
+                }
+                out
+            };
+            let from_zero = stream_from(0);
+            for start in starts {
+                let seeked = stream_from(start);
+                let offset = start as usize * MIX_CHANNELS;
+                let max_difference = seeked
+                    .iter()
+                    .zip(&from_zero[offset..])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_difference < 1.0e-4,
+                    "{rate} Hz playback from {start} differs by {max_difference}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preview_never_opens_more_clip_decoders_than_the_cap() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+        use crate::clip_audio::{reader_census, MAX_OPEN_CLIP_READERS};
+        use opentake_media::ffmpeg_status::HelperProcessCount;
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.wav");
+        write_wav(&source, &noisy_tone(10.0, 440.0, 11));
+        // Four more overlapping audible clips than the cap, entering at
+        // staggered frames and all still playing in the third window.
+        let extra = 4;
+        let clips = (0..MAX_OPEN_CLIP_READERS + extra)
+            .map(|index| {
+                let start = index as i32 * 3;
+                let mut clip = audio_clip(&format!("c{index}"), "tone", start, 180 - start);
+                clip.trim_start_frame = index as i32;
+                clip.volume = 0.05;
+                clip
+            })
+            .collect::<Vec<_>>();
+        let timeline = audio_timeline(clips);
+        let paths = HashMap::from([("tone".to_string(), source)]);
+        let media = media_for(&paths);
+        let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
+            .unwrap()
+            .expect("audible timeline");
+        let rate = 48_000_u32;
+        let total = timeline_audio_frames(&timeline, rate).unwrap() as usize;
+        let window = rate as usize * STREAM_WINDOW_SECONDS;
+        let census = reader_census::start();
+        let processes = HelperProcessCount::start();
+        let mut sources = PreviewAudioSources::default();
+        let mut previewed = Vec::new();
+        let mut position = 0;
+        while position < total {
+            let len = (total - position).min(window);
+            previewed.extend(
+                mix_timeline_window_channels(
+                    &timeline,
+                    &media,
+                    rate,
+                    1,
+                    position as u64,
+                    len,
+                    &mut sources,
+                    ProfileWait::Background,
+                    &MediaCancelToken::new(),
+                )
+                .unwrap(),
+            );
+            assert!(
+                census.live() < MAX_OPEN_CLIP_READERS,
+                "readers kept between windows: {}",
+                census.live()
+            );
+            position += len;
+        }
+        let spawned = processes.count();
+        drop(processes);
+        assert_eq!(
+            census.peak(),
+            MAX_OPEN_CLIP_READERS,
+            "clip decoders open at once"
+        );
+        drop(sources);
+        assert_eq!(census.live(), 0);
+        // One probe, one decoder for each clip kept open, and one decoder per
+        // window for each other clip.
+        let windows = total.div_ceil(window);
+        assert_eq!(windows, 3);
+        let kept = MAX_OPEN_CLIP_READERS - 1;
+        assert_eq!(spawned, 1 + kept + (extra + 1) * windows);
+        // Readers opened for one window still continue the clip's samples.
+        let max_difference = previewed
+            .iter()
+            .zip(&exported)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_difference < 1.0e-6,
+            "preview differs from export by {max_difference}"
+        );
+    }
+
+    #[test]
+    fn preview_mix_matches_export_audio_with_the_same_channels() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (timeline, paths) = denoised_timeline(dir.path());
+        let media = media_for(&paths);
+        let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
+            .unwrap()
+            .expect("audible timeline");
+        let rate = 48_000_u32;
+        let total = timeline_audio_frames(&timeline, rate).unwrap() as usize;
+        assert_eq!(exported.len(), total);
+        // The preview mixes stereo; mixed as mono at the export rate it lands
+        // on the export's samples, window by window.
+        let cancel = MediaCancelToken::new();
+        let mut sources = PreviewAudioSources::default();
+        let mut previewed = Vec::new();
+        let mut position = 0;
+        while position < total {
+            let len = (total - position).min(70_001);
+            previewed.extend(
+                mix_timeline_window_channels(
+                    &timeline,
+                    &media,
+                    rate,
+                    1,
+                    position as u64,
+                    len,
+                    &mut sources,
+                    ProfileWait::Block,
+                    &cancel,
+                )
+                .unwrap(),
+            );
+            position += len;
+        }
+        let max_difference = previewed
+            .iter()
+            .zip(&exported)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_difference < 1.0e-5,
+            "preview differs by {max_difference}"
+        );
+    }
+
+    /// Wait until `ready` holds, failing after `timeout`.
+    fn wait_for(timeout: Duration, what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Start playback preparation on another thread and wait (bounded) for it.
+    fn prepare_playback(
+        timeline: &Timeline,
+        media: &HashMap<String, MediaInfo>,
+        start: u64,
+        profiles: &ProfileScope,
+    ) -> PreparedTimelineAudio {
+        let (timeline, media, profiles) = (timeline.clone(), media.clone(), profiles.clone());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let prepared = mix_timeline_stereo(
+                &timeline,
+                &media,
+                48_000,
+                start,
+                &profiles,
+                &MediaCancelToken::new(),
+            );
+            let _ = sender.send(prepared);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("playback prepare must not wait for the noise profile")
+            .expect("prepare")
+            .expect("audible timeline")
+    }
+
+    fn stop_playback(prepared: PreparedTimelineAudio) {
+        prepared.control.stop();
+        drop(prepared.consumer);
+        prepared.producer.join().expect("audio producer");
+    }
+
+    #[test]
+    fn playback_does_not_wait_for_a_denoise_profile_and_seeks_do_not_restart_it() {
+        use crate::clip_audio::test_hooks;
+
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (timeline, paths) = denoised_timeline(dir.path());
+        let media = media_for(&paths);
+        let denoised_source = paths["second"].clone();
+        let mut undenoised = timeline.clone();
+        for clip in undenoised
+            .tracks
+            .iter_mut()
+            .flat_map(|track| &mut track.clips)
+        {
+            clip.audio_denoise = None;
+        }
+        let rate = 48_000_u32;
+        let window = rate as usize * STREAM_WINDOW_SECONDS;
+        let mix_undenoised = |start: u64| {
+            mix_timeline_window_channels(
+                &undenoised,
+                &media,
+                rate,
+                MIX_CHANNELS,
+                start,
+                window,
+                &mut PreviewAudioSources::default(),
+                ProfileWait::Block,
+                &MediaCancelToken::new(),
+            )
+            .unwrap()
+        };
+
+        // Hold the background pass: playback must start, seek and restart
+        // while the profile is still being computed. The passes belong to
+        // this playback state's scope, so other tests' project transitions
+        // cannot cancel them.
+        let profiles = ProfileScope::new();
+        let hold = test_hooks::hold(&denoised_source);
+        let start = 100_000;
+        let first = prepare_playback(&timeline, &media, start, &profiles);
+        let chunk = first
+            .consumer
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first window")
+            .expect("first window mixed");
+        assert_eq!(chunk.start_frame, start);
+        assert!(
+            chunk.samples == mix_undenoised(start),
+            "until its profile is ready the clip plays undenoised"
+        );
+        assert_eq!(test_hooks::requests(&denoised_source), 1);
+
+        // A seek cancels the window decode, not the profile pass.
+        first.control.request_seek(150_000);
+        let seeked = loop {
+            let chunk = first
+                .consumer
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("window after the seek")
+                .expect("window mixed after the seek");
+            if chunk.generation == 1 {
+                break chunk;
+            }
+        };
+        assert_eq!(seeked.start_frame, 150_000);
+        // Stop and play again: a new session joins the queued pass.
+        stop_playback(first);
+        let second = prepare_playback(&timeline, &media, 150_000, &profiles);
+        assert_eq!(test_hooks::requests(&denoised_source), 1, "one queued pass");
+        assert_eq!(test_hooks::passes(&denoised_source), 0, "the pass is held");
+        stop_playback(second);
+        // Another playback state closing its project leaves the pass alone.
+        ProfileScope::new().cancel();
+        assert_eq!(test_hooks::requests(&denoised_source), 1);
+
+        drop(hold);
+        let speech = &timeline.tracks[1].clips[0];
+        let layout = ClipAudioLayout::new(speech, timeline.fps, rate).unwrap();
+        wait_for(Duration::from_secs(30), "the background profile", || {
+            !crate::clip_audio::denoise_profile_pending(
+                speech.audio_denoise,
+                &layout,
+                &denoised_source,
+                MIX_CHANNELS,
+            )
+        });
+        assert_eq!(test_hooks::passes(&denoised_source), 1, "one profile pass");
+        assert_eq!(test_hooks::requests(&denoised_source), 1);
+
+        // Once the profile is cached, playback denoises without another pass.
+        let third = prepare_playback(&timeline, &media, start, &profiles);
+        let chunk = third
+            .consumer
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first window")
+            .expect("first window mixed");
+        assert!(
+            chunk.samples != mix_undenoised(start),
+            "denoised once ready"
+        );
+        stop_playback(third);
+        assert_eq!(test_hooks::passes(&denoised_source), 1);
+    }
+
+    #[test]
+    fn preview_windows_continue_one_decode_like_export_for_resampled_aac() {
+        use opentake_media::ffmpeg_status::HelperProcessCount;
+
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.m4a");
+        let status = std::process::Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("sine=frequency=440:sample_rate=44100:duration=7")
+            .args(["-c:a", "aac", "-b:a", "128k"])
+            .arg(&source)
+            .status()
+            .expect("run ffmpeg");
+        if !status.success() {
+            eprintln!("skip: ffmpeg could not encode the AAC fixture");
+            return;
+        }
+        let mut clip = audio_clip("tone", "tone", 12, 160);
+        clip.trim_start_frame = 7;
+        clip.fade_in_frames = 10;
+        let timeline = audio_timeline(vec![clip]);
+        let paths = HashMap::from([("tone".to_string(), source)]);
+        let media = media_for(&paths);
+        let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
+            .unwrap()
+            .expect("audible timeline");
+        let rate = 48_000_u32;
+        let total = exported.len();
+        let window = rate as usize * STREAM_WINDOW_SECONDS;
+        let processes = HelperProcessCount::start();
+        let mut sources = PreviewAudioSources::default();
+        let mut previewed = Vec::new();
+        let mut position = 0;
+        while position < total {
+            let len = (total - position).min(window);
+            previewed.extend(
+                mix_timeline_window_channels(
+                    &timeline,
+                    &media,
+                    rate,
+                    1,
+                    position as u64,
+                    len,
+                    &mut sources,
+                    ProfileWait::Background,
+                    &MediaCancelToken::new(),
+                )
+                .unwrap(),
+            );
+            position += len;
+        }
+        let spawned = processes.count();
+        drop(processes);
+        // Three windows over one clip: one audibility probe and one decoder.
+        assert_eq!(spawned, 2, "helper processes for three preview windows");
+        // One continuous 44.1 kHz AAC decode resampled once, as export reads
+        // it: the window edges add nothing.
+        let max_difference = previewed
+            .iter()
+            .zip(&exported)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_difference < 1.0e-6,
+            "preview differs from export by {max_difference}"
+        );
     }
 
     #[test]
