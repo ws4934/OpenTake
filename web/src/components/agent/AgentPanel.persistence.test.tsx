@@ -669,7 +669,9 @@ describe("AgentPanel project sessions", () => {
       });
       expect(apiMocks.chatSessionDelete).not.toHaveBeenCalled();
 
-      apiMocks.chatSessionDelete.mockRejectedValueOnce(new Error("running turn"));
+      apiMocks.chatSessionDelete.mockRejectedValueOnce(
+        "finish or cancel the running turn before deleting this chat",
+      );
       confirm.mockReturnValueOnce(true);
       await act(async () => {
         deleteButtons()[0].click();
@@ -677,6 +679,9 @@ describe("AgentPanel project sessions", () => {
         await Promise.resolve();
       });
       expect(deleteButtons()).toHaveLength(2);
+      const alert = container?.querySelector('[role="alert"]');
+      expect(alert?.textContent).toContain("agent.deleteChatFailed");
+      expect(alert?.textContent).toContain("finish or cancel the running turn");
 
       confirm.mockReturnValueOnce(true);
       await act(async () => {
@@ -691,6 +696,7 @@ describe("AgentPanel project sessions", () => {
         "/tmp/Current.opentake",
       );
       expect(deleteButtons()).toHaveLength(1);
+      expect(container?.querySelector('[role="alert"]')).toBeNull();
       expect(useChatStore.getState().sessionId).toBe("chat-b");
       expect(apiMocks.chatSessionSetOpen).not.toHaveBeenCalled();
     } finally {
@@ -705,6 +711,9 @@ describe("AgentPanel project sessions", () => {
       { id: "chat-closed-2", messages: [], createdAt: 1, isOpen: false },
     ]);
     installConfirm(true);
+    apiMocks.chatSessionDelete.mockImplementation(async (sessionId: string) => {
+      if (sessionId === "chat-closed-2") throw new Error("disk is read-only");
+    });
     try {
       await act(async () => {
         root?.render(<AgentPanel />);
@@ -724,8 +733,18 @@ describe("AgentPanel project sessions", () => {
         "chat-closed-1",
         "chat-closed-2",
       ]);
-      expect(deleteClosed()).toBeNull();
+      // The failed one stays offered and the partial failure is reported.
+      expect(deleteClosed()).not.toBeNull();
+      const alert = container?.querySelector('[role="alert"]');
+      expect(alert?.textContent).toContain("agent.deleteClosedChatsFailed 1/2");
+      expect(alert?.textContent).toContain("disk is read-only");
       expect(container?.querySelectorAll('[role="tab"]')).toHaveLength(1);
+
+      const dismiss = container?.querySelector<HTMLButtonElement>(
+        'button[aria-label="agent.dismissError"]',
+      );
+      await act(async () => dismiss?.click());
+      expect(container?.querySelector('[role="alert"]')).toBeNull();
     } finally {
       restoreConfirm();
     }

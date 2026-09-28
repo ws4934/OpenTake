@@ -1456,17 +1456,20 @@ impl MediaBridge for TauriMediaBridge {
                 cancel: Some(cancel.clone()),
                 ..Default::default()
             };
+            let cache_key = opentake_media::cache_key::file_identity_key(&path);
             let result = opentake_media::transcribe::transcribe_file(&path, b, &opts);
+            // A completed full transcript is cached even when the cancel lands
+            // just after it, so the work is not repeated.
+            if let (Ok(transcript), None) = (&result, &src.language) {
+                crate::transcribe::persist_full_transcript_keyed(
+                    self.engine.cache_root(),
+                    cache_key.as_deref(),
+                    transcript,
+                );
+            }
             if matches!(result, Err(opentake_media::MediaError::Cancelled)) || cancel.is_cancelled()
             {
                 return Err(cancelled_bridge_error());
-            }
-            if let (Ok(transcript), None) = (&result, &src.language) {
-                crate::transcribe::persist_full_transcript(
-                    self.engine.cache_root(),
-                    &path,
-                    transcript,
-                );
             }
             let result = result.map_err(|e| e.to_string());
             match result {

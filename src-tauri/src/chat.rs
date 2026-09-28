@@ -968,6 +968,9 @@ fn codex_turn_failure_message(error: crate::codex::CodexTurnError) -> &'static s
         CodexTurnError::Protocol => {
             "OpenTake could not read the official Codex output; update Codex CLI and try again"
         }
+        CodexTurnError::CliFailed => {
+            "the official Codex CLI stopped unexpectedly; try again, and update Codex CLI if it keeps failing"
+        }
         CodexTurnError::ProviderFailed => {
             "official Codex reported that the turn failed; check the Codex login status and try again"
         }
@@ -1175,7 +1178,8 @@ pub async fn chat_send(
                     error @ (crate::codex::CodexTurnError::McpStart
                     | crate::codex::CodexTurnError::Timeout
                     | crate::codex::CodexTurnError::Protocol
-                    | crate::codex::CodexTurnError::ProviderFailed),
+                    | crate::codex::CodexTurnError::ProviderFailed
+                    | crate::codex::CodexTurnError::CliFailed),
                 ) => Err(LoopError::llm(
                     LlmError::Provider(codex_turn_failure_message(error).into()),
                     &first_message_id,
@@ -1432,6 +1436,7 @@ mod tests {
             CodexTurnError::Timeout,
             CodexTurnError::Protocol,
             CodexTurnError::ProviderFailed,
+            CodexTurnError::CliFailed,
         ];
         let messages = failures.map(codex_turn_failure_message);
         for (index, message) in messages.iter().enumerate() {

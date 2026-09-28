@@ -32,7 +32,7 @@ const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CODEX_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const CODEX_LOGOUT_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_LOGIN_SESSION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// How long a cancelled or failed turn waits for in-flight tool dispatches to
+/// How long a user-cancelled turn waits for in-flight tool dispatches to
 /// observe cancellation before it stops waiting for the MCP endpoint.
 const CANCELLED_TURN_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -42,6 +42,8 @@ const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_PROBE_CAPTURE_BYTES: usize = 16 * 1024;
 const MAX_FINAL_TEXT_BYTES: usize = 256 * 1024;
 const MAX_TOOL_CALLS: usize = 512;
+/// Bytes kept from the start of an oversized JSONL line to identify its item.
+const OVERSIZED_LINE_HEAD_BYTES: usize = 4096;
 const MAX_TOOL_RESULT_BLOCKS: usize = 64;
 const MAX_TOOL_RESULT_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
 const CODEX_MCP_BEARER_ENV: &str = "OPENTAKE_CODEX_MCP_BEARER_TOKEN";
@@ -172,7 +174,12 @@ pub enum CodexTurnError {
     StrictConfigRejected,
     Timeout,
     Protocol,
+    /// Codex reported that the turn failed (`turn.failed`), which covers
+    /// expired sign-ins.
     ProviderFailed,
+    /// The Codex process could not be started, lost its stdin, or exited
+    /// unsuccessfully without reporting a turn failure.
+    CliFailed,
 }
 
 #[derive(Debug)]
@@ -787,6 +794,19 @@ fn bounded_tool_result_text(text: &str) -> String {
     bounded
 }
 
+/// Truncate an oversized final reply at a UTF-8 boundary and say so.
+fn bounded_reply_text(text: &str) -> String {
+    if text.len() <= MAX_FINAL_TEXT_BYTES {
+        return text.to_owned();
+    }
+    let note = format!(
+        "\n\n[OpenTake: the reply was truncated for display; it was {} bytes.]",
+        text.len()
+    );
+    let keep = text.floor_char_boundary(MAX_FINAL_TEXT_BYTES.saturating_sub(note.len()));
+    format!("{}{note}", &text[..keep])
+}
+
 /// A short, printable rendering of an untrusted type label for a note.
 fn display_label(label: &str) -> String {
     let clean = label
@@ -823,10 +843,7 @@ fn parse_exec_event(
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or(CodexTurnError::Protocol)?;
-            if text.len() > MAX_FINAL_TEXT_BYTES {
-                return Err(CodexTurnError::Protocol);
-            }
-            Ok(ExecEvent::AgentMessage(text.to_owned()))
+            Ok(ExecEvent::AgentMessage(bounded_reply_text(text)))
         }
         Some("mcp_tool_call") => {
             let id = item
@@ -961,15 +978,15 @@ fn build_exec_args(endpoint_url: &str, isolated_cwd: &Path) -> Vec<OsString> {
     args
 }
 
-/// Cancel-safe: bytes consumed from `reader` stay in `buffer` until a full
-/// line is returned, so dropping this future inside `select!` and calling it
-/// again with the same buffer resumes the partial line instead of losing it.
 #[derive(Debug, PartialEq, Eq)]
 enum JsonlLine {
     Text(String),
     /// A line longer than [`MAX_JSONL_LINE_BYTES`], drained without being
-    /// buffered; carries its byte length.
-    Oversized(usize),
+    /// buffered; carries its byte length and whether it was the reply.
+    Oversized {
+        len: usize,
+        agent_message: bool,
+    },
 }
 
 /// Partial-line state kept outside the read future, so dropping the future
@@ -979,8 +996,20 @@ struct JsonlLineBuffer {
     bytes: Vec<u8>,
     /// Bytes drained so far from a line already known to be oversized.
     oversized: Option<usize>,
+    /// The first [`OVERSIZED_LINE_HEAD_BYTES`] of that line.
+    oversized_head: Vec<u8>,
 }
 
+/// Whether the head of an oversized JSONL line is a completed `agent_message`
+/// item (Codex serializes the item type before its text).
+fn oversized_line_is_agent_message(head: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(head);
+    head.contains(r#""type":"item.completed""#) && head.contains(r#""type":"agent_message""#)
+}
+
+/// Cancel-safe: bytes consumed from `reader` stay in `buffer` until a full
+/// line is returned, so dropping this future inside `select!` and calling it
+/// again with the same buffer resumes the partial line instead of losing it.
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buffer: &mut JsonlLineBuffer,
@@ -1000,11 +1029,19 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
         let take = newline.unwrap_or(available.len());
         if let Some(skipped) = buffer.oversized.as_mut() {
             *skipped = skipped.saturating_add(take);
+            if *skipped > MAX_STDOUT_BYTES {
+                // An unterminated line cannot outlast the stdout budget.
+                return Err(CodexTurnError::Protocol);
+            }
         } else if buffer.bytes.len().saturating_add(take) > MAX_JSONL_LINE_BYTES {
             // Drain the rest of the line without buffering it; the caller
-            // decides whether an unreadable line is fatal.
+            // decides whether an unreadable line is fatal. The head of the line
+            // is kept so the caller can tell which item it was.
             buffer.oversized = Some(buffer.bytes.len().saturating_add(take));
-            buffer.bytes = Vec::new();
+            let mut head = std::mem::take(&mut buffer.bytes);
+            head.extend_from_slice(&available[..take.min(OVERSIZED_LINE_HEAD_BYTES)]);
+            head.truncate(OVERSIZED_LINE_HEAD_BYTES);
+            buffer.oversized_head = head;
         } else {
             buffer.bytes.extend_from_slice(&available[..take]);
         }
@@ -1014,7 +1051,11 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
         }
     }
     if let Some(len) = buffer.oversized.take() {
-        return Ok(Some(JsonlLine::Oversized(len)));
+        let head = std::mem::take(&mut buffer.oversized_head);
+        return Ok(Some(JsonlLine::Oversized {
+            len,
+            agent_message: oversized_line_is_agent_message(&head),
+        }));
     }
     if buffer.bytes.last() == Some(&b'\r') {
         buffer.bytes.pop();
@@ -1121,7 +1162,7 @@ async fn run_probe(
         Err(_) => {
             let _ = child.start_kill();
             let _ = tokio::time::timeout_at(deadline, child.wait()).await;
-            return Err(CodexTurnError::ProviderFailed);
+            return Err(CodexTurnError::CliFailed);
         }
     };
     let stdout_task = child
@@ -1241,7 +1282,7 @@ async fn write_prompt_with_lifecycle<W: AsyncWrite + Unpin>(
     loop {
         tokio::select! {
             result = &mut write => {
-                return result.map_err(|_| CodexTurnError::ProviderFailed);
+                return result.map_err(|_| CodexTurnError::CliFailed);
             }
             _ = poll.tick() => {
                 if cancel.load(Ordering::Acquire) {
@@ -1251,6 +1292,23 @@ async fn write_prompt_with_lifecycle<W: AsyncWrite + Unpin>(
             _ = endpoint.stopped() => return Err(CodexTurnError::McpStart),
             _ = &mut deadline => return Err(CodexTurnError::Timeout),
         }
+    }
+}
+
+/// Deadline for draining the MCP endpoint. After a user cancel the dispatches
+/// observe their tokens and end promptly, so a straggler must not hold the
+/// cancelled turn open until the turn deadline. Internal failures keep the
+/// full deadline: timing out there would drop the endpoint, whose `Drop`
+/// cancels the whole turn and discards the error reply that is still saved.
+fn endpoint_close_deadline(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    user_cancelled: bool,
+) -> tokio::time::Instant {
+    if user_cancelled {
+        deadline.min(now + CANCELLED_TURN_CLEANUP_GRACE)
+    } else {
+        deadline
     }
 }
 
@@ -1319,9 +1377,15 @@ impl ExecStreamState {
     fn accept_line(&mut self, line: JsonlLine) -> Result<Option<ToolCall>, CodexTurnError> {
         let line = match line {
             JsonlLine::Text(line) => line,
-            JsonlLine::Oversized(len) => {
+            JsonlLine::Oversized { len, agent_message } => {
                 self.count_stdout(len)?;
-                self.oversized_lines += 1;
+                if agent_message {
+                    self.final_text = Some(format!(
+                        "[OpenTake: Codex's reply ({len} bytes) was too large to display.]"
+                    ));
+                } else {
+                    self.oversized_lines += 1;
+                }
                 return Ok(None);
             }
         };
@@ -1443,7 +1507,7 @@ async fn run_agent_turn_with_executable_until<F>(
 where
     F: FnMut(ToolCall),
 {
-    let isolated_cwd = tempfile::tempdir().map_err(|_| CodexTurnError::ProviderFailed)?;
+    let isolated_cwd = tempfile::tempdir().map_err(|_| CodexTurnError::CliFailed)?;
     let endpoint = crate::mcp::spawn(
         context.dispatcher.clone(),
         context.registry.clone(),
@@ -1581,7 +1645,7 @@ where
         None => false,
     };
     if wait_failed && outcome.is_ok() {
-        outcome = Err(CodexTurnError::ProviderFailed);
+        outcome = Err(CodexTurnError::CliFailed);
     }
     let outcome_was_cancelled = matches!(&outcome, Err(CodexTurnError::Cancelled));
     let externally_cancelled = context.cancel.load(Ordering::Acquire);
@@ -1599,13 +1663,11 @@ where
         Some(Ok(status)) => Ok(status),
         Some(Err(_)) | None => terminate_and_reap_until(&mut child, &mut tree, deadline).await,
     };
-    // After a cancel the dispatches observe their tokens and end promptly; a
-    // straggler must not hold the cancelled turn open until the turn deadline.
-    let close_deadline = if requested_cleanup_cancel {
-        deadline.min(tokio::time::Instant::now() + CANCELLED_TURN_CLEANUP_GRACE)
-    } else {
-        deadline
-    };
+    let close_deadline = endpoint_close_deadline(
+        deadline,
+        tokio::time::Instant::now(),
+        outcome_was_cancelled || externally_cancelled,
+    );
     let endpoint_close = tokio::time::timeout_at(close_deadline, endpoint.close()).await;
     let endpoint_result = match endpoint_close {
         Ok(result) => result,
@@ -1645,8 +1707,11 @@ where
     {
         outcome = Err(if strict_config_rejected(&stderr) {
             CodexTurnError::StrictConfigRejected
-        } else {
+        } else if matches!(outcome, Err(CodexTurnError::ProviderFailed)) {
+            // Keep the reported turn failure (and its sign-in hint).
             CodexTurnError::ProviderFailed
+        } else {
+            CodexTurnError::CliFailed
         });
     }
     if endpoint_result.is_err() && outcome.is_ok() {
@@ -2009,7 +2074,10 @@ mod tests {
         });
         stream.accept_line(jsonl(started)).unwrap();
         assert!(stream
-            .accept_line(JsonlLine::Oversized(MAX_JSONL_LINE_BYTES + 1))
+            .accept_line(JsonlLine::Oversized {
+                len: MAX_JSONL_LINE_BYTES + 1,
+                agent_message: false,
+            })
             .unwrap()
             .is_none());
         let message = serde_json::json!({
@@ -2029,6 +2097,84 @@ mod tests {
         let skipped = &output.tool_calls[1];
         assert_eq!(skipped.id, "t2");
         assert_eq!(skipped.result.as_ref().unwrap()["status"], "omitted");
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_oversized_line_fails_at_the_stdout_budget() {
+        let data = vec![b'x'; MAX_STDOUT_BYTES + 2];
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buffer = JsonlLineBuffer::default();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buffer).await,
+            Err(CodexTurnError::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_reply_line_is_identified_and_replaces_the_reply() {
+        // Codex writes the item type before its text.
+        let text = "r".repeat(MAX_JSONL_LINE_BYTES);
+        let line = format!(
+            r#"{{"type":"item.completed","item":{{"id":"m2","type":"agent_message","text":"{text}"}}}}"#
+        );
+        let data = format!("{line}\n").into_bytes();
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buffer = JsonlLineBuffer::default();
+        let read = read_bounded_line(&mut reader, &mut buffer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read,
+            JsonlLine::Oversized {
+                len: line.len(),
+                agent_message: true,
+            }
+        );
+
+        let mut stream = ExecStreamState::default();
+        let earlier = serde_json::json!({
+            "type": "item.completed",
+            "item": { "id": "m1", "type": "agent_message", "text": "Working on it." }
+        });
+        stream.accept_line(jsonl(earlier)).unwrap();
+        stream.accept_line(read).unwrap();
+        let output = stream.finish().unwrap();
+        assert!(
+            output.text.contains("too large to display"),
+            "{}",
+            output.text
+        );
+        assert!(!output.text.contains("Working on it."));
+    }
+
+    #[test]
+    fn a_reply_above_the_display_limit_is_truncated_with_a_note() {
+        let text = "é".repeat(MAX_FINAL_TEXT_BYTES / 2 + 10);
+        let event = serde_json::json!({
+            "type": "item.completed",
+            "item": { "id": "m", "type": "agent_message", "text": text }
+        });
+        let mut calls = HashMap::new();
+        let Ok(ExecEvent::AgentMessage(shown)) = parse_exec_event(&event.to_string(), &mut calls)
+        else {
+            panic!("an oversized reply is not a protocol error");
+        };
+        assert!(shown.len() <= MAX_FINAL_TEXT_BYTES);
+        assert!(shown.contains(&format!("it was {} bytes", text.len())));
+    }
+
+    #[test]
+    fn only_a_user_cancel_shortens_the_endpoint_drain() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(600);
+        assert_eq!(
+            endpoint_close_deadline(deadline, now, true),
+            now + CANCELLED_TURN_CLEANUP_GRACE
+        );
+        assert_eq!(endpoint_close_deadline(deadline, now, false), deadline);
+        let soon = now + Duration::from_secs(1);
+        assert_eq!(endpoint_close_deadline(soon, now, true), soon);
     }
 
     #[test]
@@ -2210,9 +2356,13 @@ mod tests {
         let mut buffer = JsonlLineBuffer::default();
         assert_eq!(
             read_bounded_line(&mut reader, &mut buffer).await,
-            Ok(Some(JsonlLine::Oversized(MAX_JSONL_LINE_BYTES + 1)))
+            Ok(Some(JsonlLine::Oversized {
+                len: MAX_JSONL_LINE_BYTES + 1,
+                agent_message: false,
+            }))
         );
         assert!(buffer.bytes.capacity() <= MAX_JSONL_LINE_BYTES);
+        assert!(buffer.oversized_head.is_empty());
         assert_eq!(
             read_bounded_line(&mut reader, &mut buffer).await,
             Ok(Some(JsonlLine::Text(r#"{"type":"thread.started"}"#.into())))
@@ -2286,7 +2436,10 @@ mod tests {
         assert_eq!(
             read,
             vec![
-                JsonlLine::Oversized(MAX_JSONL_LINE_BYTES + 10),
+                JsonlLine::Oversized {
+                    len: MAX_JSONL_LINE_BYTES + 10,
+                    agent_message: false,
+                },
                 JsonlLine::Text(r#"{"type":"thread.started"}"#.into()),
             ]
         );

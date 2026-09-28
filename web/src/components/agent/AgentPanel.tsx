@@ -95,6 +95,8 @@ export function AgentPanel() {
   // Closed conversations are not shown as tabs but still occupy the project's
   // chat storage, so the panel offers to delete them.
   const [closedSessionIds, setClosedSessionIds] = useState<string[]>([]);
+  // Failed chat deletions stay visible until dismissed or the project changes.
+  const [chatError, setChatError] = useState<string | null>(null);
   const sessionsRef = useRef<ChatSession[]>([]);
   const inputRef = useRef("");
   const resyncProjectRef = useRef<Record<string, { projectEpoch: number; projectPath: string }>>({});
@@ -300,6 +302,7 @@ export function AgentPanel() {
     }
     commitSessions([]);
     setClosedSessionIds([]);
+    setChatError(null);
     if (!isTauri || !projectPath) return;
     let disposed = false;
     const loadingEpoch = projectEpoch;
@@ -558,10 +561,13 @@ export function AgentPanel() {
       if (before.projectEpoch !== deletingEpoch || before.projectPath !== deletingPath) return;
       try {
         await chatSessionDelete(session.id, deletingEpoch, deletingPath);
-      } catch {
-        // The backend refused (for example a running turn); keep the tab.
+      } catch (error) {
+        // The backend refused (for example a running turn); keep the tab and
+        // say why.
+        setChatError(`${t("agent.deleteChatFailed")} ${errorText(error)}`);
         return;
       }
+      setChatError(null);
       const project = useProjectStore.getState();
       if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
       await removeTab(session.id, deletingEpoch, deletingPath);
@@ -575,16 +581,25 @@ export function AgentPanel() {
     const deletingPath = projectPath;
     const deleting = [...closedSessionIds];
     enqueueTabMutation(async () => {
+      let failed = 0;
+      let lastError: unknown = null;
       for (const closedId of deleting) {
         const project = useProjectStore.getState();
         if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
         try {
           await chatSessionDelete(closedId, deletingEpoch, deletingPath);
-        } catch {
+        } catch (error) {
+          failed += 1;
+          lastError = error;
           continue;
         }
         setClosedSessionIds((current) => current.filter((id) => id !== closedId));
       }
+      setChatError(
+        failed === 0
+          ? null
+          : `${t("agent.deleteClosedChatsFailed")} ${failed}/${deleting.length}: ${errorText(lastError)}`,
+      );
     });
   }
 
@@ -756,6 +771,42 @@ export function AgentPanel() {
         })}
       </div>
 
+      {chatError && (
+        <div
+          role="alert"
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "var(--space-xs)",
+            padding: "var(--space-xs) var(--space-md)",
+            borderBottom: "var(--bw-hairline) solid var(--border-subtle)",
+            color: "var(--text-primary)",
+            fontSize: "var(--fs-xs)",
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>{chatError}</span>
+          <button
+            type="button"
+            aria-label={t("agent.dismissError")}
+            onClick={() => setChatError(null)}
+            className="hover-area"
+            style={{
+              width: 24,
+              height: 24,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "var(--radius-xs)",
+              color: "var(--text-muted)",
+              flexShrink: 0,
+            }}
+          >
+            <X size={11} />
+          </button>
+        </div>
+      )}
+
       <div
         ref={scrollRef}
         onScroll={(event) => {
@@ -865,6 +916,11 @@ export function AgentPanel() {
       </div>
     </div>
   );
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : String(error);
 }
 
 function sessionTitle(session: ChatSession, fallback: string): string {
