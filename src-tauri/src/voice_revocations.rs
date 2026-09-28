@@ -8,12 +8,11 @@
 //! no project record to revoke it from), so Settings can list it and the user
 //! can retry the removal.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::durable_list::DurableJsonList;
 
 const STORE_VERSION: u32 = 1;
 
@@ -30,123 +29,60 @@ pub struct PendingVoiceRevocation {
     pub last_error: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct PersistedRevocations {
-    version: u32,
-    revocations: Vec<PendingVoiceRevocation>,
-}
-
-/// Durable queue of provider voices to revoke, written atomically.
+/// Durable queue of provider voices to revoke, written atomically. An
+/// unreadable queue is set aside (kept for recovery) instead of blocking
+/// every later record.
 pub struct VoiceRevocationStore {
-    path: PathBuf,
-    lock: Mutex<()>,
+    list: DurableJsonList<PendingVoiceRevocation>,
 }
 
 impl VoiceRevocationStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path,
-            lock: Mutex::new(()),
+            list: DurableJsonList::new(
+                path,
+                "revocations",
+                STORE_VERSION,
+                "pending voice removals",
+            ),
         }
     }
 
     pub fn list(&self) -> Result<Vec<PendingVoiceRevocation>, String> {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.read_locked()
+        self.list.list()
     }
 
     /// Queue a voice, or refresh the failure of one already queued (keeping
     /// when it was first recorded).
     pub fn record(&self, entry: PendingVoiceRevocation) -> Result<(), String> {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut entries = self.read_locked()?;
-        match entries.iter_mut().find(|existing| {
-            existing.provider == entry.provider
-                && existing.provider_voice_id == entry.provider_voice_id
-        }) {
-            Some(existing) => {
-                existing.last_error = entry.last_error;
-                if existing.voice_name.is_empty() {
-                    existing.voice_name = entry.voice_name;
+        self.list.update(|entries| {
+            match entries.iter_mut().find(|existing| {
+                existing.provider == entry.provider
+                    && existing.provider_voice_id == entry.provider_voice_id
+            }) {
+                Some(existing) => {
+                    existing.last_error = entry.last_error;
+                    if existing.voice_name.is_empty() {
+                        existing.voice_name = entry.voice_name;
+                    }
                 }
+                None => entries.push(entry),
             }
-            None => entries.push(entry),
-        }
-        self.write_locked(&entries)
+            (true, ())
+        })
     }
 
     /// Drop a voice after the provider confirmed its removal. Returns whether
     /// it was queued.
     pub fn remove(&self, provider: &str, provider_voice_id: &str) -> Result<bool, String> {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut entries = self.read_locked()?;
-        let before = entries.len();
-        entries.retain(|entry| {
-            !(entry.provider == provider && entry.provider_voice_id == provider_voice_id)
-        });
-        if entries.len() == before {
-            return Ok(false);
-        }
-        self.write_locked(&entries)?;
-        Ok(true)
-    }
-
-    fn read_locked(&self) -> Result<Vec<PendingVoiceRevocation>, String> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(format!("read pending voice removals: {error}")),
-        };
-        let persisted: PersistedRevocations = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("read pending voice removals: {error}"))?;
-        if persisted.version != STORE_VERSION {
-            return Err("unsupported pending voice removal list version".to_string());
-        }
-        Ok(persisted.revocations)
-    }
-
-    fn write_locked(&self, entries: &[PendingVoiceRevocation]) -> Result<(), String> {
-        let parent = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create pending voice removal directory: {error}"))?;
-        let bytes = serde_json::to_vec_pretty(&PersistedRevocations {
-            version: STORE_VERSION,
-            revocations: entries.to_vec(),
+        self.list.update(|entries| {
+            let before = entries.len();
+            entries.retain(|entry| {
+                !(entry.provider == provider && entry.provider_voice_id == provider_voice_id)
+            });
+            let removed = entries.len() != before;
+            (removed, removed)
         })
-        .map_err(|error| format!("encode pending voice removals: {error}"))?;
-        let staging = parent.join(format!(".voice-revocations.{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staging)
-                .map_err(|error| format!("stage pending voice removals: {error}"))?;
-            file.write_all(&bytes)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| format!("write pending voice removals: {error}"))?;
-            drop(file);
-            crate::external_mcp::replace_file_atomically(&staging, &self.path)
-                .map_err(|error| format!("publish pending voice removals: {error}"))?;
-            crate::external_mcp::sync_parent_directory(parent)
-                .map_err(|error| format!("sync pending voice removals: {error}"))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&staging);
-        }
-        result
     }
 }
 
@@ -160,6 +96,7 @@ pub fn unix_now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn entry(id: &str, error: &str) -> PendingVoiceRevocation {
         PendingVoiceRevocation {
@@ -206,13 +143,36 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_queue_is_reported_instead_of_being_overwritten() {
+    fn a_corrupt_queue_is_set_aside_and_a_new_one_starts() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("voice-revocations.json");
         fs::write(&path, b"not json").unwrap();
         let store = VoiceRevocationStore::new(path.clone());
-        assert!(store.list().is_err());
-        assert!(store.record(entry("voice-a", "offline")).is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"not json");
+        assert!(store.list().unwrap().is_empty());
+        store.record(entry("voice-a", "offline")).unwrap();
+        assert_eq!(
+            VoiceRevocationStore::new(path).list().unwrap(),
+            vec![entry("voice-a", "offline")]
+        );
+        // The unreadable queue is kept for recovery.
+        let kept = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("voice-revocations.json.unreadable-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read(&kept[0]).unwrap(), b"not json");
+
+        // A queue from another format version is set aside the same way.
+        let versioned = root.path().join("future.json");
+        fs::write(&versioned, br#"{"version": 99, "revocations": []}"#).unwrap();
+        let store = VoiceRevocationStore::new(versioned.clone());
+        assert!(store.list().unwrap().is_empty());
+        assert!(!versioned.exists());
     }
 }

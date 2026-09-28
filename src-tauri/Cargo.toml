@@ -74,7 +74,6 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 reqwest-updater = { package = "reqwest", version = "=0.13.4", default-features = false, features = ["system-proxy"] }
 rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std"] }
 futures-util = "0.3"
-tracing = "0.1"
 quick-xml = "=0.41.0"
 crossbeam-channel = "0.5"
 velato = { workspace = true }
@@ -117,6 +116,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 opentake-media = { workspace = true, features = ["test-faults"] }
+opentake-project = { workspace = true, features = ["test-hooks"] }
 tauri = { version = "2", features = ["protocol-asset", "test"] }
 tokio = { version = "1", features = ["test-util"] }
 rmcp = { version = "2.2.0", features = [
@@ -126,6 +126,7 @@ rmcp = { version = "2.2.0", features = [
 # rmcp 2.2's reqwest transport calls the compatibility alias added in 0.2.4;
 # 0.2.2/0.2.3 expose only the differently named predecessor.
 sse-stream = "=0.2.4"
+tracing = "0.1"
 
 [[test]]
 name = "external_mcp_integration"

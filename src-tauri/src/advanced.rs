@@ -3574,6 +3574,21 @@ impl TauriAdvancedWorkflowBridge {
                         },
                     )
                     .map_err(|error| {
+                        // A partial commit kept the record in the project
+                        // (in memory and in the saved timeline): the voice
+                        // stays revocable from OpenTake and must not be
+                        // removed under it.
+                        if matches!(
+                            &error,
+                            opentake_core::CoreError::Project(project)
+                                if project.is_partial_commit()
+                        ) {
+                            return advanced_execution(format!(
+                                "the voice was enrolled and recorded in the project, but saving \
+                                 the project did not fully complete; save the project again: \
+                                 {error}"
+                            ));
+                        }
                         // Without a project record the voice could never be
                         // revoked from OpenTake, so it is removed now.
                         self.abandon_enrolled_voice(
@@ -7028,6 +7043,61 @@ mod tests {
                 assert!(pending.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_partially_saved_enrollment_keeps_its_voice_and_record() {
+        let Some(fixture) = identity_fixture() else {
+            return;
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(HashSet::new()));
+        // The project save commits the record, then cannot confirm that its
+        // directory was flushed.
+        let voice = Arc::new(FixtureVoiceProvider {
+            during_enroll: Some(Box::new(|| {
+                opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
+            })),
+            ..FixtureVoiceProvider::new(
+                fixture.generated_voice.clone(),
+                revoked.clone(),
+                calls.clone(),
+            )
+        });
+        let cache = fixture.root.path().join("partial-cache");
+        let bridge = TauriAdvancedWorkflowBridge::with_identity_providers(
+            fixture.core.clone(),
+            cache,
+            fixture.root.path().join("models"),
+            Arc::new(FixtureAvatarProvider {
+                fixture: fixture.avatar_video.clone(),
+                fail: false,
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            voice,
+        );
+
+        let error = enroll_voice(&bridge, &fixture).unwrap_err();
+        assert_eq!(error.kind, AdvancedWorkflowErrorKind::ExecutionFailed);
+        assert!(
+            error.message.contains("save the project again"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["enroll"],
+            "never revoked"
+        );
+        assert!(revoked.lock().unwrap().is_empty());
+        assert!(bridge.pending_voice_revocations().unwrap().is_empty());
+        let records = fixture.core.runtime_snapshot().timeline.voice_models;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].provider_voice_id, "provider-voice-fixture");
+        assert!(!records[0].revoked);
+        let reopened = AppCore::new();
+        reopened.open_project(&fixture.bundle).unwrap();
+        assert_eq!(reopened.runtime_snapshot().timeline.voice_models.len(), 1);
     }
 
     #[test]
