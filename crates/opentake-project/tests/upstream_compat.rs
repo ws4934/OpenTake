@@ -1016,3 +1016,43 @@ fn exhaustive_legacy_default_matrix() {
         assert_eq!(std::fs::read(path).unwrap(), expected);
     }
 }
+
+#[test]
+fn non_positive_timeline_settings_open_as_missing_values() {
+    // A zero or negative rate or canvas means nothing: it is read like a
+    // missing field, so exporters and project settings get a real timebase.
+    // A nested sequence shares the root's settings. Clip frames are kept.
+    let (_tmp, bundle) = make_json_bundle(
+        "non-positive-settings",
+        &json!({
+            "fps": 0,
+            "width": -1920,
+            "height": 0,
+            "nestedSequences": [{
+                "id": "sequence",
+                "name": "Scene",
+                "timeline": {"fps": -24, "width": 0, "height": 720, "tracks": []}
+            }],
+            "tracks": [{
+                "id": "v",
+                "type": "video",
+                "clips": [{"id": "c", "mediaRef": "m", "startFrame": 10, "durationFrames": 40}]
+            }]
+        }),
+        &json!({}),
+        None,
+    );
+
+    let project = Project::open(&bundle).expect("non-positive settings open");
+
+    let timeline = &project.timeline;
+    assert_eq!(
+        (timeline.fps, timeline.width, timeline.height),
+        (30, 1920, 1080)
+    );
+    let nested = &timeline.nested_sequences[0].timeline;
+    assert_eq!((nested.fps, nested.width, nested.height), (30, 1920, 720));
+    let clip = &timeline.tracks[0].clips[0];
+    assert_eq!((clip.start_frame, clip.duration_frames), (10, 40));
+    assert!(!project.compatibility().is_read_only());
+}

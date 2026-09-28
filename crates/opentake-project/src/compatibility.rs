@@ -74,6 +74,29 @@ fn repair_timeline_ids_inner(timeline: &mut Timeline, document: &Value) {
     }
 }
 
+/// Read a non-positive frame rate, width or height like a missing field: it
+/// carries no timebase or canvas, and exporters and the settings command
+/// would otherwise divide by it or refuse to rescale from it. The root falls
+/// back to the decoder defaults and a nested sequence, which shares the
+/// project's timebase and canvas, to the root's values. Clip frames are kept.
+pub(crate) fn repair_timeline_settings(timeline: &mut Timeline) {
+    let defaults = Timeline::default();
+    repair_positive(&mut timeline.fps, defaults.fps);
+    repair_positive(&mut timeline.width, defaults.width);
+    repair_positive(&mut timeline.height, defaults.height);
+    for sequence in &mut timeline.nested_sequences {
+        repair_positive(&mut sequence.timeline.fps, timeline.fps);
+        repair_positive(&mut sequence.timeline.width, timeline.width);
+        repair_positive(&mut sequence.timeline.height, timeline.height);
+    }
+}
+
+fn repair_positive(value: &mut i32, fallback: i32) {
+    if *value <= 0 {
+        *value = fallback;
+    }
+}
+
 fn repair_id(id: &mut String, raw: Option<&Value>) {
     if let Some(Value::String(raw)) = raw {
         id.clone_from(raw);
