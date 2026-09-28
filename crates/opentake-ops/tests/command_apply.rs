@@ -1719,6 +1719,121 @@ fn set_keyframes_installs_position_track() {
     assert!(st.timeline.tracks[0].clips[0].position_track.is_some());
 }
 
+fn opacity_rows(st: &EditorState, id: &str) -> Vec<(i32, f64)> {
+    find_clip(st, id)
+        .opacity_track
+        .as_ref()
+        .map(|track| {
+            track
+                .keyframes
+                .iter()
+                .map(|kf| (kf.frame, kf.value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn set_keyframes_sorts_rows_and_the_last_duplicate_frame_wins() {
+    let mut st = state(vec![video_track("v", true, vec![clip("c", 100, 60)])]);
+    let g = SeqIdGen::default();
+    let set_opacity = |st: &mut EditorState, keyframes: Vec<Keyframe<f64>>| {
+        apply(
+            st,
+            EditCommand::SetKeyframes {
+                clip_id: "c".into(),
+                property: KeyframeProperty::Opacity,
+                payload: KeyframePayload::Scalar(KeyframeTrack::from_keyframes(keyframes)),
+            },
+            &g,
+        )
+        .unwrap()
+    };
+
+    set_opacity(
+        &mut st,
+        vec![
+            Keyframe::with_interpolation(30, 1.0, Interpolation::Linear),
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+        ],
+    );
+    assert_eq!(opacity_rows(&st, "c"), [(0, 0.0), (30, 1.0)]);
+    assert!((find_clip(&st, "c").opacity_at(115) - 0.5).abs() < 1e-9);
+
+    set_opacity(
+        &mut st,
+        vec![
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+            Keyframe::with_interpolation(0, 1.0, Interpolation::Linear),
+            Keyframe::with_interpolation(30, 1.0, Interpolation::Linear),
+        ],
+    );
+    assert_eq!(opacity_rows(&st, "c"), [(0, 1.0), (30, 1.0)]);
+    assert!((find_clip(&st, "c").opacity_at(100) - 1.0).abs() < 1e-9);
+    assert_eq!(st.undo_depth(), 2);
+}
+
+#[test]
+fn set_keyframes_rejects_out_of_range_frames_and_non_finite_values_atomically() {
+    let scalar = |rows: Vec<(i32, f64)>| {
+        KeyframePayload::Scalar(KeyframeTrack::from_keyframes(
+            rows.into_iter()
+                .map(|(frame, value)| Keyframe::new(frame, value))
+                .collect(),
+        ))
+    };
+    for (property, payload) in [
+        (KeyframeProperty::Opacity, scalar(vec![(-1, 0.5)])),
+        (KeyframeProperty::Opacity, scalar(vec![(0, 0.0), (61, 1.0)])),
+        (
+            KeyframeProperty::Opacity,
+            scalar(vec![(i32::MIN, 0.0), (i32::MAX, 1.0)]),
+        ),
+        (KeyframeProperty::Rotation, scalar(vec![(0, f64::NAN)])),
+        (
+            KeyframeProperty::Position,
+            KeyframePayload::Pair(KeyframeTrack::from_keyframes(vec![Keyframe::new(
+                0,
+                AnimPair::new(f64::INFINITY, 0.0),
+            )])),
+        ),
+        (
+            KeyframeProperty::Crop,
+            KeyframePayload::Crop(KeyframeTrack::from_keyframes(vec![Keyframe::new(
+                0,
+                Crop {
+                    top: f64::NAN,
+                    ..Crop::default()
+                },
+            )])),
+        ),
+    ] {
+        assert_arithmetic_rejection_is_atomic(
+            state(vec![video_track("v", true, vec![clip("c", 0, 60)])]),
+            EditCommand::SetKeyframes {
+                clip_id: "c".into(),
+                property,
+                payload,
+            },
+        );
+    }
+
+    // The closed clip-relative span stays writable: frame == duration is kept
+    // exactly like `clamp_keyframes_to_duration` keeps it.
+    let mut st = state(vec![video_track("v", true, vec![clip("c", 0, 60)])]);
+    apply(
+        &mut st,
+        EditCommand::SetKeyframes {
+            clip_id: "c".into(),
+            property: KeyframeProperty::Opacity,
+            payload: scalar(vec![(0, 0.0), (60, 1.0)]),
+        },
+        &SeqIdGen::default(),
+    )
+    .unwrap();
+    assert_eq!(opacity_rows(&st, "c"), [(0, 0.0), (60, 1.0)]);
+}
+
 #[test]
 fn set_keyframes_rejects_type_mismatch() {
     let mut st = state(vec![video_track("v", true, vec![clip("c", 0, 60)])]);

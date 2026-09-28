@@ -1053,7 +1053,10 @@ pub enum EditCommand {
         frame: i32,
         transform: Transform,
     },
-    /// Replace (or clear) a clip's keyframe track for one property.
+    /// Replace (or clear) a clip's keyframe track for one property. Frames are
+    /// clip-relative and must lie in `[0, duration_frames]`; values must be
+    /// finite. The stored track is sorted by frame and the last row for a
+    /// duplicate frame wins.
     SetKeyframes {
         clip_id: String,
         property: KeyframeProperty,
@@ -5112,11 +5115,8 @@ fn set_keyframes(
     let location = state
         .find_clip(&clip_id)
         .ok_or_else(|| EditError::Invalid(format!("Clip not found: {clip_id}")))?;
-    if property == KeyframeProperty::Crop
-        && state.timeline.tracks[location.track_index].clips[location.clip_index]
-            .nested_sequence_id
-            .is_some()
-    {
+    let target = &state.timeline.tracks[location.track_index].clips[location.clip_index];
+    if property == KeyframeProperty::Crop && target.nested_sequence_id.is_some() {
         return Err(EditError::Invalid(
             "compound clips do not support crop keyframes".into(),
         ));
@@ -5136,6 +5136,11 @@ fn set_keyframes(
             "keyframe payload type does not match property".into(),
         ));
     }
+    // Every entry point (agent tool, Inspector IPC) shares one contract: rows
+    // are validated against the clip, then sorted by frame with the last
+    // duplicate winning, before anything is written.
+    let payload = normalized_keyframe_payload(payload, target.duration_frames)
+        .map_err(|message| EditError::Invalid(format!("Clip {clip_id}: {message}")))?;
     let summary = format!("Set keyframes on {clip_id}");
     transact(
         state,
@@ -5168,6 +5173,29 @@ fn set_keyframes(
             Ok(vec![loc_clip_id(st, loc)])
         },
     )
+}
+
+/// Validate a replacement keyframe track against a clip of `duration_frames`
+/// (frames inside `[0, duration_frames]`, finite values), then normalize it
+/// (sorted by frame, last duplicate wins; upstream `sortAndDedupe`).
+fn normalized_keyframe_payload(
+    payload: KeyframePayload,
+    duration_frames: i32,
+) -> Result<KeyframePayload, String> {
+    Ok(match payload {
+        KeyframePayload::Scalar(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Scalar(track.normalized())
+        }
+        KeyframePayload::Pair(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Pair(track.normalized())
+        }
+        KeyframePayload::Crop(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Crop(track.normalized())
+        }
+    })
 }
 
 fn stamp_keyframe(
@@ -7388,6 +7416,37 @@ mod keyframe_edit_tests {
         let kfs = opacity_track_kfs(&state, &clip_id);
         assert_eq!(kfs.len(), 1);
         assert_eq!(kfs[0].0, 10);
+    }
+
+    #[test]
+    fn stamp_keyframe_between_persisted_extreme_frames_does_not_overflow() {
+        let (mut state, ids, clip_id) = make_state_with_clip();
+        set_opacity_track(
+            &mut state,
+            &clip_id,
+            vec![
+                Keyframe::with_interpolation(i32::MIN, 0.0, Interpolation::Linear),
+                Keyframe::new(i32::MAX, 1.0),
+            ],
+        );
+
+        apply(
+            &mut state,
+            EditCommand::StampKeyframe {
+                clip_id: clip_id.clone(),
+                property: KeyframeProperty::Opacity,
+                frame: 110,
+            },
+            &ids,
+        )
+        .unwrap();
+
+        let kfs = opacity_track_kfs(&state, &clip_id);
+        assert_eq!(
+            kfs.iter().map(|kf| kf.0).collect::<Vec<_>>(),
+            [i32::MIN, 10, i32::MAX]
+        );
+        assert!((kfs[1].1 - 0.5).abs() < 1e-6, "{}", kfs[1].1);
     }
 
     #[test]

@@ -83,6 +83,33 @@ impl KeyframeInterpolatable for Crop {
     }
 }
 
+/// Keyframe values whose components can be checked for finiteness before a
+/// track is stored (see [`KeyframeTrack::validate`]).
+pub trait FiniteKeyframeValue {
+    /// `true` when every component is a finite number.
+    fn all_finite(&self) -> bool;
+}
+
+impl FiniteKeyframeValue for f64 {
+    fn all_finite(&self) -> bool {
+        self.is_finite()
+    }
+}
+
+impl FiniteKeyframeValue for AnimPair {
+    fn all_finite(&self) -> bool {
+        self.a.is_finite() && self.b.is_finite()
+    }
+}
+
+impl FiniteKeyframeValue for Crop {
+    fn all_finite(&self) -> bool {
+        [self.left, self.top, self.right, self.bottom]
+            .iter()
+            .all(|value| value.is_finite())
+    }
+}
+
 fn default_interpolation_out() -> Interpolation {
     Interpolation::Smooth
 }
@@ -152,6 +179,22 @@ impl<V> KeyframeTrack<V> {
         !self.keyframes.is_empty()
     }
 
+    /// Restore the storage invariant that [`Self::sample`] and [`Self::upsert`]
+    /// rely on: keyframes strictly ascending by frame, one per frame. The sort
+    /// is stable, so the **last** keyframe given for a duplicate frame wins.
+    /// 1:1 port of upstream `ToolExecutor.sortAndDedupe`.
+    pub fn normalized(mut self) -> Self {
+        self.keyframes.sort_by_key(|kf| kf.frame);
+        let mut keyframes: Vec<Keyframe<V>> = Vec::with_capacity(self.keyframes.len());
+        for kf in self.keyframes {
+            match keyframes.last_mut() {
+                Some(last) if last.frame == kf.frame => *last = kf,
+                _ => keyframes.push(kf),
+            }
+        }
+        KeyframeTrack { keyframes }
+    }
+
     /// Insert or replace a keyframe, keeping `keyframes` sorted ascending by
     /// frame. Replaces in place when a keyframe already exists at `kf.frame`.
     pub fn upsert(&mut self, kf: Keyframe<V>) {
@@ -188,10 +231,34 @@ impl<V> KeyframeTrack<V> {
     }
 }
 
+impl<V: FiniteKeyframeValue> KeyframeTrack<V> {
+    /// Check a replacement track against a clip of `duration_frames`: every
+    /// frame must lie in the clip-relative span `[0, duration_frames]` (the
+    /// closed range [`Clip::clamp_keyframes_to_duration`](crate::Clip) keeps)
+    /// and every value must be finite. Errors name the offending
+    /// `keyframes[index]` in the track's current order.
+    pub fn validate(&self, duration_frames: i32) -> Result<(), String> {
+        for (index, kf) in self.keyframes.iter().enumerate() {
+            if kf.frame < 0 || kf.frame > duration_frames {
+                return Err(format!(
+                    "keyframes[{index}]: frame {} is outside the clip (0...{duration_frames})",
+                    kf.frame
+                ));
+            }
+            if !kf.value.all_finite() {
+                return Err(format!("keyframes[{index}]: values must be finite"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<V: KeyframeInterpolatable + Clone> KeyframeTrack<V> {
     /// Sample the curve at clip-relative `frame`. Clamps to the first/last value
     /// outside the keyframe span (no extrapolation). Inside a span, the *left*
-    /// keyframe's `interpolation_out` selects hold / linear / smooth.
+    /// keyframe's `interpolation_out` selects hold / linear / smooth. Frame
+    /// distances are computed in `i64`, so persisted extreme frames cannot
+    /// overflow.
     pub fn sample(&self, frame: i32, fallback: V) -> V {
         if self.keyframes.is_empty() {
             return fallback;
@@ -212,7 +279,8 @@ impl<V: KeyframeInterpolatable + Clone> KeyframeTrack<V> {
         };
         let a = &self.keyframes[b_idx - 1];
         let b = &self.keyframes[b_idx];
-        let raw = (frame - a.frame) as f64 / (b.frame - a.frame) as f64;
+        let raw = (i64::from(frame) - i64::from(a.frame)) as f64
+            / (i64::from(b.frame) - i64::from(a.frame)) as f64;
         match a.interpolation_out {
             Interpolation::Hold => a.value.clone(),
             Interpolation::Linear => V::keyframe_interpolate(a.value.clone(), b.value.clone(), raw),
@@ -558,6 +626,68 @@ mod tests {
             right.keyframes.iter().map(|k| k.frame).collect::<Vec<_>>(),
             [0, 5]
         );
+    }
+
+    #[test]
+    fn normalized_sorts_by_frame_and_the_last_duplicate_wins() {
+        let t = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::with_interpolation(30, 1.0, Interpolation::Linear),
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+            Keyframe::with_interpolation(30, 0.8, Interpolation::Hold),
+            Keyframe::with_interpolation(0, 0.25, Interpolation::Linear),
+        ])
+        .normalized();
+        assert_eq!(
+            t.keyframes
+                .iter()
+                .map(|k| (k.frame, k.value, k.interpolation_out))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0.25, Interpolation::Linear),
+                (30, 0.8, Interpolation::Hold),
+            ]
+        );
+        // The sorted track samples the ramp instead of the stale first row.
+        approx(t.sample(15, 9.9), 0.25 + (0.8 - 0.25) * 0.5);
+    }
+
+    #[test]
+    fn validate_rejects_frames_outside_the_clip_and_non_finite_values() {
+        let valid = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::new(0, 0.0),
+            Keyframe::new(30, 1.0),
+        ]);
+        assert!(valid.validate(30).is_ok());
+        assert!(valid.validate(29).unwrap_err().contains("keyframes[1]"));
+        let negative = KeyframeTrack::<f64>::from_keyframes(vec![Keyframe::new(-1, 0.0)]);
+        assert!(negative.validate(30).is_err());
+        let non_finite = KeyframeTrack::<f64>::from_keyframes(vec![Keyframe::new(3, f64::NAN)]);
+        assert!(non_finite.validate(30).unwrap_err().contains("finite"));
+        let pair = KeyframeTrack::from_keyframes(vec![Keyframe::new(
+            0,
+            AnimPair::new(0.0, f64::INFINITY),
+        )]);
+        assert!(pair.validate(30).is_err());
+        let crop = KeyframeTrack::from_keyframes(vec![Keyframe::new(
+            0,
+            Crop {
+                left: f64::NEG_INFINITY,
+                ..Crop::default()
+            },
+        )]);
+        assert!(crop.validate(30).is_err());
+    }
+
+    #[test]
+    fn sample_between_extreme_frames_does_not_overflow() {
+        let t = KeyframeTrack::<f64>::from_keyframes(vec![
+            Keyframe::with_interpolation(i32::MIN, 0.0, Interpolation::Linear),
+            Keyframe::new(i32::MAX, 1.0),
+        ]);
+        let mid = t.sample(0, 9.9);
+        assert!((mid - 0.5).abs() < 1e-6, "{mid}");
+        approx(t.sample(i32::MIN, 9.9), 0.0);
+        approx(t.sample(i32::MAX, 9.9), 1.0);
     }
 
     #[test]

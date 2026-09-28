@@ -57,8 +57,8 @@ pub use grade::{
 };
 pub use inpaint::{InpaintPlan, InpaintPlanError};
 pub use keyframe::{
-    smoothstep, split_keyframe_track, AnimPair, AnimatableProperty, Interpolation, Keyframe,
-    KeyframeInterpolatable, KeyframeTrack,
+    smoothstep, split_keyframe_track, AnimPair, AnimatableProperty, FiniteKeyframeValue,
+    Interpolation, Keyframe, KeyframeInterpolatable, KeyframeTrack,
 };
 pub use lut::{CubeLut, CubeLutError, LutReference, LutReferenceValidationError};
 pub use media::{
