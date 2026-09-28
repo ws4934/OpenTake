@@ -57,6 +57,8 @@ use std::path::Path;
 use opentake_domain::{Clip, ClipType, MediaManifest, MediaResolver, Timeline, Track};
 use serde_json::{json, Value};
 
+use crate::file_url::path_to_file_url;
+
 /// Export a [`Timeline`] as an OpenTimelineIO JSON string (pretty-printed).
 /// Pure function: takes the timeline, media manifest, and the project base dir
 /// (for resolving `Project`-relative media into `file://` URLs).
@@ -228,19 +230,6 @@ fn rational_time(frame: i32, fps: i32) -> Value {
 /// `secondsToFrame`).
 fn seconds_to_frame(seconds: f64, fps: i32) -> i32 {
     (seconds * fps as f64) as i32
-}
-
-/// Absolute path → an OTIO `file://` URL. OTIO recommends the `file://` scheme
-/// for local references; we emit `file://<abs-path>` (POSIX paths already start
-/// with `/`, giving the canonical `file:///path`).
-fn path_to_file_url(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s.starts_with('/') {
-        format!("file://{s}")
-    } else {
-        // Non-absolute (e.g. Windows or relative): still prefix the scheme.
-        format!("file:///{s}")
-    }
 }
 
 /// Helper to give a track a stable, non-empty name. Domain `Track.id` may be the
@@ -520,6 +509,28 @@ mod tests {
         assert_eq!(
             path_to_file_url(Path::new("/abs/clip.mov")),
             "file:///abs/clip.mov"
+        );
+    }
+
+    #[test]
+    fn target_url_is_percent_encoded() {
+        let mut tl = Timeline::new();
+        tl.fps = 24;
+        let mut vt = Track::new("v", ClipType::Video);
+        vt.clips.push(Clip::new("c1", "v1", 0, 24));
+        tl.tracks.push(vt);
+        let v = export_value(
+            &tl,
+            &manifest(vec![entry(
+                "v1",
+                "Take #1 50% é & 中文.mp4",
+                ClipType::Video,
+                4.0,
+            )]),
+        );
+        assert_eq!(
+            v["tracks"]["children"][0]["children"][0]["media_reference"]["target_url"],
+            "file:///media/Take%20%231%2050%25%20%C3%A9%20%26%20%E4%B8%AD%E6%96%87.mp4"
         );
     }
 

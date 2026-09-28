@@ -59,6 +59,7 @@ use std::path::Path;
 
 use opentake_domain::{Clip, ClipType, MediaManifest, MediaResolver, Timeline, Track};
 
+use crate::file_url::path_to_file_url;
 use crate::xmlnode::{boolean_attr, el, el_attrs, leaf_text, render_document, XmlNode};
 
 /// FCPXML version we target (FCP 10.5+; supported by current FCP and DaVinci).
@@ -199,9 +200,10 @@ impl<'a> Builder<'a> {
         )
     }
 
-    /// `(<asset>, <format>)` for one media ref. The asset's `src` is a `file://`
-    /// URL (or relative `media/<id>` when unresolved); its `<format>` uses the
-    /// source fps / dimensions when known.
+    /// `(<asset>, <format>)` for one media ref. The asset's `src` is a
+    /// percent-encoded `file://` URL, sub-delimiters included as upstream
+    /// `mediaSrc` requires (or relative `media/<id>` when unresolved); its
+    /// `<format>` uses the source fps / dimensions when known.
     fn asset_nodes(&self, mref: &str, asset_id: &str, format_id: &str) -> (XmlNode, XmlNode) {
         let entry = self.resolver.entry(mref);
         let name = self.resolver.display_name(mref);
@@ -481,16 +483,6 @@ fn linear_to_db(linear: f64) -> f64 {
         (20.0 * linear.log10()).max(-96.0)
     } else {
         -96.0
-    }
-}
-
-/// Absolute path → `file://` URL.
-fn path_to_file_url(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s.starts_with('/') {
-        format!("file://{s}")
-    } else {
-        format!("file:///{s}")
     }
 }
 

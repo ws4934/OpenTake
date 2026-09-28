@@ -48,6 +48,8 @@ use opentake_domain::{
     MediaManifest, MediaResolver, Timeline, Track, Transform,
 };
 
+use crate::file_url::xmeml_path_url;
+
 /// `seconds * fps` 截断取整。1:1 对应上游 `secondsToFrame`(`Int(seconds * fps)`)。
 fn seconds_to_frame(seconds: f64, fps: i32) -> i32 {
     (seconds * fps as f64) as i32
@@ -354,10 +356,13 @@ impl<'a> Builder<'a> {
             .map(|n| n.to_string_lossy().into_owned())
             .or_else(|| entry.map(|e| e.name.clone()))
             .unwrap_or_else(|| media_ref.to_string());
-        // Premiere 需要这种多斜杠的 host 形式;规范的单斜杠会解析失败。
+        // POSIX 路径保留上游多斜杠的 localhost host 形式(Premiere/Resolve 需要;
+        // 规范的单斜杠会解析失败),并按 RFC 3986 百分号编码(上游由
+        // `URL.absoluteString` 完成)。Windows 盘符/UNC 路径的形式见
+        // `file_url::xmeml_path_url`。
         let path_url = path
-            .as_ref()
-            .map(|p| format!("file://localhost//{}", p.to_string_lossy()))
+            .as_deref()
+            .map(xmeml_path_url)
             .unwrap_or_else(|| format!("media/{media_ref}"));
 
         // 一张静图解码为恰好 1 帧。
@@ -1226,7 +1231,7 @@ mod tests {
         assert!(xml.contains("<out>60</out>"));
         assert!(xml.contains("<duration>120</duration>")); // 源时长帧
         assert!(xml.contains("<file id=\"file-v1-video\">"));
-        assert!(xml.contains("<pathurl>file://localhost//"));
+        assert!(xml.contains("<pathurl>file://localhost/"));
 
         // 音频 clipitem + lane。
         assert!(xml.contains("<clipitem id=\"clipitem-c-aud\">"));
@@ -1548,6 +1553,38 @@ mod tests {
                 assert!(file.contains("<displayformat>DF</displayformat>"), "{file}");
             }
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_pathurl_is_a_percent_encoded_file_url() {
+        let dir = std::env::temp_dir().join(format!("opentake-xmeml-url-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let name = "Take #1 50% é & 中文.mp4";
+        let vpath = touch(&dir, name);
+        let mut manifest = MediaManifest::new();
+        manifest
+            .entries
+            .push(ext_entry("v1", name, ClipType::Video, &vpath, 4.0));
+        let mut tl = Timeline::new();
+        let mut vtrack = Track::new("vt", ClipType::Video);
+        vtrack.clips.push(Clip::new("c1", "v1", 0, 30));
+        tl.tracks.push(vtrack);
+
+        let xml = export_xmeml(&tl, &manifest, None);
+        let file = file_block(&xml, "file-v1-video");
+        let start = file.find("<pathurl>").expect("pathurl") + "<pathurl>".len();
+        let url = &file[start..start + file[start..].find("</pathurl>").unwrap()];
+        // The Premiere/Resolve `localhost` form, with every reserved or non-ASCII
+        // byte of the name percent-encoded (`&` as `%26`, never `&amp;`).
+        assert!(url.starts_with("file://localhost/"), "{url}");
+        assert!(
+            url.ends_with("/Take%20%231%2050%25%20%C3%A9%20%26%20%E4%B8%AD%E6%96%87.mp4"),
+            "{url}"
+        );
+        // A URL reader resolves it back to the media file.
+        let parsed = url::Url::parse(url).expect("valid URL");
+        assert_eq!(parsed.to_file_path().as_deref(), Ok(vpath.as_path()));
         fs::remove_dir_all(&dir).ok();
     }
 

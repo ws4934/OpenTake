@@ -318,6 +318,35 @@ fn empty_timeline_has_empty_spine() {
 }
 
 #[test]
+fn asset_src_is_percent_encoded() {
+    let mut tl = Timeline::new();
+    let mut vt = Track::new("v", ClipType::Video);
+    vt.clips.push(Clip::new("c1", "v1", 0, 30));
+    vt.clips.push(Clip::new("c2", "v2", 30, 30));
+    tl.tracks.push(vt);
+    let xml = export_fcpxml(
+        &tl,
+        &manifest(vec![
+            entry("v1", "Take #1 50% é & 中文.mp4", ClipType::Video, 4.0),
+            entry("v2", "sam's clip (1)!$*+,;=.mov", ClipType::Video, 4.0),
+        ]),
+        None,
+    );
+    assert!(
+        xml.contains(
+            "src=\"file:///media/Take%20%231%2050%25%20%C3%A9%20%26%20%E4%B8%AD%E6%96%87.mp4\""
+        ),
+        "{xml}"
+    );
+    // Upstream `mediaSrc`: Resolve cannot relink sub-delimiters that reach it as
+    // XML entities (`&amp;`, `&apos;`), so they are percent-encoded instead.
+    assert!(
+        xml.contains("src=\"file:///media/sam%27s%20clip%20%281%29%21%24%2A%2B%2C%3B%3D.mov\""),
+        "{xml}"
+    );
+}
+
+#[test]
 fn unresolved_media_uses_relative_src() {
     let mut tl = Timeline::new();
     let mut vt = Track::new("v", ClipType::Video);

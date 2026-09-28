@@ -50,6 +50,7 @@ pub mod edl;
 pub mod error;
 pub mod fcpxml;
 pub mod fcpxml_modern;
+mod file_url;
 pub mod gen_log;
 pub mod layout;
 pub mod otio;
