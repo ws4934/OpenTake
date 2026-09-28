@@ -1909,16 +1909,20 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
+        // The temp root itself may sit behind a symlink (macOS `/var`), so
+        // build the fixture from its resolved path: the grant for the cover
+        // is the path the retained handle resolves to.
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.join("real");
         let real_project = real.join("Linked.opentake");
         fs::create_dir_all(&real_project).unwrap();
-        let link = directory.path().join("link");
+        let link = root.join("link");
         symlink(&real, &link).unwrap();
         let project = link.join("Linked.opentake");
         let thumbnail = project.join("thumbnail.jpg");
         write_test_jpeg(&thumbnail, [10, 20, 30]);
         fs::write(project.join("project.json"), b"{}").unwrap();
-        let alias = directory.path().join("Alias.opentake");
+        let alias = root.join("Alias.opentake");
         symlink(&real_project, &alias).unwrap();
         let app = tauri::test::mock_app();
         let scope = app.handle().asset_protocol_scope();
