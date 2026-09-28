@@ -350,6 +350,11 @@ fn with_verified_index_assets<T>(
 /// rather than the UI or async executor thread. The ONNX backend is enabled in
 /// the shipped app (`opentake-media`'s `ort-backend` feature), so this calls the
 /// SigLIP2 embedder directly, mirroring how `transcribe.rs` calls whisper.
+///
+/// The project is indexed as one worker job per asset (a planning job loads the
+/// model and selects the pending assets first), so interactive queries and
+/// transcription requests are scheduled at asset boundaries instead of waiting
+/// for the whole project.
 #[tauri::command]
 pub async fn search_index_start(
     app: AppHandle,
@@ -360,74 +365,226 @@ pub async fn search_index_start(
     expected_project_path: String,
 ) -> Result<SearchIndexStatusDto, String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let handle = with_verified_index_assets(
+    let engine = media.engine();
+    let cache_root = engine.cache_root().to_path_buf();
+    let models_dir = engine.models_dir().to_path_buf();
+    let (assets, plan) = with_verified_index_assets(
         &core,
         expected_project_epoch,
         Path::new(&expected_project_path),
         |assets| {
-            let engine = media.engine();
-            let cache_root = engine.cache_root().to_path_buf();
-            let models_dir = engine.models_dir().to_path_buf();
-            let pressure = engine.export_pause();
-            let worker = production_index_worker(pressure.clone());
             let spec = search_config::embedder_spec();
             let source_identity = assets
                 .iter()
-                .map(|asset| {
-                    opentake_media::cache_key::file_identity_key(&asset.path)
-                        .unwrap_or_else(|| format!("missing:{}", asset.id))
-                })
+                .map(|asset| asset_identity(asset))
                 .collect::<Vec<_>>()
                 .join("|");
             let request = opentake_media::ort_worker::JobRequest::new(
                 opentake_media::ort_worker::JobKind::Index,
                 format!("{}@{}", spec.model, spec.version),
                 format!(
-                    "{}:{}@{}:{source_identity}",
+                    "{}:{}@{}:plan:{source_identity}",
                     cache_root.display(),
                     spec.model,
                     spec.version
                 ),
                 opentake_media::ort_worker::JobPriority::Background,
             );
-            worker
+            let job = IndexJobContext {
+                app: app.clone(),
+                cache_root: cache_root.clone(),
+                models_dir: models_dir.clone(),
+                assets: std::sync::Arc::new(assets.clone()),
+            };
+            let plan = production_index_worker()
                 .submit(request, move |models, cancel| {
-                    let job_engine = MediaEngine::new(cache_root, models_dir.clone());
-                    let model_key =
-                        format!("{}@{}:{}", spec.model, spec.version, models_dir.display());
-                    let embedder = models.get_or_try_init(&model_key, || {
-                        load_embedder(&job_engine)
-                            .map_err(opentake_media::ort_worker::WorkerError::Model)
-                    })?;
-                    index_assets(
-                        app,
-                        &job_engine,
-                        &assets,
-                        embedder.as_ref(),
-                        cancel,
-                        &pressure,
-                    )
-                    .map_err(opentake_media::ort_worker::WorkerError::Job)?;
-                    Ok(index_status_snapshot(&job_engine, &assets))
+                    job.plan(models, cancel)
+                        .map_err(opentake_media::ort_worker::WorkerError::Job)
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok((assets, plan))
         },
     )?;
-    tauri::async_runtime::spawn_blocking(move || handle.wait())
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let job = IndexJobContext {
+        app,
+        cache_root,
+        models_dir,
+        assets: std::sync::Arc::new(assets),
+    };
+    tauri::async_runtime::spawn_blocking(move || -> Result<SearchIndexStatusDto, String> {
+        let pending = plan.wait().map_err(|error| error.to_string())?;
+        let total = pending.len();
+        let spec = search_config::embedder_spec();
+        let requests = pending
+            .iter()
+            .map(|&index| {
+                opentake_media::ort_worker::JobRequest::new(
+                    opentake_media::ort_worker::JobKind::Index,
+                    format!("{}@{}", spec.model, spec.version),
+                    format!(
+                        "{}:{}@{}:asset:{}",
+                        job.cache_root.display(),
+                        spec.model,
+                        spec.version,
+                        asset_identity(&job.assets[index])
+                    ),
+                    opentake_media::ort_worker::JobPriority::Background,
+                )
+            })
+            .collect();
+        let per_asset = job.clone();
+        run_asset_jobs(
+            production_index_worker(),
+            requests,
+            move |position, models, cancel| {
+                per_asset
+                    .index_one(pending[position], position, total, models, cancel)
+                    .map_err(opentake_media::ort_worker::WorkerError::Job)
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let engine = crate::media_pressure::production_media_engine(
+            job.cache_root.clone(),
+            job.models_dir.clone(),
+        );
+        Ok(index_status_snapshot(&engine, &job.assets))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
-/// One process-wide production worker. `MediaState` itself is process-wide, so
-/// the first command supplies the same shared playback/export pressure counter
-/// observed by every later request.
-pub(crate) fn production_index_worker(
-    pressure: opentake_media::ExportPause,
-) -> &'static opentake_media::ort_worker::OrtWorker {
+fn asset_identity(asset: &ResolvedAsset) -> String {
+    opentake_media::cache_key::file_identity_key(&asset.path)
+        .unwrap_or_else(|| format!("missing:{}", asset.id))
+}
+
+/// Submit one worker job per request, strictly one after another: the next
+/// job is queued only after the previous one finished, so any interactive
+/// request that arrived meanwhile is scheduled first. The first failure
+/// (including cancellation or worker shutdown) stops the run; jobs that were
+/// not submitted yet never start.
+fn run_asset_jobs<F>(
+    worker: &opentake_media::ort_worker::OrtWorker,
+    requests: Vec<opentake_media::ort_worker::JobRequest>,
+    job: F,
+) -> Result<(), opentake_media::ort_worker::WorkerError>
+where
+    F: Fn(
+            usize,
+            &opentake_media::ort_worker::OrtModelRegistry,
+            &opentake_media::search::CancelToken,
+        ) -> Result<(), opentake_media::ort_worker::WorkerError>
+        + Send
+        + Sync
+        + 'static,
+{
+    let job = std::sync::Arc::new(job);
+    for (position, request) in requests.into_iter().enumerate() {
+        let job = job.clone();
+        worker
+            .submit(request, move |models, cancel| job(position, models, cancel))?
+            .wait()?;
+    }
+    Ok(())
+}
+
+/// Everything one indexing job needs, cheap to clone into each worker task.
+#[derive(Clone)]
+struct IndexJobContext {
+    app: AppHandle,
+    cache_root: PathBuf,
+    models_dir: PathBuf,
+    assets: std::sync::Arc<Vec<ResolvedAsset>>,
+}
+
+impl IndexJobContext {
+    fn engine(&self) -> MediaEngine {
+        crate::media_pressure::production_media_engine(
+            self.cache_root.clone(),
+            self.models_dir.clone(),
+        )
+    }
+
+    fn embedder(
+        &self,
+        engine: &MediaEngine,
+        models: &opentake_media::ort_worker::OrtModelRegistry,
+    ) -> Result<std::sync::Arc<opentake_media::search::OrtEmbedder>, String> {
+        let spec = search_config::embedder_spec();
+        let model_key = format!(
+            "{}@{}:{}",
+            spec.model,
+            spec.version,
+            self.models_dir.display()
+        );
+        models
+            .get_or_try_init(&model_key, || {
+                load_embedder(engine).map_err(opentake_media::ort_worker::WorkerError::Model)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Load (and validate) the model, then select the assets that still need
+    /// visual or transcript work, preserving manifest order.
+    fn plan(
+        &self,
+        models: &opentake_media::ort_worker::OrtModelRegistry,
+        cancel: &opentake_media::search::CancelToken,
+    ) -> Result<Vec<usize>, String> {
+        if cancel.is_cancelled() {
+            return Err("indexing cancelled".into());
+        }
+        let engine = self.engine();
+        let embedder = self.embedder(&engine, models)?;
+        let pending = pending_index_assets(&engine, &self.assets, embedder.as_ref());
+        if pending.is_empty() {
+            let _ = self.app.emit(
+                "search://index",
+                IndexProgress {
+                    completed: 0,
+                    total: 0,
+                    fraction: 1.0,
+                },
+            );
+        }
+        Ok(pending)
+    }
+
+    /// Index the asset at `asset_index` (visual embeddings, then its spoken
+    /// transcript) as step `position` of `total`.
+    fn index_one(
+        &self,
+        asset_index: usize,
+        position: usize,
+        total: usize,
+        models: &opentake_media::ort_worker::OrtModelRegistry,
+        cancel: &opentake_media::search::CancelToken,
+    ) -> Result<(), String> {
+        let engine = self.engine();
+        let embedder = self.embedder(&engine, models)?;
+        index_asset(
+            &self.app,
+            &engine,
+            &self.assets[asset_index],
+            position,
+            total,
+            embedder.as_ref(),
+            cancel,
+        )
+    }
+}
+
+/// One process-wide production worker, bound to the process-wide
+/// playback/export pressure counter shared by every `MediaEngine`.
+pub(crate) fn production_index_worker() -> &'static opentake_media::ort_worker::OrtWorker {
     static WORKER: std::sync::OnceLock<opentake_media::ort_worker::OrtWorker> =
         std::sync::OnceLock::new();
-    WORKER.get_or_init(|| opentake_media::ort_worker::OrtWorker::spawn(pressure, 8))
+    WORKER.get_or_init(|| {
+        opentake_media::ort_worker::OrtWorker::spawn(
+            crate::media_pressure::process_export_pause(),
+            8,
+        )
+    })
 }
 
 /// `search_query`: run the three-group content query — Moments (visual, when the
@@ -546,13 +703,15 @@ pub(crate) fn visual_hits_by_id(
         format!("search:{cache_root:?}:{models_dir:?}:{query:?}:{source_keys:?}:{fps}:{limit}"),
         opentake_media::ort_worker::JobPriority::Interactive,
     );
-    production_index_worker(engine.export_pause())
+    let pressure = engine.export_pause();
+    production_index_worker()
         .submit(request, move |models, cancel| {
             use opentake_media::ort_worker::WorkerError;
             if cancel.is_cancelled() {
                 return Err(WorkerError::Cancelled);
             }
-            let job_engine = MediaEngine::new(cache_root, models_dir.clone());
+            let job_engine =
+                crate::media_pressure::production_media_engine(cache_root, models_dir.clone());
             let model_key = format!("{}@{}:{}", spec.model, spec.version, models_dir.display());
             let embedder = models.get_or_try_init(&model_key, || {
                 load_embedder(&job_engine).map_err(WorkerError::Model)
@@ -575,9 +734,20 @@ pub(crate) fn visual_hits_by_id(
             .collect::<Vec<_>>())
         })
         .map_err(visual_worker_error)?
-        .wait_with_queue_timeout(std::time::Duration::from_millis(250))
+        // Behind one running background asset the query waits for that asset
+        // (bounded); under playback/export pressure it fails fast as BUSY.
+        .wait_with_queue_policy(
+            VISUAL_QUERY_MIN_QUEUE_WAIT,
+            VISUAL_QUERY_MAX_QUEUE_WAIT,
+            move || !pressure.is_active(),
+        )
         .map_err(visual_worker_error)
 }
+
+/// How long an interactive visual query always waits for the inference worker.
+const VISUAL_QUERY_MIN_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Upper bound for waiting behind one background asset job.
+const VISUAL_QUERY_MAX_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn visual_worker_error(error: opentake_media::ort_worker::WorkerError) -> String {
     use opentake_media::ort_worker::WorkerError;
@@ -591,7 +761,10 @@ fn visual_worker_error(error: opentake_media::ort_worker::WorkerError) -> String
 fn current_visual_indexes(
     cache_root: &Path,
     id_paths: &[(String, PathBuf)],
-) -> Vec<(String, opentake_media::search::embed_store::AssetIndex)> {
+) -> Vec<(
+    String,
+    std::sync::Arc<opentake_media::search::embed_store::AssetIndex>,
+)> {
     use opentake_media::search::embed_store;
     use opentake_media::search::frame_sampler::SAMPLER_VERSION;
 
@@ -601,7 +774,7 @@ fn current_visual_indexes(
         let Some(key) = embed_store::key(path) else {
             continue;
         };
-        if let Ok(index) = embed_store::load(cache_root, &key) {
+        if let Ok(index) = embed_store::load_cached(cache_root, &key) {
             if index.header.model == spec.model
                 && index.header.model_version == spec.version
                 && index.header.sampler_version == SAMPLER_VERSION
@@ -662,139 +835,129 @@ fn load_embedder(engine: &MediaEngine) -> Result<opentake_media::search::OrtEmbe
     .map_err(|e| e.to_string())
 }
 
-/// Index every not-yet-current video/image asset, emitting a `search://index`
-/// event as each completes. The single-worker sequential loop mirrors the
-/// coordinator's `ensureWorker` queue (`SearchIndexCoordinator.swift:139-160`) —
-/// one asset at a time, in manifest order — kept simple here (Tauri already runs
-/// the command off the UI thread; a background queue is a later refinement).
-fn index_assets(
-    app: AppHandle,
+/// Assets that actually need visual or transcript work (idempotent),
+/// preserving manifest order. File identity plus model/sampler versions are
+/// encoded in the two stores, so changed media and model upgrades invalidate
+/// themselves and an interrupted run resumes only missing work. Mirrors the
+/// coordinator's one-asset-at-a-time queue in manifest order
+/// (`SearchIndexCoordinator.swift:139-160`).
+fn pending_index_assets(
     engine: &MediaEngine,
     assets: &[ResolvedAsset],
     embedder: &opentake_media::search::OrtEmbedder,
-    cancel: &opentake_media::search::CancelToken,
-    pressure: &opentake_media::ExportPause,
-) -> Result<(), String> {
-    use opentake_media::search::Embedder;
-    use opentake_media::search::{index_image, index_video, needs_index, SamplerOptions};
+) -> Vec<usize> {
+    use opentake_media::search::{needs_index, Embedder};
 
     let spec = Embedder::spec(embedder).clone();
     let cache_root = engine.cache_root();
+    assets
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            let visual = is_visual(a.kind) && needs_index(cache_root, &a.path, &spec);
+            visual || needs_transcript(cache_root, a)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn needs_transcript(cache_root: &Path, asset: &ResolvedAsset) -> bool {
+    (asset.kind == ClipType::Audio || (asset.kind == ClipType::Video && asset.has_audio))
+        && !opentake_media::transcribe::cache::has_cached_on_disk(cache_root, &asset.path)
+}
+
+/// Index one asset as step `position` of `total`, emitting `search://index`
+/// progress. The worker only starts this job while no playback/export pressure
+/// is active, so each asset is a yield boundary.
+fn index_asset(
+    app: &AppHandle,
+    engine: &MediaEngine,
+    a: &ResolvedAsset,
+    position: usize,
+    total: usize,
+    embedder: &opentake_media::search::OrtEmbedder,
+    cancel: &opentake_media::search::CancelToken,
+) -> Result<(), String> {
+    use opentake_media::search::{index_image, index_video, SamplerOptions};
+
+    if cancel.is_cancelled() {
+        return Err("indexing cancelled".into());
+    }
+    let cache_root = engine.cache_root();
     let opts = SamplerOptions::default();
 
-    // Only assets that actually need visual or transcript work (idempotent),
-    // preserving manifest order. File identity plus model/sampler versions are
-    // encoded in the two stores, so changed media and model upgrades invalidate
-    // themselves and an interrupted run resumes only missing work.
-    let pending: Vec<&ResolvedAsset> = assets
-        .iter()
-        .filter(|a| {
-            let visual = is_visual(a.kind) && needs_index(cache_root, &a.path, &spec);
-            let transcript = (a.kind == ClipType::Audio
-                || (a.kind == ClipType::Video && a.has_audio))
-                && !opentake_media::transcribe::cache::has_cached_on_disk(cache_root, &a.path);
-            visual || transcript
-        })
-        .collect();
-    let total = pending.len();
-    if total == 0 {
+    // Per-asset progress: forward the sampler's fraction into the batch.
+    let on_progress = |frac: f64| {
         let _ = app.emit(
             "search://index",
             IndexProgress {
-                completed: 0,
-                total: 0,
-                fraction: 1.0,
+                completed: position,
+                total,
+                fraction: (position as f64 + frac.clamp(0.0, 1.0)) / total as f64,
             },
         );
-        return Ok(());
-    }
+    };
 
-    for (i, a) in pending.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err("indexing cancelled".into());
-        }
-        if !pressure.wait_while_active(|| cancel.is_cancelled()) {
-            return Err("indexing cancelled while yielding to playback/export".into());
-        }
-
-        // Per-asset progress: forward the sampler's fraction into the batch.
-        let base = i;
-        let on_progress = |frac: f64| {
-            let _ = app.emit(
-                "search://index",
-                IndexProgress {
-                    completed: base,
-                    total,
-                    fraction: (base as f64 + frac.clamp(0.0, 1.0)) / total as f64,
-                },
-            );
-        };
-
-        // A per-asset failure (offline file, decode error) is skipped — one bad
-        // clip must not abort the batch (upstream `failedIds.insert` + continue).
-        let visual_result = match a.kind {
-            ClipType::Image => match engine.image_thumbnail(&a.path) {
-                // Reuse the decoded thumbnail as the still's frame; a full-res
-                // decode is unnecessary for a single squash-resized embedding.
-                Ok(frame) => index_image(cache_root, &a.path, &frame, embedder, cancel),
-                Err(e) => Err(e),
-            },
-            ClipType::Video => {
-                // Probe the source for its true duration/dimensions so the sampler
-                // walks the whole clip (the manifest duration may be stale).
-                let (duration, width, height) = match engine.probe(&a.path) {
-                    Ok(p) => (p.duration_secs, p.width.unwrap_or(0), p.height.unwrap_or(0)),
-                    Err(e) => {
-                        eprintln!("[search] probe failed {}: {e}", a.path.display());
-                        emit_completed(&app, i + 1, total);
-                        continue;
-                    }
-                };
-                index_video(
+    // A per-asset failure (offline file, decode error) is skipped — one bad
+    // clip must not abort the batch (upstream `failedIds.insert` + continue).
+    let visual_result = match a.kind {
+        ClipType::Image => match engine.image_thumbnail(&a.path) {
+            // Reuse the decoded thumbnail as the still's frame; a full-res
+            // decode is unnecessary for a single squash-resized embedding.
+            Ok(frame) => index_image(cache_root, &a.path, &frame, embedder, cancel),
+            Err(e) => Err(e),
+        },
+        ClipType::Video => {
+            // Probe the source for its true duration/dimensions so the sampler
+            // walks the whole clip (the manifest duration may be stale).
+            match engine.probe(&a.path) {
+                Ok(p) => index_video(
                     cache_root,
                     &a.path,
-                    duration,
-                    width,
-                    height,
+                    p.duration_secs,
+                    p.width.unwrap_or(0),
+                    p.height.unwrap_or(0),
                     embedder,
                     &opts,
                     cancel,
                     Some(&on_progress),
-                )
-            }
-            _ => Ok(()),
-        };
-        if let Err(e) = visual_result {
-            if cancel.is_cancelled() {
-                return Err("indexing cancelled".into());
-            }
-            eprintln!("[search] index failed {}: {e}", a.path.display());
-        }
-
-        // Automatic spoken indexing shares the same one-worker boundary. A
-        // missing whisper model or bad audio marks only this asset failed; the
-        // visual store and remaining assets still converge on restart.
-        let needs_transcript = (a.kind == ClipType::Audio
-            || (a.kind == ClipType::Video && a.has_audio))
-            && !opentake_media::transcribe::cache::has_cached_on_disk(cache_root, &a.path);
-        if needs_transcript {
-            if cancel.is_cancelled() {
-                return Err("transcription cancelled".into());
-            }
-            if let Err(error) = crate::transcribe::transcribe_with_cache(
-                engine,
-                &a.path,
-                a.kind == ClipType::Video,
-                None,
-            ) {
-                eprintln!(
-                    "[search] transcription failed {}: {error}",
-                    a.path.display()
-                );
+                ),
+                Err(e) => {
+                    eprintln!("[search] probe failed {}: {e}", a.path.display());
+                    emit_completed(app, position + 1, total);
+                    return Ok(());
+                }
             }
         }
-        emit_completed(&app, i + 1, total);
+        _ => Ok(()),
+    };
+    if let Err(e) = visual_result {
+        if cancel.is_cancelled() {
+            return Err("indexing cancelled".into());
+        }
+        eprintln!("[search] index failed {}: {e}", a.path.display());
     }
+
+    // Automatic spoken indexing shares the same one-worker boundary. A
+    // missing whisper model or bad audio marks only this asset failed; the
+    // visual store and remaining assets still converge on restart.
+    if needs_transcript(cache_root, a) {
+        if cancel.is_cancelled() {
+            return Err("transcription cancelled".into());
+        }
+        if let Err(error) = crate::transcribe::transcribe_with_cache(
+            engine,
+            &a.path,
+            a.kind == ClipType::Video,
+            None,
+        ) {
+            eprintln!(
+                "[search] transcription failed {}: {error}",
+                a.path.display()
+            );
+        }
+    }
+    emit_completed(app, position + 1, total);
     Ok(())
 }
 
@@ -838,37 +1001,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn visual_query_returns_busy_while_project_indexing_runs() {
+    fn visual_query_runs_between_project_index_assets_instead_of_busy() {
         use opentake_media::ort_worker::{
             JobKind, JobPriority, JobRequest, OrtWorker, WorkerError,
         };
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            mpsc, Arc,
-        };
+        use std::sync::{mpsc, Arc, Mutex};
         use std::time::Duration;
 
-        let worker = OrtWorker::spawn(opentake_media::ExportPause::new(), 4);
+        let pause = opentake_media::ExportPause::new();
+        let worker = OrtWorker::spawn(pause.clone(), 4);
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
         let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let index = worker
-            .submit(
-                JobRequest::new(
-                    JobKind::Index,
-                    "model",
-                    "blocked-index",
-                    JobPriority::Background,
-                ),
-                move |_, _| {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        // A three-asset project index; asset 0 blocks until released.
+        let index_worker = worker.clone();
+        let index_order = order.clone();
+        let indexing = std::thread::spawn(move || {
+            let requests = (0..3)
+                .map(|i| {
+                    JobRequest::new(
+                        JobKind::Index,
+                        "model",
+                        format!("asset-{i}"),
+                        JobPriority::Background,
+                    )
+                })
+                .collect();
+            run_asset_jobs(&index_worker, requests, move |position, _, _| {
+                if position == 0 {
                     started_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    Ok(())
-                },
-            )
-            .unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                index_order
+                    .lock()
+                    .unwrap()
+                    .push(format!("asset-{position}"));
+                Ok(())
+            })
+        });
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let ran = Arc::new(AtomicBool::new(false));
-        let query_ran = ran.clone();
+
+        let query_order = order.clone();
         let query = worker
             .submit(
                 JobRequest::new(
@@ -878,31 +1057,77 @@ mod tests {
                     JobPriority::Interactive,
                 ),
                 move |_, _| {
-                    query_ran.store(true, Ordering::SeqCst);
+                    query_order.lock().unwrap().push("query".into());
                     Ok(42usize)
                 },
             )
             .unwrap();
-        let result = query.wait_with_queue_timeout(Duration::from_millis(20));
-        // Release the index even if the assertion fails, so a regression cannot
-        // leave the worker blocked during test teardown.
-        release_tx.send(()).unwrap();
-        assert_eq!(result, Err(WorkerError::QueueTimeout));
-        index.wait().unwrap();
-        assert_eq!(query.wait(), Err(WorkerError::Cancelled));
-        assert!(!ran.load(Ordering::SeqCst));
-        let ready = worker
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+        });
+        let result =
+            query.wait_with_queue_policy(Duration::from_millis(10), Duration::from_secs(5), || {
+                !pause.is_active()
+            });
+        releaser.join().unwrap();
+        assert_eq!(result, Ok(42));
+        assert_eq!(indexing.join().unwrap(), Ok(()));
+        // The query ran at the first asset boundary, not after the project.
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["asset-0", "query", "asset-1", "asset-2"]
+        );
+
+        // Playback/export pressure still makes the query fail fast as BUSY.
+        let guard = pause.guard();
+        let gated = worker
             .submit(
-                JobRequest::new(
-                    JobKind::Search,
-                    "model",
-                    "ready-query",
-                    JobPriority::Interactive,
-                ),
+                JobRequest::new(JobKind::Search, "model", "gated", JobPriority::Interactive),
                 |_, _| Ok(7usize),
             )
             .unwrap();
-        assert_eq!(ready.wait_with_queue_timeout(Duration::from_secs(2)), Ok(7));
+        let result =
+            gated.wait_with_queue_policy(Duration::from_millis(20), Duration::from_secs(5), || {
+                !pause.is_active()
+            });
+        assert_eq!(result, Err(WorkerError::QueueTimeout));
+        assert!(visual_worker_error(WorkerError::QueueTimeout).starts_with("SEARCH_VISUAL_BUSY"));
+        drop(guard);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cancelled_asset_job_stops_the_project_index_run() {
+        use opentake_media::ort_worker::{
+            JobKind, JobPriority, JobRequest, OrtWorker, WorkerError,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let worker = OrtWorker::spawn(opentake_media::ExportPause::new(), 4);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let job_ran = ran.clone();
+        let requests = (0..4)
+            .map(|i| {
+                JobRequest::new(
+                    JobKind::Index,
+                    "model",
+                    format!("cancel-asset-{i}"),
+                    JobPriority::Background,
+                )
+            })
+            .collect();
+        let result = run_asset_jobs(&worker, requests, move |position, _, _| {
+            job_ran.lock().unwrap().push(position);
+            if position == 1 {
+                Err(WorkerError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(WorkerError::Cancelled));
+        // Assets after the cancelled one were never started.
+        assert_eq!(*ran.lock().unwrap(), vec![0, 1]);
         worker.shutdown().unwrap();
     }
 

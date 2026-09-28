@@ -163,7 +163,10 @@ pub(crate) fn build_bridge(
 ) -> Arc<TauriGenerationBridge> {
     Arc::new(TauriGenerationBridge {
         core,
-        engine: Arc::new(MediaEngine::new(cache_root.clone(), models_dir)),
+        engine: Arc::new(crate::media_pressure::production_media_engine(
+            cache_root.clone(),
+            models_dir,
+        )),
         staging_root: cache_root.join("generation-staging"),
         runtime: Arc::new(GenerationRuntime::default()),
         clients: Arc::new(ProductionGenerationClientFactory),
@@ -197,7 +200,10 @@ fn build_bridge_with_clients_and_admission(
 ) -> Arc<TauriGenerationBridge> {
     Arc::new(TauriGenerationBridge {
         core,
-        engine: Arc::new(MediaEngine::new(cache_root.clone(), models_dir)),
+        engine: Arc::new(crate::media_pressure::production_media_engine(
+            cache_root.clone(),
+            models_dir,
+        )),
         staging_root: cache_root.join("generation-staging"),
         runtime: Arc::new(GenerationRuntime::default()),
         clients,

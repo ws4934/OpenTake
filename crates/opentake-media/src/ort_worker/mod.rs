@@ -351,6 +351,49 @@ where
     }
 }
 
+impl<T> JobHandle<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    /// Interactive admission that tolerates a bounded wait behind running
+    /// work. The job may stay queued for at least `min_queue_wait`; after that
+    /// it keeps waiting only while `keep_waiting()` holds (for example while
+    /// the worker is finishing one background asset rather than being held by
+    /// playback/export pressure), and never longer than `max_queue_wait`. An
+    /// expired job is cancelled under the status lock, exactly like
+    /// [`JobHandle::wait_with_queue_timeout`], so it cannot start afterwards.
+    pub fn wait_with_queue_policy(
+        &self,
+        min_queue_wait: Duration,
+        max_queue_wait: Duration,
+        keep_waiting: impl Fn() -> bool,
+    ) -> Result<T, WorkerError> {
+        const POLL: Duration = Duration::from_millis(20);
+        let started = Instant::now();
+        let mut status = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
+        while status.state == JobState::Queued && status.result.is_none() {
+            let elapsed = started.elapsed();
+            if elapsed >= max_queue_wait || (elapsed >= min_queue_wait && !keep_waiting()) {
+                self.shared.cancel.cancel();
+                return Err(WorkerError::QueueTimeout);
+            }
+            let slice = if elapsed < min_queue_wait {
+                (min_queue_wait - elapsed).min(POLL)
+            } else {
+                (max_queue_wait - elapsed).min(POLL)
+            };
+            let (next, _) = self
+                .shared
+                .changed
+                .wait_timeout(status, slice)
+                .unwrap_or_else(|e| e.into_inner());
+            status = next;
+        }
+        drop(status);
+        self.wait()
+    }
+}
+
 /// Single-worker model cache. A worker task can lazily install a typed model by
 /// stable identity; subsequent jobs reuse the exact `Arc` without a second load.
 #[derive(Default)]
@@ -741,6 +784,63 @@ mod tests {
         };
         assert_eq!(t.shape[0], -1);
         assert_eq!(t.dtype, TensorDType::F32);
+    }
+
+    #[test]
+    fn queue_policy_waits_behind_running_work_but_not_behind_pressure() {
+        use std::sync::mpsc;
+
+        let pause = ExportPause::new();
+        let worker = OrtWorker::spawn(pause.clone(), 4);
+        let request = |key: &str, priority| JobRequest::new(JobKind::Index, "m", key, priority);
+
+        // Behind a running background job the query keeps waiting past the
+        // minimum and runs as soon as that job finishes.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let blocker = worker
+            .submit(request("asset-1", JobPriority::Background), move |_, _| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(1usize)
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let query = worker
+            .submit(request("query", JobPriority::Interactive), |_, _| {
+                Ok(2usize)
+            })
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            release_tx.send(()).unwrap();
+        });
+        let result =
+            query.wait_with_queue_policy(Duration::from_millis(10), Duration::from_secs(5), || {
+                !pause.is_active()
+            });
+        releaser.join().unwrap();
+        assert_eq!(result, Ok(2));
+        assert_eq!(blocker.wait(), Ok(1));
+
+        // Under playback/export pressure it gives up after the minimum, and
+        // the expired job never runs.
+        let guard = pause.guard();
+        let gated = worker
+            .submit(request("gated", JobPriority::Interactive), |_, _| {
+                Ok(3usize)
+            })
+            .unwrap();
+        let started = Instant::now();
+        let result =
+            gated.wait_with_queue_policy(Duration::from_millis(30), Duration::from_secs(5), || {
+                !pause.is_active()
+            });
+        assert_eq!(result, Err(WorkerError::QueueTimeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(guard);
+        assert_eq!(gated.wait(), Err(WorkerError::Cancelled));
+        worker.shutdown().unwrap();
     }
 
     #[cfg(feature = "ort-backend")]

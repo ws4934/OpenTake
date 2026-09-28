@@ -189,7 +189,7 @@ pub async fn transcribe_media(
         format!("transcribe:{cache_root:?}:{models_dir:?}:{path:?}:{source_key:?}:{media_id:?}:{language:?}"),
         JobPriority::Background,
     );
-    let handle = crate::search::production_index_worker(engine.export_pause())
+    let handle = crate::search::production_index_worker()
         .submit(request, move |_, cancel| {
             // Keep update installation excluded until queued or running work
             // actually finishes, including when the async caller is dropped.
@@ -197,7 +197,7 @@ pub async fn transcribe_media(
             if cancel.is_cancelled() {
                 return Err(WorkerError::Cancelled);
             }
-            let engine = MediaEngine::new(cache_root, models_dir);
+            let engine = crate::media_pressure::production_media_engine(cache_root, models_dir);
             let result = transcribe_with_cache(&engine, &path, is_video, language.as_deref())
                 .map_err(WorkerError::Job)?;
             Ok(TranscriptDto::from_result(&media_id, result))

@@ -35,6 +35,7 @@ mod lifecycle;
 mod lut;
 mod mcp;
 mod media;
+mod media_pressure;
 mod media_tools;
 pub mod motion;
 mod motion_documents;
@@ -61,7 +62,6 @@ use std::sync::Arc;
 
 use opentake_core::{AppCore, CoreEvent, IdGen};
 use opentake_media::library::LibraryStore;
-use opentake_media::MediaEngine;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
 use crate::media::prewarm::PrewarmScheduler;
@@ -193,7 +193,8 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("models");
-            let engine = MediaEngine::new(cache_root.clone(), models_dir.clone());
+            let engine =
+                media_pressure::production_media_engine(cache_root.clone(), models_dir.clone());
 
             // Bring up the loopback MCP server (#36) over a session-sharing clone
             // of the core, before the core is moved into managed state. Bundled +
