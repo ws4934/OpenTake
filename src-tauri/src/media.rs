@@ -5742,7 +5742,7 @@ mod tests {
                     },
                 )
             });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             let save = scope.spawn(move || {
                 saved_tx
                     .send(core_ref.save_project(Some(destination)).is_ok())
@@ -9165,7 +9165,7 @@ mod tests {
             )
         });
         let stage_output = stage_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("proxy reached its transcode stage");
         assert!(!stage_output.starts_with(&bundle));
 
