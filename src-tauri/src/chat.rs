@@ -1407,10 +1407,12 @@ mod tests {
             opentake_agent::mcp::media_bridge::BridgeError,
         > {
             self.capture_started.send(()).unwrap();
+            // Longer than the test's save window, so the test releases the
+            // capture before this gives up.
             self.release_capture
                 .lock()
                 .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("test must release the blocked timeline capture");
             Ok(opentake_agent::tools::result::Block::image(
                 "iVBORw0KGgo=",
@@ -2153,8 +2155,11 @@ mod tests {
             let result = transition_core.save_project(Some(replacement_bundle));
             transitioned_tx.send(result).unwrap();
         });
+        // A capture that held the identity lease would block this save until
+        // the capture is released, so a generous window still catches it
+        // while leaving a slow runner time to write the new bundle.
         let transition_during_capture =
-            transitioned_rx.recv_timeout(std::time::Duration::from_millis(250));
+            transitioned_rx.recv_timeout(std::time::Duration::from_secs(5));
         let transitioned_while_capture_blocked = transition_during_capture.is_ok();
 
         release_capture_tx.send(()).unwrap();
