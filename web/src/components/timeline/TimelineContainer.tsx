@@ -24,6 +24,7 @@ import { collectTargets, findSnap, findSnapDelta } from "../../lib/snap";
 import { paintTimeline, type DragPaint, type MediaGhostPaint } from "./timelineCanvas";
 import { useT } from "../../i18n";
 import { paintRuler } from "./rulerCanvas";
+import { paintCanvasFrame } from "./canvasFrame";
 import { TrackHeaderColumn } from "./TrackHeaderColumn";
 import { Playhead } from "./Playhead";
 import { SnapIndicator } from "./SnapIndicator";
@@ -947,12 +948,6 @@ export function TimelineContainer() {
     const canvas = contentCanvasRef.current;
     if (!canvas || viewport.width === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.ceil(viewport.width * dpr);
-    canvas.height = Math.ceil(viewport.height * dpr);
-    canvas.style.width = `${viewport.width}px`;
-    canvas.style.height = `${viewport.height}px`;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
     // Project the active drag so dragged clips render at their live position
     // (ghost) — `dragTick` (bumped each pointer-move) re-runs this effect.
     const d = dragRef.current;
@@ -1034,28 +1029,30 @@ export function TimelineContainer() {
         currentFrames: d.currentFrames,
       };
     }
-    paintTimeline(ctx, {
-      timeline,
-      pixelsPerFrame: zoomScale,
-      trackHeights,
-      selectedClipIds,
-      dpr,
-      width: docWidth,
-      height: docHeight,
-      firstAudioIndex: firstAudio,
-      scrollLeft,
-      scrollTop,
-      viewWidth: viewport.width,
-      viewHeight: viewport.height,
-      waveforms: currentWaveforms,
-      thumbnails: currentThumbnails,
-      missingMediaRefs,
-      emptyLabel: t("timeline.dropHint"),
-      drag,
-      mediaGhost: mediaGhostRef.current ?? undefined,
-      selectedRange: selectedTimelineRange,
-      selectedGap,
-    });
+    paintCanvasFrame(canvas, viewport.width, viewport.height, dpr, (ctx) =>
+      paintTimeline(ctx, {
+        timeline,
+        pixelsPerFrame: zoomScale,
+        trackHeights,
+        selectedClipIds,
+        dpr,
+        width: docWidth,
+        height: docHeight,
+        firstAudioIndex: firstAudio,
+        scrollLeft,
+        scrollTop,
+        viewWidth: viewport.width,
+        viewHeight: viewport.height,
+        waveforms: currentWaveforms,
+        thumbnails: currentThumbnails,
+        missingMediaRefs,
+        emptyLabel: t("timeline.dropHint"),
+        drag,
+        mediaGhost: mediaGhostRef.current ?? undefined,
+        selectedRange: selectedTimelineRange,
+        selectedGap,
+      }),
+    );
   }, [
     timeline,
     zoomScale,
@@ -1358,20 +1355,16 @@ export function TimelineContainer() {
     const canvas = rulerCanvasRef.current;
     if (!canvas || viewport.width === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.ceil(viewport.width * dpr);
-    canvas.height = Math.ceil(LAYOUT.rulerHeight * dpr);
-    canvas.style.width = `${viewport.width}px`;
-    canvas.style.height = `${LAYOUT.rulerHeight}px`;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    paintRuler(ctx, {
-      fps: timeline.fps,
-      pixelsPerFrame: zoomScale,
-      scrollLeft,
-      width: viewport.width,
-      dpr,
-      selectedRange: selectedTimelineRange,
-    });
+    paintCanvasFrame(canvas, viewport.width, LAYOUT.rulerHeight, dpr, (ctx) =>
+      paintRuler(ctx, {
+        fps: timeline.fps,
+        pixelsPerFrame: zoomScale,
+        scrollLeft,
+        width: viewport.width,
+        dpr,
+        selectedRange: selectedTimelineRange,
+      }),
+    );
   }, [timeline.fps, zoomScale, scrollLeft, viewport.width, selectedTimelineRange]);
 
   // --- Coordinate helpers (event -> document space) ---

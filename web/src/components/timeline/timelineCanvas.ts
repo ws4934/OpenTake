@@ -7,11 +7,21 @@
 
 import { BG, BORDER, TEXT, LAYOUT, TRACK_SIZE, TRIM, GHOST, RANGE } from "../../lib/theme";
 import { clipRect, trackDisplayHeight, trackY, xForFrame } from "../../lib/geometry";
-import { linkOffsetForClip } from "../../lib/clip";
-import { drawClip, roundRectPath, type ClipThumbnailStrip } from "./clipRenderer";
+import { linkOffsetsByClipId } from "../../lib/clip";
+import {
+  drawClip,
+  roundRectPath,
+  VOLUME_KF_DOT_RADIUS,
+  type ClipThumbnailStrip,
+} from "./clipRenderer";
 import { validRange, type TimelineRange } from "../../lib/timelineRange";
 import type { GapSelection } from "../../lib/timelineGap";
-import type { Timeline, ClipType } from "../../lib/types";
+import type { Clip, Timeline, ClipType, Track } from "../../lib/types";
+
+/** A clip paints inside its track row, except the volume-envelope dots centered
+ *  on its body's bottom edge (2 px above the row's), which reach up to this far
+ *  past the row. Rows this close to the viewport still paint. */
+const ROW_PAINT_OVERFLOW = VOLUME_KF_DOT_RADIUS;
 
 export interface PaintState {
   timeline: Timeline;
@@ -150,6 +160,24 @@ export function paintTimeline(ctx: CanvasRenderingContext2D, s: PaintState) {
   // 3. Clips (skip those fully outside the visible window). A clip being dragged
   // is drawn at its live (offset) position as a ghost so it follows the cursor.
   const drag = s.drag;
+  const visBottom = scrollTop + s.viewHeight;
+  const linkOffsets = linkOffsetsByClipId(timeline);
+  // Only a move (and its swap preview) paints a clip away from its own row.
+  const carriedByMove = (clipId: string): boolean =>
+    drag?.kind === "move" && (drag.ids.has(clipId) || drag.swap?.clipId === clipId);
+  // Per-track id lookup for cross-dissolve partners, built on first use.
+  const clipIndexes = new Map<Track, Map<string, Clip>>();
+  const clipOnTrack = (track: Track, clipId: string): Clip | undefined => {
+    let index = clipIndexes.get(track);
+    if (!index) {
+      index = new Map();
+      for (const candidate of track.clips) {
+        if (!index.has(candidate.id)) index.set(candidate.id, candidate);
+      }
+      clipIndexes.set(track, index);
+    }
+    return index.get(clipId);
+  };
   const insertionLineY = (index: number): number => {
     if (timeline.tracks.length === 0) return LAYOUT.rulerHeight + LAYOUT.dropZoneHeight;
     if (index <= 0) return trackY(timeline, 0, trackHeights);
@@ -177,7 +205,13 @@ export function paintTimeline(ctx: CanvasRenderingContext2D, s: PaintState) {
   }
   for (let ti = 0; ti < timeline.tracks.length; ti++) {
     const track = timeline.tracks[ti];
+    const rowTop = trackY(timeline, ti, trackHeights);
+    const rowVisible =
+      rowTop + trackDisplayHeight(track, trackHeights) + ROW_PAINT_OVERFLOW >= scrollTop &&
+      rowTop - ROW_PAINT_OVERFLOW <= visBottom;
+    if (!rowVisible && drag?.kind !== "move") continue;
     for (const clip of track.clips) {
+      if (!rowVisible && !carriedByMove(clip.id)) continue;
       let rect = clipRect(timeline, ti, clip, pixelsPerFrame, trackHeights);
       let ghost = false;
       let isDuplicate = false;
@@ -265,15 +299,13 @@ export function paintTimeline(ctx: CanvasRenderingContext2D, s: PaintState) {
         // asset's file is offline.
         missing: clip.mediaType !== "text" && s.missingMediaRefs.has(clip.mediaRef),
         ghost,
-        linkOffset: linkOffsetForClip(timeline, clip.id),
+        linkOffset: linkOffsets.get(clip.id) ?? null,
         volumeKfGhost,
         isDuplicate,
         visibleX: { min: scrollLeft, max: visRight },
       });
       const transition = clip.transitionOut;
-      const incoming = transition
-        ? track.clips.find((candidate) => candidate.id === transition.toClipId)
-        : undefined;
+      const incoming = transition ? clipOnTrack(track, transition.toClipId) : undefined;
       if (
         transition?.kind === "crossDissolve" &&
         (!transition.fromClipId || transition.fromClipId === clip.id) &&

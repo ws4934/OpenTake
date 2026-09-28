@@ -6,6 +6,8 @@ import {
   findLogicalSingleClip,
   findSelectedVisualClip,
   fitTransformForMedia,
+  linkOffsetForClip,
+  linkOffsetsByClipId,
   liveVolumeKfLinearAt,
   mediaCanvasAspect,
   moveTransformByDelta,
@@ -669,5 +671,74 @@ describe("animated-value inspector seed (raw track sample, no fade/gain)", () =>
     // Raw = authored 0.8; effective = 0.8 × 0.25 fade at rel-frame 5.
     expect(rawOpacityAt(clip, 15)).toBeCloseTo(0.8);
     expect(opacityAt(clip, 15)).toBeCloseTo(0.2);
+  });
+});
+
+describe("linkOffsetsByClipId", () => {
+  /** Several tracks of linked and unlinked clips, deterministic pseudo-random. */
+  function linkedTimeline(): Timeline {
+    let seed = 7;
+    const next = () => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed / 2_147_483_648;
+    };
+    const types: ClipType[] = ["video", "video", "audio", "audio", "text"];
+    return timeline(
+      types.map((type, trackIndex) =>
+        track({
+          id: `t${trackIndex}`,
+          type,
+          clips: Array.from({ length: 60 }, (_, index) => {
+            const group = Math.floor(next() * 40);
+            return clip({
+              id: `c${trackIndex}-${index}`,
+              mediaType: type,
+              sourceClipType: type,
+              startFrame: index * 50 + Math.floor(next() * 8),
+              durationFrames: 40,
+              linkGroupId: group < 30 ? `g${group}` : undefined,
+            });
+          }),
+        }),
+      ),
+    );
+  }
+
+  it("matches linkOffsetForClip for every clip", () => {
+    const tl = linkedTimeline();
+    const offsets = linkOffsetsByClipId(tl);
+    let badges = 0;
+    for (const t of tl.tracks) {
+      for (const c of t.clips) {
+        const expected = linkOffsetForClip(tl, c.id);
+        expect(offsets.get(c.id) ?? null, c.id).toBe(expected);
+        if (expected !== null) badges += 1;
+      }
+    }
+    // Leads and unlinked clips carry no offset; the fixture has both kinds.
+    expect(badges).toBeGreaterThan(50);
+    expect(badges).toBeLessThan(250);
+  });
+
+  it("builds the map once per frozen timeline and afresh for a mutable one", () => {
+    const frozen = Object.freeze(linkedTimeline());
+    expect(linkOffsetsByClipId(frozen)).toBe(linkOffsetsByClipId(frozen));
+    expect(linkOffsetsByClipId(Object.freeze(linkedTimeline()))).not.toBe(
+      linkOffsetsByClipId(frozen),
+    );
+
+    const mutable = timeline([
+      track({
+        id: "v1",
+        type: "video",
+        clips: [
+          clip({ id: "lead", startFrame: 10, linkGroupId: "g" }),
+          clip({ id: "partner", startFrame: 14, linkGroupId: "g" }),
+        ],
+      }),
+    ]);
+    expect(linkOffsetsByClipId(mutable).get("partner")).toBe(4);
+    mutable.tracks[0].clips[1] = { ...mutable.tracks[0].clips[1], startFrame: 16 };
+    expect(linkOffsetsByClipId(mutable).get("partner")).toBe(6);
   });
 });
