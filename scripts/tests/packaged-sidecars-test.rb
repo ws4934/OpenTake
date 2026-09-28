@@ -27,9 +27,16 @@ def host_target
   capture!("rustc", "--print", "host-tuple").strip
 end
 
+# Linux deb/rpm bundles install sidecars into the shared /usr/bin, so they
+# must not take the distribution's ffmpeg/ffprobe names (see sidecar_name in
+# src-tauri/src/media_tools.rs and scripts/provision_ffmpeg_sidecars.py).
+def sidecar_name(tool, target)
+  target.include?("linux") ? "opentake-#{tool}" : tool
+end
+
 def executable_name(tool, target)
   suffix = target.include?("windows") ? ".exe" : ""
-  "#{tool}-#{target}#{suffix}"
+  "#{sidecar_name(tool, target)}-#{target}#{suffix}"
 end
 
 def verify_reported_version(path, tool, record)
@@ -96,7 +103,7 @@ def packaged_paths(package, target)
   elsif target.include?("windows")
     [package.join("ffmpeg.exe"), package.join("ffprobe.exe")]
   elsif target.include?("linux")
-    [package.join("ffmpeg"), package.join("ffprobe")]
+    [package.join(sidecar_name("ffmpeg", target)), package.join(sidecar_name("ffprobe", target))]
   else
     raise "unsupported packaged sidecar target: #{target}"
   end
@@ -108,10 +115,15 @@ def packaged_macos_windows_sidecars_resolve_and_execute(package: nil)
   target = host_target
   assert(lock.fetch("targets").key?(target), "unsupported packaged sidecar target: #{target}")
 
-  %w[tauri.macos.conf.json tauri.windows.conf.json tauri.linux.conf.json].each do |name|
+  {
+    "tauri.macos.conf.json" => "aarch64-apple-darwin",
+    "tauri.windows.conf.json" => "x86_64-pc-windows-msvc",
+    "tauri.linux.conf.json" => "x86_64-unknown-linux-gnu"
+  }.each do |name, config_target|
     config = JSON.parse(ROOT.join("src-tauri", name).read)
-    assert(config.dig("bundle", "externalBin") == %w[binaries/ffmpeg binaries/ffprobe],
-           "#{name} must package the locked ffmpeg and ffprobe sidecars")
+    expected = %w[ffmpeg ffprobe].map { |tool| "binaries/#{sidecar_name(tool, config_target)}" }
+    assert(config.dig("bundle", "externalBin") == expected,
+           "#{name} must package the locked ffmpeg and ffprobe sidecars as #{expected}")
   end
 
   source_ffmpeg = verify_locked_binary("ffmpeg", target, lock)

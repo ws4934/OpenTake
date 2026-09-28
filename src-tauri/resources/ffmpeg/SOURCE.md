@@ -29,6 +29,9 @@ macOS arm64/x86_64, Windows x86_64 MSVC, and Linux x86_64 GNU. Binaries stay in
 `src-tauri/binaries/` locally and are gitignored. Tauri `externalBin` packages
 the selected pair beside the application executable; development uses that
 pair or the target-named source binaries, never implicit host/PATH discovery.
+On Linux the pair is named `opentake-ffmpeg` and `opentake-ffprobe`, because
+deb and rpm bundles install it into the shared `/usr/bin`, next to the
+distribution's own `ffmpeg` package.
 Debug-only `OPENTAKE_FFMPEG` / `OPENTAKE_FFPROBE` overrides remain available.
 
 FFmpeg source tags used by the locked target assets:
