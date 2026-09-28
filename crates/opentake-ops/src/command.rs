@@ -1373,9 +1373,15 @@ pub fn apply(
     ids: &dyn IdGen,
 ) -> Result<EditResult, EditError> {
     // Commands inspect clip ends while deriving their transaction plan. Guard
-    // the complete persisted graph before even that read; undo/redo additionally
-    // validate their candidate history snapshot before replacing live state.
-    validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // the complete persisted graph before even that read. Undo/redo only
+    // validate the history snapshot they would restore, and a removal only the
+    // clips it keeps, so a malformed clip can always be undone or removed.
+    if !matches!(
+        command,
+        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. }
+    ) {
+        validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    }
     match command {
         EditCommand::Undo => {
             // History is immutable/shared, so this candidate clones only the
@@ -2244,7 +2250,9 @@ fn transact(
     summarize: impl FnOnce(&[String]) -> String,
     work: impl FnOnce(&mut EditorState) -> Result<Vec<String>, EditError>,
 ) -> Result<EditResult, EditError> {
-    // `apply` validated the complete root/nested graph before dispatch.
+    // `apply` rejected malformed persisted arithmetic before any command work
+    // could mutate a track or consume an id (RemoveClips checks every clip it
+    // keeps); `finish_edited_timeline` validates the result.
     let before = state.snapshot();
     let affected = match work(state) {
         Ok(affected) => affected,
@@ -2940,6 +2948,33 @@ fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Resul
                 &format!("{label}.nestedSequences[{sequence_index}].timeline"),
             )?;
         }
+    }
+    Ok(())
+}
+
+/// [`validate_timeline_frame_arithmetic`] for every clip except the root clips
+/// whose ids are in `removed`.
+fn validate_kept_frame_arithmetic(
+    timeline: &Timeline,
+    label: &str,
+    removed: &HashSet<String>,
+) -> Result<(), EditError> {
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            if removed.contains(&clip.id) || clip.frame_arithmetic().is_ok() {
+                continue;
+            }
+            validate_clip_frame_arithmetic(
+                clip,
+                &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
+            )?;
+        }
+    }
+    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        validate_timeline_frame_arithmetic(
+            &sequence.timeline,
+            &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+        )?;
     }
     Ok(())
 }
@@ -4309,6 +4344,9 @@ fn remove_clips(state: &mut EditorState, clip_ids: Vec<String>) -> Result<EditRe
         }
     }
     let expanded = ops::expand_to_link_group(&state.timeline, &clip_ids.iter().cloned().collect());
+    // Removing a malformed clip is how it gets repaired, so only the clips
+    // this edit keeps must be well-formed; the result is validated as usual.
+    validate_kept_frame_arithmetic(&state.timeline, "timeline", &expanded)?;
     let count = expanded.len();
     transact(
         state,

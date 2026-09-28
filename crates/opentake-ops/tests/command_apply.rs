@@ -2462,6 +2462,103 @@ fn single_folder_commands_reject_missing_references_like_their_batches() {
     assert_eq!(st.manifest.entries[0].folder_id, Some(folder));
 }
 
+// ---- malformed clips -------------------------------------------------------
+
+/// A persisted clip no edit could create: zero frames long.
+fn malformed_timeline_state() -> EditorState {
+    state(vec![video_track(
+        "v",
+        true,
+        vec![clip("ok", 0, 30), clip("bad", 40, 0)],
+    )])
+}
+
+const BAD_CLIP: &str =
+    "timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1";
+
+#[test]
+fn a_malformed_clip_can_be_removed_and_editing_resumes() {
+    let mut st = malformed_timeline_state();
+    let ids = SeqIdGen::default();
+    let move_ok = || EditCommand::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "ok".into(),
+            to_track: 0,
+            to_frame: 60,
+        }],
+    };
+    // Every other edit is still refused while the clip is there, naming it.
+    assert_eq!(
+        apply(&mut st, move_ok(), &ids).unwrap_err(),
+        EditError::Invalid(BAD_CLIP.into())
+    );
+
+    let removed = apply(
+        &mut st,
+        EditCommand::RemoveClips {
+            clip_ids: vec!["bad".into()],
+        },
+        &ids,
+    )
+    .unwrap();
+
+    assert!(removed.changed);
+    let spans: Vec<(&str, i32)> = st.timeline.tracks[0]
+        .clips
+        .iter()
+        .map(|clip| (clip.id.as_str(), clip.start_frame))
+        .collect();
+    assert_eq!(spans, [("ok", 0)]);
+    apply(&mut st, move_ok(), &ids).unwrap();
+    assert_eq!(st.timeline.tracks[0].clips[0].start_frame, 60);
+}
+
+#[test]
+fn removing_a_valid_clip_still_names_the_malformed_one() {
+    let mut st = malformed_timeline_state();
+    let before = st.timeline.clone();
+    let error = apply(
+        &mut st,
+        EditCommand::RemoveClips {
+            clip_ids: vec!["ok".into()],
+        },
+        &SeqIdGen::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error, EditError::Invalid(BAD_CLIP.into()));
+    assert_eq!(st.timeline, before);
+    assert_eq!(st.undo_depth(), 0);
+}
+
+#[test]
+fn undo_and_redo_restore_valid_history_over_a_malformed_document() {
+    let ids = SeqIdGen::default();
+    let move_a = EditCommand::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "a".into(),
+            to_track: 0,
+            to_frame: 50,
+        }],
+    };
+
+    // Undo: the live document went bad after the last edit.
+    let mut st = state(vec![video_track("v", true, vec![clip("a", 0, 30)])]);
+    let original = st.timeline.clone();
+    apply(&mut st, move_a.clone(), &ids).unwrap();
+    st.timeline.tracks[0].clips.push(clip("bad", 100, 0));
+    assert!(apply(&mut st, EditCommand::Undo, &ids).unwrap().changed);
+    assert_eq!(st.timeline, original);
+
+    // Redo: the live document went bad after an undo.
+    let mut st = state(vec![video_track("v", true, vec![clip("a", 0, 30)])]);
+    apply(&mut st, move_a, &ids).unwrap();
+    let moved = st.timeline.clone();
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    st.timeline.tracks[0].clips.push(clip("bad", 100, 0));
+    assert!(apply(&mut st, EditCommand::Redo, &ids).unwrap().changed);
+    assert_eq!(st.timeline, moved);
+}
+
 // ---- remove tracks --------------------------------------------------------
 
 #[test]
