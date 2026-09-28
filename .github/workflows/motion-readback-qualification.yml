@@ -22,7 +22,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        # Exact test counts per runner: Linux also runs the Unix-only and
+        # Linux-only browser tests (private profile, parent-death signal, no
+        # listening CDP socket, no browser left after process::exit).
+        include:
+          - os: ubuntu-24.04
+            lib_tests: 115
+            chromium_tests: 12
+          - os: windows-2022
+            lib_tests: 113
+            chromium_tests: 10
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -51,6 +60,8 @@ jobs:
         shell: pwsh
         env:
           SOURCE_SHA: ${{ inputs.commit_sha || github.sha }}
+          LIB_TESTS: ${{ matrix.lib_tests }}
+          CHROMIUM_TESTS: ${{ matrix.chromium_tests }}
         run: |
           if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_SHA) { throw 'Source SHA mismatch' }
           rustc --version
@@ -61,8 +72,8 @@ jobs:
           $output | ForEach-Object { Write-Output $_ }
           if ($testExit -ne 0) { throw 'Motion readback qualification failed' }
           $text = $output -join "`n"
-          if ($text -notmatch 'test result: ok\. 97 passed; 0 failed; 0 ignored;') { throw 'Expected all 97 Motion unit tests' }
-          if ($text -notmatch 'test result: ok\. 7 passed; 0 failed; 0 ignored;') { throw 'Expected all 7 Chromium integration tests' }
+          if ($text -notmatch "test result: ok\. $env:LIB_TESTS passed; 0 failed; 0 ignored;") { throw "Expected all $env:LIB_TESTS Motion unit tests" }
+          if ($text -notmatch "test result: ok\. $env:CHROMIUM_TESTS passed; 0 failed; 0 ignored;") { throw "Expected all $env:CHROMIUM_TESTS Chromium integration tests" }
           if ($text -notmatch '4K opaque single-frame elapsed_ms=\d+' -or $text -notmatch '4K transparent single-frame elapsed_ms=\d+') { throw 'Both real 4K paths must execute' }
       - name: Preserve qualification evidence
         if: always()
