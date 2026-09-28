@@ -28,6 +28,8 @@ import type {
   ChatMessage,
   ChatSession,
   ChatToolCall,
+  CloseSaveFailedEvent,
+  FailedCloseChoice,
   ClipType,
   EditRequest,
   EditResult,
@@ -2580,6 +2582,36 @@ export async function onProjectSaved(
       handler(p.path, p.projectEpoch);
     }
   });
+}
+
+/** Subscribe to `close_save_failed`: the save before a close or quit failed.
+ *  The handler claims the prompt with {@link lifecycleClaimFailedClose} and
+ *  answers with {@link lifecycleResolveFailedClose}. No-op outside Tauri. */
+export async function onCloseSaveFailed(
+  handler: (event: CloseSaveFailedEvent) => void,
+): Promise<() => void> {
+  await ensureTauri();
+  if (!listenImpl) return () => {};
+  return listenImpl("close_save_failed", (e) => {
+    const p = e.payload as Partial<CloseSaveFailedEvent> | undefined;
+    if (p && (p.intent === "hide" || p.intent === "exit") && typeof p.message === "string") {
+      handler({ intent: p.intent, message: p.message });
+    }
+  });
+}
+
+/** Claim the pending failed-close prompt. `false` when the native fallback
+ *  already showed it or nothing is waiting. */
+export async function lifecycleClaimFailedClose(): Promise<boolean> {
+  await ensureTauri();
+  if (!invokeImpl) return false;
+  return (await invokeImpl<string | null>("lifecycle_claim_failed_close")) !== null;
+}
+
+/** Answer a failed close or quit save. */
+export async function lifecycleResolveFailedClose(choice: FailedCloseChoice): Promise<void> {
+  await ensureTauri();
+  if (invokeImpl) await invokeImpl<void>("lifecycle_resolve_failed_close", { choice });
 }
 
 /** Subscribe to `go_home` after macOS window close saves and hides the window.

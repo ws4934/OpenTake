@@ -20,6 +20,7 @@ vi.mock("./store/libraryStore", async (importOriginal) => ({
 vi.mock("./lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/api")>()),
   onGoHome: vi.fn(async () => () => {}),
+  onCloseSaveFailed: vi.fn(async () => () => {}),
 }));
 vi.mock("./hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
 vi.mock("./hooks/useAutosave", () => ({ useAutosave: vi.fn() }));

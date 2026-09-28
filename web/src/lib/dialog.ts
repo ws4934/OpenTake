@@ -6,7 +6,7 @@
  * allow `null`).
  */
 
-import type { open as TauriOpen } from "@tauri-apps/plugin-dialog";
+import type { message as TauriMessage, open as TauriOpen } from "@tauri-apps/plugin-dialog";
 import { isTauri, pickSavePath, type SaveDialogRequest, type SavePurpose } from "./api";
 
 /** The typed `open` from the dialog plugin, or null outside Tauri. */
@@ -25,4 +25,11 @@ export type SaveDialogFn = (request: SaveDialogRequest) => Promise<string | null
 export async function saveDialog(purpose: SavePurpose): Promise<SaveDialogFn | null> {
   if (!isTauri) return null;
   return (request) => pickSavePath(purpose, request);
+}
+
+/** The typed native `message` dialog, or null outside Tauri. */
+export async function messageDialog(): Promise<typeof TauriMessage | null> {
+  if (!isTauri) return null;
+  const mod = await import("@tauri-apps/plugin-dialog");
+  return mod.message;
 }

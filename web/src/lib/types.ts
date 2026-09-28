@@ -1826,3 +1826,15 @@ export interface GenerationLog {
   version: number;
   entries: GenerationLogEntry[];
 }
+
+/** `close_save_failed`: the save before a window close ("hide", macOS) or a
+ *  quit ("exit") failed, and the user chooses how to continue. */
+export interface CloseSaveFailedEvent {
+  intent: "hide" | "exit";
+  message: string;
+}
+
+/** The answer to a failed close or quit save: `retry` after a successful
+ *  Save As, `discard` to close without saving (nothing is deleted), or
+ *  `cancel` to keep the project open. */
+export type FailedCloseChoice = "retry" | "discard" | "cancel";
