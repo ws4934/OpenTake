@@ -181,6 +181,93 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
 
             self.assertEqual(destination.read_bytes(), binary)
 
+    def provision_with_downloads(
+        self, record: dict[str, object], remaining: list[bytes], delays: list[float]
+    ) -> Path:
+        """Provision a Linux sidecar whose successive downloads pop their bytes
+        from the front of `remaining`; every back-off delay is appended to
+        `delays`. Returns the published path."""
+
+        def download_fixture(_url: str, path: Path) -> None:
+            path.write_bytes(remaining.pop(0))
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        binary_dir = root / "src-tauri" / "binaries"
+        binary_dir.mkdir(parents=True)
+        with (
+            mock.patch.object(provisioner, "ROOT", root),
+            mock.patch.object(provisioner, "BIN_DIR", binary_dir),
+            mock.patch.object(provisioner, "download", download_fixture),
+            mock.patch.object(provisioner, "verify", lambda *_args: None),
+            mock.patch.object(provisioner.time, "sleep", delays.append),
+        ):
+            provisioner.provision("ffmpeg", record, "x86_64-unknown-linux-gnu")
+        return binary_dir / "ffmpeg-x86_64-unknown-linux-gnu"
+
+    def test_download_with_the_wrong_bytes_is_fetched_again(self) -> None:
+        binary = b"pinned ffmpeg"
+        record = {
+            "url": "https://example.invalid/ffmpeg",
+            "sha256": digest(binary),
+            "version": "7.0",
+        }
+
+        remaining = [b"replaced upstream", binary]
+        delays: list[float] = []
+        published = self.provision_with_downloads(record, remaining, delays)
+
+        self.assertEqual(published.read_bytes(), binary)
+        self.assertEqual(remaining, [])
+        self.assertEqual(delays, [1])
+
+    def test_archive_with_the_wrong_bytes_is_fetched_again(self) -> None:
+        binary = b"pinned ffprobe"
+
+        def archive_bytes(member: bytes) -> bytes:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "sidecar.zip"
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("ffmpeg", member)
+                return path.read_bytes()
+
+        pinned_archive = archive_bytes(binary)
+        record = {
+            "url": "https://example.invalid/ffmpeg.zip",
+            "sha256": digest(binary),
+            "version": "7.0",
+            "archive": {
+                "format": "zip",
+                "member": "ffmpeg",
+                "sha256": digest(pinned_archive),
+            },
+        }
+
+        remaining = [archive_bytes(b"other build"), pinned_archive]
+        published = self.provision_with_downloads(record, remaining, [])
+
+        self.assertEqual(published.read_bytes(), binary)
+        self.assertEqual(remaining, [])
+
+    def test_repeated_checksum_mismatch_fails_after_bounded_downloads(self) -> None:
+        record = {
+            "url": "https://example.invalid/ffmpeg",
+            "sha256": digest(b"pinned ffmpeg"),
+            "version": "7.0",
+        }
+        attempts = provisioner.DOWNLOAD_CHECKSUM_ATTEMPTS
+        remaining = [b"wrong"] * (attempts + 1)
+        delays: list[float] = []
+
+        with self.assertRaisesRegex(
+            RuntimeError, f"checksum mismatch.*after {attempts} downloads"
+        ):
+            self.provision_with_downloads(record, remaining, delays)
+
+        self.assertEqual(len(remaining), 1, "one download per attempt")
+        self.assertEqual(delays, list(range(1, attempts)))
+
     def test_rejects_archive_checksum_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
