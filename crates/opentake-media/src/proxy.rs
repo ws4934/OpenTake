@@ -361,9 +361,10 @@ pub fn create_proxy(
             "source changed while proxy was being created".to_string(),
         ));
     }
-    if source_stamp != source_file_stamp_file(&source).ok()
-        || source_stamp != source_file_stamp(request.source).ok()
-    {
+    // Compare the retained handle only: renaming or unlinking the source path
+    // does not change the bytes the proxy was made from, and playback compares
+    // the stamp with whatever the path names before it uses the proxy.
+    if source_stamp != source_file_stamp_file(&source).ok() {
         return Err(MediaError::Checksum(
             "source identity changed while proxy was being created".to_string(),
         ));
