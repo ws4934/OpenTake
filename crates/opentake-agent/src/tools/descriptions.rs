@@ -258,7 +258,7 @@ pub fn input_schema(tool: ToolName) -> Value {
                         "properties": {
                             "clipId": {"type": "string", "description": "The clip ID to move."},
                             "toTrack": {"type": "integer", "description": "Destination track index (0-based). Omit to keep the clip on its current track."},
-                            "toFrame": {"type": "integer", "description": "Destination start frame. Omit to keep the clip at its current start."}
+                            "toFrame": {"type": "integer", "description": "Destination start frame (>= 0). Omit to keep the clip at its current start. Rejected if a linked partner that follows the move would start before frame 0."}
                         },
                         "required": ["clipId"]
                     }

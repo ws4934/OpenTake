@@ -1849,7 +1849,14 @@ impl Dispatcher {
         let requested_ids: BTreeSet<String> =
             entries.iter().map(|entry| entry.clip_id.clone()).collect();
         let mut moves = Vec::with_capacity(entries.len());
-        for m in entries {
+        for (i, m) in entries.into_iter().enumerate() {
+            // Upstream `moveClips` rejects a negative destination instead of
+            // letting the ops layer clamp it to 0.
+            if let Some(frame) = m.to_frame.filter(|frame| *frame < 0) {
+                return Err(ToolError::new(format!(
+                    "moves[{i}]: toFrame must be >= 0 (got {frame})"
+                )));
+            }
             // Optional to_track / to_frame default to the clip's current location.
             let (cur_track, cur_frame) = clip_location(before, &m.clip_id);
             let to_frame = m.to_frame.or(cur_frame).unwrap_or(0);
@@ -1879,6 +1886,11 @@ impl Dispatcher {
             if delta == 0 {
                 continue;
             }
+            // Every partner keeps its offset to the lead. Upstream
+            // `partnerMoves` clamps a partner at frame 0, which silently
+            // changes a J/L-cut offset; like `auto_cut_to_beats`, OpenTake
+            // rejects the move instead and names the smallest valid toFrame.
+            let mut earliest: Option<(&str, i32, i32)> = None;
             for (track_index, track) in before.tracks.iter().enumerate() {
                 for partner in &track.clips {
                     if partner.id == m.clip_id
@@ -1890,14 +1902,25 @@ impl Dispatcher {
                     let partner_frame = partner
                         .start_frame
                         .checked_add(delta)
-                        .ok_or_else(|| ToolError::new("linked partner move frame overflow"))?
-                        .max(0);
+                        .ok_or_else(|| ToolError::new("linked partner move frame overflow"))?;
+                    if earliest.is_none_or(|(_, _, frame)| partner_frame < frame) {
+                        earliest = Some((&partner.id, partner.start_frame, partner_frame));
+                    }
                     moves.push(ClipMove {
                         clip_id: partner.id.clone(),
                         to_track: track_index,
                         to_frame: partner_frame,
                     });
                 }
+            }
+            if let Some((partner_id, partner_start, partner_frame)) =
+                earliest.filter(|(_, _, frame)| *frame < 0)
+            {
+                let min_to_frame = i64::from(current_frame) - i64::from(partner_start);
+                return Err(ToolError::new(format!(
+                    "moves[{i}]: moving clip {} to frame {to_frame} would move its linked partner {partner_id} to frame {partner_frame}, before frame 0; use toFrame >= {min_to_frame} to keep their offset",
+                    m.clip_id
+                )));
             }
         }
         let res = self.apply(EditCommand::MoveClips { moves })?;
@@ -6063,6 +6086,86 @@ mod tests {
         let timeline = handle.timeline();
         assert_eq!(timeline.tracks[0].clips[0].start_frame, 20);
         assert_eq!(timeline.tracks[1].clips[0].start_frame, 14);
+    }
+
+    /// J-cut: the linked audio `audio-j` enters 10 frames before `video-j`.
+    fn jcut_handle() -> Arc<StateHandle> {
+        let mut tl = Timeline::new();
+        let mut video_track = Track::new("video-track", ClipType::Video);
+        let mut video = Clip::new("video-j", "video-asset", 30, 30);
+        video.link_group_id = Some("jcut".into());
+        video_track.clips.push(video);
+        let mut audio_track = Track::new("audio-track", ClipType::Audio);
+        let mut audio = audio_clip("audio-j", "audio-asset", 20, 30);
+        audio.link_group_id = Some("jcut".into());
+        audio_track.clips.push(audio);
+        tl.tracks = vec![video_track, audio_track];
+        Arc::new(StateHandle::new(tl, MediaManifest::new()))
+    }
+
+    /// `(video start, audio start)` of a two-track linked fixture.
+    fn linked_starts(handle: &StateHandle) -> (i32, i32) {
+        let timeline = handle.timeline();
+        (
+            timeline.tracks[0].clips[0].start_frame,
+            timeline.tracks[1].clips[0].start_frame,
+        )
+    }
+
+    #[test]
+    fn move_clips_rejects_a_linked_partner_crossing_frame_zero() {
+        let handle = jcut_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "move_clips",
+            serde_json::json!({"moves":[{"clipId":"video-j","toFrame":5}]}),
+        );
+
+        assert!(result.is_error, "{}", result.text_joined());
+        let message = result.text_joined();
+        assert!(
+            message.contains("linked partner audio-j to frame -5"),
+            "{message}"
+        );
+        assert!(message.contains("toFrame >= 10"), "{message}");
+        assert_unedited(&handle, &before);
+    }
+
+    #[test]
+    fn move_clips_rejects_a_negative_to_frame() {
+        for (handle, clip_id) in [(jcut_handle(), "video-j"), (seeded_handle(), "clip-1")] {
+            let dispatcher = dispatcher_with(handle.clone());
+            let before = handle.timeline();
+            let result = dispatcher.dispatch(
+                "move_clips",
+                serde_json::json!({"moves":[{"clipId":clip_id,"toFrame":-10}]}),
+            );
+
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(
+                result
+                    .text_joined()
+                    .contains("moves[0]: toFrame must be >= 0 (got -10)"),
+                "{}",
+                result.text_joined()
+            );
+            assert_unedited(&handle, &before);
+        }
+    }
+
+    #[test]
+    fn move_clips_keeps_the_linked_offset_when_every_partner_stays_on_the_timeline() {
+        let handle = jcut_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        for (to_frame, expected) in [(10, (10, 0)), (50, (50, 40)), (35, (35, 25))] {
+            let result = dispatcher.dispatch(
+                "move_clips",
+                serde_json::json!({"moves":[{"clipId":"video-j","toFrame":to_frame}]}),
+            );
+            assert!(!result.is_error, "{}", result.text_joined());
+            assert_eq!(linked_starts(&handle), expected, "toFrame {to_frame}");
+        }
     }
 
     #[test]
