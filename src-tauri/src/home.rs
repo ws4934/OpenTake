@@ -1615,7 +1615,12 @@ mod tests {
         assert!(long.len() <= 255, "{} bytes", long.len());
         assert!(long.starts_with("\u{e9}\u{e9}"));
         assert!(long.ends_with(" (Deleted 3f2a).opentake"));
-        assert!(validated_project_path(&Path::new("/projects").join(long)).is_ok());
+        let projects = if cfg!(windows) {
+            Path::new(r"C:\projects")
+        } else {
+            Path::new("/projects")
+        };
+        assert!(validated_project_path(&projects.join(long)).is_ok());
     }
 
     #[cfg(unix)]

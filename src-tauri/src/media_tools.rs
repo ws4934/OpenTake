@@ -190,9 +190,14 @@ mod tests {
                 None,
                 None,
             );
+            // `tool_path` joins with the host separator, so build the
+            // expectation the same way (`/usr/bin\opentake-ffmpeg` on a
+            // Windows host running this test).
             assert_eq!(
                 packaged,
-                PathBuf::from(format!("/usr/bin/opentake-{tool}")).into_os_string()
+                PathBuf::from("/usr/bin")
+                    .join(format!("opentake-{tool}"))
+                    .into_os_string()
             );
             assert_ne!(
                 packaged,
