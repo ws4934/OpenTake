@@ -2694,6 +2694,118 @@ mod frame_arithmetic_tests {
         )
     }
 
+    fn previous_validate_settings_frame_projection(
+        timeline: &Timeline,
+        fps: i32,
+        label: &str,
+    ) -> Result<(), EditError> {
+        for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+            previous_validate_settings_frame_projection(
+                &sequence.timeline,
+                fps,
+                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+            )?;
+        }
+        if timeline.fps <= 0 || timeline.fps == fps {
+            return Ok(());
+        }
+        let scale = fps as f64 / timeline.fps as f64;
+        for (track_index, track) in timeline.tracks.iter().enumerate() {
+            let mut order: Vec<usize> = (0..track.clips.len()).collect();
+            order.sort_by_key(|&index| track.clips[index].start_frame);
+            let mut previous_end = None;
+            for clip_index in order {
+                let clip = &track.clips[clip_index];
+                let source_end = clip
+                    .start_frame
+                    .checked_add(clip.duration_frames)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!(
+                            "{label}.tracks[{track_index}].clips[{clip_index}]: source end overflows"
+                        ))
+                    })?;
+                let scaled_start = (clip.start_frame as f64 * scale).round() as i32;
+                let scaled_end = (source_end as f64 * scale).round() as i32;
+                let start_frame = scaled_start.max(previous_end.unwrap_or(scaled_start));
+                let duration_frames = scaled_end
+                    .checked_sub(start_frame)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!(
+                            "{label}.tracks[{track_index}].clips[{clip_index}]: projected duration overflows"
+                        ))
+                    })?
+                    .max(1);
+                let trim_start_frame = (clip.trim_start_frame as f64 * scale).round() as i32;
+                let trim_end_frame = (clip.trim_end_frame as f64 * scale).round() as i32;
+                previous_end = Some(previous_checked_clip_frame_arithmetic(
+                    start_frame,
+                    duration_frames,
+                    trim_start_frame,
+                    trim_end_frame,
+                    clip.speed,
+                    clip.media_type,
+                    &format!("{label}.tracks[{track_index}].clips[{clip_index}] projected"),
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_settings_projection_keeps_every_command_error_message() {
+        let clip = |id: &str, start: i32, duration: i32, trim: i32, speed: f64| {
+            let mut clip = Clip::new(id, "m", start, duration);
+            clip.trim_start_frame = trim;
+            clip.trim_end_frame = trim / 2;
+            clip.speed = speed;
+            clip
+        };
+        let clip_sets = [
+            vec![clip("a", 0, 10, 0, 1.0), clip("b", 3, 4, 2, 1.0)],
+            vec![clip("a", 10, 7, 5, 2.0), clip("b", 17, 1, 0, 0.5)],
+            vec![clip("a", i32::MAX - 10, 5, 0, 1.0)],
+            vec![clip("a", 1 << 29, 1 << 29, 0, 1.0)],
+            vec![clip("a", 0, 1 << 20, i32::MAX / 2, 3.0)],
+            vec![clip("a", 5, 3, 0, 1e9)],
+        ];
+        for root_fps in [-5, 0, 1, 24, 30, 60] {
+            for child_fps in [0, 30, 1000] {
+                for (index, clips) in clip_sets.iter().enumerate() {
+                    let mut child = Timeline::new();
+                    child.fps = child_fps;
+                    child.tracks = vec![Track::new("child", ClipType::Video)];
+                    child.tracks[0].clips = clips_with_prefix(clips, "child-");
+                    let mut root = Timeline::new();
+                    root.fps = root_fps;
+                    root.tracks = vec![Track::new("root", ClipType::Video)];
+                    root.tracks[0].clips = clips.clone();
+                    root.nested_sequences
+                        .push(NestedSequence::new("sequence", "Scene", child));
+                    for fps in [1, 25, 30, 120, i32::MAX] {
+                        let case = (root_fps, child_fps, index, fps);
+                        let previous =
+                            previous_validate_settings_frame_projection(&root, fps, "timeline");
+                        assert_eq!(
+                            validate_settings_frame_projection(&root, fps, "timeline"),
+                            previous,
+                            "{case:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn clips_with_prefix(clips: &[Clip], prefix: &str) -> Vec<Clip> {
+        clips
+            .iter()
+            .map(|clip| Clip {
+                id: format!("{prefix}{}", clip.id),
+                ..clip.clone()
+            })
+            .collect()
+    }
+
     #[test]
     fn shared_rule_keeps_every_command_error_message() {
         let starts = [-1, 0, 7, i32::MAX - 3, i32::MAX];
@@ -2837,56 +2949,8 @@ fn validate_settings_frame_projection(
     fps: i32,
     label: &str,
 ) -> Result<(), EditError> {
-    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        validate_settings_frame_projection(
-            &sequence.timeline,
-            fps,
-            &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-        )?;
-    }
-    if timeline.fps <= 0 || timeline.fps == fps {
-        return Ok(());
-    }
-    let scale = fps as f64 / timeline.fps as f64;
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
-        let mut order: Vec<usize> = (0..track.clips.len()).collect();
-        order.sort_by_key(|&index| track.clips[index].start_frame);
-        let mut previous_end = None;
-        for clip_index in order {
-            let clip = &track.clips[clip_index];
-            let source_end = clip
-                .start_frame
-                .checked_add(clip.duration_frames)
-                .ok_or_else(|| {
-                    EditError::Invalid(format!(
-                        "{label}.tracks[{track_index}].clips[{clip_index}]: source end overflows"
-                    ))
-                })?;
-            let scaled_start = (clip.start_frame as f64 * scale).round() as i32;
-            let scaled_end = (source_end as f64 * scale).round() as i32;
-            let start_frame = scaled_start.max(previous_end.unwrap_or(scaled_start));
-            let duration_frames = scaled_end
-                .checked_sub(start_frame)
-                .ok_or_else(|| {
-                    EditError::Invalid(format!(
-                        "{label}.tracks[{track_index}].clips[{clip_index}]: projected duration overflows"
-                    ))
-                })?
-                .max(1);
-            let trim_start_frame = (clip.trim_start_frame as f64 * scale).round() as i32;
-            let trim_end_frame = (clip.trim_end_frame as f64 * scale).round() as i32;
-            previous_end = Some(checked_clip_frame_arithmetic(
-                start_frame,
-                duration_frames,
-                trim_start_frame,
-                trim_end_frame,
-                clip.speed,
-                clip.media_type,
-                &format!("{label}.tracks[{track_index}].clips[{clip_index}] projected"),
-            )?);
-        }
-    }
-    Ok(())
+    ops::settings::settings_projection(timeline, fps)
+        .map_err(|fault| EditError::Invalid(fault.describe(label)))
 }
 
 fn validate_unplaced_entry(entry: &UnplacedClipEntry, label: &str) -> Result<(), EditError> {
@@ -3036,12 +3100,13 @@ fn place_media(
         |affected| format!("Placed media as {} clip(s)", affected.len()),
         move |current| {
             if let Some(settings) = settings {
-                ops::set_timeline_settings(
+                ops::settings::apply_timeline_settings(
                     &mut current.timeline,
                     settings.fps,
                     settings.width,
                     settings.height,
-                );
+                )
+                .map_err(EditError::Invalid)?;
             }
             let target_timeline =
                 timeline_for_sequence_mut(&mut current.timeline, sequence_id.as_deref())?;
@@ -7551,12 +7616,22 @@ fn set_timeline_settings_cmd(
         )));
     }
     validate_settings_frame_projection(&state.timeline, fps, "timeline")?;
+    let changed = std::cell::Cell::new(false);
     transact(
         state,
         "Change Project Settings",
-        move |_| format!("Set timeline to {width}×{height} @ {fps} fps"),
+        |_| {
+            if changed.get() {
+                format!("Set timeline to {width}×{height} @ {fps} fps")
+            } else {
+                format!("Timeline is already {width}×{height} @ {fps} fps")
+            }
+        },
         |st| {
-            ops::set_timeline_settings(&mut st.timeline, fps, width, height);
+            changed.set(
+                ops::settings::apply_timeline_settings(&mut st.timeline, fps, width, height)
+                    .map_err(EditError::Invalid)?,
+            );
             Ok(Vec::new())
         },
     )

@@ -4013,6 +4013,133 @@ fn place_media_settings_new_track_and_linked_audio_are_one_undo_step() {
 }
 
 #[test]
+fn project_settings_repair_a_timeline_without_a_frame_rate() {
+    // fps 0 gives no timebase to rescale from, so the new rate is written and
+    // clip frames are kept, as upstream applyTimelineSettings does. The
+    // command used to report success while leaving everything unchanged.
+    let mut child = Timeline::new();
+    child.fps = 0;
+    child.tracks = vec![video_track("child", true, vec![clip("inner", 4, 8)])];
+    let mut timeline = Timeline::new();
+    timeline.fps = 0;
+    timeline.tracks = vec![video_track("v", true, vec![clip("a", 10, 40)])];
+    timeline
+        .nested_sequences
+        .push(NestedSequence::new("sequence", "Scene", child));
+    let mut st = EditorState::new(timeline, MediaManifest::new());
+    let before = st.timeline.clone();
+    let ids = SeqIdGen::default();
+
+    let result = apply(
+        &mut st,
+        EditCommand::SetTimelineSettings {
+            fps: 30,
+            width: 1280,
+            height: 720,
+        },
+        &ids,
+    )
+    .unwrap();
+
+    assert!(result.changed);
+    assert_eq!(result.summary, "Set timeline to 1280×720 @ 30 fps");
+    assert_eq!(
+        (st.timeline.fps, st.timeline.width, st.timeline.height),
+        (30, 1280, 720)
+    );
+    let a = &st.timeline.tracks[0].clips[0];
+    assert_eq!((a.start_frame, a.duration_frames), (10, 40));
+    let child = &st.timeline.nested_sequences[0].timeline;
+    assert_eq!(child.fps, 30);
+    let inner = &child.tracks[0].clips[0];
+    assert_eq!((inner.start_frame, inner.duration_frames), (4, 8));
+
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    assert_eq!(st.timeline, before);
+}
+
+#[test]
+fn a_nested_timeline_without_a_frame_rate_does_not_block_project_settings() {
+    let mut child = Timeline::new();
+    child.fps = 0;
+    child.tracks = vec![video_track("child", true, vec![clip("inner", 4, 8)])];
+    let mut timeline = Timeline::new();
+    timeline.tracks = vec![video_track("v", true, vec![clip("a", 10, 40)])];
+    timeline
+        .nested_sequences
+        .push(NestedSequence::new("sequence", "Scene", child));
+    let mut st = EditorState::new(timeline, MediaManifest::new());
+
+    let result = apply(
+        &mut st,
+        EditCommand::SetTimelineSettings {
+            fps: 60,
+            width: 1920,
+            height: 1080,
+        },
+        &SeqIdGen::default(),
+    )
+    .unwrap();
+
+    assert!(result.changed);
+    let a = &st.timeline.tracks[0].clips[0];
+    assert_eq!((a.start_frame, a.duration_frames), (20, 80));
+    let child = &st.timeline.nested_sequences[0].timeline;
+    assert_eq!(child.fps, 60);
+    let inner = &child.tracks[0].clips[0];
+    assert_eq!((inner.start_frame, inner.duration_frames), (4, 8));
+}
+
+#[test]
+fn place_media_applies_its_settings_to_a_timeline_without_a_frame_rate() {
+    let mut st = state_with_media(vec![], vec![media_entry("m", ClipType::Video, 2.0)]);
+    st.timeline.fps = 0;
+
+    let result = apply(
+        &mut st,
+        EditCommand::PlaceMedia {
+            sequence_id: None,
+            settings: Some(ProjectTimelineSettings {
+                fps: 30,
+                width: 1280,
+                height: 720,
+            }),
+            target: PlaceMediaTarget::NewTrack {
+                kind: ClipType::Video,
+                at: Some(0),
+            },
+            entry: unplaced_media("m", ClipType::Video, 0, 30),
+        },
+        &SeqIdGen::new("place-"),
+    )
+    .unwrap();
+
+    assert_eq!(result.affected_clip_ids.len(), 1);
+    assert_eq!(
+        (st.timeline.fps, st.timeline.width, st.timeline.height),
+        (30, 1280, 720)
+    );
+    assert!(st.timeline.settings_configured);
+}
+
+#[test]
+fn unchanged_project_settings_do_not_claim_to_set_the_timeline() {
+    let mut st = state(vec![]);
+    let ids = SeqIdGen::default();
+    let settings = EditCommand::SetTimelineSettings {
+        fps: 30,
+        width: 1920,
+        height: 1080,
+    };
+    assert!(apply(&mut st, settings.clone(), &ids).unwrap().changed);
+
+    let again = apply(&mut st, settings, &ids).unwrap();
+
+    assert!(!again.changed);
+    assert_eq!(again.summary, "Timeline is already 1920×1080 @ 30 fps");
+}
+
+#[test]
 fn place_media_targets_a_nested_track_by_stable_id_with_root_settings() {
     let mut child = Timeline::new();
     child.tracks = vec![video_track(
