@@ -96,6 +96,61 @@ pub fn fail_next_repair_stored_copy_for_test() {
 std::thread_local! {
     static STORED_INDEX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STREAM_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether this thread currently holds the library write lock.
+    static WRITE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whole-file hash/copy passes started while holding the write lock.
+    static STREAMS_UNDER_WRITE_LOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The library write lock. It serializes manifest read-modify-write and the
+/// O(1) renames that publish content; whole-file hashing and copying happen
+/// outside it so one large favorite cannot block every other library write.
+struct WriteLockGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl WriteLockGuard<'_> {
+    fn acquire(lock: &Mutex<()>) -> WriteLockGuard<'_> {
+        let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        WRITE_LOCK_HELD.with(|held| held.set(true));
+        WriteLockGuard { _guard: guard }
+    }
+}
+
+impl Drop for WriteLockGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        WRITE_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+/// Content-addressed leaves found in `files/`, grouped by content id. Only
+/// non-empty, nofollow regular files whose names carry a valid content id are
+/// candidates; anything else (`.DS_Store`, `desktop.ini`, sync-tool metadata,
+/// directories, links, truncated leftovers) is ignored.
+struct StoredIndex {
+    by_id: HashMap<String, Vec<OsString>>,
+}
+
+impl StoredIndex {
+    /// The unique stored leaf for `id`. Several leaves claiming one id stay a
+    /// fail-closed error for that id only; the rest of the library keeps
+    /// working and reconciliation/favoriting resolve verified duplicates.
+    fn lookup(&self, id: &str) -> Result<Option<&OsString>> {
+        match self.by_id.get(id).map(Vec::as_slice) {
+            None | Some([]) => Ok(None),
+            Some([name]) => Ok(Some(name)),
+            Some(_) => Err(MediaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("multiple stored copies claim library id {id}"),
+            ))),
+        }
+    }
+
+    fn candidates(&self, id: &str) -> &[OsString] {
+        self.by_id.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 /// One favorited asset in the global library.
@@ -302,6 +357,7 @@ struct OwnedLeaf {
 }
 
 impl OwnedLeaf {
+    #[cfg(test)]
     fn create(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Self> {
         let name = name.as_ref().as_os_str().to_owned();
         let mut options = OpenOptions::new();
@@ -487,6 +543,10 @@ impl Drop for OwnedLeaf {
 }
 
 fn stream_hash_copy(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<String> {
+    #[cfg(test)]
+    if WRITE_LOCK_HELD.with(std::cell::Cell::get) {
+        STREAMS_UNDER_WRITE_LOCK.with(|count| count.set(count.get() + 1));
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
     loop {
@@ -504,6 +564,42 @@ fn stream_hash(reader: &mut impl Read) -> std::io::Result<String> {
     #[cfg(test)]
     STREAM_HASH_CALLS.with(|count| count.set(count.get() + 1));
     stream_hash_copy(reader, &mut std::io::sink())
+}
+
+/// Number of hard links to the open file.
+#[cfg(unix)]
+fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.nlink())
+}
+
+/// Number of hard links to the open file.
+#[cfg(windows)]
+fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `info` is a properly sized, writable BY_HANDLE_FILE_INFORMATION
+    // and the file handle stays open for this synchronous call.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::from(info.nNumberOfLinks))
+}
+
+/// Make a rename inside `dir` durable before anything refers to it. Windows
+/// (NTFS) journals directory updates and has no directory fsync.
+fn sync_dir(dir: &Dir) -> std::io::Result<()> {
+    // The capability itself may be a path-only descriptor that cannot be
+    // synced; open the directory for reading through it instead.
+    #[cfg(unix)]
+    dir.open(".")?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn read_nofollow(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
@@ -549,6 +645,32 @@ fn rename_owned(root: &Dir, leaf: &mut OwnedLeaf, target: &Path) -> std::io::Res
     if !leaf.matches_name(root)? {
         return Err(std::io::Error::other(
             "library leaf identity changed during rename",
+        ));
+    }
+    Ok(())
+}
+
+/// Move a retained leaf from one directory capability to another on the same
+/// filesystem without replacing an existing target on Windows. The leaf's
+/// identity is checked on both sides; if the name was swapped underneath us
+/// the foreign file that landed on `target` is moved back out of `to` (best
+/// effort) and the move fails, so it can never be published as ours.
+fn move_owned(from: &Dir, leaf: &mut OwnedLeaf, to: &Dir, target: &Path) -> std::io::Result<()> {
+    if !leaf.matches_name(from)? {
+        return Err(std::io::Error::other(
+            "library leaf identity changed before move",
+        ));
+    }
+    #[cfg(not(windows))]
+    from.rename(&leaf.name, to, target)?;
+    #[cfg(windows)]
+    rename_transaction_leaf_by_handle(to, leaf, target, false)?;
+    let source_name = std::mem::replace(&mut leaf.name, target.as_os_str().to_owned());
+    if !leaf.matches_name(to)? {
+        let quarantine = unique_atomic_artifact(&source_name, "quarantine");
+        let _ = to.rename(target, from, Path::new(&quarantine));
+        return Err(std::io::Error::other(
+            "library leaf identity changed during move",
         ));
     }
     Ok(())
@@ -963,78 +1085,132 @@ impl LibraryStore {
         ))
     }
 
-    fn stored_index(&self) -> Result<HashMap<String, OsString>> {
+    fn stored_index(&self) -> Result<StoredIndex> {
         #[cfg(test)]
         STORED_INDEX_SCANS.with(|count| count.set(count.get() + 1));
         let capabilities = self.capabilities()?;
-        let mut index = HashMap::new();
+        let mut by_id: HashMap<String, Vec<OsString>> = HashMap::new();
         for entry in capabilities.files.entries()? {
             let entry = entry?;
-            if entry.file_name() == STAGING_SUBDIR {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                // `.staging`, Finder's `.DS_Store`, and other hidden metadata.
                 continue;
             }
             let file_type = entry.file_type()?;
             if !file_type.is_file() || file_type.is_symlink() {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "library content path is not a nofollow regular file",
-                )));
+                tracing::debug!(
+                    "library: ignoring non-regular entry in files/: {}",
+                    name.to_string_lossy()
+                );
+                continue;
             }
+            let Some(id) = Self::content_id_from_name(&name) else {
+                tracing::debug!(
+                    "library: ignoring foreign file in files/: {}",
+                    name.to_string_lossy()
+                );
+                continue;
+            };
             if entry.metadata()?.len() == 0 {
                 continue;
             }
-            let name = entry.file_name();
-            let Some(id) = Self::content_id_from_name(&name) else {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "library content filename has no valid content id",
-                )));
-            };
-            if index.insert(id.clone(), name).is_some() {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("multiple stored copies claim library id {id}"),
-                )));
-            }
+            by_id.entry(id).or_default().push(name);
         }
-        Ok(index)
+        for names in by_id.values_mut() {
+            names.sort();
+        }
+        Ok(StoredIndex { by_id })
     }
 
     fn open_stored_leaf(&self, id: &str) -> Result<Option<OwnedLeaf>> {
-        let Some(name) = self.stored_index()?.remove(id) else {
+        let index = self.stored_index()?;
+        let Some(name) = index.lookup(id)? else {
             return Ok(None);
         };
         let capabilities = self.capabilities()?;
-        Ok(Some(OwnedLeaf::open(&capabilities.files, &name)?))
+        Ok(Some(OwnedLeaf::open(&capabilities.files, name)?))
     }
 
-    fn open_stored_verified(&self, id: &str) -> Result<Option<OwnedLeaf>> {
-        let Some(mut leaf) = self.open_stored_leaf(id)? else {
-            return Ok(None);
-        };
-        let actual = stream_hash(leaf.handle.as_file_mut())?;
-        leaf.rewind()?;
-        if actual != id {
-            return Err(MediaError::Other(anyhow::anyhow!(
-                "stored library content hash mismatch: expected {id}, got {actual}"
-            )));
+    /// Hash every leaf claiming `id` through its own read-only handle.
+    /// Mismatching leaves (bit rot, external edits, a crash-truncated write)
+    /// are quarantined with [`Self::release_stored_leaf`], which hides them
+    /// from [`Self::stored_index`]; they are never adopted. Returns the
+    /// verified leaves, rewound, in name order.
+    fn verify_candidates(&self, id: &str, names: &[OsString]) -> Result<Vec<OwnedLeaf>> {
+        let files = &self.capabilities()?.files;
+        let mut verified = Vec::new();
+        for name in names {
+            let mut leaf = match OwnedLeaf::open(files, name) {
+                Ok(leaf) => leaf,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let actual = stream_hash(leaf.handle.as_file_mut())?;
+            if actual == id {
+                leaf.rewind()?;
+                verified.push(leaf);
+            } else {
+                tracing::warn!(
+                    "library: quarantining stored copy {} (expected {id}, got {actual})",
+                    name.to_string_lossy()
+                );
+                self.release_stored_leaf(leaf)?;
+            }
         }
-        Ok(Some(leaf))
+        Ok(verified)
     }
 
-    fn open_stored_verified_writable(&self, id: &str) -> Result<Option<OwnedLeaf>> {
-        let Some(name) = self.stored_index()?.remove(id) else {
-            return Ok(None);
-        };
-        let mut leaf = OwnedLeaf::open_writable(&self.capabilities()?.files, &name)?;
-        let actual = stream_hash(leaf.handle.as_file_mut())?;
-        leaf.rewind()?;
-        if actual != id {
-            return Err(MediaError::Other(anyhow::anyhow!(
-                "stored library content hash mismatch: expected {id}, got {actual}"
-            )));
+    /// Keep the first verified leaf and release every other one, so exactly
+    /// one name claims the id afterwards.
+    fn keep_first_verified(&self, id: &str, verified: Vec<OwnedLeaf>) -> Result<Option<OwnedLeaf>> {
+        let mut verified = verified.into_iter();
+        let kept = verified.next();
+        for duplicate in verified {
+            tracing::warn!(
+                "library: releasing duplicate stored copy {} of {id}",
+                duplicate.name.to_string_lossy()
+            );
+            self.release_stored_leaf(duplicate)?;
         }
-        Ok(Some(leaf))
+        Ok(kept)
+    }
+
+    /// Stop `leaf` from claiming its content id without destroying data that
+    /// is reachable elsewhere. A file with a single link is truncated through
+    /// a handle proven to be the same file (empty leaves are ignored by
+    /// [`Self::stored_index`]). A file with several links — two names in
+    /// `files/` for one file, or a hard link from outside the library — only
+    /// loses this directory entry, so the other links keep their bytes. A name
+    /// that no longer refers to the verified file is left alone.
+    fn release_stored_leaf(&self, leaf: OwnedLeaf) -> Result<()> {
+        let files = &self.capabilities()?.files;
+        if link_count(leaf.handle.as_file())? <= 1 {
+            match OwnedLeaf::open_writable(files, &leaf.name) {
+                Ok(writable) if writable.handle == leaf.handle => {
+                    return Ok(writable.truncate_exact()?);
+                }
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                // Not writable (for example a read-only file): unlink instead.
+                Err(_) => {}
+            }
+        }
+        match OwnedLeaf::open_identity(files, &leaf.name) {
+            Ok(current) if current.handle == leaf.handle => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let name = leaf.name.clone();
+        // Windows cannot remove a name while this process holds the file
+        // without delete sharing.
+        drop(leaf);
+        match files.remove_file(&name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Validate all retained stored leaves once and return their content ids.
@@ -1046,7 +1222,7 @@ impl LibraryStore {
         let mut ids = HashSet::with_capacity(manifest.entries.len());
         for entry in manifest.entries {
             let id = entry.id;
-            let Some(name) = index.get(&id) else {
+            let Some(name) = index.lookup(&id)? else {
                 continue;
             };
             let mut leaf = OwnedLeaf::open(&self.capabilities()?.files, name)?;
@@ -1076,8 +1252,13 @@ impl LibraryStore {
         let mut ids = HashSet::with_capacity(requested.len());
         let mut failures = HashMap::new();
         for id in requested {
-            let Some(name) = index.get(id) else {
-                continue;
+            let name = match index.lookup(id) {
+                Ok(Some(name)) => name,
+                Ok(None) => continue,
+                Err(error) => {
+                    failures.insert(id.clone(), error.to_string());
+                    continue;
+                }
             };
             let verified = (|| -> Result<()> {
                 let mut leaf = OwnedLeaf::open(&capabilities.files, name)?;
@@ -1125,24 +1306,19 @@ impl LibraryStore {
     /// decisions. This is not path authority; callers must consume bytes via
     /// [`Self::copy_stored_verified`].
     pub fn stored_file_name(&self, id: &str) -> Result<Option<OsString>> {
-        Ok(self.stored_index()?.remove(id))
+        Ok(self.stored_index()?.lookup(id)?.cloned())
     }
 
     /// Validate storage after a crash while leaving unknown mutable names
     /// untouched. A strictly valid manifest is required first; unknown leaves
-    /// remain hidden until a later content-verified adoption.
+    /// (staging leftovers, foreign files such as `.DS_Store`, directories)
+    /// stay hidden and never make the library unavailable. It reads no file
+    /// contents; see [`Self::resolve_duplicate_copies`] for duplicate claims.
     pub fn reconcile_storage(&self) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.lock_writes();
         self.reconcile_manifest_artifacts()?;
-        let manifest = self.load_manifest()?;
-        let valid_ids: HashSet<&str> = manifest
-            .entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect();
+        // A strictly valid manifest is required before anything else.
+        self.load_manifest()?;
         let capabilities = self.capabilities()?;
         let active_stages = self
             .active_stages
@@ -1156,55 +1332,46 @@ impl LibraryStore {
                 continue;
             }
             let file_type = entry.file_type()?;
-            if file_type.is_dir() && !file_type.is_symlink() {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "library staging contains an unexpected directory",
-                )));
-            }
             if !file_type.is_file() || file_type.is_symlink() {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "library staging leaf is not a nofollow regular file",
-                )));
+                tracing::warn!(
+                    "library: ignoring unexpected staging entry {}",
+                    name.to_string_lossy()
+                );
             }
             // Unknown startup leaves stay hidden. Reopening by this mutable
             // name for cleanup could target a replacement installed after the
             // directory enumeration, so reconciliation performs no destructive
             // action without an already-retained owner handle.
         }
-        let mut seen_owned_ids = HashSet::new();
-        for entry in capabilities.files.entries()? {
-            let entry = entry?;
-            if entry.file_name() == STAGING_SUBDIR {
-                continue;
-            }
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() || file_type.is_symlink() {
-                return Err(MediaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "library content path is not a nofollow regular file",
-                )));
-            }
-            if entry.metadata()?.len() == 0 {
-                continue;
-            }
-            let name = entry.file_name();
-            let content_id = Self::content_id_from_name(&name);
-            let is_manifest_owned = content_id
-                .as_deref()
-                .is_some_and(|id| valid_ids.contains(id));
-            if let Some(id) = content_id.as_deref().filter(|id| valid_ids.contains(*id)) {
-                if !seen_owned_ids.insert(id.to_string()) {
-                    return Err(MediaError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("multiple stored copies claim library id {id}"),
-                    )));
-                }
-            }
-            let _ = is_manifest_owned;
-        }
         Ok(())
+    }
+
+    /// Resolve manifest-owned ids that several leaves claim (crash leftovers,
+    /// copies restored by hand, hard links). Each candidate is hashed through
+    /// its own handle: mismatching ones are quarantined and verified extras
+    /// released, so lookups for those ids work again. This hashes whole
+    /// files, so it runs without the write lock and is meant for a background
+    /// thread after startup; favoriting such content resolves it the same way.
+    pub fn resolve_duplicate_copies(&self) -> Result<usize> {
+        let (manifest, index) = {
+            let _guard = self.lock_writes();
+            (self.load_manifest()?, self.stored_index()?)
+        };
+        let mut resolved = 0;
+        for entry in &manifest.entries {
+            let candidates = index.candidates(&entry.id);
+            if candidates.len() < 2 {
+                continue;
+            }
+            let verified = self.verify_candidates(&entry.id, candidates)?;
+            self.keep_first_verified(&entry.id, verified)?;
+            resolved += 1;
+        }
+        Ok(resolved)
+    }
+
+    fn lock_writes(&self) -> WriteLockGuard<'_> {
+        WriteLockGuard::acquire(&self.write_lock)
     }
 
     /// Read the manifest, returning an empty one if it does not exist yet.
@@ -1291,154 +1458,195 @@ impl LibraryStore {
     /// Read/hash one source snapshot and prepare a favorite without publishing a
     /// new manifest entry. Existing entries are returned without staging; new
     /// content is durable but hidden until [`Self::publish_favorite`].
+    ///
+    /// The source is read exactly once, into a private stage on the same
+    /// filesystem as `files/`. Verifying an existing stored copy (or a crash
+    /// orphan) is a whole-file hash, so it runs outside the write lock.
     pub fn prepare_favorite(&self, req: &FavoriteRequest<'_>) -> Result<PreparedFavorite> {
         let capabilities = Arc::clone(self.capabilities()?);
         let staged_name = Self::staging_name(req.source);
-        self.active_stages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(staged_name.clone());
-        let mut stage = match OwnedLeaf::create(&capabilities.staging, &staged_name) {
-            Ok(stage) => stage,
-            Err(error) => {
-                self.active_stages
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&staged_name);
-                return Err(MediaError::Io(error));
-            }
-        };
-        let streamed = (|| -> std::io::Result<String> {
+        let (stage, id) = self.stage_bytes(&capabilities, &staged_name, |stage| {
             let mut source = std::fs::File::open(req.source)?;
-            let id = stream_hash_copy(&mut source, stage.handle.as_file_mut())?;
-            stage.sync_all()?;
-            stage.rewind()?;
-            Ok(id)
-        })();
-        let id = match streamed {
-            Ok(id) => id,
-            Err(error) => {
-                self.active_stages
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&staged_name);
-                return Err(MediaError::Io(error));
-            }
-        };
-
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let manifest = match self.load_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                self.active_stages
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&staged_name);
-                drop(stage);
-                return Err(error);
-            }
-        };
-
-        if let Some(existing) = manifest.entries.iter().find(|e| e.id == id).cloned() {
-            let stored = match self.open_stored_verified(&id) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    self.active_stages
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&staged_name);
-                    drop(stage);
-                    return Err(error);
-                }
-            };
-            if stored.is_some() {
-                self.active_stages
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&staged_name);
-                drop(stage);
-                return Ok(PreparedFavorite {
-                    entry: existing,
-                    capabilities,
-                    active_stages: Arc::clone(&self.active_stages),
-                    stage: None,
-                    stored_name: None,
-                    final_leaf: None,
-                });
-            }
-            return Ok(PreparedFavorite {
-                entry: existing,
-                capabilities,
-                active_stages: Arc::clone(&self.active_stages),
-                stage: Some(stage),
-                stored_name: Some(Self::stored_name(&id, req.source)),
-                final_leaf: None,
-            });
-        }
-
-        let entry = LibraryEntry {
-            id: id.clone(),
-            kind: req.kind.to_string(),
-            category: req.category.clone(),
-            favorited_at: req.favorited_at,
-            source: req.source.to_str().map(|s| s.to_string()),
-            thumb: req.thumb.clone(),
-        };
-        let orphan = match self.open_stored_verified(&id) {
-            Ok(orphan) => orphan,
-            Err(error) => {
-                self.active_stages
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&staged_name);
-                drop(stage);
-                return Err(error);
-            }
-        };
-        if let Some(orphan) = orphan {
-            self.active_stages
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&staged_name);
-            drop(stage);
-            return Ok(PreparedFavorite {
-                entry,
-                capabilities,
-                active_stages: Arc::clone(&self.active_stages),
-                stage: None,
-                stored_name: Some(orphan.name.clone()),
-                final_leaf: Some(orphan),
-            });
-        }
-        let stored_name = Self::stored_name(&id, req.source);
-        Ok(PreparedFavorite {
-            entry,
+            stream_hash_copy(&mut source, stage)
+        })?;
+        let mut prepared = PreparedFavorite {
+            entry: LibraryEntry {
+                id: id.clone(),
+                kind: req.kind.to_string(),
+                category: req.category.clone(),
+                favorited_at: req.favorited_at,
+                source: req.source.to_str().map(|s| s.to_string()),
+                thumb: req.thumb.clone(),
+            },
             capabilities,
             active_stages: Arc::clone(&self.active_stages),
             stage: Some(stage),
-            stored_name: Some(stored_name),
+            stored_name: Some(Self::stored_name(&id, req.source)),
             final_leaf: None,
+        };
+
+        // Snapshot ownership and candidate names under the lock (cheap reads);
+        // hash the candidates after releasing it.
+        let (existing, candidates) = {
+            let _guard = self.lock_writes();
+            let existing = self
+                .load_manifest()?
+                .entries
+                .into_iter()
+                .find(|entry| entry.id == id);
+            let candidates = self.stored_index()?.candidates(&id).to_vec();
+            (existing, candidates)
+        };
+        let verified = self.verify_candidates(&id, &candidates)?;
+        let kept = self.keep_first_verified(&id, verified)?;
+
+        if let Some(existing) = existing {
+            prepared.entry = existing;
+            if kept.is_some() {
+                // The durable copy is intact; nothing to publish.
+                prepared.release_stage();
+                prepared.stored_name = None;
+            }
+            // Otherwise keep the stage to repair a missing or quarantined copy.
+            return Ok(prepared);
+        }
+
+        if let Some(orphan) = kept {
+            // A verified crash orphan: adopt it instead of storing a second
+            // copy. Mismatching orphans were quarantined and verified
+            // duplicates released above.
+            prepared.release_stage();
+            prepared.stored_name = Some(orphan.name.clone());
+            prepared.final_leaf = Some(orphan);
+        }
+        Ok(prepared)
+    }
+
+    /// Create a private stage, fill it through `fill` (which returns the
+    /// content id of the bytes it wrote), and make it durable. The stage is
+    /// registered as active until it is published or dropped.
+    fn stage_bytes(
+        &self,
+        capabilities: &LibraryCapabilities,
+        staged_name: &OsStr,
+        fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<String>,
+    ) -> Result<(OwnedLeaf, String)> {
+        self.active_stages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(staged_name.to_owned());
+        let staged = (|| -> std::io::Result<(OwnedLeaf, String)> {
+            // Transaction access lets the stage be renamed by its own handle
+            // into `files/` on Windows; other openers still cannot delete it.
+            let mut stage = OwnedLeaf::create_transaction(&capabilities.staging, staged_name)?;
+            let id = fill(stage.handle.as_file_mut())?;
+            stage.sync_all()?;
+            stage.rewind()?;
+            Ok((stage, id))
+        })();
+        staged.map_err(|error| {
+            self.active_stages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(staged_name);
+            MediaError::Io(error)
         })
+    }
+
+    /// A stage whose name no longer maps to the retained handle cannot be
+    /// published by rename. Re-stage the retained, verified bytes under a new
+    /// private name (outside the write lock) so rebinding the name can never
+    /// change what is published.
+    fn rebind_stage_if_moved(&self, prepared: &mut PreparedFavorite) -> Result<()> {
+        let capabilities = Arc::clone(&prepared.capabilities);
+        let Some(stage) = prepared.stage.as_mut() else {
+            return Ok(());
+        };
+        let bound = match stage.matches_name(&capabilities.staging) {
+            Ok(bound) => bound,
+            // The name was moved away or deleted: re-stage the retained bytes.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if bound {
+            return Ok(());
+        }
+        stage.rewind()?;
+        let expected = prepared.entry.id.clone();
+        let fresh_name = Self::staging_name(Path::new(&stage.name));
+        let (fresh, actual) = self.stage_bytes(&capabilities, &fresh_name, |fresh| {
+            stream_hash_copy(stage.handle.as_file_mut(), fresh)
+        })?;
+        if actual != expected {
+            drop(fresh);
+            self.active_stages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&fresh_name);
+            return Err(MediaError::Other(anyhow::anyhow!(
+                "prepared favorite content changed before publication"
+            )));
+        }
+        prepared.release_stage();
+        prepared.stage = Some(fresh);
+        Ok(())
+    }
+
+    /// Move the private stage into `files/` under its final content name. This
+    /// is one rename on the same filesystem (the stage lives in `files/.staging`),
+    /// so publication never copies or hashes the content again. The returned
+    /// leaf still truncates its content on drop until the caller disarms it.
+    fn publish_stage(&self, prepared: &mut PreparedFavorite) -> Result<OwnedLeaf> {
+        let stored_name = prepared.stored_name.clone().ok_or_else(|| {
+            MediaError::Other(anyhow::anyhow!("favorite preparation has no target"))
+        })?;
+        let mut stage = prepared.stage.take().ok_or_else(|| {
+            MediaError::Other(anyhow::anyhow!(
+                "favorite preparation was already published"
+            ))
+        })?;
+        let staged_name = stage.name.clone();
+        let moved = move_owned(
+            &prepared.capabilities.staging,
+            &mut stage,
+            &prepared.capabilities.files,
+            Path::new(&stored_name),
+        );
+        self.active_stages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&staged_name);
+        moved?;
+        // The manifest will refer to this name: persist the directory entry
+        // (and the removal from staging) first.
+        sync_dir(&prepared.capabilities.files)?;
+        sync_dir(&prepared.capabilities.staging)?;
+        Ok(stage)
     }
 
     /// Publish a prepared favorite after its project mapping is durable. The
     /// manifest is re-read under the write lock so concurrent prepares dedup at
-    /// publication time. RAII owns the staged or final copy until the manifest
-    /// commit succeeds; startup reconciliation removes crash-window leftovers.
+    /// publication time. The lock covers only the manifest and one rename: no
+    /// whole-file hash or copy runs while it is held. RAII owns the staged or
+    /// final copy until the manifest commit succeeds.
     pub fn publish_favorite(&self, mut prepared: PreparedFavorite) -> Result<FavoriteOutcome> {
         if !Arc::ptr_eq(self.capabilities()?, &prepared.capabilities) {
             return Err(MediaError::Other(anyhow::anyhow!(
                 "favorite preparation belongs to a different library capability"
             )));
         }
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.rebind_stage_if_moved(&mut prepared)?;
+        let guard = self.lock_writes();
+        let outcome = self.publish_locked(&mut prepared);
+        // Close the retained stage/final handles before other writers can look
+        // the content up: on Windows they carry DELETE access, which would make
+        // a concurrent verification open fail with a sharing violation.
+        drop(prepared);
+        drop(guard);
+        outcome
+    }
+
+    fn publish_locked(&self, prepared: &mut PreparedFavorite) -> Result<FavoriteOutcome> {
         let mut manifest = self.load_manifest()?;
         let manifest_before = manifest.clone();
         manifest.version = MANIFEST_VERSION;
@@ -1448,33 +1656,9 @@ impl LibraryStore {
             .find(|entry| entry.id == prepared.entry.id)
             .cloned()
         {
-            if self.open_stored_verified(&existing.id)?.is_none() {
-                let stage = prepared.stage.as_mut().ok_or_else(|| {
-                    MediaError::Other(anyhow::anyhow!(
-                        "existing library entry has no durable copy"
-                    ))
-                })?;
-                let stored_name = prepared.stored_name.as_ref().ok_or_else(|| {
-                    MediaError::Other(anyhow::anyhow!("favorite preparation has no target"))
-                })?;
-                stage.rewind()?;
-                let mut final_leaf = OwnedLeaf::create(&prepared.capabilities.files, stored_name)?;
-                let actual =
-                    stream_hash_copy(stage.handle.as_file_mut(), final_leaf.handle.as_file_mut())?;
-                if actual != existing.id {
-                    return Err(MediaError::Other(anyhow::anyhow!(
-                        "prepared favorite changed before repair publication"
-                    )));
-                }
-                final_leaf.sync_all()?;
-                if !final_leaf.matches_name(&prepared.capabilities.files)? {
-                    return Err(MediaError::Other(anyhow::anyhow!(
-                        "stored favorite identity changed before publication"
-                    )));
-                }
+            if prepared.stage.is_some() && self.stored_index()?.lookup(&existing.id)?.is_none() {
+                let mut final_leaf = self.publish_stage(prepared)?;
                 final_leaf.disarm_cleanup();
-                prepared.final_leaf = Some(final_leaf);
-                prepared.release_stage();
             }
             return Ok(FavoriteOutcome {
                 entry: existing,
@@ -1482,27 +1666,9 @@ impl LibraryStore {
             });
         }
 
-        let stored_name = prepared.stored_name.as_ref().ok_or_else(|| {
-            MediaError::Other(anyhow::anyhow!("favorite preparation has no target"))
-        })?;
         if prepared.final_leaf.is_none() {
-            let stage = prepared.stage.as_mut().ok_or_else(|| {
-                MediaError::Other(anyhow::anyhow!(
-                    "favorite preparation was already published"
-                ))
-            })?;
-            stage.rewind()?;
-            let mut final_leaf = OwnedLeaf::create(&prepared.capabilities.files, stored_name)?;
-            let actual =
-                stream_hash_copy(stage.handle.as_file_mut(), final_leaf.handle.as_file_mut())?;
-            if actual != prepared.entry.id {
-                return Err(MediaError::Other(anyhow::anyhow!(
-                    "prepared favorite content changed before publication"
-                )));
-            }
-            final_leaf.sync_all()?;
+            let final_leaf = self.publish_stage(prepared)?;
             prepared.final_leaf = Some(final_leaf);
-            prepared.release_stage();
         }
         if !prepared
             .final_leaf
@@ -1583,27 +1749,31 @@ impl LibraryStore {
     pub fn stored_path(&self, id: &str) -> Result<Option<PathBuf>> {
         Ok(self
             .stored_index()?
-            .remove(id)
+            .lookup(id)?
             .map(|name| self.files_dir().join(name)))
     }
 
     /// Compatibility/debug enumeration of absolute stored paths. Returned paths
     /// carry no authority and must not be used for preview, import, or deletion.
     pub fn stored_paths(&self) -> Result<HashMap<String, PathBuf>> {
-        Ok(self
-            .stored_index()?
-            .into_iter()
-            .map(|(id, name)| (id, self.files_dir().join(name)))
-            .collect())
+        let index = self.stored_index()?;
+        let mut paths = HashMap::with_capacity(index.by_id.len());
+        for id in index.by_id.keys() {
+            if let Some(name) = index.lookup(id)? {
+                paths.insert(id.clone(), self.files_dir().join(name));
+            }
+        }
+        Ok(paths)
     }
 
     /// Remove an entry from the manifest and delete its stored copy. Returns
     /// `true` if an entry was removed. Runs under the write lock.
+    ///
+    /// Removal does not verify content: a damaged copy (bit rot, external
+    /// edit, crash leftover) must stay deletable. Every nofollow regular leaf
+    /// claiming the id is opened before the commit and truncated after it.
     pub fn remove(&self, id: &str) -> Result<bool> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.lock_writes();
 
         let mut manifest = self.load_manifest()?;
         let before = manifest.entries.len();
@@ -1612,13 +1782,21 @@ impl LibraryStore {
             return Ok(false);
         }
         manifest.version = MANIFEST_VERSION;
-        let stored = self.open_stored_verified_writable(id)?;
+        let files = &self.capabilities()?.files;
+        let mut stored = Vec::new();
+        for name in self.stored_index()?.candidates(id) {
+            match OwnedLeaf::open(files, name) {
+                Ok(leaf) => stored.push(leaf),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.store_manifest(&manifest)?;
         // Commit the manifest first. A failed manifest write must not leave an
         // entry that still exists on disk pointing at a copy we already deleted.
         // A failed best-effort cleanup after the commit only leaves an orphaned
         // content-addressed file, which is safe and can be reclaimed later.
-        if let Some(stored) = stored {
+        for stored in stored {
             let cleanup = || -> std::io::Result<()> {
                 #[cfg(any(test, feature = "test-faults"))]
                 if FAIL_REMOVED_STORED_CLEANUP.with(|fail| fail.replace(false)) {
@@ -1627,8 +1805,8 @@ impl LibraryStore {
                         "injected removed-stored cleanup failure",
                     ));
                 }
-                stored.handle.as_file().set_len(0)?;
-                stored.handle.as_file().sync_all()
+                self.release_stored_leaf(stored)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
             };
             if let Err(error) = cleanup() {
                 // The manifest is already committed, so the removal stands; only
@@ -1648,10 +1826,7 @@ impl LibraryStore {
     /// lock so it cannot race a concurrent favorite/remove. Used by the command
     /// layer's `library_categorize` (#55).
     pub fn set_category(&self, id: &str, category: Option<String>) -> Result<Option<LibraryEntry>> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.lock_writes();
 
         let mut manifest = self.load_manifest()?;
         let Some(entry) = manifest.entries.iter_mut().find(|e| e.id == id) else {
@@ -1668,10 +1843,7 @@ impl LibraryStore {
     /// (`None` un-categorizes them). Returns the number of entries changed. Runs
     /// under the write lock. Used by the command layer's `library_rename` (#55).
     pub fn rename_category(&self, from: &str, to: Option<String>) -> Result<usize> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.lock_writes();
 
         let mut manifest = self.load_manifest()?;
         let mut changed = 0usize;
@@ -2116,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_crash_orphan_fails_closed_instead_of_becoming_owned() {
+    fn mismatched_crash_orphan_is_quarantined_instead_of_becoming_owned() {
         let tmp = tempfile::tempdir().unwrap();
         let source = src_file(tmp.path(), "clip.mp4", b"trusted bytes");
         let store = LibraryStore::new(tmp.path().join("lib"));
@@ -2124,40 +2296,80 @@ mod tests {
         let orphan = store.files_dir().join(format!("{id}.crashed.mp4"));
         std::fs::write(&orphan, b"untrusted bytes").unwrap();
 
-        let error = store
-            .favorite(&req(&source, "video", None))
-            .expect_err("mismatched orphan must not be adopted");
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
 
-        assert!(error.to_string().contains("hash mismatch"), "{error}");
-        assert!(store.entries().unwrap().is_empty());
-        assert_eq!(std::fs::read(orphan).unwrap(), b"untrusted bytes");
+        assert_eq!(entry.id, id);
+        assert_eq!(store.entries().unwrap(), vec![entry.clone()]);
+        let stored = store.stored_path(&id).unwrap().unwrap();
+        assert_ne!(stored, orphan, "the mismatched orphan must not be adopted");
+        assert_eq!(std::fs::read(stored).unwrap(), b"trusted bytes");
+        // Quarantined: truncated through its own handle, so it is hidden.
+        assert_eq!(std::fs::metadata(&orphan).unwrap().len(), 0);
+        assert_eq!(store.stored_ids_verified().unwrap(), HashSet::from([id]));
     }
 
     #[test]
-    fn duplicate_crash_orphan_claims_fail_closed() {
+    fn duplicate_crash_orphans_adopt_one_verified_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let source = src_file(tmp.path(), "clip.mp4", b"duplicate orphan bytes");
         let store = LibraryStore::new(tmp.path().join("lib"));
         let id = store.content_id(&source).unwrap();
-        std::fs::write(
-            store.files_dir().join(format!("{id}.first.mp4")),
-            b"duplicate orphan bytes",
-        )
-        .unwrap();
-        std::fs::write(
-            store.files_dir().join(format!("{id}.second.mp4")),
-            b"duplicate orphan bytes",
-        )
-        .unwrap();
+        let first = store.files_dir().join(format!("{id}.first.mp4"));
+        let second = store.files_dir().join(format!("{id}.second.mp4"));
+        std::fs::write(&first, b"duplicate orphan bytes").unwrap();
+        std::fs::write(&second, b"duplicate orphan bytes").unwrap();
 
-        let error = store
-            .favorite(&req(&source, "video", None))
-            .expect_err("duplicate orphan claims must fail closed");
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
 
-        assert!(
-            error.to_string().contains("multiple stored copies"),
-            "{error}"
-        );
+        assert_eq!(entry.id, id);
+        assert_eq!(store.stored_path(&id).unwrap(), Some(first.clone()));
+        assert_eq!(std::fs::read(&first).unwrap(), b"duplicate orphan bytes");
+        assert_eq!(std::fs::metadata(&second).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_duplicates_never_lose_the_kept_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"linked bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let kept = store.stored_path(&entry.id).unwrap().unwrap();
+        // A second name for the same file, sorted after the kept one.
+        let linked = store.files_dir().join(format!("{}.zz.mp4", entry.id));
+        std::fs::hard_link(&kept, &linked).unwrap();
+
+        store.resolve_duplicate_copies().unwrap();
+
+        assert_eq!(std::fs::read(&kept).unwrap(), b"linked bytes");
+        assert!(!linked.exists(), "only the extra name is removed");
+        assert_eq!(store.stored_path(&entry.id).unwrap(), Some(kept.clone()));
+
+        // A hard link from outside the library keeps its bytes on removal.
+        let outside = tmp.path().join("outside-link.mp4");
+        std::fs::hard_link(&kept, &outside).unwrap();
+        assert!(store.remove(&entry.id).unwrap());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"linked bytes");
+        assert!(!kept.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_stored_copy_can_be_refavorited_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"read only bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let stored = store.stored_path(&entry.id).unwrap().unwrap();
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let again = store
+            .favorite_with_outcome(&req(&source, "video", None))
+            .unwrap();
+        assert!(!again.created);
+        assert!(store.remove(&entry.id).unwrap());
         assert!(store.entries().unwrap().is_empty());
     }
 
@@ -2375,12 +2587,17 @@ mod tests {
         std::fs::remove_file(store.stored_path(&entry.id).unwrap().unwrap()).unwrap();
         std::fs::create_dir(store.files_dir().join(format!("{}.mp4", entry.id))).unwrap();
 
-        let error = store
-            .stored_path(&entry.id)
-            .expect_err("directory must not be accepted as durable content");
-
-        assert!(error.to_string().contains("nofollow regular file"));
-        assert!(store.reconcile_storage().is_err());
+        assert_eq!(
+            store.stored_path(&entry.id).unwrap(),
+            None,
+            "a directory must not be accepted as durable content"
+        );
+        store.reconcile_storage().unwrap();
+        // The entry has no durable copy; favoriting the source repairs it.
+        let repaired = store.favorite(&req(&source, "video", None)).unwrap();
+        assert_eq!(repaired, entry);
+        let stored = store.stored_path(&entry.id).unwrap().unwrap();
+        assert_eq!(std::fs::read(stored).unwrap(), b"directory collision");
     }
 
     #[test]
@@ -2398,9 +2615,150 @@ mod tests {
         let error = store
             .stored_paths()
             .expect_err("duplicate candidates must fail closed");
-
         assert!(error.to_string().contains("multiple stored copies"));
-        assert!(store.reconcile_storage().is_err());
+
+        // Duplicate resolution keeps only the copy that verifies.
+        store.reconcile_storage().unwrap();
+        assert_eq!(store.resolve_duplicate_copies().unwrap(), 1);
+        let paths = store.stored_paths().unwrap();
+        assert_eq!(
+            std::fs::read(&paths[&entry.id]).unwrap(),
+            b"duplicate collision"
+        );
+        assert_eq!(
+            std::fs::metadata(store.files_dir().join(format!("{}.mov", entry.id)))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn favorite_publishes_the_staged_inode_without_hashing_under_the_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(
+            tmp.path(),
+            "clip.mp4",
+            &vec![7_u8; 3 * STREAM_BUFFER_SIZE + 5],
+        );
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        STREAMS_UNDER_WRITE_LOCK.with(|count| count.set(0));
+
+        let prepared = store
+            .prepare_favorite(&req(&source, "video", None))
+            .unwrap();
+        let staged = Handle::from_file(
+            prepared
+                .stage
+                .as_ref()
+                .unwrap()
+                .handle
+                .as_file()
+                .try_clone()
+                .unwrap(),
+        )
+        .unwrap();
+        let outcome = store.publish_favorite(prepared).unwrap();
+        assert!(outcome.created);
+        let stored = store.stored_path(&outcome.entry.id).unwrap().unwrap();
+        // One copy: the published file is the very inode the source was
+        // streamed into, moved by rename.
+        assert_eq!(Handle::from_path(&stored).unwrap(), staged);
+        // Windows: the cloned stage handle carries DELETE access; release it
+        // like publication releases its own before other writers look it up.
+        drop(staged);
+        assert_eq!(
+            nonempty_file_count(&store.files_dir().join(STAGING_SUBDIR)),
+            0
+        );
+
+        // Re-favoriting, repairing and removing never hash or copy a whole
+        // file while holding the global write lock either.
+        store.favorite(&req(&source, "video", None)).unwrap();
+        std::fs::remove_file(&stored).unwrap();
+        store.favorite(&req(&source, "video", None)).unwrap();
+        assert!(store.stored_path(&outcome.entry.id).unwrap().is_some());
+        assert!(store.remove(&outcome.entry.id).unwrap());
+        STREAMS_UNDER_WRITE_LOCK.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn foreign_files_and_directories_in_files_do_not_break_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        let store = LibraryStore::new(&root);
+        let kept_source = src_file(tmp.path(), "kept.mp4", b"kept bytes");
+        let kept = store.favorite(&req(&kept_source, "video", None)).unwrap();
+        let files = store.files_dir();
+        std::fs::write(files.join(".DS_Store"), b"finder metadata").unwrap();
+        std::fs::write(files.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::write(files.join("Thumbs.db"), b"thumbs").unwrap();
+        std::fs::write(files.join("note.txt"), b"a note").unwrap();
+        std::fs::create_dir(files.join("Some Folder")).unwrap();
+        std::fs::create_dir(files.join(STAGING_SUBDIR).join("nested")).unwrap();
+
+        store.reconcile_storage().unwrap();
+        let reopened = LibraryStore::new(&root);
+        reopened.reconcile_storage().unwrap();
+
+        let source = src_file(tmp.path(), "clip.mp4", b"new favorite bytes");
+        let added = reopened.favorite(&req(&source, "video", None)).unwrap();
+        let mut copied = Vec::new();
+        assert!(reopened
+            .copy_stored_verified(&kept.id, &mut copied)
+            .unwrap()
+            .is_some());
+        assert_eq!(copied, b"kept bytes");
+        assert_eq!(
+            reopened.stored_ids_verified().unwrap(),
+            HashSet::from([kept.id.clone(), added.id.clone()])
+        );
+        assert!(reopened.remove(&kept.id).unwrap());
+        assert_eq!(reopened.entries().unwrap(), vec![added]);
+        assert_eq!(
+            std::fs::read(files.join(".DS_Store")).unwrap(),
+            b"finder metadata"
+        );
+        assert!(files.join("Some Folder").is_dir());
+    }
+
+    #[test]
+    fn a_damaged_stored_copy_can_still_be_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"original bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let stored = store.stored_path(&entry.id).unwrap().unwrap();
+        std::fs::write(&stored, b"Original bytes").unwrap();
+
+        assert!(store.remove(&entry.id).unwrap());
+
+        assert!(store.entries().unwrap().is_empty());
+        assert_eq!(std::fs::metadata(&stored).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn refavoriting_repairs_a_damaged_stored_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = src_file(tmp.path(), "clip.mp4", b"original bytes");
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let damaged = store.stored_path(&entry.id).unwrap().unwrap();
+        std::fs::write(&damaged, b"Original bytes").unwrap();
+
+        let outcome = store
+            .favorite_with_outcome(&req(&source, "video", None))
+            .unwrap();
+
+        assert!(!outcome.created);
+        assert_eq!(outcome.entry, entry);
+        assert_eq!(std::fs::metadata(&damaged).unwrap().len(), 0);
+        let repaired = store.stored_path(&entry.id).unwrap().unwrap();
+        assert_eq!(std::fs::read(repaired).unwrap(), b"original bytes");
+        assert_eq!(
+            store.stored_ids_verified().unwrap(),
+            HashSet::from([entry.id])
+        );
     }
 
     #[test]

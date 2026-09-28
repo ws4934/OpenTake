@@ -53,8 +53,25 @@ impl LibraryState {
                 "global library unavailable: storage reconciliation failed: {error}"
             ));
         }
+        let store = Arc::new(store);
+        // Hashing duplicate copies can take long; keep it off the setup thread.
+        let background = Arc::clone(&store);
+        if let Err(error) = std::thread::Builder::new()
+            .name("opentake-library-duplicates".into())
+            .spawn(move || match background.resolve_duplicate_copies() {
+                Ok(0) => {}
+                Ok(resolved) => {
+                    eprintln!("[library] resolved duplicate copies of {resolved} entries")
+                }
+                Err(error) => {
+                    eprintln!("[library] duplicate copy resolution failed: {error}")
+                }
+            })
+        {
+            eprintln!("[library] could not start duplicate resolution: {error}");
+        }
         LibraryState {
-            store: Some(Arc::new(store)),
+            store: Some(store),
             init_error: None,
             workflow_lock: Mutex::new(()),
         }
@@ -1274,6 +1291,33 @@ mod tests {
             std::fs::read(files.join(format!("{}.mp4", "0".repeat(64)))).unwrap(),
             b"final orphan"
         );
+    }
+
+    #[test]
+    fn startup_keeps_the_library_available_with_foreign_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let files = root.join(opentake_media::library::FILES_SUBDIR);
+        std::fs::create_dir_all(files.join(".staging/unexpected-dir")).unwrap();
+        std::fs::write(files.join(".DS_Store"), b"finder metadata").unwrap();
+        std::fs::write(files.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::create_dir(files.join("Some Folder")).unwrap();
+
+        let library = LibraryState::new(LibraryStore::new(root));
+
+        let store = library.store().expect("library stays available");
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"favorite bytes").unwrap();
+        let entry = store
+            .favorite(&FavoriteRequest {
+                source: &source,
+                kind: "video",
+                category: None,
+                favorited_at: 1.0,
+                thumb: None,
+            })
+            .unwrap();
+        assert!(store.remove(&entry.id).unwrap());
     }
 
     #[test]

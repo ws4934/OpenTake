@@ -66,6 +66,10 @@ impl ExportPause {
             self.0.changed.notify_all();
         }
     }
+    /// True when both handles observe the same shared counter.
+    pub fn ptr_eq(&self, other: &ExportPause) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     /// True while any export is active.
     pub fn is_active(&self) -> bool {
         self.0.active.load(Ordering::SeqCst) > 0

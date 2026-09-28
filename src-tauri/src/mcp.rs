@@ -1134,7 +1134,7 @@ impl TauriMediaBridge {
     fn new(core: AppCore, cache_root: PathBuf, models_dir: PathBuf) -> Self {
         TauriMediaBridge {
             core,
-            engine: MediaEngine::new(cache_root, models_dir),
+            engine: crate::media_pressure::production_media_engine(cache_root, models_dir),
             render: crate::render::RenderState::new(),
         }
     }
@@ -3992,6 +3992,24 @@ mod tests {
             .import_from_path(&empty.to_string_lossy(), None, None)
             .expect_err("MCP empty directory import must be rejected");
         assert_eq!(core.media(), before);
+    }
+
+    #[test]
+    fn mcp_media_engine_shares_the_app_playback_export_pressure() {
+        let tmp = tempfile::tempdir().expect("create temp root");
+        let bridge = TauriMediaBridge::new(
+            AppCore::new(),
+            tmp.path().join("cache"),
+            tmp.path().join("models"),
+        );
+        let app_engine = crate::media_pressure::production_media_engine(
+            tmp.path().join("cache"),
+            tmp.path().join("models"),
+        );
+        assert!(bridge
+            .engine
+            .export_pause()
+            .ptr_eq(&app_engine.export_pause()));
     }
 
     #[test]
