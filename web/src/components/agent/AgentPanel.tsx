@@ -551,6 +551,11 @@ export function AgentPanel() {
     }
   }
 
+  function isCurrentProject(epoch: number, path: string): boolean {
+    const project = useProjectStore.getState();
+    return project.projectEpoch === epoch && project.projectPath === path;
+  }
+
   function deleteChat(session: ChatSession) {
     if (interactionLocked || !projectPath) return;
     if (!window.confirm(t("agent.deleteChatConfirm"))) return;
@@ -563,13 +568,13 @@ export function AgentPanel() {
         await chatSessionDelete(session.id, deletingEpoch, deletingPath);
       } catch (error) {
         // The backend refused (for example a running turn); keep the tab and
-        // say why.
+        // say why, unless another project is open by now.
+        if (!isCurrentProject(deletingEpoch, deletingPath)) return;
         setChatError(`${t("agent.deleteChatFailed")} ${errorText(error)}`);
         return;
       }
+      if (!isCurrentProject(deletingEpoch, deletingPath)) return;
       setChatError(null);
-      const project = useProjectStore.getState();
-      if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
       await removeTab(session.id, deletingEpoch, deletingPath);
     });
   }
@@ -584,8 +589,7 @@ export function AgentPanel() {
       let failed = 0;
       let lastError: unknown = null;
       for (const closedId of deleting) {
-        const project = useProjectStore.getState();
-        if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
+        if (!isCurrentProject(deletingEpoch, deletingPath)) return;
         try {
           await chatSessionDelete(closedId, deletingEpoch, deletingPath);
         } catch (error) {
@@ -593,8 +597,10 @@ export function AgentPanel() {
           lastError = error;
           continue;
         }
+        if (!isCurrentProject(deletingEpoch, deletingPath)) return;
         setClosedSessionIds((current) => current.filter((id) => id !== closedId));
       }
+      if (!isCurrentProject(deletingEpoch, deletingPath)) return;
       setChatError(
         failed === 0
           ? null

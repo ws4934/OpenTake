@@ -589,6 +589,15 @@ impl ChatState {
         }
     }
 
+    /// Request that the running turn of `key` stop (`chat_cancel`).
+    fn cancel_turn(&self, key: &SessionKey) -> Result<(), String> {
+        let turns = self.turns.lock().map_err(|e| e.to_string())?;
+        if let Some(flag) = turns.running.get(key) {
+            flag.request();
+        }
+        Ok(())
+    }
+
     fn release_turn(&self, key: &SessionKey) {
         if let Ok(mut turns) = self.turns.lock() {
             if let Some(owner) = turns.running.remove(key) {
@@ -1412,16 +1421,11 @@ pub fn chat_cancel(
     expected_project_epoch: u64,
     expected_project_path: String,
 ) -> Result<(), String> {
-    let key = SessionKey {
+    state.cancel_turn(&SessionKey {
         project_epoch: expected_project_epoch,
         project_dir: PathBuf::from(expected_project_path),
         session_id,
-    };
-    let turns = state.turns.lock().map_err(|e| e.to_string())?;
-    if let Some(flag) = turns.running.get(&key) {
-        flag.request();
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -2216,6 +2220,331 @@ mod tests {
             }
             Err(opentake_agent::mcp::media_bridge::cancelled_bridge_error())
         }
+    }
+
+    /// Ignores cancellation: blocks `transcribe_sources_cancellable` until
+    /// the test releases it (or a long safety timeout passes).
+    #[cfg(unix)]
+    struct StubbornTranscriptBridge {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(unix)]
+    impl opentake_agent::mcp::media_bridge::MediaBridge for StubbornTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            _sources: &[opentake_agent::mcp::media_bridge::TranscriptSource],
+            _cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<
+            Vec<opentake_agent::mcp::media_bridge::TranscriptSourceResult>,
+            opentake_agent::mcp::media_bridge::BridgeError,
+        > {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(60));
+            Err(opentake_agent::mcp::media_bridge::cancelled_bridge_error())
+        }
+    }
+
+    /// A saved project whose timeline holds one video clip with audio, so
+    /// `get_transcript` reaches the media bridge.
+    #[cfg(unix)]
+    fn project_with_a_talking_clip(root: &std::path::Path) -> AppCore {
+        let core = AppCore::new();
+        core.save_project(Some(root.join("A.opentake"))).unwrap();
+        core.apply(
+            opentake_ops::command::EditCommand::RegisterMediaAndAddClip {
+                media: opentake_domain::MediaManifestEntry {
+                    id: "talk".into(),
+                    name: "talk.mov".into(),
+                    kind: opentake_domain::ClipType::Video,
+                    source: opentake_domain::MediaSource::Project {
+                        relative_path: "media/talk.mov".into(),
+                    },
+                    duration: 10.0,
+                    generation_input: None,
+                    source_width: Some(1920),
+                    source_height: Some(1080),
+                    source_fps: Some(30.0),
+                    has_audio: Some(true),
+                    color: None,
+                    proxy: None,
+                    folder_id: None,
+                    cached_remote_url: None,
+                    cached_remote_url_expires_at: None,
+                },
+                entry: opentake_ops::command::ClipEntry {
+                    media_ref: "talk".into(),
+                    media_type: opentake_domain::ClipType::Video,
+                    source_clip_type: opentake_domain::ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 300,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: true,
+                    add_linked_audio: false,
+                    transform: None,
+                },
+                auto_track: true,
+            },
+        )
+        .unwrap();
+        core
+    }
+
+    /// A fake official Codex CLI that reads the prompt, opens an MCP session
+    /// on the turn's private endpoint with curl, calls `get_transcript`, and
+    /// then runs `after_call` (with the call still in flight when
+    /// `background` is set).
+    #[cfg(unix)]
+    fn fake_codex_calling_get_transcript(
+        root: &std::path::Path,
+        background: bool,
+        after_call: &str,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let call_suffix = if background { " &" } else { "" };
+        let script = format!(
+            r#"#!/bin/sh
+set -u
+url=""
+for arg in "$@"; do
+  case "$arg" in
+    mcp_servers.opentake.url=*) url="${{arg#mcp_servers.opentake.url=\"}}"; url="${{url%\"}}" ;;
+  esac
+done
+IFS= read -r prompt || true
+printf '%s\n' '{{"type":"thread.started"}}'
+auth="Authorization: Bearer $OPENTAKE_CODEX_MCP_BEARER_TOKEN"
+session="$(curl -sS --max-time 10 -D - -o /dev/null -H "$auth" \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  --data '{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"fake-codex","version":"0"}}}}}}' \
+  "$url" | tr -d '\r' | sed -n 's/^[Mm][Cc][Pp]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Ii][Dd]: //p')"
+curl -sS --max-time 10 -o /dev/null -H "$auth" -H "mcp-session-id: $session" \
+  -H 'mcp-protocol-version: 2025-06-18' \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  --data '{{"jsonrpc":"2.0","method":"notifications/initialized"}}' "$url"
+curl -sS -N -o /dev/null -H "$auth" -H "mcp-session-id: $session" \
+  -H 'mcp-protocol-version: 2025-06-18' \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+  --data '{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_transcript","arguments":{{}}}}}}' \
+  "$url"{call_suffix}
+{after_call}
+"#
+        );
+        let path = root.join("fake-codex");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// A reserved Codex turn on a saved project whose dispatcher uses
+    /// `bridge` for transcription.
+    #[cfg(unix)]
+    struct CodexTurnFixture {
+        state: ChatState,
+        project: ChatProjectContext,
+        key: SessionKey,
+        cancel: Arc<TurnCancel>,
+        _lease: crate::updater::ActivityLease,
+        context: crate::codex::CodexTurnContext,
+    }
+
+    #[cfg(unix)]
+    fn codex_turn_fixture(
+        root: &std::path::Path,
+        bridge: Arc<dyn opentake_agent::mcp::media_bridge::MediaBridge>,
+    ) -> CodexTurnFixture {
+        let core = project_with_a_talking_clip(root);
+        let state = ChatState::new(
+            core.clone(),
+            root.join("no-workflows"),
+            root.join("chat-cache"),
+            root.join("chat-models"),
+        );
+        let project = state.project_context().unwrap();
+        let key = project.key("chat-codex");
+        let cancel = Arc::new(TurnCancel::new());
+        let lease = state.reserve_turn(key.clone(), cancel.clone()).unwrap();
+        let gate = state.project_turn_gate(&project, &key, cancel.clone());
+        let handle: Arc<dyn CoreHandle> = Arc::new(AppCoreHandle::new(core));
+        let registry = Arc::new(RwLock::new(crate::mcp::build_registry(
+            &root.join("no-workflows"),
+        )));
+        let dispatcher = Arc::new(Dispatcher::with_bridge(
+            handle,
+            registry.clone(),
+            Some(bridge),
+        ));
+        let context = crate::codex::CodexTurnContext {
+            dispatcher,
+            registry,
+            gate,
+            cancel: cancel.requested.clone(),
+        };
+        CodexTurnFixture {
+            state,
+            project,
+            key,
+            cancel,
+            _lease: lease,
+            context,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_bridge_entry(entered: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the fake Codex CLI called get_transcript")
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_chat_cancel_ends_a_turn_with_a_long_transcription_within_two_seconds() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_codex_calling_get_transcript(temp.path(), false, "sleep 60");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let fixture = codex_turn_fixture(
+            temp.path(),
+            Arc::new(CancelAwaitingTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+            }),
+        );
+        let context = fixture.context;
+        let turn = tokio::spawn(async move {
+            crate::codex::run_agent_turn_with_executable(&script, context, "caption it", |_| {})
+                .await
+        });
+        wait_for_bridge_entry(entered_rx).await;
+
+        let started = std::time::Instant::now();
+        fixture.state.cancel_turn(&fixture.key).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), turn)
+            .await
+            .expect("the cancelled turn ended")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result.unwrap_err(), crate::codex::CodexTurnError::Cancelled);
+        assert!(fixture.cancel.media.is_cancelled());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "chat_cancel took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_stop_during_an_internal_failure_drain_takes_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        // The tool call is still running when the CLI reports garbage, so
+        // the turn fails internally and drains its endpoint.
+        let script = fake_codex_calling_get_transcript(
+            temp.path(),
+            true,
+            "sleep 1\nprintf '%s\\n' 'not json'\nsleep 60",
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fixture = codex_turn_fixture(
+            temp.path(),
+            Arc::new(StubbornTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let context = fixture.context;
+        let turn = tokio::spawn(async move {
+            crate::codex::run_agent_turn_with_executable(&script, context, "caption it", |_| {})
+                .await
+        });
+        wait_for_bridge_entry(entered_rx).await;
+        // The protocol error has cancelled only the dispatch; the stubborn
+        // transcription keeps the drain waiting on the 30-minute deadline.
+        let drain_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !fixture.cancel.media.is_cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(drain_started.is_ok(), "the internal failure began draining");
+        assert!(!fixture.cancel.requested.load(Ordering::Acquire));
+
+        fixture.state.cancel_turn(&fixture.key).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), turn)
+            .await
+            .expect("Stop during the drain took effect")
+            .unwrap();
+        assert!(result.is_err());
+        // The Stop wins: the turn is no longer eligible to commit its reply.
+        assert!(!fixture.cancel.begin_finalization());
+        let _ = release_tx.send(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_deadline_keeps_the_timeout_reply_when_a_tool_call_outlives_the_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_codex_calling_get_transcript(temp.path(), false, "sleep 60");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fixture = codex_turn_fixture(
+            temp.path(),
+            Arc::new(StubbornTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let context = fixture.context;
+        // Leave the fake CLI time to start and call the tool; the runner
+        // keeps the last two seconds for cleanup.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let turn = tokio::spawn(async move {
+            crate::codex::run_agent_turn_with_executable_until(
+                &script,
+                context,
+                "caption it",
+                |_| {},
+                deadline,
+            )
+            .await
+        });
+        wait_for_bridge_entry(entered_rx).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), turn)
+            .await
+            .expect("the turn ended at its deadline")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), crate::codex::CodexTurnError::Timeout);
+        // The stuck tool call was only asked to stop; the turn itself was not
+        // cancelled, so its timeout reply is still committed.
+        assert!(fixture.cancel.media.is_cancelled());
+        assert!(!fixture.cancel.requested.load(Ordering::Acquire));
+        let mut session = ChatSession::new("chat-codex");
+        session
+            .messages
+            .push(ChatMessage::assistant("timed out", vec![]));
+        assert!(matches!(
+            fixture.state.finalize_project_turn(
+                &fixture.project,
+                &fixture.key,
+                &fixture.cancel,
+                session
+            ),
+            Ok(TurnFinalization::Committed)
+        ));
+        let _ = release_tx.send(());
     }
 
     #[test]
