@@ -49,10 +49,9 @@ struct WaveformSink(RmsBuckets);
 
 impl PcmSink for WaveformSink {
     fn push_frames(&mut self, frames: &[u8]) -> Result<()> {
-        for sample in frames.chunks_exact(4) {
-            self.0.push(f32::from_le_bytes([
-                sample[0], sample[1], sample[2], sample[3],
-            ]));
+        let (samples, _) = frames.as_chunks::<4>();
+        for sample in samples {
+            self.0.push(f32::from_le_bytes(*sample));
         }
         Ok(())
     }
