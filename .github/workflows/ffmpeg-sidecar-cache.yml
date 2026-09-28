@@ -1,0 +1,70 @@
+name: FFmpeg sidecar cache
+
+# pr.yml and pr-native.yml run on pull_request, so a cache they save is scoped
+# to that pull request's merge ref and invisible to every other pull request.
+# This workflow provisions the pinned FFmpeg sidecars on main whenever the lock
+# or the provisioner changes and saves them under the keys those workflows
+# restore, so a pull request's first run restores them from main's cache
+# scope. The provisioner re-verifies every restored file before use.
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/ffmpeg-sidecars.lock.json
+      - scripts/provision_ffmpeg_sidecars.py
+      - .github/workflows/ffmpeg-sidecar-cache.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-sidecar-cache
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    name: Seed (${{ matrix.target }})
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Restore pinned FFmpeg sidecars
+        id: sidecar-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-sidecars-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('scripts/ffmpeg-sidecars.lock.json', 'scripts/provision_ffmpeg_sidecars.py') }}
+
+      - name: Provision pinned FFmpeg
+        if: steps.sidecar-cache.outputs.cache-hit != 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python scripts/provision_ffmpeg_sidecars.py --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg provisioning failed' }
+
+      - name: Save pinned FFmpeg sidecars
+        if: steps.sidecar-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: src-tauri/binaries
+          key: ${{ steps.sidecar-cache.outputs.cache-primary-key }}
