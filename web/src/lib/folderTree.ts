@@ -39,3 +39,10 @@ export function folderTrail(folders: MediaFolder[], folderId: string | null): Me
   }
   return trail;
 }
+
+/** The folder cursor if that folder still exists, else `null` (root). A folder
+ *  deleted or undone while the panel pointed into it must not stay the target
+ *  of new media. */
+export function existingFolderId(folders: MediaFolder[], folderId: string | null): string | null {
+  return folderId !== null && folders.some((folder) => folder.id === folderId) ? folderId : null;
+}

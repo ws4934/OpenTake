@@ -70,6 +70,8 @@ const srv = vi.hoisted(() => {
     saveDialog: vi.fn(async () => srv.save),
     getDefaultProjectDir: vi.fn(async () => ""),
     checkPathExists: vi.fn(async (_path: string) => false),
+    // A refresh snapshot to return instead of the default one.
+    refreshSnapshot: null as null | Record<string, unknown>,
   };
 });
 
@@ -80,7 +82,7 @@ vi.mock("../lib/api", () => ({
   sampleProjectMaterialize: srv.sampleProjectMaterialize,
   getDefaultProjectDir: srv.getDefaultProjectDir,
   checkPathExists: srv.checkPathExists,
-  getTimeline: async () => ({
+  getTimeline: async () => srv.refreshSnapshot ?? ({
     timeline: srv.timeline,
     projectEpoch: 5,
     version: 0,
@@ -119,6 +121,8 @@ import {
 } from "./projectActions";
 import { useEditorUiStore } from "./uiStore";
 import { useMediaStore } from "./mediaStore";
+import { forceRefresh } from "./sync";
+import { projectOpenNotices } from "../lib/projectMessages";
 import { useProjectStore } from "./projectStore";
 import { useRecentStore } from "./recentStore";
 import { useI18nStore } from "../i18n";
@@ -246,7 +250,7 @@ describe("openProjectPath", () => {
     srv.openDialog.mockResolvedValue(undefined);
     useMediaStore.setState({ items: [], folders: [], importing: false, error: null });
     useRecentStore.setState({ recents: [] });
-    useProjectStore.setState({ projectPath: null, timelineVersion: 0 });
+    useProjectStore.setState({ projectPath: null, projectEpoch: 0, timelineVersion: 0 });
     useEditorUiStore.setState({ view: "home", toast: null });
     useI18nStore.setState({ locale: "zh-CN" });
   });
@@ -258,6 +262,78 @@ describe("openProjectPath", () => {
     expect(useRecentStore.getState().recents[0]?.path).toBe("/tmp/core-resolved.opentake");
     expect(useMediaStore.getState().items.map((item) => item.id)).toEqual(["m1"]);
     expect(useEditorUiStore.getState().view).toBe("editor");
+  });
+
+  it("keeps open notices naming offline media until dismissed, not on later refreshes", async () => {
+    const warnings = ["media.json:offline-media:m1", "media.json:offline-media:gone"];
+    srv.projectOpen.mockImplementationOnce(async () => ({
+      timeline: srv.timeline,
+      projectEpoch: 11,
+      version: 0,
+      projectPath: "/tmp/unsafe.opentake",
+      compatibilityReadOnly: false,
+      compatibilityBlockers: [],
+      compatibilityWarnings: warnings,
+    }));
+
+    await openProjectPath("/tmp/unsafe.opentake");
+
+    const notices = useProjectStore.getState().openNotices;
+    expect(notices).toEqual({ projectEpoch: 11, warnings, mediaNames: { m1: "clip" } });
+    expect(projectOpenNotices(notices!.warnings, notices!.mediaNames)).toEqual([
+      "以下素材的路径不安全，已作为离线素材打开，可重新链接：clip、gone",
+    ]);
+    // A notice is not a transient toast that could vanish or be replaced.
+    expect(useEditorUiStore.getState().toast).toBeNull();
+
+    // Dismissed, it stays dismissed: a refresh of the same project carries
+    // the same warnings but never records them again.
+    useProjectStore.getState().setOpenNotices(null);
+    srv.refreshSnapshot = {
+      timeline: structuredClone(srv.timeline),
+      projectEpoch: 11,
+      version: 1,
+      projectPath: "/tmp/unsafe.opentake",
+      compatibilityReadOnly: false,
+      compatibilityBlockers: [],
+      compatibilityWarnings: warnings,
+    };
+    try {
+      await forceRefresh();
+    } finally {
+      srv.refreshSnapshot = null;
+    }
+    expect(useProjectStore.getState().timelineVersion).toBe(1);
+    expect(useProjectStore.getState().openNotices).toBeNull();
+    expect(useEditorUiStore.getState().toast).toBeNull();
+  });
+
+  it("tells the user an oversized generation log was moved aside", async () => {
+    useI18nStore.setState({ locale: "en" });
+    srv.projectOpen.mockImplementationOnce(async () => ({
+      timeline: srv.timeline,
+      projectEpoch: 12,
+      version: 0,
+      projectPath: "/tmp/big-log.opentake",
+      compatibilityReadOnly: false,
+      compatibilityBlockers: [],
+      compatibilityWarnings: [
+        "generation-log.json:moved-aside:generation-log.oversized-1.json",
+      ],
+    }));
+
+    await openProjectPath("/tmp/big-log.opentake");
+
+    const notices = useProjectStore.getState().openNotices!;
+    expect(projectOpenNotices(notices.warnings, notices.mediaNames)).toEqual([
+      "The generation log was too large; it was moved to generation-log.oversized-1.json inside the project and a new log was started.",
+    ]);
+  });
+
+  it("opens a project without warnings silently", async () => {
+    await openProjectPath("/tmp/demo.opentake");
+    expect(useProjectStore.getState().openNotices).toBeNull();
+    expect(useEditorUiStore.getState().toast).toBeNull();
   });
 
   it("waits for a debounced Motion Studio save before replacing project authority", async () => {
@@ -559,6 +635,90 @@ describe("saveCurrentProject", () => {
       "保存失败：project is compatibility read-only because this build does not understand future fields",
     );
     expect(useProjectStore.getState().lastSavedVersion).toBe(8);
+  });
+
+  const saveFailures: Array<{
+    code: string;
+    params?: Record<string, string>;
+    zh: string;
+    en: string;
+  }> = [
+    {
+      code: "projectStorageFull",
+      zh: "磁盘空间不足，无法保存项目。",
+      en: "There is not enough disk space to save the project.",
+    },
+    {
+      code: "projectPermissionDenied",
+      zh: "OpenTake 没有写入项目文件夹的权限。",
+      en: "OpenTake is not allowed to write to the project folder.",
+    },
+    {
+      code: "projectIo",
+      params: { kind: "broken pipe" },
+      zh: "无法读取或写入项目文件（broken pipe）。",
+      en: "The project files could not be read or written (broken pipe).",
+    },
+    {
+      code: "projectInvalidManifest",
+      zh: "素材列表中有一个无法再次打开的文件路径，因此项目未保存。",
+      en: "The media list contains a file path that could not be opened again, so the project was not saved.",
+    },
+    {
+      code: "projectComponentTooLarge",
+      params: { file: "generation-log.json", sizeMib: "17.0", limitMib: "16" },
+      zh: "generation-log.json 大小为 17.0 MiB，超过了项目文件允许的 16 MiB。",
+      en: "generation-log.json is 17.0 MiB, more than the 16 MiB a project file may hold.",
+    },
+    {
+      code: "projectPartialCommit",
+      zh: "时间线已保存，但素材列表更新失败。请再次保存以完成。",
+      en: "The timeline was saved, but updating the media list failed. Save again to finish.",
+    },
+    {
+      code: "projectDurabilityUnconfirmed",
+      zh: "项目已保存，但磁盘未确认写入。请再次保存，确保断电后修改不会丢失。",
+      en: "The project was saved, but the disk did not confirm the write. Save again to make sure the changes survive a power failure.",
+    },
+    {
+      code: "projectRecoveryRequired",
+      zh: "项目无法安全保存。旧版本已保留在项目旁一个以“.opentake-backup”结尾的隐藏文件夹中；在项目再次成功保存之前请保留它。",
+      en: 'The project could not be saved safely. The previous version was kept next to the project in a hidden folder ending in ".opentake-backup"; keep it until the project saves successfully again.',
+    },
+  ];
+
+  for (const failure of saveFailures) {
+    it(`shows ${failure.code} in the active language`, async () => {
+      for (const [locale, prefix, expected] of [
+        ["zh-CN", "保存失败：", failure.zh],
+        ["en", "Save failed: ", failure.en],
+      ] as const) {
+        useI18nStore.setState({ locale });
+        useEditorUiStore.setState({ toast: null });
+        srv.projectSave.mockRejectedValueOnce({
+          code: failure.code,
+          message: "English server message",
+          ...(failure.params ? { params: failure.params } : {}),
+        });
+
+        await saveCurrentProject();
+
+        expect(useEditorUiStore.getState().toast?.message).toBe(`${prefix}${expected}`);
+      }
+    });
+  }
+
+  it("keeps the server message for an unknown code or missing params", async () => {
+    for (const rejection of [
+      { code: "projectSomethingNew", message: "Something new failed." },
+      { code: "projectComponentTooLarge", message: "project.json is 70.0 MiB, too large." },
+      { code: "internal", message: "Project operation failed" },
+    ]) {
+      useEditorUiStore.setState({ toast: null });
+      srv.projectSave.mockRejectedValueOnce(rejection);
+      await saveCurrentProject();
+      expect(useEditorUiStore.getState().toast?.message).toBe(`保存失败：${rejection.message}`);
+    }
   });
 
   it("queues one follow-up save when the document advances during an in-flight save", async () => {

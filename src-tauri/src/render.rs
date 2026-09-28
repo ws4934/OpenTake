@@ -1916,6 +1916,31 @@ fn capture_frame_to_media_impl(
     workflow()
 }
 
+fn media_folder_exists(core: &AppCore, folder_id: &str) -> bool {
+    core.media()
+        .folders
+        .iter()
+        .any(|folder| folder.id == folder_id)
+}
+
+/// Move a captured still into `folder_id`. A folder that no longer exists
+/// (deleted or undone, possibly while the frame was captured) leaves the
+/// still in the root: the capture already succeeded, and the web tells the
+/// user when its folder cursor was stale.
+fn move_capture_to_folder(core: &AppCore, asset_id: &str, folder_id: String) -> Result<(), String> {
+    if !media_folder_exists(core, &folder_id) {
+        return Ok(());
+    }
+    match core.apply(EditCommand::MoveToFolder {
+        asset_ids: vec![asset_id.to_string()],
+        folder_id: Some(folder_id.clone()),
+    }) {
+        Ok(_) => Ok(()),
+        Err(_) if !media_folder_exists(core, &folder_id) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn capture_frame_to_media_workflow(
     core: &AppCore,
     render: &RenderState,
@@ -1955,11 +1980,7 @@ fn capture_frame_to_media_workflow(
     })
     .map_err(|e| e.to_string())?;
     if let Some(fid) = folder_id {
-        core.apply(EditCommand::MoveToFolder {
-            asset_ids: vec![entry.id.clone()],
-            folder_id: Some(fid),
-        })
-        .map_err(|e| e.to_string())?;
+        move_capture_to_folder(core, &entry.id, fid)?;
     }
 
     Ok(crate::media::MediaListDto::from_core(
@@ -2341,6 +2362,41 @@ mod tests {
         assert!(!called.get());
         assert!(!sentinel.exists());
         assert_eq!(recursive_tree(&captures), before);
+    }
+
+    #[test]
+    fn a_capture_for_a_deleted_folder_stays_in_the_root() {
+        let core = AppCore::new();
+        core.apply(EditCommand::CreateFolder {
+            name: "Stills".into(),
+            parent_folder_id: None,
+        })
+        .expect("create folder");
+        let folder_id = core.media().folders[0].id.clone();
+        let still = core
+            .import_media_file(
+                std::env::temp_dir().join("capture-folder.png"),
+                "Frame 1",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("import still");
+        let folder_of = |core: &AppCore| {
+            core.media()
+                .entries
+                .iter()
+                .find(|entry| entry.id == still.id)
+                .expect("still stays imported")
+                .folder_id
+                .clone()
+        };
+
+        // A folder that no longer exists (deleted or undone) is not an error.
+        move_capture_to_folder(&core, &still.id, "deleted-folder".into())
+            .expect("a missing folder keeps the still in the root");
+        assert_eq!(folder_of(&core), None);
+
+        move_capture_to_folder(&core, &still.id, folder_id.clone()).expect("move into folder");
+        assert_eq!(folder_of(&core), Some(folder_id));
     }
 
     #[test]

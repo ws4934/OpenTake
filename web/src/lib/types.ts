@@ -716,6 +716,10 @@ export interface RuntimeTimelineSnapshot extends TimelineSnapshot {
   projectPath: string | null;
   compatibilityReadOnly: boolean;
   compatibilityBlockers: string[];
+  /** File-qualified notices about recoverable problems the core handled when
+   *  the project was opened (`media.json:offline-media:<id>`,
+   *  `media.json:ignored-proxy:<id>`, `generation-log.json:moved-aside:<file>`). */
+  compatibilityWarnings: string[];
 }
 
 export interface ProjectRevision {

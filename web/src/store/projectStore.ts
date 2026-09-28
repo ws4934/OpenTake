@@ -57,6 +57,11 @@ interface ProjectState {
   lastSavedAt: number | null;
   canUndo: boolean;
   canRedo: boolean;
+  /** Recoverable problems the core handled when the current project was
+   *  opened, kept until the user dismisses them. Media names are captured at
+   *  open time; the banner translates the warnings in the active language. */
+  openNotices: ProjectOpenNotices | null;
+  setOpenNotices: (notices: ProjectOpenNotices | null) => void;
   /** Replace the whole authoritative snapshot. Same-project versions and
    * project epochs may only advance. The store takes ownership of an accepted
    * timeline and deep-freezes it in place, so callers must hand over a fresh
@@ -76,6 +81,12 @@ interface ProjectState {
   recordSaveCompleted: () => void;
 }
 
+export interface ProjectOpenNotices {
+  projectEpoch: number;
+  warnings: string[];
+  mediaNames: Record<string, string>;
+}
+
 export const useProjectStore = create<ProjectState>((set) => ({
   snapshotMutationRevision: 0,
   projectEpoch: 0,
@@ -88,6 +99,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
   lastSavedAt: null,
   canUndo: false,
   canRedo: false,
+  openNotices: null,
+  setOpenNotices: (openNotices) => set({ openNotices }),
   replaceProjectSnapshot: (snapshot) =>
     set((state) => {
       if (
@@ -133,6 +146,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
               lastSavedAt: null,
               canUndo: false,
               canRedo: false,
+              openNotices: null,
             }
           : {}),
       };
@@ -150,6 +164,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
       lastSavedAt: null,
       canUndo: false,
       canRedo: false,
+      openNotices: null,
     })),
   setProjectPath: (projectPath) =>
     set((state) => ({

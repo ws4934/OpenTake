@@ -64,7 +64,9 @@ pub use archive::{archive, ArchiveReport, MissingMedia};
 pub use bundle::{copy_media_dir, Project, ProjectCompatibility, ThumbnailUpdate};
 pub use edl::export_edl;
 pub use error::{ProjectError, Result};
-pub use fcpxml::{export_xmeml, export_xmeml_with_timecodes};
+pub use fcpxml::{
+    export_xmeml, export_xmeml_with_timecodes, rate_tags as xmeml_rate_tags, SourceTimecode,
+};
 pub use fcpxml_modern::export_fcpxml;
 pub use gen_log::{GenerationLog, GenerationLogEntry, GENERATION_LOG_RETENTION_BYTES};
 pub use otio::export_otio;

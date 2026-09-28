@@ -21,6 +21,7 @@ import { Icon } from "../ui/Icon";
 import { useProjectStore } from "../../store/projectStore";
 import { resolveEffectivePreviewState, useEditorUiStore } from "../../store/uiStore";
 import { useMediaStore, refreshMedia } from "../../store/mediaStore";
+import { existingFolderId } from "../../lib/folderTree";
 import { useSettingsStore } from "../../store/settingsStore";
 import { formatTimecode, totalFrames } from "../../lib/geometry";
 import { currentTimelineOf } from "../../lib/timelineScope";
@@ -141,6 +142,7 @@ export function Preview() {
   const motionTrackingSelection = useEditorUiStore((s) => s.motionTrackingSelection);
   const pushToast = useEditorUiStore((s) => s.pushToast);
   const mediaPanelCurrentFolderId = useEditorUiStore((s) => s.mediaPanelCurrentFolderId);
+  const setMediaPanelCurrentFolderId = useEditorUiStore((s) => s.setMediaPanelCurrentFolderId);
   // Preview canvas zoom + pan (Item 1). Read here and applied to the timeline
   // stage transform below; the scroll-zoom gesture writes them via a native
   // (non-passive) wheel listener (see the effect below).
@@ -485,13 +487,13 @@ export function Preview() {
     // nameBase: "Frame" on the timeline tab, the asset's name on the video tab.
     const nameBase = onVideoTab ? (previewItem?.name ?? "Frame") : "Frame";
     const sourceMediaId = onVideoTab ? (previewItem?.id ?? null) : null;
+    // A folder deleted or undone since the panel opened it is no longer a
+    // target: capture into the root and say so instead of failing.
+    const folderId = existingFolderId(useMediaStore.getState().folders, mediaPanelCurrentFolderId);
+    const staleFolder = folderId !== mediaPanelCurrentFolderId;
+    if (staleFolder) setMediaPanelCurrentFolderId(null);
     try {
-      const list = await captureFrameToMedia(
-        frame,
-        nameBase,
-        mediaPanelCurrentFolderId,
-        sourceMediaId,
-      );
+      const list = await captureFrameToMedia(frame, nameBase, folderId, sourceMediaId);
       if (!list) {
         pushToast(t("preview.captureFrameUnavailable"));
         return;
@@ -499,7 +501,7 @@ export function Preview() {
       // The command emits media_changed too, but refresh explicitly so the panel
       // reflects the rename/folder-move (which fire after that event) immediately.
       await refreshMedia();
-      pushToast(t("preview.captureFrameSaved"));
+      pushToast(t(staleFolder ? "preview.captureFrameSavedToRoot" : "preview.captureFrameSaved"));
     } catch (error) {
       console.warn("capture frame failed:", error);
       pushToast(t("preview.captureFrameFailed"));
