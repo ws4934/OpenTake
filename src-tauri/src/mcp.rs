@@ -38,10 +38,10 @@ use same_file::Handle;
 use opentake_agent::chat::ChatTurnGate;
 use opentake_agent::mcp::dispatch::Dispatcher;
 use opentake_agent::mcp::media_bridge::{
-    BridgeError, ImportOutcome, ImportSource, InspectMediaRequest, InspectMediaResult,
-    InspectResult, InspectedFrame, InspectedMediaFrame, MediaBridge, SearchCandidate,
-    SearchIndexState, SearchMediaResult, SearchSpokenHit, SearchVisualHit,
-    TimelineResultCaptureRequest, TranscriptSource, TranscriptSourceResult,
+    cancelled_bridge_error, ensure_bridge_not_cancelled, BridgeError, ImportOutcome, ImportSource,
+    InspectMediaRequest, InspectMediaResult, InspectResult, InspectedFrame, InspectedMediaFrame,
+    MediaBridge, SearchCandidate, SearchIndexState, SearchMediaResult, SearchSpokenHit,
+    SearchVisualHit, TimelineResultCaptureRequest, TranscriptSource, TranscriptSourceResult,
     IMPORT_BYTES_DECODED_MAX, TIMELINE_RESULT_IMAGE_BASE64_MAX,
 };
 use opentake_agent::mcp::motion::MotionBridge;
@@ -496,11 +496,16 @@ impl LiveProjectMcpGate {
         Some(operation())
     }
 
+    /// Run the admission phase of a dispatch under the project-identity lease.
+    /// The returned permit keeps `cancel` registered with the transition hook
+    /// after the lease is released, so the deferred phase (which may decode,
+    /// transcribe or composite for minutes) is cancelled by a project switch
+    /// instead of delaying it.
     fn with_live_dispatch<T>(
         &self,
         cancel: &opentake_media::MediaCancelToken,
         operation: impl FnOnce() -> T,
-    ) -> Option<T> {
+    ) -> Option<(T, LiveDispatchPermit)> {
         self.with_live_dispatch_inner(cancel, || {}, operation)
     }
 
@@ -510,7 +515,7 @@ impl LiveProjectMcpGate {
         cancel: &opentake_media::MediaCancelToken,
         after_admission: impl FnOnce(),
         operation: impl FnOnce() -> T,
-    ) -> Option<T> {
+    ) -> Option<(T, LiveDispatchPermit)> {
         self.with_live_dispatch_inner(cancel, after_admission, operation)
     }
 
@@ -519,7 +524,7 @@ impl LiveProjectMcpGate {
         cancel: &opentake_media::MediaCancelToken,
         after_admission: impl FnOnce(),
         operation: impl FnOnce() -> T,
-    ) -> Option<T> {
+    ) -> Option<(T, LiveDispatchPermit)> {
         let admitted_generation = self.identity_generation.load(Ordering::Acquire);
         if self.transition_pending() || cancel.is_cancelled() {
             return None;
@@ -537,7 +542,7 @@ impl LiveProjectMcpGate {
         }
         let expected = self.core.runtime_snapshot();
         expected.project_dir.as_ref()?;
-        let _permit = self.register_dispatch(cancel)?;
+        let permit = self.register_dispatch(cancel)?;
         if self.transition_pending() || cancel.is_cancelled() {
             return None;
         }
@@ -549,7 +554,7 @@ impl LiveProjectMcpGate {
             cancel.cancel();
             return None;
         }
-        Some(result)
+        Some((result, permit))
     }
 }
 
@@ -575,7 +580,7 @@ impl ChatTurnGate for LiveProjectMcpGate {
         args: serde_json::Value,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        let (expected_epoch, expected_dir, receipt) =
+        let ((expected_epoch, expected_dir, receipt), permit) =
             self.with_live_dispatch(request_cancel, || {
                 let snapshot = self.core.runtime_snapshot();
                 (
@@ -584,9 +589,11 @@ impl ChatTurnGate for LiveProjectMcpGate {
                     dispatcher.dispatch_cancellable_deferred(name, args, request_cancel),
                 )
             })?;
-        // GPU work happens after `with_live_dispatch` releases the project
-        // identity workflow read lease.
+        // GPU capture and media-heavy tool bodies run after `with_live_dispatch`
+        // releases the project identity workflow read lease; the permit keeps
+        // them cancellable by a project transition.
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
+        drop(permit);
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir
@@ -606,7 +613,7 @@ impl ChatTurnGate for LiveProjectMcpGate {
         undo_scope: &str,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        let (expected_epoch, expected_dir, receipt) =
+        let ((expected_epoch, expected_dir, receipt), permit) =
             self.with_live_dispatch(request_cancel, || {
                 let snapshot = self.core.runtime_snapshot();
                 (
@@ -621,6 +628,7 @@ impl ChatTurnGate for LiveProjectMcpGate {
                 )
             })?;
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
+        drop(permit);
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir
@@ -1312,13 +1320,34 @@ impl MediaBridge for TauriMediaBridge {
         &self,
         request: &InspectMediaRequest,
     ) -> Result<InspectMediaResult, BridgeError> {
-        inspect_source_media(&self.core, &self.engine, request)
+        self.inspect_media_cancellable(request, &opentake_media::MediaCancelToken::new())
+    }
+
+    fn inspect_media_cancellable(
+        &self,
+        request: &InspectMediaRequest,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> Result<InspectMediaResult, BridgeError> {
+        inspect_source_media(&self.core, &self.engine, request, cancel)
     }
 
     fn inspect_timeline(
         &self,
         frames: &[i32],
         max_longest_edge: u32,
+    ) -> Result<InspectResult, BridgeError> {
+        self.inspect_timeline_cancellable(
+            frames,
+            max_longest_edge,
+            &opentake_media::MediaCancelToken::new(),
+        )
+    }
+
+    fn inspect_timeline_cancellable(
+        &self,
+        frames: &[i32],
+        max_longest_edge: u32,
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<InspectResult, BridgeError> {
         // Snapshot the live session, then composite off the session lock (the
         // preview path's discipline; a local GPU context per call keeps this off
@@ -1327,12 +1356,27 @@ impl MediaBridge for TauriMediaBridge {
         let timeline = snapshot.timeline;
         let manifest = snapshot.media;
         let project_dir = snapshot.project_dir;
-        composite_frames_jpeg(&timeline, &manifest, &project_dir, frames, max_longest_edge)
+        composite_frames_jpeg(
+            &timeline,
+            &manifest,
+            &project_dir,
+            frames,
+            max_longest_edge,
+            cancel,
+        )
     }
 
     fn transcribe_sources(
         &self,
         sources: &[TranscriptSource],
+    ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
+        self.transcribe_sources_cancellable(sources, &opentake_media::MediaCancelToken::new())
+    }
+
+    fn transcribe_sources_cancellable(
+        &self,
+        sources: &[TranscriptSource],
+        cancel: &opentake_media::MediaCancelToken,
     ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
         // Per-source, skip-don't-fail (mirrors upstream's per-URL `catch { skipped
         // … }` loop): a missing file, an un-installed model, or a decode error
@@ -1353,6 +1397,9 @@ impl MediaBridge for TauriMediaBridge {
         let mut out = Vec::with_capacity(sources.len());
         let snapshot = self.core.runtime_snapshot();
         for resolved_source in resolve_transcript_batch(&snapshot, sources) {
+            // A cancelled batch fails as a whole; remaining sources are not
+            // reported as skipped.
+            ensure_bridge_not_cancelled(cancel)?;
             let src = resolved_source.source;
             let skip = |reason: String| TranscriptSourceResult {
                 media_ref: src.media_ref.clone(),
@@ -1400,24 +1447,28 @@ impl MediaBridge for TauriMediaBridge {
                 Backend::Unloaded => unreachable!("backend was just loaded above"),
             };
             // With a language hint, transcribe directly with the hint threaded to
-            // the backend (the cache convenience uses auto-detect defaults). The
-            // auto path keeps using the caching convenience so repeats are instant.
-            let result = match &src.language {
-                Some(lang) => {
-                    let opts = opentake_media::TranscribeOptions {
-                        preferred_language: Some(lang.clone()),
-                        ..Default::default()
-                    };
-                    opentake_media::transcribe::transcribe_file(&path, b, &opts)
-                        .map_err(|e| e.to_string())
-                }
-                None => {
-                    let cache = opentake_media::TranscriptCache::new(self.engine.cache_root());
-                    cache
-                        .transcript(&path, is_video, None, b)
-                        .map_err(|e| e.to_string())
-                }
+            // the backend. The auto path persists the full transcript into the
+            // shared cache layout so repeats are instant. Both observe `cancel`
+            // in PCM extraction and Whisper inference.
+            let _ = is_video; // the backend reads the track type from the file.
+            let opts = opentake_media::TranscribeOptions {
+                preferred_language: src.language.clone(),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
             };
+            let result = opentake_media::transcribe::transcribe_file(&path, b, &opts);
+            if matches!(result, Err(opentake_media::MediaError::Cancelled)) || cancel.is_cancelled()
+            {
+                return Err(cancelled_bridge_error());
+            }
+            if let (Ok(transcript), None) = (&result, &src.language) {
+                crate::transcribe::persist_full_transcript(
+                    self.engine.cache_root(),
+                    &path,
+                    transcript,
+                );
+            }
+            let result = result.map_err(|e| e.to_string());
             match result {
                 Ok(t) => out.push(TranscriptSourceResult {
                     media_ref: src.media_ref.clone(),
@@ -1493,6 +1544,24 @@ impl MediaBridge for TauriMediaBridge {
         scope: &str,
         limit: usize,
     ) -> Result<SearchMediaResult, BridgeError> {
+        self.search_media_cancellable(
+            candidates,
+            query,
+            scope,
+            limit,
+            &opentake_media::MediaCancelToken::new(),
+        )
+    }
+
+    fn search_media_cancellable(
+        &self,
+        candidates: &[SearchCandidate],
+        query: &str,
+        scope: &str,
+        limit: usize,
+        cancel: &opentake_media::MediaCancelToken,
+    ) -> Result<SearchMediaResult, BridgeError> {
+        ensure_bridge_not_cancelled(cancel)?;
         // Resolve every candidate id to its source path from the live manifest.
         // Missing (offline) files are kept — their index/transcript reads simply
         // yield nothing, matching upstream (a missing file has no results, not an
@@ -1570,6 +1639,7 @@ impl MediaBridge for TauriMediaBridge {
             (status, indexable, indexed_opt, moments)
         };
 
+        ensure_bridge_not_cancelled(cancel)?;
         // Spoken group (skipped for scope == "visual"). Works regardless of the
         // visual index — keyword search over cached transcripts.
         let spoken: Vec<SearchSpokenHit> = if scope == "visual" {
@@ -1587,6 +1657,7 @@ impl MediaBridge for TauriMediaBridge {
                 .collect()
         };
 
+        ensure_bridge_not_cancelled(cancel)?;
         Ok(SearchMediaResult {
             status,
             indexable_assets,
@@ -2440,7 +2511,9 @@ fn inspect_source_media(
     core: &AppCore,
     engine: &MediaEngine,
     request: &InspectMediaRequest,
+    cancel: &opentake_media::MediaCancelToken,
 ) -> Result<InspectMediaResult, BridgeError> {
+    ensure_bridge_not_cancelled(cancel)?;
     let snapshot = core.runtime_snapshot();
     let entry = snapshot
         .media
@@ -2517,15 +2590,18 @@ fn inspect_source_media(
         ));
     }
 
+    ensure_bridge_not_cancelled(cancel)?;
     let (frames, overview_timestamps) = if entry.kind == ClipType::Video {
         inspect_video_frames(&path, start, end, request.max_frames, request.overview)?
     } else {
         (Vec::new(), Vec::new())
     };
+    ensure_bridge_not_cancelled(cancel)?;
 
     let (transcript, transcription_unavailable) = if probe.has_audio {
-        match inspect_media_transcript(engine, &path, entry.kind == ClipType::Video, (start, end)) {
+        match inspect_media_transcript(engine, &path, (start, end), cancel) {
             Ok(transcript) => (Some(transcript), false),
+            Err(_) if cancel.is_cancelled() => return Err(cancelled_bridge_error()),
             Err(error) => {
                 eprintln!("[mcp] inspect_media transcription unavailable: {error}");
                 (None, true)
@@ -2764,17 +2840,22 @@ fn inspect_video_frames(
 fn inspect_media_transcript(
     engine: &MediaEngine,
     path: &Path,
-    is_video: bool,
     range: (f64, f64),
+    cancel: &opentake_media::MediaCancelToken,
 ) -> Result<opentake_media::TranscriptionResult, String> {
     if let Some(full) = opentake_media::transcribe::cache::cached_on_disk(engine.cache_root(), path)
     {
         return Ok(opentake_media::transcribe::cache::filter(&full, range));
     }
     let backend = crate::transcribe::load_backend(engine)?;
-    let cache = opentake_media::TranscriptCache::new(engine.cache_root());
-    cache
-        .transcript(path, is_video, Some(range), &backend)
+    // Without a cached full transcript only the window is transcribed (and not
+    // cached), exactly as `TranscriptCache::transcript` does for a range.
+    let opts = opentake_media::TranscribeOptions {
+        source_range: Some(range),
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    opentake_media::transcribe::transcribe_file(path, &backend, &opts)
         .map_err(|error| error.to_string())
 }
 
@@ -2843,7 +2924,9 @@ fn composite_frames_jpeg(
     project_dir: &Option<PathBuf>,
     frames: &[i32],
     max_longest_edge: u32,
+    cancel: &opentake_media::MediaCancelToken,
 ) -> Result<InspectResult, BridgeError> {
+    ensure_bridge_not_cancelled(cancel)?;
     let render_size = fit_render_size(timeline.width, timeline.height, max_longest_edge);
 
     let text = project_text(timeline);
@@ -2870,6 +2953,7 @@ fn composite_frames_jpeg(
     let mut lut_cache = HashMap::new();
     let mut lottie = crate::render::LottieMaterializer::new();
     for &f in frames {
+        ensure_bridge_not_cancelled(cancel)?;
         let frame_plan = plan.frame(timeline, f);
         let mut resolver = InspectResolver {
             device: &dev.device,
@@ -3621,6 +3705,215 @@ mod tests {
         save.join().expect("Save As thread joined");
     }
 
+    /// Transcription bridge that blocks until released or, when
+    /// `honor_cancel`, until the dispatch token is cancelled.
+    struct BlockingTranscriptBridge {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        released: Mutex<bool>,
+        wake: std::sync::Condvar,
+        honor_cancel: bool,
+        observed_cancel: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingTranscriptBridge {
+        fn new(entered: std::sync::mpsc::Sender<()>, honor_cancel: bool) -> Self {
+            Self {
+                entered: Mutex::new(entered),
+                released: Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+                honor_cancel,
+                observed_cancel: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    impl MediaBridge for BlockingTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            _sources: &[TranscriptSource],
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
+            let _ = self.entered.lock().unwrap().send(());
+            let mut released = self.released.lock().unwrap();
+            while !*released && !(self.honor_cancel && cancel.is_cancelled()) {
+                released = self
+                    .wake
+                    .wait_timeout(released, Duration::from_millis(5))
+                    .unwrap()
+                    .0;
+            }
+            if cancel.is_cancelled() {
+                self.observed_cancel.store(true, Ordering::Release);
+                return Err(cancelled_bridge_error());
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// A saved project whose timeline has one video clip to transcribe.
+    fn transcribable_project(core: &AppCore, bundle: PathBuf) {
+        core.save_project(Some(bundle)).unwrap();
+        core.apply(
+            opentake_ops::command::EditCommand::RegisterMediaAndAddClip {
+                media: opentake_domain::MediaManifestEntry {
+                    id: "talk".into(),
+                    name: "talk.mov".into(),
+                    kind: ClipType::Video,
+                    source: opentake_domain::MediaSource::Project {
+                        relative_path: "media/talk.mov".into(),
+                    },
+                    duration: 10.0,
+                    generation_input: None,
+                    source_width: Some(1920),
+                    source_height: Some(1080),
+                    source_fps: Some(30.0),
+                    has_audio: Some(true),
+                    color: None,
+                    proxy: None,
+                    folder_id: None,
+                    cached_remote_url: None,
+                    cached_remote_url_expires_at: None,
+                },
+                entry: opentake_ops::command::ClipEntry {
+                    media_ref: "talk".into(),
+                    media_type: ClipType::Video,
+                    source_clip_type: ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 300,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: true,
+                    add_linked_audio: false,
+                    transform: None,
+                },
+                auto_track: true,
+            },
+        )
+        .unwrap();
+    }
+
+    fn transcript_dispatch(
+        core: &AppCore,
+        bridge: Arc<BlockingTranscriptBridge>,
+    ) -> (
+        Arc<LiveProjectMcpGate>,
+        std::thread::JoinHandle<Option<ToolResult>>,
+        opentake_media::MediaCancelToken,
+    ) {
+        let gate = LiveProjectMcpGate::new(core.clone());
+        let registry = Arc::new(RwLock::new(PluginRegistry::with_builtins()));
+        let handle: Arc<dyn CoreHandle> = Arc::new(AppCoreHandle::new(core.clone()));
+        let dispatcher = Arc::new(Dispatcher::with_bridge(handle, registry, Some(bridge)));
+        let cancel = opentake_media::MediaCancelToken::new();
+        let worker_gate = gate.clone();
+        let worker_cancel = cancel.clone();
+        let dispatch = std::thread::spawn(move || {
+            worker_gate.dispatch_cancellable(
+                &dispatcher,
+                "get_transcript",
+                serde_json::json!({}),
+                &worker_cancel,
+            )
+        });
+        (gate, dispatch, cancel)
+    }
+
+    #[test]
+    fn project_switch_cancels_a_running_transcription_without_waiting_for_it() {
+        let fixture = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        transcribable_project(&core, fixture.path().join("A.opentake"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let bridge = Arc::new(BlockingTranscriptBridge::new(entered_tx, true));
+        let (_gate, dispatch, cancel) = transcript_dispatch(&core, bridge.clone());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("transcription started");
+
+        let started = std::time::Instant::now();
+        let switch_core = core.clone();
+        let switch = std::thread::spawn(move || switch_core.new_project());
+        switch.join().expect("new project thread joined");
+        let switched_in = started.elapsed();
+        let result = dispatch.join().expect("dispatch thread joined");
+        let finished_in = started.elapsed();
+
+        assert!(cancel.is_cancelled());
+        assert!(bridge.observed_cancel.load(Ordering::Acquire));
+        assert!(result.is_none(), "a cancelled dispatch reports no result");
+        assert!(switched_in < Duration::from_secs(1), "{switched_in:?}");
+        assert!(finished_in < Duration::from_secs(1), "{finished_in:?}");
+        bridge.release();
+    }
+
+    #[test]
+    fn desktop_transcription_batch_fails_as_a_whole_once_cancelled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        transcribable_project(&core, fixture.path().join("A.opentake"));
+        let bridge = TauriMediaBridge::new(
+            core,
+            fixture.path().join("cache"),
+            fixture.path().join("models"),
+        );
+        let cancel = opentake_media::MediaCancelToken::new();
+        cancel.cancel();
+        let error = bridge
+            .transcribe_sources_cancellable(
+                &[TranscriptSource {
+                    media_ref: "talk".into(),
+                    is_video: true,
+                    language: None,
+                }],
+                &cancel,
+            )
+            .expect_err("a cancelled batch reports no per-source skips");
+        assert_eq!(error.message, "Cancelled");
+        let error = bridge
+            .inspect_timeline_cancellable(&[0], 512, &cancel)
+            .expect_err("a cancelled composite renders nothing");
+        assert_eq!(error.message, "Cancelled");
+    }
+
+    #[test]
+    fn slow_transcription_runs_outside_the_project_identity_lease() {
+        let fixture = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        transcribable_project(&core, fixture.path().join("A.opentake"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        // This bridge ignores cancellation: only releasing the lease lets the
+        // switch complete while it is still running.
+        let bridge = Arc::new(BlockingTranscriptBridge::new(entered_tx, false));
+        let (_gate, dispatch, _cancel) = transcript_dispatch(&core, bridge.clone());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("transcription started");
+
+        let (switched_tx, switched_rx) = std::sync::mpsc::channel();
+        let switch_core = core.clone();
+        let target = fixture.path().join("B.opentake");
+        let switch = std::thread::spawn(move || {
+            let _ = switched_tx.send(switch_core.save_project(Some(target)));
+        });
+        switched_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Save As completed while the transcription was still running")
+            .expect("Save As succeeded");
+        switch.join().expect("Save As thread joined");
+
+        bridge.release();
+        assert!(
+            dispatch.join().expect("dispatch thread joined").is_none(),
+            "a result computed for project A is not returned after the switch"
+        );
+    }
+
     fn unknown_core(root: &Path) -> AppCore {
         let bundle = root.join("Unknown.opentake");
         let project = opentake_project::Project::new(&bundle);
@@ -4167,6 +4460,7 @@ mod tests {
                 max_frames: 1,
                 overview: false,
             },
+            &opentake_media::MediaCancelToken::new(),
         )
         .expect("inspect imported image");
 
@@ -4246,6 +4540,7 @@ mod tests {
                 max_frames: 1,
                 overview: false,
             },
+            &opentake_media::MediaCancelToken::new(),
         )
         .unwrap();
         let pixel = image::load_from_memory(&result.frames[0].bytes)
@@ -4355,6 +4650,7 @@ mod tests {
                 max_frames: 2,
                 overview: false,
             },
+            &opentake_media::MediaCancelToken::new(),
         )
         .expect("inspect imported Lottie");
 
@@ -4450,6 +4746,7 @@ mod tests {
                 max_frames: 1,
                 overview: false,
             },
+            &opentake_media::MediaCancelToken::new(),
         )
         .expect_err("symlink source must be rejected");
 
@@ -5182,8 +5479,15 @@ mod tests {
             .push(external_entry("asset-1", &video, 320, 240));
 
         // Sample 3 frames across [0, 30) at the 512px cap.
-        let res = composite_frames_jpeg(&timeline, &manifest, &None, &[0, 10, 20], 512)
-            .expect("composite should succeed with a GPU + fixture");
+        let res = composite_frames_jpeg(
+            &timeline,
+            &manifest,
+            &None,
+            &[0, 10, 20],
+            512,
+            &opentake_media::MediaCancelToken::new(),
+        )
+        .expect("composite should succeed with a GPU + fixture");
         assert_eq!(res.frames.len(), 3);
         // 320x240 is already under 512 → unscaled.
         assert_eq!((res.width, res.height), (320, 240));

@@ -32,6 +32,9 @@ const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CODEX_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const CODEX_LOGOUT_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_LOGIN_SESSION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a cancelled or failed turn waits for in-flight tool dispatches to
+/// observe cancellation before it stops waiting for the MCP endpoint.
+const CANCELLED_TURN_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
@@ -1596,7 +1599,14 @@ where
         Some(Ok(status)) => Ok(status),
         Some(Err(_)) | None => terminate_and_reap_until(&mut child, &mut tree, deadline).await,
     };
-    let endpoint_close = tokio::time::timeout_at(deadline, endpoint.close()).await;
+    // After a cancel the dispatches observe their tokens and end promptly; a
+    // straggler must not hold the cancelled turn open until the turn deadline.
+    let close_deadline = if requested_cleanup_cancel {
+        deadline.min(tokio::time::Instant::now() + CANCELLED_TURN_CLEANUP_GRACE)
+    } else {
+        deadline
+    };
+    let endpoint_close = tokio::time::timeout_at(close_deadline, endpoint.close()).await;
     let endpoint_result = match endpoint_close {
         Ok(result) => result,
         Err(_) => {

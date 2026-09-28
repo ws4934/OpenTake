@@ -897,9 +897,10 @@ impl EmitLoop for AppEmitter {
 }
 
 /// Binds every Context Signal snapshot and complete tool dispatch to the
-/// project accepted by `chat_send`. The read lease makes identity check + tool
-/// side effect one atomic project-lifecycle boundary, including MediaBridge
-/// calls that bypass `CoreHandle`.
+/// project accepted by `chat_send`. Admission runs under the identity read
+/// lease; media-heavy tool bodies and captures run from `finish_dispatch`
+/// after it is released, pinned to the admitted project, and a project
+/// transition cancels them through the turn's token instead of waiting.
 struct ProjectTurnGate {
     state: ChatState,
     project: ChatProjectContext,
@@ -2187,6 +2188,127 @@ mod tests {
             .unwrap();
         assert_eq!(disk.messages.len(), 1);
         assert_eq!(disk.messages[0].content, "A baseline");
+    }
+
+    /// Blocks `transcribe_sources_cancellable` until its token is cancelled.
+    struct CancelAwaitingTranscriptBridge {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl opentake_agent::mcp::media_bridge::MediaBridge for CancelAwaitingTranscriptBridge {
+        fn transcribe_sources_cancellable(
+            &self,
+            _sources: &[opentake_agent::mcp::media_bridge::TranscriptSource],
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<
+            Vec<opentake_agent::mcp::media_bridge::TranscriptSourceResult>,
+            opentake_agent::mcp::media_bridge::BridgeError,
+        > {
+            let _ = self.entered.lock().unwrap().send(());
+            let started = std::time::Instant::now();
+            while !cancel.is_cancelled() && started.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(opentake_agent::mcp::media_bridge::cancelled_bridge_error())
+        }
+    }
+
+    #[test]
+    fn byok_turn_transcription_is_cancelled_by_a_project_switch_without_blocking_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        core.save_project(Some(temp.path().join("A.opentake")))
+            .unwrap();
+        core.apply(
+            opentake_ops::command::EditCommand::RegisterMediaAndAddClip {
+                media: opentake_domain::MediaManifestEntry {
+                    id: "talk".into(),
+                    name: "talk.mov".into(),
+                    kind: opentake_domain::ClipType::Video,
+                    source: opentake_domain::MediaSource::Project {
+                        relative_path: "media/talk.mov".into(),
+                    },
+                    duration: 10.0,
+                    generation_input: None,
+                    source_width: Some(1920),
+                    source_height: Some(1080),
+                    source_fps: Some(30.0),
+                    has_audio: Some(true),
+                    color: None,
+                    proxy: None,
+                    folder_id: None,
+                    cached_remote_url: None,
+                    cached_remote_url_expires_at: None,
+                },
+                entry: opentake_ops::command::ClipEntry {
+                    media_ref: "talk".into(),
+                    media_type: opentake_domain::ClipType::Video,
+                    source_clip_type: opentake_domain::ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 300,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: true,
+                    add_linked_audio: false,
+                    transform: None,
+                },
+                auto_track: true,
+            },
+        )
+        .unwrap();
+        let state = ChatState::new(
+            core.clone(),
+            temp.path().join("no-workflows"),
+            temp.path().join("chat-cache"),
+            temp.path().join("chat-models"),
+        );
+        let project = state.project_context().unwrap();
+        let cancel = Arc::new(TurnCancel::new());
+        let _lease = state
+            .reserve_turn(project.key("chat-byok"), cancel.clone())
+            .unwrap();
+        let gate = ProjectTurnGate {
+            state: state.clone(),
+            project,
+            cancel: cancel.clone(),
+            undo_scope: "test:byok-transcript".into(),
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let handle: Arc<dyn CoreHandle> = Arc::new(AppCoreHandle::new(core.clone()));
+        let registry = Arc::new(RwLock::new(crate::mcp::build_registry(
+            &temp.path().join("no-workflows"),
+        )));
+        let dispatcher = Arc::new(Dispatcher::with_bridge(
+            handle,
+            registry,
+            Some(Arc::new(CancelAwaitingTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+            })),
+        ));
+        let dispatch = std::thread::spawn(move || {
+            gate.dispatch(&dispatcher, "get_transcript", serde_json::json!({}))
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("transcription started");
+
+        let started = std::time::Instant::now();
+        core.new_project();
+        let switched_in = started.elapsed();
+        let result = dispatch.join().expect("dispatch thread joined");
+        let finished_in = started.elapsed();
+
+        assert!(cancel.media.is_cancelled());
+        assert!(result.is_none(), "a stale-project result is dropped");
+        assert!(
+            switched_in < std::time::Duration::from_secs(1),
+            "{switched_in:?}"
+        );
+        assert!(
+            finished_in < std::time::Duration::from_secs(1),
+            "{finished_in:?}"
+        );
     }
 
     #[test]
