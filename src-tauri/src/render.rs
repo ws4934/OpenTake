@@ -1892,8 +1892,7 @@ pub async fn capture_frame_to_media(
         let _activity = activity;
         let render = app.state::<RenderState>();
         let media = app.state::<crate::media::MediaState>();
-        let target_folder = folder_id.clone();
-        capture_frame_to_media_impl(&core, target_folder.as_deref(), || {
+        capture_frame_to_media_impl(&core, || {
             capture_frame_to_media_workflow(
                 &core,
                 &render,
@@ -1911,17 +1910,9 @@ pub async fn capture_frame_to_media(
 
 fn capture_frame_to_media_impl(
     core: &AppCore,
-    folder_id: Option<&str>,
     workflow: impl FnOnce() -> Result<crate::media::MediaListDto, String>,
 ) -> Result<crate::media::MediaListDto, String> {
     core.ensure_project_mutable().map_err(|e| e.to_string())?;
-    // Refuse a deleted target folder before capturing, so the frame is not
-    // imported to the root and then reported as a failure.
-    if let Some(folder_id) = folder_id {
-        if !media_folder_exists(core, folder_id) {
-            return Err(format!("folderId not found: {folder_id}"));
-        }
-    }
     workflow()
 }
 
@@ -1930,6 +1921,24 @@ fn media_folder_exists(core: &AppCore, folder_id: &str) -> bool {
         .folders
         .iter()
         .any(|folder| folder.id == folder_id)
+}
+
+/// Move a captured still into `folder_id`. A folder that no longer exists
+/// (deleted or undone, possibly while the frame was captured) leaves the
+/// still in the root: the capture already succeeded, and the web tells the
+/// user when its folder cursor was stale.
+fn move_capture_to_folder(core: &AppCore, asset_id: &str, folder_id: String) -> Result<(), String> {
+    if !media_folder_exists(core, &folder_id) {
+        return Ok(());
+    }
+    match core.apply(EditCommand::MoveToFolder {
+        asset_ids: vec![asset_id.to_string()],
+        folder_id: Some(folder_id.clone()),
+    }) {
+        Ok(_) => Ok(()),
+        Err(_) if !media_folder_exists(core, &folder_id) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn capture_frame_to_media_workflow(
@@ -1970,15 +1979,8 @@ fn capture_frame_to_media_workflow(
         }],
     })
     .map_err(|e| e.to_string())?;
-    // The folder was checked before capturing; one deleted while the frame
-    // was captured leaves the imported still in the root rather than failing
-    // an import that already succeeded.
-    if let Some(fid) = folder_id.filter(|fid| media_folder_exists(core, fid)) {
-        core.apply(EditCommand::MoveToFolder {
-            asset_ids: vec![entry.id.clone()],
-            folder_id: Some(fid),
-        })
-        .map_err(|e| e.to_string())?;
+    if let Some(fid) = folder_id {
+        move_capture_to_folder(core, &entry.id, fid)?;
     }
 
     Ok(crate::media::MediaListDto::from_core(
@@ -2349,7 +2351,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let sentinel = captures.join("frame-workflow-ran-before-guard.png");
 
-        let error = capture_frame_to_media_impl(&core, None, || {
+        let error = capture_frame_to_media_impl(&core, || {
             called.set(true);
             fs::write(&sentinel, b"bad ordering").expect("write workflow sentinel");
             Err("workflow should not run".into())
@@ -2363,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_frame_to_media_refuses_a_deleted_folder_before_capturing() {
+    fn a_capture_for_a_deleted_folder_stays_in_the_root() {
         let core = AppCore::new();
         core.apply(EditCommand::CreateFolder {
             name: "Stills".into(),
@@ -2371,25 +2373,30 @@ mod tests {
         })
         .expect("create folder");
         let folder_id = core.media().folders[0].id.clone();
-        let before = core.media();
+        let still = core
+            .import_media_file(
+                std::env::temp_dir().join("capture-folder.png"),
+                "Frame 1",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("import still");
+        let folder_of = |core: &AppCore| {
+            core.media()
+                .entries
+                .iter()
+                .find(|entry| entry.id == still.id)
+                .expect("still stays imported")
+                .folder_id
+                .clone()
+        };
 
-        let called = std::cell::Cell::new(false);
-        let error = capture_frame_to_media_impl(&core, Some("deleted-folder"), || {
-            called.set(true);
-            Err("workflow should not run".into())
-        })
-        .expect_err("a missing folder must be refused");
-        assert_eq!(error, "folderId not found: deleted-folder");
-        assert!(!called.get(), "nothing may be captured or imported");
-        assert_eq!(core.media(), before);
+        // A folder that no longer exists (deleted or undone) is not an error.
+        move_capture_to_folder(&core, &still.id, "deleted-folder".into())
+            .expect("a missing folder keeps the still in the root");
+        assert_eq!(folder_of(&core), None);
 
-        let error = capture_frame_to_media_impl(&core, Some(&folder_id), || {
-            called.set(true);
-            Err("workflow ran".into())
-        })
-        .expect_err("workflow error surfaces");
-        assert_eq!(error, "workflow ran");
-        assert!(called.get(), "an existing folder lets the capture run");
+        move_capture_to_folder(&core, &still.id, folder_id.clone()).expect("move into folder");
+        assert_eq!(folder_of(&core), Some(folder_id));
     }
 
     #[test]
