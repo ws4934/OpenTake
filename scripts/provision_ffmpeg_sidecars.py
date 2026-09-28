@@ -84,6 +84,16 @@ def verify_detached(path: Path, expected_sha: str, version: str) -> None:
     verify_regular_file(path, expected_sha)
 
 
+class ChecksumMismatch(RuntimeError):
+    """Downloaded bytes did not match the pinned SHA-256."""
+
+
+# A mirror can serve different bytes for the same URL (an unversioned archive
+# replaced upstream, a truncated proxy response), so a mismatch is retried with
+# a fresh download before provisioning fails.
+DOWNLOAD_CHECKSUM_ATTEMPTS = 3
+
+
 def download(url: str, destination_path: Path) -> None:
     last_error: Exception | None = None
     for attempt in range(1, 5):
@@ -120,7 +130,7 @@ def materialize_download(
         raise RuntimeError("sidecar archive requires string member and sha256")
     actual_archive_sha = sha256(download_path)
     if actual_archive_sha != expected_archive_sha:
-        raise RuntimeError(
+        raise ChecksumMismatch(
             "sidecar archive checksum mismatch: "
             f"{actual_archive_sha} != {expected_archive_sha}"
         )
@@ -136,6 +146,28 @@ def materialize_download(
             raise RuntimeError("sidecar archive member exceeds the 256 MiB limit")
         with archive_file.open(matches[0]) as source, destination_path.open("wb") as target:
             shutil.copyfileobj(source, target, length=1024 * 1024)
+
+
+def fetch_pinned(
+    tool: str,
+    record: dict[str, object],
+    url: str,
+    expected_sha: str,
+    archive_path: Path,
+    destination_path: Path,
+) -> None:
+    """Download `url` into `destination_path` (through its pinned archive when
+    the record has one) and check the pinned SHA-256 of the result."""
+    if record.get("archive") is None:
+        download(url, destination_path)
+    else:
+        download(url, archive_path)
+        materialize_download(record, archive_path, destination_path)
+    actual_sha = sha256(destination_path)
+    if actual_sha != expected_sha:
+        raise ChecksumMismatch(
+            f"download checksum mismatch for {tool}: {actual_sha} != {expected_sha}"
+        )
 
 
 def provision(tool: str, record: dict[str, object], target: str) -> None:
@@ -160,16 +192,22 @@ def provision(tool: str, record: dict[str, object], target: str) -> None:
         temporary_root = Path(temporary_directory)
         temporary_path = temporary_root / f"{tool}-verified"
         archive_path = temporary_root / f"{tool}-download"
-        if record.get("archive") is None:
-            download(url, temporary_path)
-        else:
-            download(url, archive_path)
-            materialize_download(record, archive_path, temporary_path)
-        actual_sha = sha256(temporary_path)
-        if actual_sha != expected_sha:
-            raise RuntimeError(
-                f"download checksum mismatch for {tool}: {actual_sha} != {expected_sha}"
-            )
+        for attempt in range(1, DOWNLOAD_CHECKSUM_ATTEMPTS + 1):
+            try:
+                fetch_pinned(
+                    tool, record, url, expected_sha, archive_path, temporary_path
+                )
+                break
+            except ChecksumMismatch as error:
+                for partial in (archive_path, temporary_path):
+                    if partial.exists():
+                        partial.unlink()
+                if attempt == DOWNLOAD_CHECKSUM_ATTEMPTS:
+                    raise RuntimeError(
+                        f"{error} (after {DOWNLOAD_CHECKSUM_ATTEMPTS} downloads)"
+                    ) from error
+                print(f"{error}; downloading {tool} again", file=sys.stderr)
+                time.sleep(attempt)
         if "windows" not in target:
             temporary_path.chmod(
                 temporary_path.stat().st_mode
