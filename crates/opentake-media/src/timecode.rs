@@ -44,7 +44,7 @@ use crate::ff;
 /// `fps` is the integer timebase (upstream `rateTags` timebase: 30 for 29.97,
 /// 60 for 59.94, …); `<= 0` yields `None`.
 pub fn parse_smpte_timecode(input: &str, fps: i32) -> Option<i32> {
-    parse_start_timecode(input, fps).map(|timecode| timecode.frame)
+    parse_start_timecode(input, fps, true).map(|timecode| timecode.frame)
 }
 
 /// A source's start timecode: its frame at the export timebase and whether the
@@ -58,8 +58,10 @@ pub struct StartTimecode {
 
 /// [`parse_smpte_timecode`], keeping the tag's drop-frame flag. The flag is set
 /// only when drop-frame math was applied (a `;`/`.` separator at a drop-frame
-/// rate), so the label rebuilt from `frame` matches the tag.
-pub fn parse_start_timecode(input: &str, fps: i32) -> Option<StartTimecode> {
+/// rate), so the label rebuilt from `frame` matches the tag. `ntsc` is false
+/// for an integer-rate source (a true 30.000 fps file): drop-frame does not
+/// exist there, so a `;` tag is read as non-drop.
+pub fn parse_start_timecode(input: &str, fps: i32, ntsc: bool) -> Option<StartTimecode> {
     if fps <= 0 {
         return None;
     }
@@ -101,7 +103,7 @@ pub fn parse_start_timecode(input: &str, fps: i32) -> Option<StartTimecode> {
 
     // Only compensate when the timebase is genuinely a drop-frame rate; a stray
     // ';' on 24/25 fps is honored as plain non-drop.
-    if drop_frame && is_drop_frame_rate(fps) {
+    if drop_frame && ntsc && is_drop_frame_rate(fps) {
         let drop = drop_frames_per_minute(fps);
         let total_minutes = hh * 60 + mm;
         let dropped = drop * (total_minutes - total_minutes / 10);
@@ -150,15 +152,15 @@ fn drop_frames_per_minute(fps: i32) -> i32 {
 /// `rateTags` timebase), so the frames-per-second used for parsing matches the
 /// `<rate>` written alongside the `<timecode>` node.
 pub fn read_start_timecode_frame(path: &Path, fps: i32) -> Option<i32> {
-    read_start_timecode(path, fps).map(|timecode| timecode.frame)
+    read_start_timecode(path, fps, true).map(|timecode| timecode.frame)
 }
 
 /// [`read_start_timecode_frame`], keeping the tag's drop-frame flag (see
-/// [`parse_start_timecode`]).
-pub fn read_start_timecode(path: &Path, fps: i32) -> Option<StartTimecode> {
+/// [`parse_start_timecode`] for `ntsc`).
+pub fn read_start_timecode(path: &Path, fps: i32, ntsc: bool) -> Option<StartTimecode> {
     let json = ff::ffprobe_json(path).ok()?;
     let tag = timecode_tag(&json)?;
-    parse_start_timecode(&tag, fps)
+    parse_start_timecode(&tag, fps, ntsc)
 }
 
 /// Extract the first `tags.timecode` string from ffprobe JSON, preferring a
@@ -203,21 +205,21 @@ mod tests {
     fn start_timecode_keeps_the_tag_drop_frame_flag() {
         // Non-drop at 29.97: the camera's `01:00:00:00` is frame 108000.
         assert_eq!(
-            parse_start_timecode("01:00:00:00", 30),
+            parse_start_timecode("01:00:00:00", 30, true),
             Some(StartTimecode {
                 frame: 108_000,
                 drop_frame: false
             })
         );
         assert_eq!(
-            parse_start_timecode("00:01:00;02", 30),
+            parse_start_timecode("00:01:00;02", 30, true),
             Some(StartTimecode {
                 frame: 1800,
                 drop_frame: true
             })
         );
         assert_eq!(
-            parse_start_timecode("00:01:00.04", 60),
+            parse_start_timecode("00:01:00.04", 60, true),
             Some(StartTimecode {
                 frame: 3600,
                 drop_frame: true
@@ -225,13 +227,21 @@ mod tests {
         );
         // A stray `;` at a non-drop rate is honoured as non-drop.
         assert_eq!(
-            parse_start_timecode("00:00:01;00", 25),
+            parse_start_timecode("00:00:01;00", 25, false),
             Some(StartTimecode {
                 frame: 25,
                 drop_frame: false
             })
         );
-        assert_eq!(parse_start_timecode("garbage", 30), None);
+        // An integer 30.000 fps source has no drop-frame: `;` reads as non-drop.
+        assert_eq!(
+            parse_start_timecode("00:01:00;02", 30, false),
+            Some(StartTimecode {
+                frame: 1802,
+                drop_frame: false
+            })
+        );
+        assert_eq!(parse_start_timecode("garbage", 30, true), None);
     }
 
     // --- NDF: plain inverse of upstream formatTimecode's non-drop path ---

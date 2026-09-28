@@ -435,10 +435,11 @@ impl<'a> Builder<'a> {
         // 读不到 tmcd 轨时的分支。`<string>` 由共享的 `format_timecode` 生成(上游
         // palmier-pro #361 修正后的 drop-frame 算法),与 `<frame>` 一致,即
         // `opentake_media::parse_smpte_timecode` 读到的源时间码标签(XMEML 全用 `;`)。
-        // The drop-frame label is the source's own (a 29.97 camera may write
-        // non-drop); the frame-rate rule is only the fallback without one.
+        // Drop-frame needs an NTSC 30/60 timebase; within that, the label is
+        // the source's own (a 29.97 camera may write non-drop), and the
+        // frame-rate rule is only the fallback without a source timecode.
         let source = self.start_timecodes.get(media_ref);
-        let drop_frame = source.map_or(ntsc && timebase % 30 == 0, |tc| tc.drop_frame);
+        let drop_frame = ntsc && timebase % 30 == 0 && source.is_none_or(|tc| tc.drop_frame);
         let start_frame = source.map_or(0, |tc| tc.start_frame);
         let timecode = el(
             "timecode",
@@ -1010,8 +1011,9 @@ fn center_param(base: (f64, f64), keyframes: &[(i32, f64, f64)]) -> XmlNode {
 }
 
 /// 实 fps → FCP7 (timebase, ntsc)。NTSC 速率(timebase×1000/1001:29.97、23.976…)
-/// 置 ntsc TRUE。1:1 对应上游 `rateTags`。
-fn rate_tags(raw_fps: f64) -> (i32, bool) {
+/// 置 ntsc TRUE。1:1 对应上游 `rateTags`。Callers that read a source's start
+/// timecode use it to parse at the same timebase and NTSC mode the exporter writes.
+pub fn rate_tags(raw_fps: f64) -> (i32, bool) {
     let timebase = (raw_fps.round() as i32).max(1);
     let ntsc_rate = timebase as f64 * 1000.0 / 1001.0;
     let ntsc = (raw_fps - ntsc_rate).abs() < (raw_fps - timebase as f64).abs();
@@ -1572,6 +1574,7 @@ mod tests {
             ("df30", "df30.mp4", 29.97),
             ("ndf60", "ndf60.mp4", 59.94),
             ("untagged", "untagged.mp4", 29.97),
+            ("int30", "int30.mp4", 30.0),
         ] {
             let mut entry = ext_entry(id, name, ClipType::Video, &touch(&dir, name), 4.0);
             entry.source_fps = Some(fps);
@@ -1579,7 +1582,10 @@ mod tests {
         }
         let mut tl = Timeline::new();
         let mut vtrack = Track::new("vt", ClipType::Video);
-        for (index, id) in ["ndf30", "df30", "ndf60", "untagged"].iter().enumerate() {
+        for (index, id) in ["ndf30", "df30", "ndf60", "untagged", "int30"]
+            .iter()
+            .enumerate()
+        {
             let start = index as i32 * 30;
             vtrack
                 .clips
@@ -1593,6 +1599,9 @@ mod tests {
             ("ndf30".to_string(), ndf(108_000)),
             ("df30".to_string(), df(107_892)),
             ("ndf60".to_string(), ndf(36_000)),
+            // A drop-frame flag on an integer 30.000 fps file cannot be
+            // exported: DF needs `<ntsc>TRUE</ntsc>`.
+            ("int30".to_string(), df(108_000)),
         ]);
         let xml = export_xmeml_with_timecodes(&tl, &manifest, None, &tcs);
         for (id, frame, string, format) in [
@@ -1601,6 +1610,7 @@ mod tests {
             ("file-ndf60-video", 36_000, "00:10:00:00", "NDF"),
             // No source timecode: today's frame-rate rule.
             ("file-untagged-video", 0, "00;00;00;00", "DF"),
+            ("file-int30-video", 108_000, "01:00:00:00", "NDF"),
         ] {
             let file = file_block(&xml, id);
             assert!(file.contains(&format!("<frame>{frame}</frame>")), "{file}");
