@@ -76,6 +76,7 @@ impl RunningPlayback {
     }
 
     fn shutdown(self) -> Result<(), PlaybackCommandError> {
+        self.engine.control().release_pressure();
         self.proxy_check_cancel.cancel();
         self.publication.close();
         if let Some(server) = self.server.as_ref() {
@@ -180,6 +181,8 @@ pub struct PlaybackStateInner {
     /// Owns preview's background denoise-profile passes; a project
     /// transition cancels them.
     profiles: ProfileScope,
+    /// Playback/export pressure raised while a session plays (#43).
+    pressure: opentake_media::ExportPause,
 }
 
 /// Managed playback state. Cloning shares it, so async commands can move the
@@ -197,12 +200,7 @@ impl Deref for PlaybackState {
 
 impl Default for PlaybackState {
     fn default() -> Self {
-        Self(Arc::new(PlaybackStateInner {
-            slot: Mutex::new(PlaybackSlot::default()),
-            audio_prepare: AudioPrepareWorker::new(),
-            reaper: BoundedReaper::new(),
-            profiles: ProfileScope::new(),
-        }))
+        Self::with_pressure(crate::media_pressure::process_export_pause())
     }
 }
 
@@ -220,6 +218,16 @@ where
 impl PlaybackState {
     pub fn new() -> Self {
         PlaybackState::default()
+    }
+
+    fn with_pressure(pressure: opentake_media::ExportPause) -> Self {
+        Self(Arc::new(PlaybackStateInner {
+            slot: Mutex::new(PlaybackSlot::default()),
+            audio_prepare: AudioPrepareWorker::new(),
+            reaper: BoundedReaper::new(),
+            profiles: ProfileScope::new(),
+            pressure,
+        }))
     }
 
     pub fn ensure_project_transition_available(&self) -> Result<(), PlaybackCommandError> {
@@ -566,6 +574,9 @@ impl PlaybackState {
             kind,
         } = work;
         let identity = &identity;
+        // Background inference yields from the moment playback is requested;
+        // a failed handshake or a pause recorded meanwhile releases it.
+        handles.engine.hold_pressure(self.pressure.guard());
         let handshake = (|| {
             if let Some(audio) = handles.audio.as_ref() {
                 audio.prepare_resume()?;
@@ -577,11 +588,13 @@ impl PlaybackState {
         let Some(pending) = slot.resuming.take_if(|pending| pending.token == token) else {
             // A stop, restart or project boundary took the session meanwhile
             // and owns its teardown.
+            handles.engine.release_pressure();
             return Err(PlaybackCommandError::superseded(
                 "playback session changed while resuming",
             ));
         };
         if let Err(error) = handshake {
+            handles.engine.release_pressure();
             handles.publication.close();
             if let Some(audio) = handles.audio.as_ref() {
                 let _ = audio.pause();
@@ -671,6 +684,7 @@ impl PlaybackState {
                     pending.pause = Some(frame);
                     pending.seek = None;
                     if let Some(running) = slot_ref.running.as_ref() {
+                        running.engine.control().release_pressure();
                         running.proxy_check_cancel.cancel();
                         running.close_publication();
                         if let Some(audio) = running.audio.as_ref() {
@@ -699,6 +713,9 @@ impl PlaybackState {
                 let running = slot.running.as_ref().ok_or_else(|| {
                     PlaybackCommandError::superseded("playback session is no longer installed")
                 })?;
+                // Release before any fallible step: a failed pause still
+                // leaves the session recorded as paused.
+                running.engine.control().release_pressure();
                 running.proxy_check_cancel.cancel();
                 // Freeze every observable output before touching audio or waiting
                 // on the render thread. A decode already in flight can finish,
@@ -1319,6 +1336,61 @@ mod tests {
             });
         }
         (state, gate)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn playing_session_holds_background_pressure_until_paused_or_stopped() {
+        let pressure = opentake_media::ExportPause::new();
+        let state = PlaybackState::with_pressure(pressure.clone());
+        let current = identity(1, 3, "pressure");
+        let cancel = opentake_media::MediaCancelToken::new();
+        let Some((ticket, cleanup, admission)) = state
+            .coordinate_start(current.clone(), current.revision(), 0, cancel.clone())
+            .expect("start is coordinated")
+        else {
+            panic!("fresh session builds");
+        };
+        drop(admission);
+        let server = PreviewServer::start().await.expect("start preview server");
+        let (engine, _stopped) = PlaybackEngine::test_stub();
+        let install_state = state.clone();
+        let install_identity = current.clone();
+        tokio::task::spawn_blocking(move || {
+            install_state.install_if_current(
+                ticket,
+                cleanup,
+                install_identity.revision(),
+                PlaybackResources {
+                    proxy_check_cancel: opentake_media::MediaCancelToken::new(),
+                    engine,
+                    audio: None,
+                    publication: PublicationGate::open(),
+                    server,
+                },
+                0,
+                &cancel,
+            )
+        })
+        .await
+        .expect("install task")
+        .expect("install fresh playback");
+        assert!(pressure.is_active(), "playing session raises pressure");
+
+        state
+            .control(current.clone(), SessionControl::Pause, 4)
+            .expect("pause running session");
+        assert!(!pressure.is_active(), "paused session releases pressure");
+
+        assert!(state
+            .prepare_start(current.clone(), current.revision(), 4)
+            .expect("resume retained session")
+            .is_none());
+        assert!(pressure.is_active(), "resumed session raises pressure");
+
+        state
+            .control(current, SessionControl::Stop, 0)
+            .expect("stop running session");
+        assert!(!pressure.is_active(), "stopped session releases pressure");
     }
 
     fn install_server_on_running(state: &PlaybackState, server: Arc<PreviewServer>) {

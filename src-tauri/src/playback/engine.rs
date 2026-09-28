@@ -556,6 +556,27 @@ pub struct EngineControl {
     control_tx: mpsc::Sender<PlaybackCmd>,
     seek_mailbox: Arc<SeekMailbox>,
     pause_requested: Arc<AtomicBool>,
+    pressure: PressureSlot,
+}
+
+/// Playback/export pressure held while the engine plays, so background
+/// inference yields (#43). The command layer fills it before a start or
+/// resume handshake; it is emptied by a pause (before any fallible step), by a
+/// stop, and by the render thread itself when it halts at the end of the
+/// timeline or on a render failure and when it exits for any reason.
+type PressureSlot = Arc<Mutex<Option<opentake_media::ExportPauseGuard>>>;
+
+fn release_pressure_slot(slot: &PressureSlot) {
+    slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+}
+
+/// Empties the pressure slot when the render thread returns or unwinds.
+struct ReleasePressureOnExit(PressureSlot);
+
+impl Drop for ReleasePressureOnExit {
+    fn drop(&mut self) {
+        release_pressure_slot(&self.0);
+    }
 }
 
 impl EngineControl {
@@ -564,7 +585,19 @@ impl EngineControl {
             control_tx,
             seek_mailbox: Arc::new(SeekMailbox::default()),
             pause_requested: Arc::new(AtomicBool::new(false)),
+            pressure: PressureSlot::default(),
         }
+    }
+
+    /// Hold playback pressure while this engine plays. At most one guard is
+    /// held per engine; a second hold replaces the first.
+    pub(crate) fn hold_pressure(&self, guard: opentake_media::ExportPauseGuard) {
+        *self.pressure.lock().unwrap_or_else(|p| p.into_inner()) = Some(guard);
+    }
+
+    /// Release playback pressure (pause, stop, failed start or resume).
+    pub(crate) fn release_pressure(&self) {
+        release_pressure_slot(&self.pressure);
     }
 
     /// Seek the running engine to `frame`.
@@ -575,6 +608,7 @@ impl EngineControl {
     }
 
     pub fn pause(&self, frame: i32) -> Result<(), String> {
+        self.release_pressure();
         self.pause_requested.store(true, Ordering::Release);
         let (reply, _acknowledgement) = mpsc::channel();
         if self
@@ -813,11 +847,14 @@ impl PlaybackEngine {
             rx,
             seek_mailbox: Arc::clone(&control.seek_mailbox),
             pause_requested: Arc::clone(&control.pause_requested),
+            pressure: Arc::clone(&control.pressure),
             cancel: cancel.clone(),
         };
+        let exit_pressure = Arc::clone(&control.pressure);
         let handle = thread::Builder::new()
             .name("opentake-playback-render".to_string())
             .spawn(move || {
+                let _release_pressure = ReleasePressureOnExit(exit_pressure);
                 let renderer = match build() {
                     Ok(renderer) => renderer,
                     Err(error) => {
@@ -1042,6 +1079,7 @@ struct LoopControl {
     rx: mpsc::Receiver<PlaybackCmd>,
     seek_mailbox: Arc<SeekMailbox>,
     pause_requested: Arc<AtomicBool>,
+    pressure: PressureSlot,
     /// The session's media cancellation. Once it fires the session is being
     /// torn down: a render it interrupted is a stop, never a failure.
     cancel: MediaCancelToken,
@@ -1067,6 +1105,7 @@ fn run_render_loop<R: FrameRenderer>(
         rx,
         seek_mailbox,
         pause_requested,
+        pressure,
         cancel,
     } = control;
     let total = renderer.total_frames();
@@ -1092,6 +1131,7 @@ fn run_render_loop<R: FrameRenderer>(
         if paused {
             match rx.recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
+                    release_pressure_slot(&pressure);
                     clock.seek(frame);
                     resume_decode_streams(paused_frame, frame, || renderer.seek());
                     if paused_frame != Some(frame) {
@@ -1133,6 +1173,7 @@ fn run_render_loop<R: FrameRenderer>(
         loop {
             match rx.try_recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
+                    release_pressure_slot(&pressure);
                     clock.seek(frame);
                     paused = true;
                     paused_frame = Some(frame);
@@ -1214,6 +1255,8 @@ fn run_render_loop<R: FrameRenderer>(
                 paused_frame = Some(clamped);
                 retry_on_resume = true;
                 clock.halt();
+                // Halted until a resume: background inference may run.
+                release_pressure_slot(&pressure);
                 if done {
                     eprintln!("[playback] final frame {clamped}: {}", failure.message);
                     sink.push_terminal(clamped);
@@ -1231,6 +1274,10 @@ fn run_render_loop<R: FrameRenderer>(
 
         // Auto-stop once the clock reaches the final frame (#53: end → stop).
         if done || paused {
+            if done {
+                // Reaching the end is a pause the command layer never sees.
+                release_pressure_slot(&pressure);
+            }
             paused = true;
             continue;
         }
@@ -1433,6 +1480,41 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn render_thread_releases_playback_pressure_whenever_it_stops_playing() {
+        let pressure = opentake_media::ExportPause::new();
+
+        // An explicit pause releases at once.
+        let run = run_stub(1_000_000, None);
+        run.engine.control().hold_pressure(pressure.guard());
+        run.engine.pause(0).expect("pause");
+        assert!(!pressure.is_active(), "pause releases pressure");
+
+        // Resuming until the end of the timeline releases without a pause.
+        let run = run_stub(50, None);
+        wait_until("the loop to reach the end", || {
+            run.renders.lock().unwrap().contains(&49)
+        });
+        run.engine.control().hold_pressure(pressure.guard());
+        run.engine.resume(0).expect("resume from the start");
+        wait_until("the end-of-timeline release", || !pressure.is_active());
+
+        // A render failure halts the loop and releases.
+        let failing = run_stub(100, Some(5));
+        wait_until("the failing render", || {
+            failing.errors.0.lock().unwrap().len() == 1
+        });
+        failing.engine.control().hold_pressure(pressure.guard());
+        failing.engine.resume(5).expect("retry resume");
+        wait_until("the failure-halt release", || !pressure.is_active());
+
+        // Stopping (the render thread exits) releases.
+        failing.engine.control().hold_pressure(pressure.guard());
+        failing.engine.stop();
+        assert!(!pressure.is_active(), "thread exit releases pressure");
+        run.engine.stop();
     }
 
     #[test]
