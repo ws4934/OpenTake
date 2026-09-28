@@ -925,6 +925,32 @@ impl ChatTurnGate for ProjectTurnGate {
     }
 }
 
+/// User-facing text for a failed official Codex turn. Only a provider-reported
+/// turn failure (which covers expired sign-ins) points at the login status.
+fn codex_turn_failure_message(error: crate::codex::CodexTurnError) -> &'static str {
+    use crate::codex::CodexTurnError;
+    match error {
+        CodexTurnError::McpStart => {
+            "the OpenTake tool server for official Codex stopped during the turn; try again"
+        }
+        CodexTurnError::Timeout => {
+            "the official Codex turn took too long and was stopped; try a smaller request"
+        }
+        CodexTurnError::Protocol => {
+            "OpenTake could not read the official Codex output; update Codex CLI and try again"
+        }
+        CodexTurnError::ProviderFailed => {
+            "official Codex reported that the turn failed; check the Codex login status and try again"
+        }
+        CodexTurnError::Cancelled => "the official Codex turn was cancelled",
+        CodexTurnError::Unavailable => "official Codex CLI was not found",
+        CodexTurnError::IncompatibleCli | CodexTurnError::StrictConfigRejected => {
+            "the installed official Codex CLI is not compatible with this OpenTake version"
+        }
+        CodexTurnError::NotAuthenticated => "official Codex is not signed in",
+    }
+}
+
 fn truncate_for_codex_prompt(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let truncated = chars.by_ref().take(max_chars).collect::<String>();
@@ -1116,14 +1142,13 @@ pub async fn chat_send(
                     codex_final = Some(message);
                     Ok(first_message_id.clone())
                 }
-                Err(crate::codex::CodexTurnError::McpStart)
-                | Err(crate::codex::CodexTurnError::Timeout)
-                | Err(crate::codex::CodexTurnError::Protocol)
-                | Err(crate::codex::CodexTurnError::ProviderFailed) => Err(LoopError::llm(
-                    LlmError::Provider(
-                        "official Codex turn failed; check the Codex login status and try again"
-                            .into(),
-                    ),
+                Err(
+                    error @ (crate::codex::CodexTurnError::McpStart
+                    | crate::codex::CodexTurnError::Timeout
+                    | crate::codex::CodexTurnError::Protocol
+                    | crate::codex::CodexTurnError::ProviderFailed),
+                ) => Err(LoopError::llm(
+                    LlmError::Provider(codex_turn_failure_message(error).into()),
                     &first_message_id,
                     codex_sequence.next(),
                 )),
@@ -1350,6 +1375,30 @@ pub fn chat_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_turn_failures_have_distinct_messages_and_only_provider_failure_blames_login() {
+        use crate::codex::CodexTurnError;
+        let failures = [
+            CodexTurnError::McpStart,
+            CodexTurnError::Timeout,
+            CodexTurnError::Protocol,
+            CodexTurnError::ProviderFailed,
+        ];
+        let messages = failures.map(codex_turn_failure_message);
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(
+                messages.iter().filter(|other| other == &message).count(),
+                1,
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("login"),
+                failures[index] == CodexTurnError::ProviderFailed,
+                "{message}"
+            );
+        }
+    }
 
     struct RedactionMediaBridge;
 
