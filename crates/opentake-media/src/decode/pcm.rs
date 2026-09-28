@@ -6,12 +6,17 @@
 //! always carries an f32 mono view for downstream consumers (whisper). The
 //! `PcmFormat` selects the on-wire sample format ffmpeg emits.
 //!
-//! The arg builder ([`pcm_args`]) and the s16→f32 conversion are pure and
+//! Decoded PCM is consumed as it streams out of FFmpeg: the stdout reader
+//! hands whole sample frames to a [`PcmSink`] chunk by chunk, so callers keep
+//! only what they need (one f32 buffer for [`extract_pcm`], per-bucket sums
+//! for waveforms) and never a raw byte copy of the whole track next to it.
+//!
+//! The arg builder ([`pcm_args`]) and the sample conversions are pure and
 //! unit-tested; the extraction itself requires ffmpeg.
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{ChildStderr, ChildStdout, ExitStatus};
+use std::process::{ChildStderr, ExitStatus};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -42,31 +47,160 @@ impl PcmFormat {
             PcmFormat::F32 => 4,
         }
     }
+
+    /// One little-endian sample as a unit-range f32.
+    fn sample(self, bytes: &[u8]) -> f32 {
+        match self {
+            PcmFormat::S16Le => i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0,
+            PcmFormat::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        }
+    }
 }
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// Upper bound on the PCM one whole-track decode may buffer. A whole track's
+/// Upper bound on the PCM one whole-track decode may deliver. A whole track's
 /// decoded length is only estimated by the container (a VBR MP3 without a
 /// Xing/VBRI header is sized from its first frames' bitrate, and audio may
-/// outlast the video), so the buffer grows until EOF and only this ceiling
+/// outlast the video), so the output is read until EOF and only this ceiling
 /// guards against runaway decoder output: about 18 hours of 16 kHz mono f32,
 /// or 3 hours of 48 kHz stereo f32.
 const WHOLE_TRACK_PCM_MAX_BYTES: u64 = 4 << 30;
 const STDERR_DETAIL_LIMIT: usize = 64 * 1024;
-const PCM_CONVERT_CHUNK_FRAMES: usize = 8 * 1024;
+const STDOUT_CHUNK_BYTES: usize = 64 * 1024;
 const PCM_PROGRESS_TOTAL: usize = 4_000;
 const PCM_DECODE_PROGRESS_END: usize = 3_000;
 
 /// Byte-level progress reported while FFmpeg streams decoded PCM to stdout.
 pub type PcmProgressCallback = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
-struct PipeReaders {
-    stdout: JoinHandle<Result<StdoutRead>>,
+/// Consumer of decoded PCM, fed on the stdout reader thread while FFmpeg is
+/// still decoding.
+pub(crate) trait PcmSink: Send + 'static {
+    /// Consume whole sample frames: `frames.len()` is a multiple of the frame
+    /// size of the spec the decode was started with.
+    fn push_frames(&mut self, frames: &[u8]) -> Result<()>;
+}
+
+/// Collects the mono f32 view: channels are averaged per frame.
+#[derive(Debug)]
+struct MonoF32Sink {
+    spec: PcmSpec,
+    samples: Vec<f32>,
+}
+
+impl MonoF32Sink {
+    fn with_capacity(spec: PcmSpec, frames: usize) -> Result<Self> {
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(frames)
+            .map_err(|error| allocation_error(format!("mono f32 reserve {frames}: {error}")))?;
+        Ok(MonoF32Sink { spec, samples })
+    }
+}
+
+impl PcmSink for MonoF32Sink {
+    fn push_frames(&mut self, frames: &[u8]) -> Result<()> {
+        let bps = self.spec.format.bytes_per_sample();
+        let channels = usize::from(self.spec.channels.max(1));
+        let frame_bytes = bps * channels;
+        let count = frames.len() / frame_bytes;
+        self.samples
+            .try_reserve(count)
+            .map_err(|error| allocation_error(format!("mono f32 grow by {count}: {error}")))?;
+        for frame in frames.chunks_exact(frame_bytes) {
+            let mut sum = 0.0f32;
+            for sample in frame.chunks_exact(bps) {
+                sum += self.spec.format.sample(sample);
+            }
+            self.samples.push(sum / channels as f32);
+        }
+        Ok(())
+    }
+}
+
+/// Collects interleaved f32 without folding channels.
+pub(crate) struct InterleavedF32Sink {
+    format: PcmFormat,
+    samples: Vec<f32>,
+}
+
+impl InterleavedF32Sink {
+    pub(crate) fn with_capacity(format: PcmFormat, samples: usize) -> Result<Self> {
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(samples).map_err(|error| {
+            allocation_error(format!("interleaved f32 reserve {samples}: {error}"))
+        })?;
+        Ok(InterleavedF32Sink {
+            format,
+            samples: buffer,
+        })
+    }
+
+    pub(crate) fn into_samples(self) -> Vec<f32> {
+        self.samples
+    }
+}
+
+impl PcmSink for InterleavedF32Sink {
+    fn push_frames(&mut self, frames: &[u8]) -> Result<()> {
+        let bps = self.format.bytes_per_sample();
+        let count = frames.len() / bps;
+        self.samples.try_reserve(count).map_err(|error| {
+            allocation_error(format!("interleaved f32 grow by {count}: {error}"))
+        })?;
+        self.samples.extend(
+            frames
+                .chunks_exact(bps)
+                .map(|sample| self.format.sample(sample)),
+        );
+        Ok(())
+    }
+}
+
+/// Re-frames arbitrary read chunks into whole sample frames for a sink; a
+/// frame split across reads is carried to the next one.
+pub(super) struct FrameAligner {
+    frame_bytes: usize,
+    carry: Vec<u8>,
+}
+
+impl FrameAligner {
+    pub(super) fn new(frame_bytes: usize) -> Self {
+        FrameAligner {
+            frame_bytes,
+            carry: Vec::with_capacity(frame_bytes),
+        }
+    }
+
+    pub(super) fn feed(&mut self, mut data: &[u8], sink: &mut impl PcmSink) -> Result<()> {
+        if !self.carry.is_empty() {
+            let take = (self.frame_bytes - self.carry.len()).min(data.len());
+            self.carry.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.carry.len() < self.frame_bytes {
+                return Ok(());
+            }
+            sink.push_frames(&self.carry)?;
+            self.carry.clear();
+        }
+        let whole = data.len() - data.len() % self.frame_bytes;
+        if whole > 0 {
+            sink.push_frames(&data[..whole])?;
+        }
+        // A trailing partial frame at EOF is dropped, as FFmpeg never ends
+        // a PCM stream mid-frame on success.
+        self.carry.extend_from_slice(&data[whole..]);
+        Ok(())
+    }
+}
+
+struct PipeReaders<S> {
+    stdout: JoinHandle<Result<StdoutRead<S>>>,
     stderr: JoinHandle<Result<Vec<u8>>>,
 }
 
-struct StdoutRead {
-    bytes: Vec<u8>,
+struct StdoutRead<S> {
+    sink: S,
     exceeded_cap: bool,
     total_read: usize,
 }
@@ -129,28 +263,32 @@ struct ReadLimit {
     /// Reading past this many bytes fails the decode with
     /// `audio_buffer_too_large`.
     cap: usize,
-    /// Expected output size: reserved up front (the buffer still grows past
-    /// it, up to `cap`) and used as the progress total.
+    /// Expected output size: the sink's initial reservation (its buffers
+    /// still grow past it, up to `cap`) and the progress total.
     expected: usize,
 }
 
-fn read_stdout(
-    mut stdout: ChildStdout,
+/// Stream stdout into `sink` in bounded chunks. Only one read chunk and at
+/// most one partial frame are buffered here; the sink owns everything else.
+fn read_stdout<S: PcmSink>(
+    mut stdout: impl Read,
+    mut sink: S,
+    frame_bytes: usize,
     limit: ReadLimit,
     cancel: MediaCancelToken,
     progress: Option<PcmProgressCallback>,
-) -> Result<StdoutRead> {
+) -> Result<StdoutRead<S>> {
     cancel.reader_started();
     let result = (|| {
-        let mut bytes = Vec::new();
-        let reserve = limit.expected.min(limit.cap);
-        bytes
-            .try_reserve_exact(reserve)
-            .map_err(|error| allocation_error(format!("stdout reserve {reserve}: {error}")))?;
+        let mut aligner = FrameAligner::new(frame_bytes);
         let mut exceeded_cap = false;
         let mut total_read = 0_usize;
-        let mut chunk = [0_u8; 64 * 1024];
+        let mut accepted = 0_usize;
+        let mut chunk = vec![0_u8; STDOUT_CHUNK_BYTES];
         loop {
+            if cancel.is_cancelled() {
+                return Err(MediaError::Cancelled);
+            }
             let read = stdout
                 .read(&mut chunk)
                 .map_err(|error| MediaError::Ffmpeg(format!("read stdout: {error}")))?;
@@ -161,14 +299,9 @@ fn read_stdout(
             if let Some(report) = &progress {
                 report(total_read.min(limit.expected), limit.expected);
             }
-            let retained = limit.cap.saturating_sub(bytes.len()).min(read);
-            bytes.try_reserve(retained).map_err(|error| {
-                allocation_error(format!(
-                    "stdout grow to {}: {error}",
-                    bytes.len() + retained
-                ))
-            })?;
-            bytes.extend_from_slice(&chunk[..retained]);
+            let retained = limit.cap.saturating_sub(accepted).min(read);
+            aligner.feed(&chunk[..retained], &mut sink)?;
+            accepted += retained;
             if retained < read {
                 // Stop at the cap instead of draining a runaway stream: the
                 // closed pipe ends the decoder, and the error is reported
@@ -178,7 +311,7 @@ fn read_stdout(
             }
         }
         Ok(StdoutRead {
-            bytes,
+            sink,
             exceeded_cap,
             total_read,
         })
@@ -217,7 +350,7 @@ fn join_reader<T>(handle: JoinHandle<Result<T>>, name: &str) -> Result<T> {
         .map_err(|_| MediaError::Ffmpeg(format!("{name} reader panicked")))?
 }
 
-fn join_pipes(readers: PipeReaders) -> Result<(StdoutRead, Vec<u8>)> {
+fn join_pipes<S>(readers: PipeReaders<S>) -> Result<(StdoutRead<S>, Vec<u8>)> {
     // Join both handles before propagating either failure. Returning after the
     // first failed join would detach the other pipe reader and could keep the
     // FFmpeg pipe (and its allocation) alive beyond this decode request.
@@ -234,11 +367,11 @@ fn terminate_child(child: &mut ffmpeg_sidecar::child::FfmpegChild) {
     let _ = child.wait();
 }
 
-fn wait_for_pcm_child(
+fn wait_for_pcm_child<S>(
     child: &mut ffmpeg_sidecar::child::FfmpegChild,
-    readers: PipeReaders,
+    readers: PipeReaders<S>,
     cancel: &MediaCancelToken,
-) -> Result<(ExitStatus, StdoutRead, Vec<u8>)> {
+) -> Result<(ExitStatus, StdoutRead<S>, Vec<u8>)> {
     loop {
         if cancel.checkpoint() {
             terminate_child(child);
@@ -264,13 +397,13 @@ fn wait_for_pcm_child(
     }
 }
 
-fn validate_pcm_output(
+fn validate_pcm_output<S>(
     path: &Path,
     status: ExitStatus,
-    stdout: StdoutRead,
+    stdout: StdoutRead<S>,
     stderr: Vec<u8>,
     reader_cap: usize,
-) -> Result<Vec<u8>> {
+) -> Result<S> {
     if stdout.exceeded_cap {
         return Err(audio_buffer_too_large(format!(
             "FFmpeg PCM output exceeded the {reader_cap}-byte limit after {} bytes",
@@ -288,10 +421,10 @@ fn validate_pcm_output(
             "decode exited {status}{suffix}"
         )));
     }
-    if stdout.bytes.is_empty() {
+    if stdout.total_read == 0 {
         return Err(MediaError::no_track("audio", path));
     }
-    Ok(stdout.bytes)
+    Ok(stdout.sink)
 }
 
 /// Requested PCM layout.
@@ -365,69 +498,6 @@ fn bounded_pcm_args(
     args
 }
 
-/// Convert interleaved raw PCM bytes to mono f32, averaging `channels`.
-#[cfg(test)]
-fn raw_to_mono_f32(bytes: &[u8], spec: &PcmSpec) -> Result<Vec<f32>> {
-    raw_to_mono_f32_cancellable(bytes, spec, &MediaCancelToken::new(), None, None)
-}
-
-fn raw_to_mono_f32_cancellable(
-    bytes: &[u8],
-    spec: &PcmSpec,
-    cancel: &MediaCancelToken,
-    progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
-    checkpoint_hook: Option<&dyn Fn(usize)>,
-) -> Result<Vec<f32>> {
-    let bps = spec.format.bytes_per_sample();
-    let ch = spec.channels.max(1) as usize;
-    let frame_bytes = bps * ch;
-    if frame_bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let frames = bytes.len() / frame_bytes;
-    let mut out = Vec::new();
-    out.try_reserve_exact(frames)
-        .map_err(|error| allocation_error(format!("mono f32 reserve {frames}: {error}")))?;
-    for f in 0..frames {
-        if f.is_multiple_of(PCM_CONVERT_CHUNK_FRAMES) {
-            if let Some(hook) = checkpoint_hook {
-                hook(f);
-            }
-            if cancel.checkpoint() {
-                return Err(MediaError::Cancelled);
-            }
-            if let Some(report) = progress {
-                let converted =
-                    f.saturating_mul(PCM_PROGRESS_TOTAL - PCM_DECODE_PROGRESS_END) / frames.max(1);
-                report(PCM_DECODE_PROGRESS_END + converted, PCM_PROGRESS_TOTAL);
-            }
-        }
-        let base = f * frame_bytes;
-        let mut sum = 0.0f32;
-        for c in 0..ch {
-            let off = base + c * bps;
-            let s = match spec.format {
-                PcmFormat::S16Le => {
-                    let v = i16::from_le_bytes([bytes[off], bytes[off + 1]]);
-                    v as f32 / 32768.0
-                }
-                PcmFormat::F32 => {
-                    f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-                }
-            };
-            sum += s;
-        }
-        out.push(sum / ch as f32);
-    }
-    if cancel.checkpoint() {
-        return Err(MediaError::Cancelled);
-    }
-    if let Some(report) = progress {
-        report(PCM_PROGRESS_TOTAL, PCM_PROGRESS_TOTAL);
-    }
-    Ok(out)
-}
-
 /// Decode `path`'s first audio track to the requested PCM spec, returning a mono
 /// f32 buffer. `range` is an absolute-seconds `[lo, hi)` window. Errors with
 /// `NoTrack("audio", …)` when the file has no audio stream.
@@ -461,33 +531,45 @@ pub fn extract_pcm_cancellable_with_progress(
             report(mapped, PCM_PROGRESS_TOTAL);
         }) as PcmProgressCallback
     });
-    let raw = decode_raw_pcm_cancellable(path, spec, range, cancel, decode_progress)?;
-    let samples = raw_to_mono_f32_cancellable(&raw, spec, cancel, progress.as_deref(), None)?;
+    let sink = decode_pcm_streaming(path, spec, range, cancel, decode_progress, |frames| {
+        MonoF32Sink::with_capacity(*spec, frames)
+    })?;
+    if cancel.checkpoint() {
+        return Err(MediaError::Cancelled);
+    }
+    if let Some(report) = &progress {
+        report(PCM_PROGRESS_TOTAL, PCM_PROGRESS_TOTAL);
+    }
     Ok(PcmBuffer {
         spec: *spec,
-        samples_f32: samples,
+        samples_f32: sink.samples,
     })
 }
 
-pub(super) fn decode_raw_pcm_cancellable(
+/// Decode `path`'s first audio track as `spec` and stream it into the sink
+/// built by `make_sink`, which receives the expected frame count: the exact
+/// frame budget for a `range`, or the probe's estimate for a whole track.
+pub(crate) fn decode_pcm_streaming<S: PcmSink>(
     path: &Path,
     spec: &PcmSpec,
     range: Option<(f64, f64)>,
     cancel: &MediaCancelToken,
     progress: Option<PcmProgressCallback>,
-) -> Result<Vec<u8>> {
+    make_sink: impl FnOnce(usize) -> Result<S>,
+) -> Result<S> {
     let ceiling = usize::try_from(WHOLE_TRACK_PCM_MAX_BYTES).unwrap_or(usize::MAX);
-    decode_raw_pcm_with_ceiling(path, spec, range, cancel, progress, ceiling)
+    decode_pcm_streaming_with_ceiling(path, spec, range, cancel, progress, make_sink, ceiling)
 }
 
-fn decode_raw_pcm_with_ceiling(
+fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
     path: &Path,
     spec: &PcmSpec,
     range: Option<(f64, f64)>,
     cancel: &MediaCancelToken,
     progress: Option<PcmProgressCallback>,
+    make_sink: impl FnOnce(usize) -> Result<S>,
     whole_track_ceiling: usize,
-) -> Result<Vec<u8>> {
+) -> Result<S> {
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
@@ -537,6 +619,7 @@ fn decode_raw_pcm_with_ceiling(
             )
         }
     };
+    let sink = make_sink(limit.expected / frame_bytes)?;
     let mut child = ff::ffmpeg()
         .args(args)
         .spawn()
@@ -560,7 +643,7 @@ fn decode_raw_pcm_with_ceiling(
     let stderr_cancel = cancel.clone();
     let stdout_reader = match thread::Builder::new()
         .name("opentake-pcm-stdout".to_string())
-        .spawn(move || read_stdout(stdout, limit, stdout_cancel, progress))
+        .spawn(move || read_stdout(stdout, sink, frame_bytes, limit, stdout_cancel, progress))
     {
         Ok(reader) => reader,
         Err(error) => {
@@ -653,9 +736,16 @@ mod tests {
         let cancel = MediaCancelToken::new();
         let started = Instant::now();
 
-        let error =
-            decode_raw_pcm_with_ceiling(&input, &f32_mono_spec(), None, &cancel, None, 64 * 1024)
-                .expect_err("output past the ceiling must fail");
+        let error = decode_pcm_streaming_with_ceiling(
+            &input,
+            &f32_mono_spec(),
+            None,
+            &cancel,
+            None,
+            |frames| MonoF32Sink::with_capacity(f32_mono_spec(), frames),
+            64 * 1024,
+        )
+        .expect_err("output past the ceiling must fail");
 
         assert!(
             error.to_string().contains("audio_buffer_too_large"),
@@ -830,7 +920,8 @@ mod tests {
                     cap: 1024 * 1024,
                     expected: 1024 * 1024,
                 };
-                read_stdout(stdout, limit, stdout_cancel, None)
+                let sink = MonoF32Sink::with_capacity(f32_mono_spec(), 0)?;
+                read_stdout(stdout, sink, 4, limit, stdout_cancel, None)
             }),
             stderr: std::thread::spawn(move || read_stderr(stderr, stderr_cancel)),
         };
@@ -864,43 +955,47 @@ mod tests {
         assert_eq!(cancel.active_reader_count(), 0);
     }
 
-    #[test]
-    fn cancellation_inside_raw_conversion_stops_the_actual_sample_loop() {
-        let spec = f32_mono_spec();
-        let frames = PCM_CONVERT_CHUNK_FRAMES * 4;
-        let raw = vec![0_u8; frames * spec.format.bytes_per_sample()];
-        let cancel = MediaCancelToken::new();
-        let worker_cancel = cancel.clone();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let hook = move |_frame: usize| {
-                entered_tx.send(()).expect("conversion checkpoint entered");
-                release_rx.recv().expect("release conversion checkpoint");
-            };
-            let result =
-                raw_to_mono_f32_cancellable(&raw, &spec, &worker_cancel, None, Some(&hook));
-            done_tx.send(result).expect("publish conversion result");
-        });
+    /// Records each pushed chunk and cancels the decode after the first.
+    struct CancellingSink {
+        cancel: MediaCancelToken,
+        pushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
 
-        entered_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("actual conversion loop reached its checkpoint");
-        cancel.cancel();
-        release_tx.send(()).expect("release conversion loop");
-        let result = done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("conversion cancellation must return promptly");
+    impl PcmSink for CancellingSink {
+        fn push_frames(&mut self, _frames: &[u8]) -> Result<()> {
+            self.pushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.cancel();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_the_streaming_conversion_between_chunks() {
+        // Far more PCM than one read chunk, delivered in small reads.
+        let raw = vec![0_u8; STDOUT_CHUNK_BYTES * 8];
+        let stdout = std::io::BufReader::with_capacity(4096, raw.as_slice());
+        let cancel = MediaCancelToken::new();
+        let pushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CancellingSink {
+            cancel: cancel.clone(),
+            pushes: std::sync::Arc::clone(&pushes),
+        };
+        let limit = ReadLimit {
+            cap: raw.len(),
+            expected: raw.len(),
+        };
+
+        let result = read_stdout(stdout, sink, 4, limit, cancel.clone(), None);
 
         assert!(matches!(result, Err(MediaError::Cancelled)));
-        assert_eq!(cancel.checkpoint_count(), 1);
-        worker.join().expect("conversion worker joins");
+        assert_eq!(pushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(cancel.active_reader_count(), 0);
     }
 
     #[test]
     fn reader_failure_still_joins_the_other_started_reader() {
-        let stdout = std::thread::spawn(|| {
+        let stdout = std::thread::spawn(|| -> Result<StdoutRead<MonoF32Sink>> {
             Err(MediaError::Ffmpeg(
                 "deterministic stdout read failure".to_string(),
             ))
@@ -947,8 +1042,10 @@ mod tests {
             .args(["-c", "exit 7"])
             .status()
             .expect("obtain deterministic nonzero status");
+        let mut sink = MonoF32Sink::with_capacity(f32_mono_spec(), 1).unwrap();
+        sink.push_frames(&[1, 2, 3, 4]).unwrap();
         let stdout = StdoutRead {
-            bytes: vec![1, 2, 3, 4],
+            sink,
             exceeded_cap: false,
             total_read: 4,
         };
@@ -1010,6 +1107,17 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
     }
 
+    /// Mono f32 view of `bytes`, delivered in reads of `read_size` bytes.
+    fn mono(bytes: &[u8], spec: &PcmSpec, read_size: usize) -> Vec<f32> {
+        let frame_bytes = spec.format.bytes_per_sample() * usize::from(spec.channels);
+        let mut sink = MonoF32Sink::with_capacity(*spec, 0).unwrap();
+        let mut aligner = FrameAligner::new(frame_bytes);
+        for read in bytes.chunks(read_size) {
+            aligner.feed(read, &mut sink).unwrap();
+        }
+        sink.samples
+    }
+
     #[test]
     fn raw_s16_mono_converts_to_unit_floats() {
         let spec = PcmSpec {
@@ -1022,7 +1130,7 @@ mod tests {
         bytes.extend_from_slice(&0i16.to_le_bytes());
         bytes.extend_from_slice(&16384i16.to_le_bytes());
         bytes.extend_from_slice(&(-32768i16).to_le_bytes());
-        let out = raw_to_mono_f32(&bytes, &spec).unwrap();
+        let out = mono(&bytes, &spec, 64);
         assert_eq!(out.len(), 3);
         assert!((out[0] - 0.0).abs() < 1e-6);
         assert!((out[1] - 0.5).abs() < 1e-3);
@@ -1041,7 +1149,7 @@ mod tests {
         for v in [1.0f32, 0.0, -0.5, 0.5] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        let out = raw_to_mono_f32(&bytes, &spec).unwrap();
+        let out = mono(&bytes, &spec, 64);
         assert_eq!(out.len(), 2);
         assert!((out[0] - 0.5).abs() < 1e-6);
         assert!((out[1] - 0.0).abs() < 1e-6);
@@ -1055,7 +1163,28 @@ mod tests {
             format: PcmFormat::S16Le,
         };
         // 3 bytes = 1 full s16 sample + 1 stray byte → 1 sample.
-        let out = raw_to_mono_f32(&[0, 0, 7], &spec).unwrap();
+        let out = mono(&[0, 0, 7], &spec, 64);
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn frames_split_across_reads_convert_like_one_read() {
+        let spec = PcmSpec {
+            sample_rate: 48_000,
+            channels: 3,
+            format: PcmFormat::F32,
+        };
+        let bytes = (0..3 * 1000)
+            .flat_map(|index| ((index as f32 * 0.37).sin()).to_le_bytes())
+            .collect::<Vec<_>>();
+        let whole = mono(&bytes, &spec, bytes.len());
+        assert_eq!(whole.len(), 1000);
+        for read_size in [1, 5, 11, 12, 4096] {
+            assert_eq!(
+                mono(&bytes, &spec, read_size),
+                whole,
+                "reads of {read_size}"
+            );
+        }
     }
 }
