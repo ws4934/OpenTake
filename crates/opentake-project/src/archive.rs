@@ -83,6 +83,10 @@ pub fn archive(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ProjectError::io(dest_bundle, error)),
     }
+    // The save-time path rule: an unsafe `.project` path would be joined onto
+    // the source bundle (reading outside it) and written into a manifest the
+    // archive's own reader then opens offline.
+    crate::media_paths::validate_manifest_paths(manifest)?;
 
     let media_dir = layout::media_dir(dest_bundle);
     create_dir_all(&media_dir)?;
