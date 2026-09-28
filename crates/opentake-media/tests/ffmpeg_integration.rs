@@ -111,6 +111,27 @@ fn decode_frame_returns_rgba_of_expected_size() {
 }
 
 #[test]
+fn decode_past_the_last_frame_is_a_typed_error() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let av = dir.path().join("av.mp4");
+    assert!(make_av(&av));
+    let request = FrameRequest {
+        time_secs: 30.0,
+        ..FrameRequest::default()
+    };
+    match decode_frame_at(&av, &request) {
+        Err(error @ opentake_media::MediaError::NoFrameAt { time_secs }) => {
+            assert_eq!(time_secs, 30.0);
+            assert_eq!(error.to_string(), "decode failed: no frame at 30.000s");
+        }
+        other => panic!("expected NoFrameAt, got {:?}", other.map(|(time, _)| time)),
+    }
+}
+
+#[test]
 fn decode_frame_scales_within_box() {
     if !ffmpeg_available() {
         return;
@@ -1042,8 +1063,8 @@ fn continuous_decode_reports_real_failures_with_the_log_tail() {
     }
 }
 
-/// A file name that is not valid UTF-8 reaches ffmpeg byte for byte: the
-/// encoder writes it, and frame, stream and PCM decoding all read it back.
+/// A path that is not valid UTF-8 reaches ffmpeg byte for byte: the encoder
+/// writes it, and frame, stream and PCM decoding all read it back.
 /// A lossy conversion would replace `\xff` with U+FFFD and open another path.
 #[cfg(target_os = "linux")]
 #[test]
@@ -1057,7 +1078,11 @@ fn non_utf8_file_names_encode_and_decode() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join(OsStr::from_bytes(b"clip-\xff.mp4"));
+    // The encoder's workspace is created next to the output, so its FFmpeg
+    // arguments carry the non-UTF-8 directory too.
+    let parent = dir.path().join(OsStr::from_bytes(b"dir-\xfe"));
+    std::fs::create_dir(&parent).unwrap();
+    let out = parent.join(OsStr::from_bytes(b"clip-\xff.mp4"));
     assert!(out.to_str().is_none(), "fixture name must not be UTF-8");
 
     let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);

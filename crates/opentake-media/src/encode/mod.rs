@@ -128,27 +128,123 @@ const FIRST_PASS_END: usize = 100;
 const PCM_WRITE_END: usize = 700;
 const MUX_WAIT_START: usize = 800;
 const MUX_COPY_START: usize = 900;
+/// Bytes of FFmpeg's stderr kept for an encode or mux error message.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+/// Lines of that tail quoted in the error message.
+const STDERR_TAIL_LINES: usize = 12;
+/// Name prefix of the private encode workspace next to the output.
+pub const ENCODE_WORKSPACE_PREFIX: &str = ".opentake-encode-";
 
 pub type EncodeProgressCallback = dyn Fn(usize, usize);
 
 /// A streaming RGBA → video encoder. FFmpeg writes only inside a private
-/// owner-only workspace; completed bytes are copied into the caller's retained
-/// output file, so FFmpeg never reopens the final pathname.
+/// owner-only workspace, created next to the output so it lives on the same
+/// volume, and never reopens the final pathname. The finished file is either
+/// copied into the caller's retained output file ([`VideoEncoder::finish`])
+/// or handed over in place for the caller to publish by rename
+/// ([`VideoEncoder::finish_in_workspace`]).
 pub struct VideoEncoder {
     child: ffmpeg_sidecar::child::FfmpegChild,
     stdin: Option<std::process::ChildStdin>,
     output_pump: Option<JoinHandle<Result<()>>>,
-    stderr_pump: Option<JoinHandle<Result<()>>>,
+    stderr_pump: Option<JoinHandle<Result<Vec<u8>>>>,
+    /// The end of the first pass's stderr, once its pump has been joined.
+    stderr_tail: Vec<u8>,
     expected_frame_bytes: usize,
     fps: i32,
     /// Frames fully written to the first pass; they fix the output duration.
     frames_written: u64,
-    workspace: tempfile::TempDir,
+    /// `None` only after [`VideoEncoder::finish_in_workspace`] handed it over.
+    workspace: Option<EncodeWorkspace>,
     first_pass: PathBuf,
-    output: File,
+    /// `None` for an encoder whose result is published from the workspace.
+    output: Option<File>,
     acodec: &'static str,
     pending_audio: Option<PendingAudio>,
     child_reaped: bool,
+}
+
+/// The private directory an encode writes in: owner-only on Unix, next to
+/// the output, and removed with everything left in it when dropped.
+struct EncodeWorkspace {
+    /// Retained no-follow handle of the directory.
+    directory: File,
+    // Dropped after `directory`, so Windows can remove the directory.
+    dir: tempfile::TempDir,
+}
+
+impl EncodeWorkspace {
+    fn next_to(out_hint: &Path) -> Result<Self> {
+        let parent = match out_hint.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let dir = tempfile::Builder::new()
+            .prefix(ENCODE_WORKSPACE_PREFIX)
+            .tempdir_in(parent)
+            .map_err(MediaError::Io)?;
+        let directory = open_directory_nofollow(dir.path())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            directory
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(MediaError::Io)?;
+            // SAFETY: `geteuid` has no preconditions.
+            let owner = unsafe { libc::geteuid() };
+            if directory.metadata().map_err(MediaError::Io)?.uid() != owner {
+                return Err(MediaError::Encode(
+                    "encode workspace is not owned by this user".to_string(),
+                ));
+            }
+        }
+        Ok(EncodeWorkspace { directory, dir })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// A finished encode left in its workspace for the caller to publish with a
+/// single rename, so no second copy of the movie is ever written. The
+/// workspace, and the file if it is still there, are removed when this is
+/// dropped; once the file has been renamed away only the empty workspace
+/// remains to remove.
+pub struct EncodedFile {
+    /// Retained handle of the finished file: readable, writable and, on
+    /// Windows, opened with `DELETE` access so it can be renamed and deleted
+    /// through the handle.
+    file: File,
+    name: OsString,
+    workspace: EncodeWorkspace,
+}
+
+impl EncodedFile {
+    /// The retained handle of the finished file.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// The retained no-follow handle of the workspace directory holding it.
+    pub fn directory(&self) -> &File {
+        &self.workspace.directory
+    }
+
+    /// Path of the workspace directory.
+    pub fn directory_path(&self) -> &Path {
+        self.workspace.path()
+    }
+
+    /// The file's single-component name inside the workspace.
+    pub fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
+    /// Full path of the finished file inside the workspace.
+    pub fn path(&self) -> PathBuf {
+        self.workspace.path().join(&self.name)
+    }
 }
 
 struct PendingAudio {
@@ -164,6 +260,20 @@ impl VideoEncoder {
         Self::new_with_file(out, output, w, h, fps, preset)
     }
 
+    /// Start an encoder whose result stays in a private workspace next to
+    /// `out_hint` (same directory, so the same volume) until
+    /// [`VideoEncoder::finish_in_workspace`] hands it over for publishing by
+    /// rename. `out_hint` itself is never opened.
+    pub fn new_in_workspace(
+        out_hint: &Path,
+        w: u32,
+        h: u32,
+        fps: i32,
+        preset: &ExportPreset,
+    ) -> Result<Self> {
+        Self::start(out_hint, None, w, h, fps, preset)
+    }
+
     /// Open and truncate a regular, non-link output file without following a
     /// symlink. Callers that need an identity-safe cleanup guard can retain
     /// this handle and pass a clone into `new_with_file`.
@@ -172,6 +282,9 @@ impl VideoEncoder {
         open_output_nofollow(out)
     }
 
+    /// Start an encoder whose finished bytes [`VideoEncoder::finish`] copies
+    /// into `output`, a retained handle to `out_hint`. The workspace is
+    /// created next to `out_hint`.
     pub fn new_with_file(
         out_hint: &Path,
         mut output: File,
@@ -182,16 +295,18 @@ impl VideoEncoder {
     ) -> Result<Self> {
         output.set_len(0).map_err(MediaError::Io)?;
         output.seek(SeekFrom::Start(0)).map_err(MediaError::Io)?;
-        let workspace = tempfile::Builder::new()
-            .prefix("opentake-encode-")
-            .tempdir()
-            .map_err(MediaError::Io)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            workspace.path(),
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .map_err(MediaError::Io)?;
+        Self::start(out_hint, Some(output), w, h, fps, preset)
+    }
+
+    fn start(
+        out_hint: &Path,
+        output: Option<File>,
+        w: u32,
+        h: u32,
+        fps: i32,
+        preset: &ExportPreset,
+    ) -> Result<Self> {
+        let workspace = EncodeWorkspace::next_to(out_hint)?;
         let extension = if matches!(preset.codec, VideoCodec::ProRes422 | VideoCodec::ProRes4444) {
             "mov"
         } else {
@@ -242,10 +357,11 @@ impl VideoEncoder {
             stdin,
             output_pump: Some(output_pump),
             stderr_pump: Some(stderr_pump),
+            stderr_tail: Vec::new(),
             expected_frame_bytes: w as usize * h as usize * 4,
             fps,
             frames_written: 0,
-            workspace,
+            workspace: Some(workspace),
             first_pass,
             output,
             acodec: preset.acodec_arg(),
@@ -268,9 +384,15 @@ impl VideoEncoder {
             .stdin
             .as_mut()
             .ok_or_else(|| MediaError::Encode("encoder stdin closed".into()))?;
-        stdin
-            .write_all(&rgba.rgba)
-            .map_err(|e| MediaError::Encode(format!("write frame: {e}")))?;
+        if let Err(error) = stdin.write_all(&rgba.rgba) {
+            // A closed pipe usually means FFmpeg rejected its arguments or
+            // input and exited; its stderr says why.
+            self.reap_child();
+            return Err(MediaError::Encode(with_stderr_tail(
+                format!("write frame: {error}"),
+                &self.stderr_tail,
+            )));
+        }
         self.frames_written += 1;
         Ok(())
     }
@@ -305,7 +427,7 @@ impl VideoEncoder {
                 "streamed audio must be mono f32 at a positive sample rate".to_string(),
             ));
         }
-        let path = self.workspace.path().join("audio.pcm");
+        let path = self.workspace_path()?.join("audio.pcm");
         let mut output = if let Some(pending) = &self.pending_audio {
             if pending.spec != spec {
                 return Err(MediaError::Encode(
@@ -362,8 +484,10 @@ impl VideoEncoder {
         self.reap_child();
     }
 
+    /// Finish an encoder started with [`VideoEncoder::new`] or
+    /// [`VideoEncoder::new_with_file`]: its output file receives the result.
     pub fn finish(mut self) -> Result<()> {
-        self.finish_cancellable_inner(&MediaCancelToken::new(), None, None)
+        self.finish_into_output(&MediaCancelToken::new(), None, None)
     }
 
     pub fn finish_cancellable(
@@ -371,38 +495,129 @@ impl VideoEncoder {
         cancel: &MediaCancelToken,
         progress: Option<&EncodeProgressCallback>,
     ) -> Result<()> {
-        self.finish_cancellable_inner(cancel, progress, None)
+        self.finish_into_output(cancel, progress, None)
     }
 
-    fn finish_cancellable_inner(
+    /// Finish an encoder started with [`VideoEncoder::new_in_workspace`] and
+    /// hand over the synced result in its workspace, without copying it.
+    pub fn finish_in_workspace(
+        mut self,
+        cancel: &MediaCancelToken,
+        progress: Option<&EncodeProgressCallback>,
+    ) -> Result<EncodedFile> {
+        if self.output.is_some() {
+            return Err(MediaError::Encode(
+                "an encoder with an output file finishes into that file".to_string(),
+            ));
+        }
+        let progress = DedupedProgress::new(progress);
+        let finished = self.finish_passes(cancel, &progress, None)?;
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or_else(|| MediaError::Encode("encode workspace is missing".to_string()))?;
+        let name = finished
+            .file_name()
+            .ok_or_else(|| MediaError::Encode("encoded file has no name".to_string()))?
+            .to_os_string();
+        let file = open_encoded_file(&workspace.directory, workspace.path(), &name)?;
+        file.sync_all().map_err(MediaError::Io)?;
+        if cancel.checkpoint() {
+            return Err(MediaError::Cancelled);
+        }
+        let workspace = self
+            .workspace
+            .take()
+            .ok_or_else(|| MediaError::Encode("encode workspace is missing".to_string()))?;
+        progress.report(ENCODE_PROGRESS_TOTAL);
+        Ok(EncodedFile {
+            file,
+            name,
+            workspace,
+        })
+    }
+
+    fn finish_into_output(
         &mut self,
         cancel: &MediaCancelToken,
         progress: Option<&EncodeProgressCallback>,
         mux_wait_hook: Option<&dyn Fn()>,
     ) -> Result<()> {
+        if self.output.is_none() {
+            return Err(MediaError::Encode(
+                "an encoder without an output file finishes in its workspace".to_string(),
+            ));
+        }
+        let progress = DedupedProgress::new(progress);
+        let finished = self.finish_passes(cancel, &progress, mux_wait_hook)?;
+        let copy_start = if finished == self.first_pass {
+            FIRST_PASS_END
+        } else {
+            MUX_COPY_START
+        };
+        self.copy_file_to_output(&finished, cancel, &progress, copy_start)?;
+        if cancel.checkpoint() {
+            return Err(MediaError::Cancelled);
+        }
+        let output = self.output_file()?;
+        output.flush().map_err(MediaError::Io)?;
+        output.sync_all().map_err(MediaError::Io)?;
+        progress.report(ENCODE_PROGRESS_TOTAL);
+        Ok(())
+    }
+
+    /// Run the first pass to completion and mux any audio. Returns the
+    /// finished file in the workspace: the first pass, or the mux result
+    /// (after the first pass and the PCM spool it replaces are removed).
+    fn finish_passes(
+        &mut self,
+        cancel: &MediaCancelToken,
+        progress: &DedupedProgress<'_>,
+        mux_wait_hook: Option<&dyn Fn()>,
+    ) -> Result<PathBuf> {
         let status = self.wait_for_child(cancel, progress)?;
         if !status.success() {
-            return Err(MediaError::Encode(format!("ffmpeg exited {status}")));
+            return Err(MediaError::Encode(with_stderr_tail(
+                format!("ffmpeg exited {status}"),
+                &self.stderr_tail,
+            )));
         }
-        report_progress(progress, FIRST_PASS_END);
+        progress.report(FIRST_PASS_END);
 
-        match self.pending_audio.take() {
-            Some(audio) => self.mux_audio(&audio, cancel, progress, mux_wait_hook)?,
-            None => self.copy_video_only(cancel, progress)?,
+        let finished = match self.pending_audio.take() {
+            Some(audio) => {
+                let muxed = self.mux_audio(&audio, cancel, progress, mux_wait_hook)?;
+                // Free the intermediate files before the result is copied or
+                // published, so the workspace holds one movie at a time.
+                let _ = std::fs::remove_file(&self.first_pass);
+                let _ = std::fs::remove_file(&audio.path);
+                muxed
+            }
+            None => self.first_pass.clone(),
         };
         if cancel.checkpoint() {
             return Err(MediaError::Cancelled);
         }
-        self.output.flush().map_err(MediaError::Io)?;
-        self.output.sync_all().map_err(MediaError::Io)?;
-        report_progress(progress, ENCODE_PROGRESS_TOTAL);
-        Ok(())
+        Ok(finished)
+    }
+
+    fn workspace_path(&self) -> Result<&Path> {
+        self.workspace
+            .as_ref()
+            .map(EncodeWorkspace::path)
+            .ok_or_else(|| MediaError::Encode("encode workspace is missing".to_string()))
+    }
+
+    fn output_file(&mut self) -> Result<&mut File> {
+        self.output
+            .as_mut()
+            .ok_or_else(|| MediaError::Encode("encoder has no output file".to_string()))
     }
 
     fn wait_for_child(
         &mut self,
         cancel: &MediaCancelToken,
-        progress: Option<&EncodeProgressCallback>,
+        progress: &DedupedProgress<'_>,
     ) -> Result<ExitStatus> {
         self.stdin.take();
         let mut polls = 0_usize;
@@ -422,7 +637,7 @@ impl VideoEncoder {
                 Ok(None) => {
                     polls = polls.saturating_add(1);
                     if polls.is_multiple_of(20) {
-                        report_progress(progress, (polls / 20).min(FIRST_PASS_END - 1));
+                        progress.report((polls / 20).min(FIRST_PASS_END - 1));
                     }
                     thread::sleep(ENCODE_POLL_INTERVAL);
                 }
@@ -440,11 +655,12 @@ impl VideoEncoder {
             .take()
             .map(|pump| join_named_pump(pump, "encoder output"))
             .unwrap_or(Ok(()));
-        let stderr = self
-            .stderr_pump
-            .take()
-            .map(|pump| join_named_pump(pump, "encoder stderr"))
-            .unwrap_or(Ok(()));
+        let stderr = match self.stderr_pump.take() {
+            Some(pump) => join_named_pump(pump, "encoder stderr").map(|tail| {
+                self.stderr_tail = tail;
+            }),
+            None => Ok(()),
+        };
         output.and(stderr)
     }
 
@@ -462,27 +678,18 @@ impl VideoEncoder {
         self.child.as_inner_mut().id()
     }
 
-    fn copy_video_only(
-        &mut self,
-        cancel: &MediaCancelToken,
-        progress: Option<&EncodeProgressCallback>,
-    ) -> Result<()> {
-        self.copy_file_to_output(&self.first_pass.clone(), cancel, progress, FIRST_PASS_END)
-    }
-
     fn copy_file_to_output(
         &mut self,
         source_path: &Path,
         cancel: &MediaCancelToken,
-        progress: Option<&EncodeProgressCallback>,
+        progress: &DedupedProgress<'_>,
         progress_start: usize,
     ) -> Result<()> {
         let mut source = File::open(source_path).map_err(MediaError::Io)?;
         source.seek(SeekFrom::Start(0)).map_err(MediaError::Io)?;
-        self.output.set_len(0).map_err(MediaError::Io)?;
-        self.output
-            .seek(SeekFrom::Start(0))
-            .map_err(MediaError::Io)?;
+        let output = self.output_file()?;
+        output.set_len(0).map_err(MediaError::Io)?;
+        output.seek(SeekFrom::Start(0)).map_err(MediaError::Io)?;
         let total = source.metadata().map_err(MediaError::Io)?.len().max(1);
         let mut copied = 0_u64;
         let mut chunk = [0_u8; OUTPUT_COPY_CHUNK];
@@ -494,14 +701,12 @@ impl VideoEncoder {
             if read == 0 {
                 break;
             }
-            self.output
-                .write_all(&chunk[..read])
-                .map_err(MediaError::Io)?;
+            output.write_all(&chunk[..read]).map_err(MediaError::Io)?;
             copied = copied.saturating_add(read as u64);
             let mapped = progress_start
                 + ((copied.min(total) * (ENCODE_PROGRESS_TOTAL - progress_start) as u64) / total)
                     as usize;
-            report_progress(progress, mapped.min(ENCODE_PROGRESS_TOTAL - 1));
+            progress.report(mapped.min(ENCODE_PROGRESS_TOTAL - 1));
         }
         Ok(())
     }
@@ -510,12 +715,12 @@ impl VideoEncoder {
         &mut self,
         audio: &PendingAudio,
         cancel: &MediaCancelToken,
-        progress: Option<&EncodeProgressCallback>,
+        progress: &DedupedProgress<'_>,
         mux_wait_hook: Option<&dyn Fn()>,
-    ) -> Result<()> {
-        report_progress(progress, PCM_WRITE_END);
+    ) -> Result<PathBuf> {
+        progress.report(PCM_WRITE_END);
 
-        let mux_path = self.workspace.path().join(
+        let mux_path = self.workspace_path()?.join(
             if self
                 .first_pass
                 .extension()
@@ -573,8 +778,8 @@ impl VideoEncoder {
                 )));
             }
         };
-        report_progress(progress, MUX_WAIT_START);
-        let status = wait_external_child(
+        progress.report(MUX_WAIT_START);
+        let (status, stderr_tail) = wait_external_child(
             &mut child,
             pump,
             stderr_pump,
@@ -583,9 +788,12 @@ impl VideoEncoder {
             mux_wait_hook,
         )?;
         if !status.success() {
-            return Err(MediaError::Encode(format!("ffmpeg mux exited {status}")));
+            return Err(MediaError::Encode(with_stderr_tail(
+                format!("ffmpeg mux exited {status}"),
+                &stderr_tail,
+            )));
         }
-        self.copy_file_to_output(&mux_path, cancel, progress, MUX_COPY_START)
+        Ok(mux_path)
     }
 }
 
@@ -666,13 +874,163 @@ fn drain_stdout(mut stdout: ChildStdout) -> Result<()> {
     }
 }
 
-fn drain_stderr(mut stderr: ChildStderr) -> Result<()> {
+/// Read stderr to its end, keeping only its last [`STDERR_TAIL_BYTES`].
+fn drain_stderr(mut stderr: ChildStderr) -> Result<Vec<u8>> {
+    let mut tail = std::collections::VecDeque::with_capacity(STDERR_TAIL_BYTES);
     let mut bytes = [0_u8; 8 * 1024];
     loop {
         let read = stderr.read(&mut bytes).map_err(MediaError::Io)?;
         if read == 0 {
-            return Ok(());
+            return Ok(tail.into());
         }
+        let kept = &bytes[read.saturating_sub(STDERR_TAIL_BYTES)..read];
+        let overflow = (tail.len() + kept.len()).saturating_sub(STDERR_TAIL_BYTES);
+        tail.drain(..overflow);
+        tail.extend(kept);
+    }
+}
+
+/// `message`, followed by the last lines FFmpeg wrote to stderr, if any.
+fn with_stderr_tail(message: String, stderr_tail: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr_tail);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return message;
+    }
+    let quoted = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
+    format!("{message}: {}", quoted.join(" | "))
+}
+
+/// Forwards encode progress, dropping repeats of the last reported value:
+/// a large copy reports every 64 KiB, but only per-mille changes matter.
+struct DedupedProgress<'a> {
+    callback: Option<&'a EncodeProgressCallback>,
+    last: std::cell::Cell<Option<usize>>,
+}
+
+impl<'a> DedupedProgress<'a> {
+    fn new(callback: Option<&'a EncodeProgressCallback>) -> Self {
+        DedupedProgress {
+            callback,
+            last: std::cell::Cell::new(None),
+        }
+    }
+
+    fn report(&self, done: usize) {
+        let done = done.min(ENCODE_PROGRESS_TOTAL);
+        if self.last.replace(Some(done)) != Some(done) {
+            report_progress(self.callback, done);
+        }
+    }
+}
+
+fn open_directory_nofollow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        // Without delete sharing the workspace cannot be renamed or replaced
+        // while it is retained.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let directory = options.open(path).map_err(MediaError::Io)?;
+    let metadata = directory.metadata().map_err(MediaError::Io)?;
+    if metadata_is_link(&metadata) || !metadata.is_dir() {
+        return Err(MediaError::Encode(
+            "encode workspace must be a real directory".to_string(),
+        ));
+    }
+    Ok(directory)
+}
+
+/// Open the finished `name` inside the retained workspace without following
+/// a link, with the access a caller needs to verify, rename and delete it.
+#[cfg(unix)]
+fn open_encoded_file(directory: &File, _path: &Path, name: &std::ffi::OsStr) -> Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| MediaError::Encode("encoded file name contains NUL".to_string()))?;
+    // SAFETY: `directory` is a live descriptor and `name` a NUL-terminated
+    // single component; a returned descriptor is owned by the File below.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(MediaError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `openat` returned a new descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    ensure_regular_file(file)
+}
+
+#[cfg(not(unix))]
+fn open_encoded_file(_directory: &File, path: &Path, name: &std::ffi::OsStr) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        // No delete sharing: nothing else can rename or replace the file
+        // while it is retained; the holder renames it through this handle.
+        options
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path.join(name)).map_err(MediaError::Io)?;
+    ensure_regular_file(file)
+}
+
+fn ensure_regular_file(file: File) -> Result<File> {
+    let metadata = file.metadata().map_err(MediaError::Io)?;
+    if metadata_is_link(&metadata) || !metadata.is_file() {
+        return Err(MediaError::Encode(
+            "encoded output must be a regular non-link file".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
     }
 }
 
@@ -684,6 +1042,7 @@ fn write_pcm_s16le_cancellable(
     progress: Option<&EncodeProgressCallback>,
     checkpoint_hook: Option<&dyn Fn(usize)>,
 ) -> Result<()> {
+    let progress = DedupedProgress::new(progress);
     destination.set_len(0).map_err(MediaError::Io)?;
     destination
         .seek(SeekFrom::Start(0))
@@ -701,7 +1060,7 @@ fn write_pcm_s16le_cancellable(
         let completed = (done + chunk.len()).min(samples.len());
         let span = PCM_WRITE_END - FIRST_PASS_END;
         let mapped = FIRST_PASS_END + completed.saturating_mul(span) / samples.len().max(1);
-        report_progress(progress, mapped);
+        progress.report(mapped);
     }
     if cancel.checkpoint() {
         return Err(MediaError::Cancelled);
@@ -709,14 +1068,15 @@ fn write_pcm_s16le_cancellable(
     Ok(())
 }
 
+/// Wait for the mux child; returns its exit status and the end of its stderr.
 fn wait_external_child(
     child: &mut ffmpeg_sidecar::child::FfmpegChild,
     output_pump: JoinHandle<Result<()>>,
-    stderr_pump: JoinHandle<Result<()>>,
+    stderr_pump: JoinHandle<Result<Vec<u8>>>,
     cancel: &MediaCancelToken,
-    progress: Option<&EncodeProgressCallback>,
+    progress: &DedupedProgress<'_>,
     wait_hook: Option<&dyn Fn()>,
-) -> Result<ExitStatus> {
+) -> Result<(ExitStatus, Vec<u8>)> {
     if let Some(hook) = wait_hook {
         hook();
     }
@@ -732,14 +1092,13 @@ fn wait_external_child(
             Ok(Some(status)) => {
                 let output = join_named_pump(output_pump, "mux output");
                 let stderr = join_named_pump(stderr_pump, "mux stderr");
-                output.and(stderr)?;
-                return Ok(status);
+                output?;
+                return Ok((status, stderr?));
             }
             Ok(None) => {
                 polls = polls.saturating_add(1);
                 if polls.is_multiple_of(20) {
-                    report_progress(
-                        progress,
+                    progress.report(
                         MUX_WAIT_START + (polls / 20).min(MUX_COPY_START - MUX_WAIT_START - 1),
                     );
                 }
@@ -755,7 +1114,7 @@ fn wait_external_child(
     }
 }
 
-fn join_named_pump(pump: JoinHandle<Result<()>>, name: &str) -> Result<()> {
+fn join_named_pump<T>(pump: JoinHandle<Result<T>>, name: &str) -> Result<T> {
     pump.join()
         .map_err(|_| MediaError::Encode(format!("{name} pump panicked")))?
 }
@@ -812,6 +1171,160 @@ mod tests {
 
         encoder.finish().unwrap();
         assert!(output.is_file());
+    }
+
+    fn workspace_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn failed_encode_reports_ffmpeg_stderr() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("odd.mp4");
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        // libx264 with 4:2:0 chroma rejects an odd width when it opens.
+        let mut encoder = VideoEncoder::new(&output, 15, 16, 30, &preset).unwrap();
+        let frame = RgbaFrame::new(15, 16, vec![0; 15 * 16 * 4]);
+        let error = (0..64)
+            .find_map(|_| encoder.push_frame(&frame).err())
+            .unwrap_or_else(|| encoder.finish().unwrap_err());
+        let message = error.to_string();
+        assert!(
+            message.contains("divisible by 2"),
+            "the error quotes FFmpeg's reason: {message}"
+        );
+        assert!(message.len() < STDERR_TAIL_BYTES + 256, "{message}");
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_and_keeps_the_end() {
+        let long: Vec<u8> = (0..500)
+            .flat_map(|line| format!("line {line}\n").into_bytes())
+            .collect();
+        let message = with_stderr_tail("ffmpeg exited 1".to_string(), &long);
+        assert!(message.starts_with("ffmpeg exited 1: "));
+        assert!(message.ends_with("line 499"));
+        assert_eq!(message.matches(" | ").count(), STDERR_TAIL_LINES - 1);
+        assert_eq!(with_stderr_tail("x".to_string(), b"\n \n"), "x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_encode_is_published_by_rename_next_to_the_output() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("movie.mp4");
+        std::fs::write(&output, b"previous movie").unwrap();
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut encoder = VideoEncoder::new_in_workspace(&output, 16, 16, 30, &preset).unwrap();
+        for _ in 0..3 {
+            encoder.push_frame(&RgbaFrame::black(16, 16)).unwrap();
+        }
+        let spec = PcmSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            format: PcmFormat::F32,
+        };
+        encoder
+            .push_audio_chunk(spec, &[0.1; 4_800], &MediaCancelToken::new())
+            .unwrap();
+        let reports = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = std::rc::Rc::clone(&reports);
+        let record = move |done: usize, _total: usize| recorded.borrow_mut().push(done);
+        let encoded = encoder
+            .finish_in_workspace(&MediaCancelToken::new(), Some(&record))
+            .unwrap();
+
+        // The workspace sits in the output's directory, holds only the
+        // finished movie, and the previous movie is untouched.
+        assert_eq!(encoded.directory_path().parent(), Some(temp.path()));
+        assert!(encoded
+            .directory_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(ENCODE_WORKSPACE_PREFIX));
+        assert_eq!(
+            workspace_entries(encoded.directory_path()),
+            [encoded.name().to_string_lossy()]
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous movie");
+        assert_eq!(reports.borrow().last(), Some(&ENCODE_PROGRESS_TOTAL));
+        assert!(reports.borrow().windows(2).all(|pair| pair[0] < pair[1]));
+
+        let encoded_inode = encoded.file().metadata().unwrap().ino();
+        std::fs::rename(encoded.path(), &output).unwrap();
+        let workspace = encoded.directory_path().to_path_buf();
+        drop(encoded);
+        assert_eq!(std::fs::metadata(&output).unwrap().ino(), encoded_inode);
+        assert!(!workspace.exists(), "the empty workspace is removed");
+        assert_eq!(workspace_entries(temp.path()), ["movie.mp4"]);
+        let probe = crate::probe::probe(&output).unwrap();
+        assert!(probe.has_video && probe.has_audio);
+    }
+
+    #[test]
+    fn copy_mode_and_aborted_encodes_leave_no_workspace() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+
+        let copied = temp.path().join("copied.mp4");
+        let mut encoder = VideoEncoder::new(&copied, 16, 16, 30, &preset).unwrap();
+        encoder.push_frame(&RgbaFrame::black(16, 16)).unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(workspace_entries(temp.path()), ["copied.mp4"]);
+
+        let aborted = temp.path().join("aborted.mp4");
+        let mut encoder = VideoEncoder::new_in_workspace(&aborted, 16, 16, 30, &preset).unwrap();
+        encoder.push_frame(&RgbaFrame::black(16, 16)).unwrap();
+        encoder.abort();
+        assert_eq!(workspace_entries(temp.path()), ["copied.mp4"]);
+
+        let dropped = VideoEncoder::new_in_workspace(&aborted, 16, 16, 30, &preset)
+            .unwrap()
+            .finish_in_workspace(&MediaCancelToken::new(), None)
+            .unwrap();
+        drop(dropped);
+        assert_eq!(workspace_entries(temp.path()), ["copied.mp4"]);
+    }
+
+    #[test]
+    fn large_output_copy_reports_each_progress_value_once() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("copy.mp4");
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut encoder = VideoEncoder::new(&output, 16, 16, 30, &preset).unwrap();
+        // A sparse 128 MiB source: 2,048 chunk copies.
+        let source = temp.path().join("large.bin");
+        File::create(&source)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        let reports = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = std::rc::Rc::clone(&reports);
+        let record = move |done: usize, _total: usize| recorded.borrow_mut().push(done);
+        let progress = DedupedProgress::new(Some(&record));
+        encoder
+            .copy_file_to_output(&source, &MediaCancelToken::new(), &progress, MUX_COPY_START)
+            .unwrap();
+        let reports = reports.borrow().clone();
+        assert!(
+            reports.len() <= ENCODE_PROGRESS_TOTAL - MUX_COPY_START,
+            "{} reports",
+            reports.len()
+        );
+        assert!(reports.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(reports.last(), Some(&(ENCODE_PROGRESS_TOTAL - 1)));
+        encoder.abort();
     }
 
     #[cfg(unix)]
@@ -1136,7 +1649,7 @@ mod tests {
                 output_pump,
                 stderr_pump,
                 &worker_cancel,
-                None,
+                &DedupedProgress::new(None),
                 Some(&hook),
             );
             let reaped = child
