@@ -22,15 +22,25 @@ sha2 = "0.10"
 hex = "0.4"
 thiserror = "1"
 
-# The live backend speaks Chrome DevTools Protocol directly. Both dependencies
-# are feature-gated, so the default/offline crate keeps its existing surface.
+# The live backend speaks Chrome DevTools Protocol directly over the browser's
+# debugging pipes. These dependencies are feature-gated, so the default/offline
+# crate keeps its existing surface.
 base64 = { version = "0.22", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["handshake"] }
 tempfile = { version = "3", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
+# Maps the CDP pipes onto descriptors 3/4 in the browser, checks for stale
+# profile owners, and (Linux) sets the parent-death signal.
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Inheritable CDP pipe handles for --remote-debugging-io-pipes and stale
+# profile owner checks; already in the tree through opentake-process-tree.
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # Offline PNG round-trip for the stub renderer's frame-file checks (mirrors the
@@ -43,4 +53,4 @@ default = []
 # Gates the real headless-Chromium (CDP) backend behind a feature so neither the
 # default build nor CI tests require a Chromium binary. Browser discovery and
 # the fail-closed API compile unconditionally; live CDP wiring is feature-gated.
-chromium = ["dep:base64", "dep:image", "dep:opentake-process-tree", "dep:tungstenite", "dep:tempfile", "dep:libc"]
+chromium = ["dep:base64", "dep:image", "dep:opentake-process-tree", "dep:tempfile", "dep:libc", "dep:windows-sys"]

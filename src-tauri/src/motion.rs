@@ -779,6 +779,19 @@ enum StoredMotionSource {
     },
 }
 
+/// Remove Chromium profiles that an earlier run left behind (for example
+/// after a crash), off the UI thread.
+pub(crate) fn spawn_stale_browser_profile_cleanup() {
+    let spawned = std::thread::Builder::new()
+        .name("motion-profile-cleanup".into())
+        .spawn(|| {
+            HeadlessChromiumRenderer::remove_stale_browser_profiles();
+        });
+    if let Err(error) = spawned {
+        eprintln!("[motion] stale browser profile cleanup could not start: {error}");
+    }
+}
+
 struct PreparedMotionCommit {
     stored_source: StoredMotionSource,
     document_source: Option<DocumentMotionSource>,

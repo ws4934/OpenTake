@@ -370,14 +370,18 @@ impl Crc32 {
 /// unsupported; declared external resources continue to use the exact
 /// [`SandboxPolicy`] allowlist.
 ///
-/// The CDP wiring is gated behind the `chromium` cargo feature so the default
-/// build does not require a browser or websocket dependency. The live path
-/// locates Chrome/Chromium/Edge and reuses one renderer-owned browser profile
-/// and process across successful renders. Each render gets a fresh root CDP
-/// connection, disposable browser context, and target. The backend injects a
-/// strict CSP, intercepts every request with `Fetch`, and kills the browser on
+/// The CDP wiring is gated behind the `chromium` feature so the default build
+/// does not require a browser. The live path locates Chrome/Chromium/Edge and
+/// talks CDP over pipes inherited at spawn (`--remote-debugging-pipe`), so no
+/// debugging port is ever exposed to other local processes. It reuses one
+/// renderer-owned browser profile and process across renders and closes it
+/// after [`DEFAULT_BROWSER_IDLE_TIMEOUT`] without use. Each render gets a
+/// disposable browser context and target. The backend injects a strict CSP,
+/// intercepts every request with `Fetch`, and kills the browser on
 /// cancellation, timeout, or protocol failure. Without the feature, [`render`]
 /// returns [`MotionError::RendererUnavailable`].
+///
+/// [`DEFAULT_BROWSER_IDLE_TIMEOUT`]: HeadlessChromiumRenderer::DEFAULT_BROWSER_IDLE_TIMEOUT
 #[derive(Clone, Debug)]
 pub struct HeadlessChromiumRenderer {
     cache: MotionCache,
@@ -389,6 +393,10 @@ pub struct HeadlessChromiumRenderer {
 }
 
 impl HeadlessChromiumRenderer {
+    /// How long the retained browser stays alive without a render.
+    pub const DEFAULT_BROWSER_IDLE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(120);
+
     /// Build the renderer with a cache and sandbox policy.
     pub fn new(cache: MotionCache, policy: SandboxPolicy) -> Self {
         #[cfg(feature = "chromium")]
@@ -408,9 +416,22 @@ impl HeadlessChromiumRenderer {
     pub fn with_browser_path(mut self, path: impl Into<PathBuf>) -> Self {
         #[cfg(feature = "chromium")]
         {
+            let idle_timeout = self.browser_pool.idle_timeout();
             self.browser_pool = chromium_backend::BrowserPool::registered();
+            self.browser_pool.set_idle_timeout(idle_timeout);
         }
         self.browser_path = Some(path.into());
+        self
+    }
+
+    /// Close the retained browser after `timeout` without a render instead of
+    /// [`Self::DEFAULT_BROWSER_IDLE_TIMEOUT`]. Clones share the browser pool
+    /// and therefore this setting.
+    pub fn with_browser_idle_timeout(self, timeout: std::time::Duration) -> Self {
+        #[cfg(feature = "chromium")]
+        self.browser_pool.set_idle_timeout(timeout);
+        #[cfg(not(feature = "chromium"))]
+        let _ = timeout;
         self
     }
 
@@ -432,6 +453,21 @@ impl HeadlessChromiumRenderer {
     pub fn shutdown_all_pools() {
         #[cfg(feature = "chromium")]
         chromium_backend::shutdown_all_pools();
+    }
+
+    /// Delete browser profiles that earlier OpenTake processes left in the
+    /// temp directory after a crash or forced exit, returning how many were
+    /// removed. Profiles of running processes are never touched. Renderers
+    /// also do this once per process before their first browser launch.
+    pub fn remove_stale_browser_profiles() -> usize {
+        #[cfg(feature = "chromium")]
+        {
+            chromium_backend::remove_stale_profiles()
+        }
+        #[cfg(not(feature = "chromium"))]
+        {
+            0
+        }
     }
 
     /// Locate Chrome, Chromium, or Edge without launching it. An explicit
@@ -542,18 +578,18 @@ impl HeadlessChromiumRenderer {
         cancellation: &MotionCancellationToken,
         progress: &dyn Fn(u32, u32),
     ) -> MotionResult<RenderedClip> {
-        let validated = (|| {
+        let validated = (|| -> MotionResult<()> {
             req.validate()?;
             if let MotionSource::Code { html_css_js } = &req.source {
                 self.policy.check_document_size(html_css_js)?;
             }
             Ok(())
         })();
-        if let Err(error) = validated {
-            #[cfg(feature = "chromium")]
+        #[cfg(feature = "chromium")]
+        if validated.is_err() {
             self.browser_pool.invalidate_idle();
-            return Err(error);
         }
+        validated?;
 
         #[cfg(feature = "chromium")]
         {
@@ -580,11 +616,12 @@ impl MotionRenderer for HeadlessChromiumRenderer {
 mod chromium_backend {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
-    use std::io::{BufRead, BufReader, Cursor};
-    use std::net::TcpStream;
+    use std::io::{BufRead, BufReader, Cursor, PipeReader, PipeWriter, Read, Write};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{mpsc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
+    use std::sync::{
+        mpsc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError, TryLockError, Weak,
+    };
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -592,15 +629,20 @@ mod chromium_backend {
     use opentake_process_tree::{configure_command, ProcessTree};
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
-    use tungstenite::stream::MaybeTlsStream;
-    use tungstenite::{Message, WebSocket};
 
     use super::*;
 
     static AUTHOR_FENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static BROWSER_POOLS: OnceLock<Mutex<Vec<Weak<BrowserPool>>>> = OnceLock::new();
+    static IDLE_REAPER: OnceLock<(Mutex<IdleReaper>, Condvar)> = OnceLock::new();
     const GPU_TRACE_FIELD_LIMIT: usize = 96;
     const GPU_TRACE_STATUS_LIMIT: usize = 48;
+    /// CDP reads wake up this often so cancellation and watchdogs stay prompt.
+    const CDP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    /// Largest CDP message accepted from Chromium. A guarded 4096x4096
+    /// screencast frame, the largest legitimate message, stays well below it.
+    const MAX_CDP_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+    const PROFILE_PREFIX: &str = "opentake-chromium-";
 
     fn trace_enabled() -> bool {
         std::env::var_os("OPENTAKE_MOTION_TRACE").is_some()
@@ -615,8 +657,11 @@ mod chromium_backend {
     fn browser_launch_args() -> &'static [&'static str] {
         &[
             "--headless=new",
-            "--remote-debugging-port=0",
-            "--remote-debugging-address=127.0.0.1",
+            // CDP travels over pipes inherited at spawn (descriptors 3 and 4
+            // on Unix; on Windows the handles --remote-debugging-io-pipes
+            // names). No socket listens for another local process, and the
+            // browser exits when OpenTake's end of the pipe closes.
+            "--remote-debugging-pipe",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-networking",
@@ -639,18 +684,24 @@ mod chromium_backend {
         ]
     }
 
-    fn drain_browser_stderr<R: BufRead>(reader: R, sender: mpsc::Sender<String>) -> usize {
+    /// The Windows switch naming the inherited pipe handles Chromium reads
+    /// commands from and writes events to.
+    #[cfg(any(windows, test))]
+    fn windows_io_pipes_arg(commands: u32, events: u32) -> String {
+        format!("--remote-debugging-io-pipes={commands},{events}")
+    }
+
+    /// Forward Chromium diagnostics to the Motion trace. Stderr is only piped
+    /// while tracing, and then it is consumed through EOF: a full pipe blocks
+    /// Chrome/GPU/Viz threads on Windows.
+    fn drain_browser_stderr<R: BufRead>(reader: R) -> usize {
         let mut drained = 0usize;
         for line in reader.lines() {
             let Ok(line) = line else {
                 break;
             };
             drained += 1;
-            // Endpoint discovery drops its receiver as soon as launch returns.
-            // Keep consuming the inherited Chrome/GPU/Viz pipe after that:
-            // stopping here can fill the Windows pipe and block compositor
-            // threads while unrelated CDP commands continue to respond.
-            let _ = sender.send(line);
+            trace(format!("chromium: {line}"));
         }
         drained
     }
@@ -659,6 +710,7 @@ mod chromium_backend {
         slot: Mutex<Option<LiveBrowser>>,
         invalidation_pending: AtomicBool,
         shutting_down: AtomicBool,
+        idle_timeout_millis: AtomicU64,
     }
 
     impl BrowserPool {
@@ -667,6 +719,9 @@ mod chromium_backend {
                 slot: Mutex::new(None),
                 invalidation_pending: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
+                idle_timeout_millis: AtomicU64::new(duration_millis(
+                    HeadlessChromiumRenderer::DEFAULT_BROWSER_IDLE_TIMEOUT,
+                )),
             }
         }
 
@@ -675,10 +730,21 @@ mod chromium_backend {
             let mut registry = BROWSER_POOLS
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             registry.retain(|weak| weak.strong_count() != 0);
             registry.push(Arc::downgrade(&pool));
             pool
+        }
+
+        pub(super) fn idle_timeout(&self) -> Duration {
+            Duration::from_millis(self.idle_timeout_millis.load(Ordering::Acquire))
+        }
+
+        pub(super) fn set_idle_timeout(&self, timeout: Duration) {
+            self.idle_timeout_millis
+                .store(duration_millis(timeout), Ordering::Release);
+            // A retained browser is re-evaluated against the new timeout.
+            wake_idle_reaper();
         }
 
         pub(super) fn shutdown(&self) {
@@ -737,22 +803,23 @@ mod chromium_backend {
                 drop(slot.take());
             }
             if let Some(browser) = slot.as_mut() {
-                if let Some(status) = browser.process.try_wait()? {
+                if let Some(reason) = browser.unusable_reason() {
                     drop(slot.take());
                     return Err(MotionError::render_failed(format!(
-                        "reusable Chromium exited before the next render: {status}"
+                        "reusable Chromium exited before the next render: {reason}"
                     )));
                 }
                 trace("reusing live Chromium process");
             } else {
-                let (process, websocket_url) =
+                let (process, pipe) =
                     BrowserProcess::launch(executable, deadline, timeout, cancellation)?;
                 *slot = Some(LiveBrowser {
                     process,
-                    websocket_url,
+                    pipe: Some(pipe),
                     executable: executable.to_path_buf(),
+                    idle_since: Instant::now(),
                 });
-                trace("browser launched and CDP endpoint is ready");
+                trace("browser launched and CDP pipe is ready");
             }
 
             Ok(BrowserLease {
@@ -790,6 +857,31 @@ mod chromium_backend {
             drop(slot);
             drop(browser);
         }
+
+        /// Close the retained browser once it has been unused for the idle
+        /// timeout. Returns when this pool next needs a look, if ever; a pool
+        /// with an active lease is skipped because the lease wakes the reaper
+        /// when it retains its browser.
+        fn reap_idle(&self, now: Instant) -> Option<Instant> {
+            let mut slot = match self.slot.try_lock() {
+                Ok(slot) => slot,
+                Err(TryLockError::WouldBlock) => return None,
+                Err(TryLockError::Poisoned(error)) => {
+                    let slot = error.into_inner();
+                    self.slot.clear_poison();
+                    slot
+                }
+            };
+            let expires = slot.as_ref()?.idle_since.checked_add(self.idle_timeout())?;
+            if now < expires {
+                return Some(expires);
+            }
+            trace("closing idle Chromium process");
+            // Shut down while holding the slot so a concurrent acquire waits
+            // for this browser to exit instead of racing its profile cleanup.
+            drop(slot.take());
+            None
+        }
     }
 
     impl std::fmt::Debug for BrowserPool {
@@ -800,10 +892,45 @@ mod chromium_backend {
         }
     }
 
+    fn duration_millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn registered_pools() -> Vec<Arc<BrowserPool>> {
+        let Some(registry) = BROWSER_POOLS.get() else {
+            return Vec::new();
+        };
+        registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
     struct LiveBrowser {
         process: BrowserProcess,
-        websocket_url: String,
+        /// Lent to one render at a time; a browser whose pipe was not handed
+        /// back is never retained.
+        pipe: Option<CdpPipe>,
         executable: PathBuf,
+        idle_since: Instant,
+    }
+
+    impl LiveBrowser {
+        /// Why this retained browser cannot serve another render, if it can't:
+        /// it exited or its CDP pipe is gone.
+        fn unusable_reason(&mut self) -> Option<String> {
+            match self.process.try_wait() {
+                Ok(Some(status)) => return Some(format!("exited with {status}")),
+                Ok(None) => {}
+                Err(error) => return Some(format!("process status is unavailable: {error}")),
+            }
+            match self.pipe.as_mut() {
+                Some(pipe) => pipe.discard_idle_messages().err(),
+                None => Some("its CDP pipe was not returned".to_owned()),
+            }
+        }
     }
 
     struct BrowserLease<'a> {
@@ -814,38 +941,49 @@ mod chromium_backend {
     }
 
     impl BrowserLease<'_> {
-        fn websocket_url(&self) -> MotionResult<&str> {
+        fn browser(&mut self) -> MotionResult<&mut LiveBrowser> {
             self.slot
-                .as_ref()
-                .and_then(|slot| slot.as_ref())
-                .map(|browser| browser.websocket_url.as_str())
+                .as_mut()
+                .and_then(|slot| slot.as_mut())
                 .ok_or_else(|| MotionError::render_failed("Chromium browser lease was empty"))
         }
 
+        /// Lend the browser's CDP pipe to one render. The browser is retained
+        /// only if the render hands the pipe back with [`Self::restore_pipe`].
+        fn take_pipe(&mut self) -> MotionResult<CdpPipe> {
+            self.browser()?
+                .pipe
+                .take()
+                .ok_or_else(|| MotionError::render_failed("Chromium CDP pipe is already in use"))
+        }
+
+        fn restore_pipe(&mut self, pipe: CdpPipe) {
+            if let Ok(browser) = self.browser() {
+                browser.pipe = Some(pipe);
+            }
+        }
+
         fn commit_reuse(&mut self) {
-            if self.pool.shutting_down.load(Ordering::Acquire)
+            let tainted = self.pool.shutting_down.load(Ordering::Acquire)
                 || self.observed_invalidation
-                || self.pool.invalidation_pending.swap(false, Ordering::AcqRel)
-            {
-                let browser = self.slot.as_mut().and_then(|slot| slot.take());
+                || self.pool.invalidation_pending.swap(false, Ordering::AcqRel);
+            let Some(slot) = self.slot.as_mut() else {
+                return;
+            };
+            if tainted || slot.as_ref().is_some_and(|browser| browser.pipe.is_none()) {
+                let browser = slot.take();
                 drop(browser);
                 return;
+            }
+            if let Some(browser) = slot.as_mut() {
+                browser.idle_since = Instant::now();
             }
             self.reusable = true;
         }
     }
 
     pub(super) fn shutdown_all_pools() {
-        let Some(registry) = BROWSER_POOLS.get() else {
-            return;
-        };
-        let pools: Vec<_> = registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for pool in pools {
+        for pool in registered_pools() {
             pool.shutdown();
         }
     }
@@ -858,6 +996,7 @@ mod chromium_backend {
                 .take()
                 .expect("Chromium browser lease guard is present until drop");
             let browser = (!self.reusable || pending).then(|| slot.take()).flatten();
+            let retained = slot.is_some();
             drop(slot);
             drop(browser);
 
@@ -865,6 +1004,64 @@ mod chromium_backend {
             // the guard was released. A later acquirer also checks the pending
             // bit before it can reuse the retained browser.
             self.pool.drain_pending_invalidation();
+            if retained {
+                wake_idle_reaper();
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct IdleReaper {
+        running: bool,
+        rescan: bool,
+    }
+
+    fn idle_reaper() -> &'static (Mutex<IdleReaper>, Condvar) {
+        IDLE_REAPER.get_or_init(|| (Mutex::new(IdleReaper::default()), Condvar::new()))
+    }
+
+    /// Make sure a thread closes retained browsers once they have been idle
+    /// for their pool's idle timeout. The thread exits while no pool retains
+    /// a browser; the next retained lease starts it again.
+    fn wake_idle_reaper() {
+        let (state, wakeup) = idle_reaper();
+        let mut reaper = state.lock().unwrap_or_else(PoisonError::into_inner);
+        reaper.rescan = true;
+        if !reaper.running {
+            // Without the thread a retained browser simply lives until the
+            // renderer or the application shuts its pool down.
+            reaper.running = thread::Builder::new()
+                .name("opentake-chromium-idle".to_owned())
+                .spawn(run_idle_reaper)
+                .is_ok();
+        }
+        wakeup.notify_one();
+    }
+
+    fn run_idle_reaper() {
+        let (state, wakeup) = idle_reaper();
+        let mut reaper = state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            reaper.rescan = false;
+            drop(reaper);
+            let next = registered_pools()
+                .iter()
+                .filter_map(|pool| pool.reap_idle(Instant::now()))
+                .min();
+            reaper = state.lock().unwrap_or_else(PoisonError::into_inner);
+            if reaper.rescan {
+                // A lease retained a browser during the scan.
+                continue;
+            }
+            let Some(next) = next else {
+                reaper.running = false;
+                return;
+            };
+            let wait = next.saturating_duration_since(Instant::now());
+            reaper = wakeup
+                .wait_timeout(reaper, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -947,14 +1144,8 @@ mod chromium_backend {
         let dir = renderer.cache.begin_render(req)?;
         remove_partial_frames(&dir)?;
         let mut partial = PartialFrames::new(dir.clone());
-        let websocket_url = browser.websocket_url()?.to_owned();
-        let (socket, _) = tungstenite::connect(websocket_url.as_str()).map_err(|error| {
-            MotionError::render_failed(format!("failed to connect to Chromium CDP: {error}"))
-        })?;
-        trace("connected to browser CDP");
-        set_socket_poll_timeout(&socket)?;
         let mut cdp = Cdp::new(
-            socket,
+            browser.take_pipe()?,
             renderer.policy.clone(),
             cancellation.clone(),
             deadline,
@@ -1135,7 +1326,7 @@ mod chromium_backend {
         cdp.close_target(&target_id)?;
         cdp.dispose_browser_context(&browser_context_id)?;
         check_abort(cancellation, deadline, renderer.policy.timeout)?;
-        drop(cdp);
+        browser.restore_pipe(cdp.into_pipe());
         publish_completed_render(
             cancellation,
             renderer.policy.timeout,
@@ -1732,34 +1923,18 @@ mod chromium_backend {
             deadline: Instant,
             timeout: Duration,
             cancellation: &MotionCancellationToken,
-        ) -> MotionResult<(Self, String)> {
+        ) -> MotionResult<(Self, CdpPipe)> {
+            remove_stale_profiles_once();
             // tempfile creates an exclusive user-private directory (0700 on
             // Unix), even when the shared OS temp directory is world readable.
             let profile = create_private_profile()?;
-            let mut command = Command::new(executable);
-            command
-                .args(browser_launch_args())
-                .arg(format!("--user-data-dir={}", profile.display()))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-            configure_command(&mut command);
-            #[cfg(target_os = "linux")]
-            kill_with_parent_process(&mut command);
-            let mut child = spawn_browser(command).map_err(|error| {
-                let _ = std::fs::remove_dir_all(&profile);
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    MotionError::renderer_unavailable(format!(
-                        "Chromium executable does not exist at {}",
-                        executable.display()
-                    ))
-                } else {
-                    MotionError::render_failed(format!(
-                        "failed to launch Chromium at {}: {error}",
-                        executable.display()
-                    ))
+            let (mut child, host) = match spawn_with_cdp_pipes(executable, &profile) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&profile);
+                    return Err(error);
                 }
-            })?;
+            };
             let tree = match ProcessTree::attach(child.id()) {
                 Ok(tree) => tree,
                 Err(error) => {
@@ -1777,46 +1952,58 @@ mod chromium_backend {
                 tree,
                 shutdown_complete: false,
             };
-            let Some(stderr) = process.child.as_mut().and_then(|child| child.stderr.take()) else {
-                let _ = process.shutdown();
-                return Err(MotionError::render_failed(
-                    "Chromium stderr was not captured",
-                ));
-            };
-            let (sender, receiver) = mpsc::channel();
-            thread::spawn(move || {
-                drain_browser_stderr(BufReader::new(stderr), sender);
-            });
+            if let Some(stderr) = process.child.as_mut().and_then(|child| child.stderr.take()) {
+                // Only piped while tracing. Without the drain thread the pipe
+                // is closed, so Chromium's writes fail instead of blocking.
+                let _ = thread::Builder::new()
+                    .name("opentake-chromium-stderr".to_owned())
+                    .spawn(move || drain_browser_stderr(BufReader::new(stderr)));
+            }
+            let mut pipe = CdpPipe::new(host.commands, host.events).map_err(|error| {
+                MotionError::render_failed(format!(
+                    "failed to start the Chromium CDP pipe: {error}"
+                ))
+            })?;
+            process.wait_until_ready(&mut pipe, deadline, timeout, cancellation)?;
+            Ok((process, pipe))
+        }
 
+        /// Chromium starts serving CDP once it answers its first command.
+        fn wait_until_ready(
+            &mut self,
+            pipe: &mut CdpPipe,
+            deadline: Instant,
+            timeout: Duration,
+            cancellation: &MotionCancellationToken,
+        ) -> MotionResult<()> {
+            let id = pipe.next_id();
+            pipe.send(&json!({"id": id, "method": "Browser.getVersion", "params": {}}))?;
             loop {
-                if cancellation.is_cancelled() {
-                    return Err(MotionError::Cancelled);
-                }
-                if Instant::now() >= deadline {
-                    return Err(MotionError::Timeout(timeout));
-                }
-                if let Some(status) = process
-                    .child
-                    .as_mut()
-                    .expect("launched Chromium child is present")
-                    .try_wait()?
-                {
+                check_abort_state(cancellation, deadline, timeout)?;
+                if let Some(status) = self.try_wait()? {
                     return Err(MotionError::render_failed(format!(
                         "Chromium exited before CDP was ready: {status}"
                     )));
                 }
-                match receiver.recv_timeout(Duration::from_millis(20)) {
-                    Ok(line) => {
-                        if let Some((_, url)) = line.split_once("DevTools listening on ") {
-                            return Ok((process, url.trim().to_owned()));
-                        }
+                let message = match pipe.recv(Duration::from_millis(20)) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        return Err(match self.try_wait() {
+                            Ok(Some(status)) => MotionError::render_failed(format!(
+                                "Chromium exited before CDP was ready: {status}"
+                            )),
+                            _ => error,
+                        });
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(MotionError::render_failed(
-                            "Chromium closed stderr before publishing its CDP endpoint",
-                        ));
-                    }
+                };
+                if message.get("id").and_then(Value::as_u64) == Some(id) {
+                    return match message.get("error") {
+                        Some(error) => Err(MotionError::render_failed(format!(
+                            "Chromium CDP Browser.getVersion failed: {error}"
+                        ))),
+                        None => Ok(()),
+                    };
                 }
             }
         }
@@ -1885,6 +2072,50 @@ mod chromium_backend {
         }
     }
 
+    /// Spawn Chromium with its CDP pipe ends and return OpenTake's ends.
+    fn spawn_with_cdp_pipes(
+        executable: &Path,
+        profile: &Path,
+    ) -> MotionResult<(Child, HostPipeEnds)> {
+        let (host, browser) = cdp_pipes().map_err(|error| {
+            MotionError::render_failed(format!("failed to create the Chromium CDP pipes: {error}"))
+        })?;
+        let mut command = Command::new(executable);
+        command
+            .args(browser_launch_args())
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(if trace_enabled() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        configure_command(&mut command);
+        #[cfg(target_os = "linux")]
+        kill_with_parent_process(&mut command);
+        let inherited = inherit_cdp_pipes(&mut command, browser).map_err(|error| {
+            MotionError::render_failed(format!("failed to hand the CDP pipes to Chromium: {error}"))
+        })?;
+        let child = spawn_browser(command).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                MotionError::renderer_unavailable(format!(
+                    "Chromium executable does not exist at {}",
+                    executable.display()
+                ))
+            } else {
+                MotionError::render_failed(format!(
+                    "failed to launch Chromium at {}: {error}",
+                    executable.display()
+                ))
+            }
+        })?;
+        // From here on only the browser holds its pipe ends: each side sees
+        // end-of-file as soon as the other side closes or dies.
+        drop(inherited);
+        Ok((child, host))
+    }
+
     /// Kill the browser when the app process dies. Tauri exits with
     /// `process::exit`, so destructors cannot be the only containment boundary
     /// for a retained Chromium process.
@@ -1934,7 +2165,7 @@ mod chromium_backend {
         let (reply, response) = mpsc::sync_channel(1);
         spawner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .send((command, reply))
             .map_err(|_| stopped())?;
         response.recv().map_err(|_| stopped())?
@@ -1946,8 +2177,9 @@ mod chromium_backend {
     }
 
     fn create_private_profile() -> std::io::Result<PathBuf> {
-        // Keep the owning pid in the name so leftovers can be traced to a process.
-        let prefix = format!("opentake-chromium-{}-", std::process::id());
+        // Keep the owning pid in the name so leftovers can be traced to a
+        // process and removed once it no longer exists.
+        let prefix = format!("{PROFILE_PREFIX}{}-", std::process::id());
         let mut builder = tempfile::Builder::new();
         builder.prefix(&prefix);
         #[cfg(unix)]
@@ -1958,22 +2190,467 @@ mod chromium_backend {
         Ok(builder.tempdir()?.keep())
     }
 
-    type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+    /// Remove Chromium profiles that OpenTake processes which no longer exist
+    /// left in the temp directory (a crash or kill skips profile cleanup).
+    /// Profiles of running processes, this one included, are never touched.
+    pub(super) fn remove_stale_profiles() -> usize {
+        remove_stale_profiles_in(
+            &std::env::temp_dir(),
+            std::process::id(),
+            process_is_running,
+        )
+    }
 
-    fn set_socket_poll_timeout(socket: &CdpSocket) -> MotionResult<()> {
-        match socket.get_ref() {
-            MaybeTlsStream::Plain(stream) => stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .map_err(MotionError::Io),
-            _ => Err(MotionError::render_failed(
-                "the local Chromium CDP endpoint unexpectedly used TLS",
-            )),
+    fn remove_stale_profiles_once() {
+        static SWEEP: Once = Once::new();
+        SWEEP.call_once(|| {
+            let removed = remove_stale_profiles();
+            if removed > 0 {
+                trace(format!("removed {removed} stale Chromium profiles"));
+            }
+        });
+    }
+
+    fn remove_stale_profiles_in(
+        dir: &Path,
+        own_pid: u32,
+        is_running: impl Fn(u32) -> Option<bool>,
+    ) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let Some(owner) = entry.file_name().to_str().and_then(profile_owner) else {
+                continue;
+            };
+            // An unknown liveness answer keeps the profile.
+            if owner == own_pid || is_running(owner) != Some(false) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_dir() || !owned_by_current_user(&metadata) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(error) => trace(format!(
+                    "stale Chromium profile {} was not removed: {error}",
+                    path.display()
+                )),
+            }
+        }
+        removed
+    }
+
+    /// The owning process id of a profile named `opentake-chromium-<pid>-<suffix>`.
+    fn profile_owner(name: &str) -> Option<u32> {
+        let (pid, suffix) = name.strip_prefix(PROFILE_PREFIX)?.split_once('-')?;
+        if pid.is_empty() || suffix.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        pid.parse().ok()
+    }
+
+    #[cfg(unix)]
+    fn owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        metadata.uid() == unsafe { libc::geteuid() }
+    }
+
+    /// The Windows temp directory is private to the user.
+    #[cfg(not(unix))]
+    fn owned_by_current_user(_: &std::fs::Metadata) -> bool {
+        true
+    }
+
+    /// Whether `pid` names a running process; `None` when that is unknown.
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> Option<bool> {
+        let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 1)?;
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            Some(libc::EPERM) => Some(true),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_is_running(pid: u32) -> Option<bool> {
+        windows_pipes::process_is_running(pid)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn process_is_running(_: u32) -> Option<bool> {
+        None
+    }
+
+    /// OpenTake's ends of the two CDP pipes.
+    struct HostPipeEnds {
+        commands: PipeWriter,
+        events: PipeReader,
+    }
+
+    /// The browser's ends: it reads commands and writes events.
+    struct BrowserPipeEnds {
+        commands: PipeReader,
+        events: PipeWriter,
+    }
+
+    fn cdp_pipes() -> std::io::Result<(HostPipeEnds, BrowserPipeEnds)> {
+        let (browser_commands, host_commands) = std::io::pipe()?;
+        let (host_events, browser_events) = std::io::pipe()?;
+        Ok((
+            HostPipeEnds {
+                commands: host_commands,
+                events: host_events,
+            },
+            BrowserPipeEnds {
+                commands: browser_commands,
+                events: browser_events,
+            },
+        ))
+    }
+
+    /// Browser pipe ends that must stay open in this process until the
+    /// browser has been spawned, and must be closed right after.
+    struct InheritedPipeEnds {
+        #[cfg(unix)]
+        _ends: [std::os::fd::OwnedFd; 2],
+        #[cfg(windows)]
+        _ends: [std::os::windows::io::OwnedHandle; 2],
+    }
+
+    /// Chromium reads CDP commands from descriptor 3 and writes to 4.
+    #[cfg(unix)]
+    fn inherit_cdp_pipes(
+        command: &mut Command,
+        browser: BrowserPipeEnds,
+    ) -> std::io::Result<InheritedPipeEnds> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        // Move both ends above the fixed descriptors, so neither dup2 in the
+        // child can replace the other end before it is duplicated. The copies
+        // stay close-on-exec; dup2 clears the flag on descriptors 3 and 4.
+        let above_fixed = |fd: libc::c_int| -> std::io::Result<OwnedFd> {
+            // SAFETY: `fd` is an open descriptor owned by `browser`;
+            // F_DUPFD_CLOEXEC returns a new descriptor owned by the result.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+            if duplicate < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fcntl succeeded, so `duplicate` is open and unowned.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+        };
+        let commands = above_fixed(browser.commands.as_raw_fd())?;
+        let events = above_fixed(browser.events.as_raw_fd())?;
+        drop(browser);
+        let (commands_fd, events_fd) = (commands.as_raw_fd(), events.as_raw_fd());
+        // SAFETY: the hook runs in the forked child before exec and only calls
+        // the async-signal-safe dup2. Both descriptors stay open in this
+        // process until the spawn returns (they are owned by the result).
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(commands_fd, 3) < 0 || libc::dup2(events_fd, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(InheritedPipeEnds {
+            _ends: [commands, events],
+        })
+    }
+
+    /// Windows Chromium adopts inherited pipe handles named by value in
+    /// `--remote-debugging-io-pipes` (Chromium 117+).
+    #[cfg(windows)]
+    fn inherit_cdp_pipes(
+        command: &mut Command,
+        browser: BrowserPipeEnds,
+    ) -> std::io::Result<InheritedPipeEnds> {
+        use std::os::windows::io::AsRawHandle;
+
+        // Std spawns with bInheritHandles and no handle list, so these
+        // duplicates are inheritable only across the spawn below. A process
+        // another thread starts in that window may inherit them as well; they
+        // are the browser's ends (read commands, write events), which cannot
+        // be used to send the browser a command.
+        let commands = windows_pipes::inheritable_duplicate(browser.commands.as_raw_handle())?;
+        let events = windows_pipes::inheritable_duplicate(browser.events.as_raw_handle())?;
+        drop(browser);
+        command.arg(windows_io_pipes_arg(
+            windows_pipes::handle_value(&commands)?,
+            windows_pipes::handle_value(&events)?,
+        ));
+        Ok(InheritedPipeEnds {
+            _ends: [commands, events],
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn inherit_cdp_pipes(
+        _command: &mut Command,
+        _browser: BrowserPipeEnds,
+    ) -> std::io::Result<InheritedPipeEnds> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Chromium CDP pipes are not supported on this platform",
+        ))
+    }
+
+    #[cfg(windows)]
+    mod windows_pipes {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
+            ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        /// An inheritable duplicate of `handle`. Inherited handles keep their
+        /// value in the child, which is how Chromium finds them.
+        pub(super) fn inheritable_duplicate(handle: RawHandle) -> std::io::Result<OwnedHandle> {
+            let mut duplicate: HANDLE = std::ptr::null_mut();
+            // SAFETY: `handle` is a live pipe handle the caller owns, the
+            // current-process pseudo handle needs no closing, and `duplicate`
+            // outlives the call.
+            let duplicated = unsafe {
+                let process = GetCurrentProcess();
+                DuplicateHandle(
+                    process,
+                    handle,
+                    process,
+                    &mut duplicate,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if duplicated == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: DuplicateHandle succeeded; the new handle is owned here.
+            Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+        }
+
+        /// Chromium parses each handle as an unsigned 32-bit integer; kernel
+        /// handle values always fit.
+        pub(super) fn handle_value(handle: &OwnedHandle) -> std::io::Result<u32> {
+            u32::try_from(handle.as_raw_handle() as usize).map_err(|_| {
+                std::io::Error::other("pipe handle does not fit Chromium's handle argument")
+            })
+        }
+
+        pub(super) fn process_is_running(pid: u32) -> Option<bool> {
+            // SAFETY: no pointers are passed; a returned handle is closed below.
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if process.is_null() {
+                // SAFETY: reads the calling thread's last-error value.
+                return match unsafe { GetLastError() } {
+                    ERROR_INVALID_PARAMETER => Some(false),
+                    ERROR_ACCESS_DENIED => Some(true),
+                    _ => None,
+                };
+            }
+            let mut exit_code = 0_u32;
+            // SAFETY: `process` is a live handle with query access and
+            // `exit_code` outlives the call.
+            let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+            // SAFETY: closes the handle opened above exactly once.
+            unsafe {
+                let _ = CloseHandle(process);
+            }
+            queried.then_some(exit_code == STILL_ACTIVE as u32)
+        }
+    }
+
+    /// One Chrome DevTools Protocol connection over the browser's debugging
+    /// pipes: JSON messages, each terminated by a NUL byte. The blocking pipe
+    /// I/O runs on two threads, so reads honour cancellation and watchdogs and
+    /// a stalled browser can never block a render in `write`.
+    pub(super) struct CdpPipe {
+        outgoing: mpsc::Sender<Vec<u8>>,
+        incoming: mpsc::Receiver<Inbound>,
+        next_id: u64,
+        closed: Option<String>,
+    }
+
+    enum Inbound {
+        Message(Vec<u8>),
+        Closed(String),
+    }
+
+    impl CdpPipe {
+        fn new(
+            commands: impl Write + Send + 'static,
+            events: impl Read + Send + 'static,
+        ) -> std::io::Result<Self> {
+            let (outgoing, queued) = mpsc::channel::<Vec<u8>>();
+            let (received, incoming) = mpsc::channel();
+            thread::Builder::new()
+                .name("opentake-cdp-writer".to_owned())
+                .spawn(move || write_cdp_messages(commands, queued))?;
+            thread::Builder::new()
+                .name("opentake-cdp-reader".to_owned())
+                .spawn(move || {
+                    let closed = read_cdp_messages(events, MAX_CDP_MESSAGE_BYTES, |message| {
+                        received.send(Inbound::Message(message)).is_ok()
+                    });
+                    let _ = received.send(Inbound::Closed(closed));
+                })?;
+            Ok(CdpPipe {
+                outgoing,
+                incoming,
+                next_id: 1,
+                closed: None,
+            })
+        }
+
+        /// Command ids stay unique for the browser's lifetime, so a late reply
+        /// to an abandoned command can never answer a later render.
+        fn next_id(&mut self) -> u64 {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn send(&mut self, message: &Value) -> MotionResult<()> {
+            if let Some(reason) = &self.closed {
+                return Err(MotionError::render_failed(format!(
+                    "failed to send Chromium CDP command: {reason}"
+                )));
+            }
+            let mut bytes = serde_json::to_vec(message).map_err(|error| {
+                MotionError::render_failed(format!(
+                    "failed to encode a Chromium CDP command: {error}"
+                ))
+            })?;
+            // JSON escapes control characters, so NUL only ever terminates.
+            bytes.push(0);
+            self.outgoing.send(bytes).map_err(|_| {
+                MotionError::render_failed(
+                    "failed to send Chromium CDP command: the browser pipe is closed",
+                )
+            })
+        }
+
+        /// The next message, or `None` when none arrived within `timeout`.
+        fn recv(&mut self, timeout: Duration) -> MotionResult<Option<Value>> {
+            if let Some(reason) = &self.closed {
+                return Err(cdp_closed_error(reason));
+            }
+            match self.incoming.recv_timeout(timeout) {
+                Ok(Inbound::Message(bytes)) => {
+                    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                        MotionError::render_failed(format!(
+                            "Chromium sent malformed CDP JSON: {error}"
+                        ))
+                    })
+                }
+                Ok(Inbound::Closed(reason)) => {
+                    let error = cdp_closed_error(&reason);
+                    self.closed = Some(reason);
+                    Err(error)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let reason = "the CDP reader stopped".to_owned();
+                    let error = cdp_closed_error(&reason);
+                    self.closed = Some(reason);
+                    Err(error)
+                }
+            }
+        }
+
+        /// Drop whatever arrived while the browser was idle (late events of
+        /// earlier renders) and report why the pipe is unusable, if it is.
+        fn discard_idle_messages(&mut self) -> Result<(), String> {
+            loop {
+                if let Some(reason) = &self.closed {
+                    return Err(reason.clone());
+                }
+                match self.incoming.try_recv() {
+                    Ok(Inbound::Message(_)) => {}
+                    Ok(Inbound::Closed(reason)) => self.closed = Some(reason),
+                    Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.closed = Some("the CDP reader stopped".to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    fn cdp_closed_error(reason: &str) -> MotionError {
+        MotionError::render_failed(format!(
+            "Chromium CDP connection closed unexpectedly: {reason}"
+        ))
+    }
+
+    fn write_cdp_messages(mut pipe: impl Write, messages: mpsc::Receiver<Vec<u8>>) {
+        for message in messages {
+            if pipe
+                .write_all(&message)
+                .and_then(|()| pipe.flush())
+                .is_err()
+            {
+                // The reader reports the closed connection to the render.
+                return;
+            }
+        }
+    }
+
+    /// Split the browser's event pipe into NUL-terminated messages and hand
+    /// each to `deliver` until it returns false. Returns why reading stopped.
+    fn read_cdp_messages(
+        mut pipe: impl Read,
+        max_message_bytes: usize,
+        mut deliver: impl FnMut(Vec<u8>) -> bool,
+    ) -> String {
+        let too_large = || format!("a CDP message exceeded {max_message_bytes} bytes");
+        let mut pending = Vec::new();
+        let mut chunk = vec![0_u8; 64 * 1024];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) if pending.is_empty() => return "Chromium closed the CDP pipe".to_owned(),
+                Ok(0) => return "Chromium closed the CDP pipe inside a message".to_owned(),
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return format!("reading the CDP pipe failed: {error}"),
+            };
+            let mut received = &chunk[..read];
+            while let Some(end) = received.iter().position(|byte| *byte == 0) {
+                if pending.len() + end > max_message_bytes {
+                    return too_large();
+                }
+                pending.extend_from_slice(&received[..end]);
+                if !deliver(std::mem::take(&mut pending)) {
+                    return "the CDP connection was dropped".to_owned();
+                }
+                received = &received[end + 1..];
+            }
+            if pending.len() + received.len() > max_message_bytes {
+                return too_large();
+            }
+            pending.extend_from_slice(received);
         }
     }
 
     struct Cdp {
-        socket: CdpSocket,
-        next_id: u64,
+        pipe: CdpPipe,
         policy: SandboxPolicy,
         cancellation: MotionCancellationToken,
         deadline: Instant,
@@ -1985,14 +2662,13 @@ mod chromium_backend {
 
     impl Cdp {
         fn new(
-            socket: CdpSocket,
+            pipe: CdpPipe,
             policy: SandboxPolicy,
             cancellation: MotionCancellationToken,
             deadline: Instant,
         ) -> Self {
             Self {
-                socket,
-                next_id: 1,
+                pipe,
                 policy,
                 cancellation,
                 deadline,
@@ -2003,14 +2679,18 @@ mod chromium_backend {
             }
         }
 
+        /// Hand the connection back for the next render of this browser.
+        fn into_pipe(self) -> CdpPipe {
+            self.pipe
+        }
+
         fn command(
             &mut self,
             method: &str,
             params: Value,
             session: Option<&str>,
         ) -> MotionResult<Value> {
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.pipe.next_id();
             let mut message = json!({"id": id, "method": method, "params": params});
             if let Some(session) = session {
                 message["sessionId"] = Value::String(session.to_owned());
@@ -2032,8 +2712,7 @@ mod chromium_backend {
         }
 
         fn gpu_backend_trace(&mut self) -> MotionResult<String> {
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.pipe.next_id();
             self.send(json!({
                 "id": id,
                 "method": "SystemInfo.getInfo",
@@ -2738,49 +3417,14 @@ mod chromium_backend {
         }
 
         fn send(&mut self, value: Value) -> MotionResult<()> {
-            self.socket
-                .send(Message::text(value.to_string()))
-                .map_err(|error| {
-                    MotionError::render_failed(format!(
-                        "failed to send Chromium CDP command: {error}"
-                    ))
-                })
+            self.pipe.send(&value)
         }
 
         fn read(&mut self) -> MotionResult<Value> {
             loop {
                 self.check_abort()?;
-                match self.socket.read() {
-                    Ok(Message::Text(text)) => {
-                        return serde_json::from_str(text.as_ref()).map_err(|error| {
-                            MotionError::render_failed(format!(
-                                "Chromium sent malformed CDP JSON: {error}"
-                            ))
-                        });
-                    }
-                    Ok(Message::Ping(payload)) => {
-                        self.socket.send(Message::Pong(payload)).map_err(|error| {
-                            MotionError::render_failed(format!(
-                                "failed to answer Chromium CDP ping: {error}"
-                            ))
-                        })?;
-                    }
-                    Ok(Message::Close(reason)) => {
-                        return Err(MotionError::render_failed(format!(
-                            "Chromium CDP connection closed unexpectedly: {reason:?}"
-                        )));
-                    }
-                    Ok(_) => {}
-                    Err(tungstenite::Error::Io(error))
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => {
-                        return Err(MotionError::render_failed(format!(
-                            "failed to read Chromium CDP response: {error}"
-                        )));
-                    }
+                if let Some(value) = self.pipe.recv(CDP_POLL_INTERVAL)? {
+                    return Ok(value);
                 }
             }
         }
@@ -2833,8 +3477,7 @@ mod chromium_backend {
                 })?;
             let session = event.get("sessionId").and_then(Value::as_str);
             let allowed = url == "about:blank" || self.policy.check_url(url).is_ok();
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.pipe.next_id();
             let (method, params) = if allowed {
                 ("Fetch.continueRequest", json!({"requestId": request_id}))
             } else {
@@ -3259,11 +3902,62 @@ mod chromium_backend {
 
     #[cfg(test)]
     mod tests {
-        use std::net::{TcpListener, TcpStream};
-
-        use tungstenite::protocol::Role;
-
         use super::*;
+
+        /// A frame of the fake browser's side of a CDP pipe.
+        #[derive(Debug)]
+        enum Message {
+            Text(String),
+            Close,
+        }
+
+        impl Message {
+            fn text(text: impl Into<String>) -> Self {
+                Message::Text(text.into())
+            }
+        }
+
+        /// The browser end of an in-process CDP pipe pair, speaking the same
+        /// NUL-terminated framing as Chromium's `--remote-debugging-pipe`.
+        struct FakeBrowser {
+            commands: BufReader<PipeReader>,
+            events: PipeWriter,
+        }
+
+        impl FakeBrowser {
+            fn read(&mut self) -> std::io::Result<Message> {
+                let mut message = Vec::new();
+                if self.commands.read_until(0, &mut message)? == 0 {
+                    return Ok(Message::Close);
+                }
+                assert_eq!(message.pop(), Some(0), "CDP commands end with NUL");
+                String::from_utf8(message)
+                    .map(Message::Text)
+                    .map_err(std::io::Error::other)
+            }
+
+            fn send(&mut self, message: Message) -> std::io::Result<()> {
+                match message {
+                    Message::Text(text) => {
+                        self.events.write_all(text.as_bytes())?;
+                        self.events.write_all(&[0])
+                    }
+                    Message::Close => Ok(()),
+                }
+            }
+        }
+
+        fn fake_cdp_transport() -> (CdpPipe, FakeBrowser) {
+            let (browser_commands, client_commands) = std::io::pipe().unwrap();
+            let (client_events, browser_events) = std::io::pipe().unwrap();
+            (
+                CdpPipe::new(client_commands, client_events).unwrap(),
+                FakeBrowser {
+                    commands: BufReader::new(browser_commands),
+                    events: browser_events,
+                },
+            )
+        }
 
         #[cfg(unix)]
         #[test]
@@ -3316,66 +4010,115 @@ mod chromium_backend {
             assert!(matches!(error, MotionError::Cancelled));
         }
 
-        #[cfg(windows)]
-        #[test]
-        fn shutdown_pool_terminates_browser_and_removes_profile() {
-            let browser = HeadlessChromiumRenderer::find_browser()
-                .expect("Windows native qualification requires Chrome or Edge");
-            let tmp = tempfile::tempdir().unwrap();
-            let renderer = HeadlessChromiumRenderer::new(
-                MotionCache::new(tmp.path()),
-                SandboxPolicy::offline_with_timeout(Duration::from_secs(45)),
+        /// A renderer for live-browser unit tests, or `None` (test skipped)
+        /// when no Chrome, Chromium or Edge is installed.
+        fn live_renderer(root: &Path) -> Option<HeadlessChromiumRenderer> {
+            let Some(browser) = HeadlessChromiumRenderer::find_browser() else {
+                if cfg!(windows) {
+                    panic!("Windows native qualification requires Chrome or Edge");
+                }
+                eprintln!("SKIP: no Chrome, Chromium or Edge executable");
+                return None;
+            };
+            Some(
+                HeadlessChromiumRenderer::new(
+                    MotionCache::new(root),
+                    SandboxPolicy::offline_with_timeout(Duration::from_secs(45)),
+                )
+                .with_browser_path(browser),
             )
-            .with_browser_path(browser);
-            let request = MotionRenderRequest::new(
-                MotionSource::code("<div style='background:#326599'>frame</div>"),
+        }
+
+        fn live_request(color: &str) -> MotionRenderRequest {
+            MotionRenderRequest::new(
+                MotionSource::code(format!("<div style='background:{color}'>frame</div>")),
                 30,
                 1,
                 48,
                 32,
-            );
-            renderer
-                .render(&request)
-                .expect("render a live browser frame");
-            let profile = renderer
-                .browser_pool
-                .slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .expect("successful render retains the browser")
-                .process
-                .profile
-                .clone();
-            assert!(profile.is_dir());
+            )
+        }
 
+        /// The retained browser's root process id and profile.
+        fn retained_browser(renderer: &HeadlessChromiumRenderer) -> (u32, PathBuf) {
+            let slot = renderer.browser_pool.slot.lock().unwrap();
+            let browser = slot
+                .as_ref()
+                .expect("a successful render retains its browser");
+            (
+                browser.process.child.as_ref().unwrap().id(),
+                browser.process.profile.clone(),
+            )
+        }
+
+        /// Processes of `group` that have not exited, per `ps`. Zombies are
+        /// ignored: an orphan's reaping depends on the system's init process.
+        #[cfg(unix)]
+        fn live_process_group_members(group: u32) -> Vec<String> {
+            let listed = Command::new("ps")
+                .args(["-A", "-o", "pid=,pgid=,stat="])
+                .output()
+                .expect("list processes with ps");
+            assert!(listed.status.success());
+            let group = group.to_string();
+            String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .filter(|line| {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    fields.len() >= 3 && fields[1] == group && !fields[2].starts_with('Z')
+                })
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[test]
+        fn shutdown_pool_terminates_browser_and_removes_profile() {
+            let tmp = tempfile::tempdir().unwrap();
+            let Some(renderer) = live_renderer(tmp.path()) else {
+                return;
+            };
+            renderer
+                .render(&live_request("#326599"))
+                .expect("render a live browser frame");
+            let (browser_pid, profile) = retained_browser(&renderer);
+            assert!(profile.is_dir());
+            #[cfg(unix)]
+            assert!(!live_process_group_members(browser_pid).is_empty());
+
+            let started = Instant::now();
             renderer.shutdown_pool();
+            let elapsed = started.elapsed();
 
             assert!(renderer.browser_pool.slot.lock().unwrap().is_none());
             assert!(
                 !profile.exists(),
                 "profile must be removed after process exit"
             );
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    live_process_group_members(browser_pid),
+                    Vec::<String>::new(),
+                    "the whole browser process tree must exit"
+                );
+                assert!(
+                    elapsed <= Duration::from_secs(2),
+                    "shutdown took {elapsed:?}"
+                );
+            }
+            let _ = (browser_pid, elapsed);
         }
 
-        fn fake_cdp_pair() -> (Cdp, WebSocket<TcpStream>) {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+        fn fake_cdp_pair() -> (Cdp, FakeBrowser) {
+            let (client, browser) = fake_cdp_transport();
             (
                 Cdp::new(
-                    client_socket,
+                    client,
                     SandboxPolicy::default(),
                     MotionCancellationToken::new(),
                     Instant::now() + Duration::from_secs(1),
                 ),
-                server_socket,
+                browser,
             )
         }
 
@@ -3390,8 +4133,7 @@ mod chromium_backend {
         fn validate_browser_launch_args_contract(args: &[&str]) -> Result<(), String> {
             const EXPECTED: &[&str] = &[
                 "--headless=new",
-                "--remote-debugging-port=0",
-                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-pipe",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-background-networking",
@@ -3415,7 +4157,15 @@ mod chromium_backend {
             let mut keys = std::collections::BTreeSet::new();
             for argument in args.iter().filter(|argument| argument.starts_with("--")) {
                 let key = argument.split_once('=').map_or(*argument, |(key, _)| key);
-                if key == "--disable-gpu" {
+                // A debugging socket would let any local process drive the
+                // browser; CDP must only use the inherited pipe.
+                if matches!(
+                    key,
+                    "--disable-gpu"
+                        | "--remote-debugging-port"
+                        | "--remote-debugging-address"
+                        | "--remote-allow-origins"
+                ) {
                     return Err(format!("forbidden Chromium switch key: {key}"));
                 }
                 if !keys.insert(key) {
@@ -3429,19 +4179,16 @@ mod chromium_backend {
         }
 
         #[test]
-        fn browser_stderr_is_drained_after_the_endpoint_receiver_disconnects() {
-            let mut stderr =
-                b"DevTools listening on ws://127.0.0.1/devtools/browser/test\n".to_vec();
+        fn browser_stderr_is_drained_through_eof() {
+            let mut stderr = Vec::new();
             for index in 0..512 {
                 stderr.extend_from_slice(format!("gpu-viz-diagnostic-{index:04}\n").as_bytes());
             }
-            let (sender, receiver) = mpsc::channel();
-            drop(receiver);
 
             assert_eq!(
-                drain_browser_stderr(Cursor::new(stderr), sender),
-                513,
-                "Chrome stderr must be consumed through EOF even after endpoint discovery"
+                drain_browser_stderr(Cursor::new(stderr)),
+                512,
+                "Chrome stderr must be consumed through EOF"
             );
         }
 
@@ -3486,8 +4233,151 @@ mod chromium_backend {
         }
 
         #[test]
-        fn browser_launch_args_bind_remote_debugging_to_loopback() {
-            validate_browser_launch_args_contract(browser_launch_args()).unwrap();
+        fn browser_launch_args_use_the_inherited_pipe_and_open_no_debugging_port() {
+            let args = browser_launch_args();
+            validate_browser_launch_args_contract(args).unwrap();
+            assert!(args.contains(&"--remote-debugging-pipe"));
+            for (forbidden, key) in [
+                ("--remote-debugging-port=0", "--remote-debugging-port"),
+                (
+                    "--remote-debugging-address=127.0.0.1",
+                    "--remote-debugging-address",
+                ),
+                ("--remote-allow-origins=*", "--remote-allow-origins"),
+            ] {
+                let mut widened = args.to_vec();
+                widened.insert(1, forbidden);
+                assert_eq!(
+                    validate_browser_launch_args_contract(&widened).unwrap_err(),
+                    format!("forbidden Chromium switch key: {key}")
+                );
+            }
+        }
+
+        #[test]
+        fn windows_pipe_handles_are_named_as_unsigned_integers() {
+            assert_eq!(
+                windows_io_pipes_arg(1234, 5678),
+                "--remote-debugging-io-pipes=1234,5678"
+            );
+        }
+
+        #[test]
+        fn cdp_pipe_frames_json_messages_with_nul_terminators() {
+            let (mut client, mut browser) = fake_cdp_transport();
+            client
+                .send(&json!({"id": 1, "method": "Browser.getVersion", "params": {}}))
+                .unwrap();
+            match browser.read().unwrap() {
+                Message::Text(text) => assert_eq!(
+                    serde_json::from_str::<Value>(&text).unwrap(),
+                    json!({"id": 1, "method": "Browser.getVersion", "params": {}})
+                ),
+                other => panic!("expected a CDP command, got {other:?}"),
+            }
+
+            // Two messages in one write and one split across writes arrive
+            // whole and in order.
+            browser
+                .events
+                .write_all(b"{\"id\":1,\"result\":{}}\0{\"method\":\"A\"}\0{\"meth")
+                .unwrap();
+            browser.events.write_all(b"od\":\"B\"}\0").unwrap();
+            let timeout = Duration::from_secs(5);
+            assert_eq!(client.recv(timeout).unwrap().unwrap()["id"], 1);
+            assert_eq!(client.recv(timeout).unwrap().unwrap()["method"], "A");
+            assert_eq!(client.recv(timeout).unwrap().unwrap()["method"], "B");
+            assert!(client.recv(Duration::from_millis(10)).unwrap().is_none());
+
+            drop(browser);
+            assert!(matches!(
+                client.recv(timeout),
+                Err(MotionError::RenderFailed(message)) if message.contains("closed")
+            ));
+            assert!(client.send(&json!({"id": 2})).is_err());
+            assert!(client.discard_idle_messages().is_err());
+        }
+
+        #[test]
+        fn cdp_reader_rejects_oversized_and_truncated_messages() {
+            let read = |bytes: &[u8]| {
+                let mut delivered = Vec::new();
+                let reason = read_cdp_messages(Cursor::new(bytes.to_vec()), 8, |message| {
+                    delivered.push(String::from_utf8(message).unwrap());
+                    true
+                });
+                (delivered, reason)
+            };
+            assert_eq!(
+                read(b"abc\0defgh\0"),
+                (
+                    vec!["abc".to_owned(), "defgh".to_owned()],
+                    "Chromium closed the CDP pipe".to_owned()
+                )
+            );
+            let (delivered, reason) = read(b"ok\x00123456789\x00");
+            assert_eq!(delivered, vec!["ok".to_owned()]);
+            assert!(reason.contains("exceeded 8 bytes"), "{reason}");
+            let (delivered, reason) = read(b"abc");
+            assert!(delivered.is_empty());
+            assert!(reason.contains("inside a message"), "{reason}");
+        }
+
+        #[test]
+        fn stale_profiles_are_removed_only_for_exited_owners() {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = |name: &str| {
+                let path = temp.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("Local State"), b"{}").unwrap();
+                path
+            };
+            let exited = profile("opentake-chromium-4000001-abc");
+            let running = profile("opentake-chromium-4000002-def");
+            let own = profile("opentake-chromium-4000003-ghi");
+            let unknown = profile("opentake-chromium-4000004-jkl");
+            let malformed = profile("opentake-chromium-4x01-mno");
+            let foreign = profile("other-app-4000001-pqr");
+            let file = temp.path().join("opentake-chromium-4000001-file");
+            std::fs::write(&file, b"not a profile").unwrap();
+            #[cfg(unix)]
+            let link = {
+                let link = temp.path().join("opentake-chromium-4000001-link");
+                std::os::unix::fs::symlink(&running, &link).unwrap();
+                link
+            };
+
+            let removed = remove_stale_profiles_in(temp.path(), 4_000_003, |pid| match pid {
+                4_000_001 | 4_000_003 => Some(false),
+                4_000_002 => Some(true),
+                _ => None,
+            });
+
+            assert_eq!(removed, 1);
+            assert!(!exited.exists());
+            for kept in [&running, &own, &unknown, &malformed, &foreign] {
+                assert!(kept.join("Local State").is_file(), "{kept:?} was removed");
+            }
+            assert!(file.is_file(), "plain files are never removed");
+            #[cfg(unix)]
+            assert!(
+                std::fs::symlink_metadata(&link).is_ok(),
+                "symlinks are neither followed nor removed"
+            );
+        }
+
+        #[test]
+        fn process_liveness_distinguishes_running_and_exited_processes() {
+            assert_eq!(process_is_running(std::process::id()), Some(true));
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            assert_eq!(process_is_running(pid), Some(false));
         }
 
         #[test]
@@ -3562,21 +4452,12 @@ mod chromium_backend {
 
         #[test]
         fn host_document_is_set_into_the_existing_about_blank_frame() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            set_socket_poll_timeout(&client_socket).unwrap();
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let wrapper =
                 host_wrapper_document("<main>author</main>", 48, 32, &SandboxPolicy::default());
             let expected_wrapper = wrapper.clone();
             let server = thread::spawn(move || {
-                let auto_attach = match server_socket.read().unwrap() {
+                let auto_attach = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected auto-attach request, got {other:?}"),
                 };
@@ -3597,11 +4478,11 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
 
-                let get_tree = match server_socket.read().unwrap() {
+                let get_tree = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected frame-tree request, got {other:?}"),
                 };
@@ -3614,7 +4495,7 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "id": 2,
@@ -3624,7 +4505,7 @@ mod chromium_backend {
                     ))
                     .unwrap();
 
-                let set_content = match server_socket.read().unwrap() {
+                let set_content = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected document-content request, got {other:?}"),
                 };
@@ -3663,11 +4544,9 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     }),
                 ] {
-                    server_socket
-                        .send(Message::text(event.to_string()))
-                        .unwrap();
+                    browser.send(Message::text(event.to_string())).unwrap();
                 }
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 3, "result": {}}).to_string()))
                     .unwrap();
 
@@ -3687,7 +4566,7 @@ mod chromium_backend {
                     ),
                     (9, "Runtime.runIfWaitingForDebugger", json!({})),
                 ] {
-                    let command = match server_socket.read().unwrap() {
+                    let command = match browser.read().unwrap() {
                         Message::Text(text) => {
                             serde_json::from_str::<Value>(text.as_ref()).unwrap()
                         }
@@ -3703,7 +4582,7 @@ mod chromium_backend {
                         })
                     );
                     if method == "Runtime.runIfWaitingForDebugger" {
-                        server_socket
+                        browser
                             .send(Message::text(
                                 json!({
                                     "method": "Fetch.requestPaused",
@@ -3717,12 +4596,12 @@ mod chromium_backend {
                             ))
                             .unwrap();
                     }
-                    server_socket
+                    browser
                         .send(Message::text(json!({"id": id, "result": {}}).to_string()))
                         .unwrap();
                 }
 
-                let continued = match server_socket.read().unwrap() {
+                let continued = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected child data request continuation, got {other:?}"),
                 };
@@ -3735,7 +4614,7 @@ mod chromium_backend {
                         "sessionId": "author-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 10, "result": {}}).to_string()))
                     .unwrap();
 
@@ -3768,12 +4647,10 @@ mod chromium_backend {
                         "sessionId": "author-session"
                     }),
                 ] {
-                    server_socket
-                        .send(Message::text(event.to_string()))
-                        .unwrap();
+                    browser.send(Message::text(event.to_string())).unwrap();
                 }
 
-                let isolated_world = match server_socket.read().unwrap() {
+                let isolated_world = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected isolated-world request, got {other:?}"),
                 };
@@ -3789,13 +4666,13 @@ mod chromium_backend {
                     .to_owned();
                 assert_eq!(nonce.len(), 32);
                 assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 11, "result": {"executionContextId": 23}}).to_string(),
                     ))
                     .unwrap();
 
-                let install_fence = match server_socket.read().unwrap() {
+                let install_fence = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected paint-fence install request, got {other:?}"),
                 };
@@ -3812,7 +4689,7 @@ mod chromium_backend {
                         "sessionId": "author-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "id": 12,
@@ -3824,7 +4701,7 @@ mod chromium_backend {
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -3871,19 +4748,10 @@ mod chromium_backend {
         #[test]
         fn oopif_fetch_routes_loopback_policy_on_the_child_session() {
             fn assert_route(policy: SandboxPolicy, expected_method: &str, should_block: bool) {
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-                let (server_stream, _) = listener.accept().unwrap();
-                let client_socket = WebSocket::from_raw_socket(
-                    MaybeTlsStream::Plain(client_stream),
-                    Role::Client,
-                    None,
-                );
-                let mut server_socket =
-                    WebSocket::from_raw_socket(server_stream, Role::Server, None);
+                let (client, mut browser) = fake_cdp_transport();
                 let expected_method = expected_method.to_owned();
                 let server = thread::spawn(move || {
-                    let command = match server_socket.read().unwrap() {
+                    let command = match browser.read().unwrap() {
                         Message::Text(text) => {
                             serde_json::from_str::<Value>(text.as_ref()).unwrap()
                         }
@@ -3894,7 +4762,7 @@ mod chromium_backend {
                     assert_eq!(command["sessionId"], "author-session");
                 });
                 let mut cdp = Cdp::new(
-                    client_socket,
+                    client,
                     policy,
                     MotionCancellationToken::new(),
                     Instant::now() + Duration::from_secs(1),
@@ -3952,17 +4820,9 @@ mod chromium_backend {
 
         #[test]
         fn compositor_fence_advances_a_finite_budget_and_waits_for_expiry() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let request = match server_socket.read().unwrap() {
+                let request = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected text CDP request, got {other:?}"),
                 };
@@ -3979,7 +4839,7 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Emulation.virtualTimeBudgetExpired",
@@ -3989,13 +4849,13 @@ mod chromium_backend {
                         .to_string(),
                     ))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4007,20 +4867,12 @@ mod chromium_backend {
 
         #[test]
         fn browser_contents_are_resized_before_device_metrics() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let (observed_sender, observed_receiver) = mpsc::channel();
             let server = thread::spawn(move || {
                 let mut observed = Vec::new();
                 loop {
-                    let request = match server_socket.read().unwrap() {
+                    let request = match browser.read().unwrap() {
                         Message::Text(text) => {
                             serde_json::from_str::<Value>(text.as_ref()).unwrap()
                         }
@@ -4033,7 +4885,7 @@ mod chromium_backend {
                     } else {
                         json!({})
                     };
-                    server_socket
+                    browser
                         .send(Message::text(
                             json!({"id": id, "result": result}).to_string(),
                         ))
@@ -4047,7 +4899,7 @@ mod chromium_backend {
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4101,11 +4953,11 @@ mod chromium_backend {
                 base64::engine::general_purpose::STANDARD
                     .encode(encode_viewport_png(image, 0).unwrap())
             }
-            fn send(socket: &mut WebSocket<TcpStream>, value: Value) {
-                socket.send(Message::text(value.to_string())).unwrap();
+            fn send(browser: &mut FakeBrowser, value: Value) {
+                browser.send(Message::text(value.to_string())).unwrap();
             }
-            fn exchange(socket: &mut WebSocket<TcpStream>, method: &str, params: Value) {
-                let command = match socket.read().unwrap() {
+            fn exchange(browser: &mut FakeBrowser, method: &str, params: Value) {
+                let command = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
                     other => panic!("expected CDP command, got {other:?}"),
                 };
@@ -4125,36 +4977,26 @@ mod chromium_backend {
                     "Runtime.evaluate" => json!({"result":{"type":"boolean","value":true}}),
                     _ => json!({}),
                 };
-                send(socket, json!({"id":command["id"],"result":result}));
+                send(browser, json!({"id":command["id"],"result":result}));
             }
-            fn advance(socket: &mut WebSocket<TcpStream>) {
+            fn advance(browser: &mut FakeBrowser) {
                 exchange(
-                    socket,
+                    browser,
                     "Emulation.setVirtualTimePolicy",
                     json!({"policy":"advance","budget":1,"maxVirtualTimeTaskStarvationCount":10_000}),
                 );
                 send(
-                    socket,
+                    browser,
                     json!({"method":"Emulation.virtualTimeBudgetExpired","params":{},"sessionId":"capture-session"}),
                 );
             }
-            fn frame(socket: &mut WebSocket<TcpStream>, id: u64, data: &str) {
+            fn frame(browser: &mut FakeBrowser, id: u64, data: &str) {
                 send(
-                    socket,
+                    browser,
                     json!({"method":"Page.screencastFrame","params":{"data":data,"metadata":{},"sessionId":id},"sessionId":"capture-session"}),
                 );
             }
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            client_stream.set_nodelay(true).unwrap();
-            server_stream.set_nodelay(true).unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let seed = [0, 0, 90];
             let transition = [0, 0, 165];
             let desired = [0, 0, 0];
@@ -4166,74 +5008,70 @@ mod chromium_backend {
                 |rgb| json!({"expression":host_background_expression(rgb),"returnByValue":true});
             let server = thread::spawn(move || {
                 exchange(
-                    &mut server_socket,
+                    &mut browser,
                     "Target.attachToTarget",
                     json!({"targetId":"target-id","flatten":true}),
                 );
-                exchange(&mut server_socket, "Page.enable", json!({}));
+                exchange(&mut browser, "Page.enable", json!({}));
                 exchange(
-                    &mut server_socket,
+                    &mut browser,
                     "Emulation.setVirtualTimePolicy",
                     json!({"policy":"pause"}),
                 );
                 exchange(
-                    &mut server_socket,
+                    &mut browser,
                     "Page.startScreencast",
                     json!({"format":"png","maxWidth":2,"maxHeight":2,"everyNthFrame":1}),
                 );
                 // The Windows failure contains three OLD frames: even seed
                 // must not be published until the startup window is drained.
-                frame(&mut server_socket, 70, &stale);
-                frame(&mut server_socket, 71, &stale);
-                frame(&mut server_socket, 72, &stale);
+                frame(&mut browser, 70, &stale);
+                frame(&mut browser, 71, &stale);
+                frame(&mut browser, 72, &stale);
                 for id in 70..=72 {
                     exchange(
-                        &mut server_socket,
+                        &mut browser,
                         "Page.screencastFrameAck",
                         json!({"sessionId":id}),
                     );
                 }
-                exchange(&mut server_socket, "Runtime.evaluate", background(seed));
-                advance(&mut server_socket);
-                frame(&mut server_socket, 77, &seeded);
+                exchange(&mut browser, "Runtime.evaluate", background(seed));
+                advance(&mut browser);
+                frame(&mut browser, 77, &seeded);
                 exchange(
-                    &mut server_socket,
+                    &mut browser,
                     "Page.screencastFrameAck",
                     json!({"sessionId":77}),
                 );
-                exchange(
-                    &mut server_socket,
-                    "Runtime.evaluate",
-                    background(transition),
-                );
-                advance(&mut server_socket);
+                exchange(&mut browser, "Runtime.evaluate", background(transition));
+                advance(&mut browser);
                 for (id, data) in [(73, &seeded), (74, &transitioned)] {
-                    frame(&mut server_socket, id, data);
+                    frame(&mut browser, id, data);
                     exchange(
-                        &mut server_socket,
+                        &mut browser,
                         "Page.screencastFrameAck",
                         json!({"sessionId":id}),
                     );
                 }
-                exchange(&mut server_socket, "Runtime.evaluate", background(desired));
-                advance(&mut server_socket);
+                exchange(&mut browser, "Runtime.evaluate", background(desired));
+                advance(&mut browser);
                 for (id, data) in [(75, &transitioned), (76, &desired_frame)] {
-                    frame(&mut server_socket, id, data);
+                    frame(&mut browser, id, data);
                     exchange(
-                        &mut server_socket,
+                        &mut browser,
                         "Page.screencastFrameAck",
                         json!({"sessionId":id}),
                     );
                 }
-                exchange(&mut server_socket, "Page.stopScreencast", json!({}));
+                exchange(&mut browser, "Page.stopScreencast", json!({}));
                 exchange(
-                    &mut server_socket,
+                    &mut browser,
                     "Target.detachFromTarget",
                     json!({"sessionId":"capture-session"}),
                 );
             });
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::offline_with_timeout(Duration::from_secs(1)),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4260,39 +5098,31 @@ mod chromium_backend {
 
         #[test]
         fn guarded_candidate_detaches_and_preserves_a_pre_start_error() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let read_json = |socket: &mut WebSocket<TcpStream>| match socket.read().unwrap() {
+                let read_json = |browser: &mut FakeBrowser| match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected CDP command, got {other:?}"),
                 };
-                let attach = read_json(&mut server_socket);
+                let attach = read_json(&mut browser);
                 assert_eq!(attach["method"], "Target.attachToTarget");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 1, "result": {"sessionId": "capture-session"}}).to_string(),
                     ))
                     .unwrap();
-                let enable = read_json(&mut server_socket);
+                let enable = read_json(&mut browser);
                 assert_eq!(enable["method"], "Page.enable");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 2, "error": {"code": -1, "message": "setup-primary"}})
                             .to_string(),
                     ))
                     .unwrap();
-                let detach = read_json(&mut server_socket);
+                let detach = read_json(&mut browser);
                 assert_eq!(detach["method"], "Target.detachFromTarget");
                 assert_eq!(detach["params"]["sessionId"], "capture-session");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 3, "error": {"code": -2, "message": "cleanup-secondary"}})
                             .to_string(),
@@ -4301,7 +5131,7 @@ mod chromium_backend {
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4328,29 +5158,21 @@ mod chromium_backend {
 
         #[test]
         fn guarded_candidate_stops_detaches_and_preserves_a_post_start_error() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let read_json = |socket: &mut WebSocket<TcpStream>| match socket.read().unwrap() {
+                let read_json = |browser: &mut FakeBrowser| match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected CDP command, got {other:?}"),
                 };
-                let attach = read_json(&mut server_socket);
+                let attach = read_json(&mut browser);
                 assert_eq!(attach["method"], "Target.attachToTarget");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 1, "result": {"sessionId": "capture-session"}}).to_string(),
                     ))
                     .unwrap();
                 for id in 2..=4 {
-                    let command = read_json(&mut server_socket);
+                    let command = read_json(&mut browser);
                     if id == 4 {
                         assert_eq!(command["method"], "Page.startScreencast");
                     }
@@ -4359,13 +5181,13 @@ mod chromium_backend {
                     } else {
                         json!({})
                     };
-                    server_socket
+                    browser
                         .send(Message::text(
                             json!({"id": id, "result": result}).to_string(),
                         ))
                         .unwrap();
                 }
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Page.screencastFrame",
@@ -4375,22 +5197,22 @@ mod chromium_backend {
                         .to_string(),
                     ))
                     .unwrap();
-                let ack = read_json(&mut server_socket);
+                let ack = read_json(&mut browser);
                 assert_eq!(ack["method"], "Page.screencastFrameAck");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 5, "result": {}}).to_string()))
                     .unwrap();
-                let stop = read_json(&mut server_socket);
+                let stop = read_json(&mut browser);
                 assert_eq!(stop["method"], "Page.stopScreencast");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 6, "error": {"code": -1, "message": "stop-secondary"}})
                             .to_string(),
                     ))
                     .unwrap();
-                let detach = read_json(&mut server_socket);
+                let detach = read_json(&mut browser);
                 assert_eq!(detach["method"], "Target.detachFromTarget");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 7, "error": {"code": -2, "message": "detach-secondary"}})
                             .to_string(),
@@ -4399,7 +5221,7 @@ mod chromium_backend {
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4427,15 +5249,7 @@ mod chromium_backend {
 
         #[test]
         fn viewport_readback_uses_a_bounded_screencast_session() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let png = base64::engine::general_purpose::STANDARD.encode(
                 encode_viewport_png(
                     image::RgbaImage::from_pixel(48, 32, image::Rgba([1, 2, 3, 255])),
@@ -4444,7 +5258,7 @@ mod chromium_backend {
                 .unwrap(),
             );
             let server = thread::spawn(move || {
-                let start = match server_socket.read().unwrap() {
+                let start = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected text CDP request, got {other:?}"),
                 };
@@ -4462,10 +5276,10 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Page.screencastFrame",
@@ -4480,7 +5294,7 @@ mod chromium_backend {
                     ))
                     .unwrap();
 
-                let ack = match server_socket.read().unwrap() {
+                let ack = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast ack, got {other:?}"),
                 };
@@ -4493,11 +5307,11 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 2, "result": {}}).to_string()))
                     .unwrap();
 
-                let stop = match server_socket.read().unwrap() {
+                let stop = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast stop, got {other:?}"),
                 };
@@ -4510,7 +5324,7 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Page.screencastFrame",
@@ -4524,11 +5338,11 @@ mod chromium_backend {
                         .to_string(),
                     ))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 3, "result": {}}).to_string()))
                     .unwrap();
 
-                let late_ack = match server_socket.read().unwrap() {
+                let late_ack = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected late-frame ack, got {other:?}"),
                 };
@@ -4541,13 +5355,13 @@ mod chromium_backend {
                         "sessionId": "render-session"
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 4, "result": {}}).to_string()))
                     .unwrap();
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4563,25 +5377,17 @@ mod chromium_backend {
 
         #[test]
         fn screencast_readback_acks_and_stops_when_the_frame_is_invalid() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let start = match server_socket.read().unwrap() {
+                let start = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast start, got {other:?}"),
                 };
                 assert_eq!(start["method"], "Page.startScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Page.screencastFrame",
@@ -4592,28 +5398,28 @@ mod chromium_backend {
                     ))
                     .unwrap();
 
-                let ack = match server_socket.read().unwrap() {
+                let ack = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected invalid-frame ack, got {other:?}"),
                 };
                 assert_eq!(ack["method"], "Page.screencastFrameAck");
                 assert_eq!(ack["params"]["sessionId"], 7);
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 2, "result": {}}).to_string()))
                     .unwrap();
 
-                let stop = match server_socket.read().unwrap() {
+                let stop = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected cleanup stop, got {other:?}"),
                 };
                 assert_eq!(stop["method"], "Page.stopScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 3, "result": {}}).to_string()))
                     .unwrap();
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4632,25 +5438,17 @@ mod chromium_backend {
 
         #[test]
         fn screencast_ack_fails_closed_on_a_late_blocked_request() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let start = match server_socket.read().unwrap() {
+                let start = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast start, got {other:?}"),
                 };
                 assert_eq!(start["method"], "Page.startScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Page.screencastFrame",
@@ -4661,12 +5459,12 @@ mod chromium_backend {
                     ))
                     .unwrap();
 
-                let ack = match server_socket.read().unwrap() {
+                let ack = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast ack, got {other:?}"),
                 };
                 assert_eq!(ack["method"], "Page.screencastFrameAck");
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Fetch.requestPaused",
@@ -4679,33 +5477,33 @@ mod chromium_backend {
                         .to_string(),
                     ))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 2, "result": {}}).to_string()))
                     .unwrap();
 
-                let failed = match server_socket.read().unwrap() {
+                let failed = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected late request rejection, got {other:?}"),
                 };
                 assert_eq!(failed["id"], 3);
                 assert_eq!(failed["method"], "Fetch.failRequest");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 3, "result": {}}).to_string()))
                     .unwrap();
 
-                let stop = match server_socket.read().unwrap() {
+                let stop = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast stop, got {other:?}"),
                 };
                 assert_eq!(stop["id"], 4);
                 assert_eq!(stop["method"], "Page.stopScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 4, "result": {}}).to_string()))
                     .unwrap();
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4720,15 +5518,7 @@ mod chromium_backend {
 
         #[test]
         fn screencast_readback_filters_the_outer_target_session() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let current_png = base64::engine::general_purpose::STANDARD.encode(
                 encode_viewport_png(
                     image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255])),
@@ -4737,19 +5527,19 @@ mod chromium_backend {
                 .unwrap(),
             );
             let server = thread::spawn(move || {
-                let start = match server_socket.read().unwrap() {
+                let start = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast start, got {other:?}"),
                 };
                 assert_eq!(start["method"], "Page.startScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
                 for (outer_session, inner_session, data) in [
                     ("other-target", 99, "wrong-target".to_owned()),
                     ("render-session", 7, current_png),
                 ] {
-                    server_socket
+                    browser
                         .send(Message::text(
                             json!({
                                 "method": "Page.screencastFrame",
@@ -4765,27 +5555,27 @@ mod chromium_backend {
                         .unwrap();
                 }
 
-                let current_ack = match server_socket.read().unwrap() {
+                let current_ack = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected current-frame ack, got {other:?}"),
                 };
                 assert_eq!(current_ack["method"], "Page.screencastFrameAck");
                 assert_eq!(current_ack["params"]["sessionId"], 7);
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 2, "result": {}}).to_string()))
                     .unwrap();
-                let stop = match server_socket.read().unwrap() {
+                let stop = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected screencast stop, got {other:?}"),
                 };
                 assert_eq!(stop["method"], "Page.stopScreencast");
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 3, "result": {}}).to_string()))
                     .unwrap();
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -4902,30 +5692,18 @@ mod chromium_backend {
 
         #[test]
         fn transparent_capture_uses_three_author_fenced_generations_per_background() {
-            fn read_json(socket: &mut WebSocket<TcpStream>) -> Value {
-                match socket.read().unwrap() {
+            fn read_json(browser: &mut FakeBrowser) -> Value {
+                match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
                     other => panic!("expected CDP command, got {other:?}"),
                 }
             }
 
-            fn send_json(socket: &mut WebSocket<TcpStream>, value: Value) {
-                socket.send(Message::text(value.to_string())).unwrap();
+            fn send_json(browser: &mut FakeBrowser, value: Value) {
+                browser.send(Message::text(value.to_string())).unwrap();
             }
 
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            // Match tungstenite::connect: protocol tests must not accumulate
-            // Nagle/delayed-ACK stalls between consecutive tiny CDP messages.
-            client_stream.set_nodelay(true).unwrap();
-            server_stream.set_nodelay(true).unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let encoded = |pixel: [u8; 4], guard: [u8; 3], marker: AuthorMarker| {
                 let mut image = image::RgbaImage::from_pixel(
                     3,
@@ -4972,7 +5750,7 @@ mod chromium_backend {
                         );
                         let desired_frame = encoded(current, rgb, marker);
                         capture_index += 1;
-                        let attach = read_json(&mut server_socket);
+                        let attach = read_json(&mut browser);
                         assert_eq!(
                             attach,
                             json!({
@@ -4982,7 +5760,7 @@ mod chromium_backend {
                             })
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"id": next_id, "result": {"sessionId": capture_session}}),
                         );
                         next_id += 1;
@@ -5000,7 +5778,7 @@ mod chromium_backend {
                                 }),
                             ),
                         ] {
-                            let command = read_json(&mut server_socket);
+                            let command = read_json(&mut browser);
                             assert_eq!(
                                 command,
                                 json!({
@@ -5015,7 +5793,7 @@ mod chromium_backend {
                             } else {
                                 json!({})
                             };
-                            send_json(&mut server_socket, json!({"id": next_id, "result": result}));
+                            send_json(&mut browser, json!({"id": next_id, "result": result}));
                             next_id += 1;
                         }
 
@@ -5023,7 +5801,7 @@ mod chromium_backend {
                         // requested color or author mutation may be published.
                         for session_id in 1..=3 {
                             send_json(
-                                &mut server_socket,
+                                &mut browser,
                                 json!({
                                     "method":"Page.screencastFrame",
                                     "params":{"data":encoded(current,[255,255,255],marker),"metadata":{},"sessionId":session_id},
@@ -5032,15 +5810,15 @@ mod chromium_backend {
                             );
                         }
                         for session_id in 1..=3 {
-                            let ack = read_json(&mut server_socket);
+                            let ack = read_json(&mut browser);
                             assert_eq!(
                                 ack,
                                 json!({"id":next_id,"method":"Page.screencastFrameAck","params":{"sessionId":session_id},"sessionId":capture_session})
                             );
-                            send_json(&mut server_socket, json!({"id":next_id,"result":{}}));
+                            send_json(&mut browser, json!({"id":next_id,"result":{}}));
                             next_id += 1;
                         }
-                        let seed_command = read_json(&mut server_socket);
+                        let seed_command = read_json(&mut browser);
                         assert_eq!(
                             seed_command,
                             json!({
@@ -5050,11 +5828,11 @@ mod chromium_backend {
                             })
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"id":next_id,"result":{"result":{"type":"boolean","value":true}}}),
                         );
                         next_id += 1;
-                        let host_fence = read_json(&mut server_socket);
+                        let host_fence = read_json(&mut browser);
                         assert_eq!(
                             host_fence,
                             json!({
@@ -5062,29 +5840,29 @@ mod chromium_backend {
                                 "params":{"policy":"advance","budget":1,"maxVirtualTimeTaskStarvationCount":10_000},"sessionId":capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id":next_id,"result":{}}));
+                        send_json(&mut browser, json!({"id":next_id,"result":{}}));
                         next_id += 1;
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"method":"Emulation.virtualTimeBudgetExpired","params":{},"sessionId":capture_session}),
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method":"Page.screencastFrame",
                                 "params":{"data":encoded(current,seed,AuthorMarker {rgb:[marker.rgb[0]^0xff,marker.rgb[1],marker.rgb[2]],..marker}),"metadata":{},"sessionId":4},
                                 "sessionId":capture_session
                             }),
                         );
-                        let seed_ack = read_json(&mut server_socket);
+                        let seed_ack = read_json(&mut browser);
                         assert_eq!(
                             seed_ack,
                             json!({"id":next_id,"method":"Page.screencastFrameAck","params":{"sessionId":4},"sessionId":capture_session})
                         );
-                        send_json(&mut server_socket, json!({"id":next_id,"result":{}}));
+                        send_json(&mut browser, json!({"id":next_id,"result":{}}));
                         next_id += 1;
 
-                        let author_generation = read_json(&mut server_socket);
+                        let author_generation = read_json(&mut browser);
                         assert_eq!(
                             author_generation,
                             json!({
@@ -5099,12 +5877,12 @@ mod chromium_backend {
                             })
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"id": next_id, "result": {"result": {"type": "boolean", "value": true}}}),
                         );
                         next_id += 1;
 
-                        let seed_fence = read_json(&mut server_socket);
+                        let seed_fence = read_json(&mut browser);
                         assert_eq!(
                             seed_fence,
                             json!({
@@ -5114,10 +5892,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id":next_id,"result":{}}));
+                        send_json(&mut browser, json!({"id":next_id,"result":{}}));
                         next_id += 1;
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method":"Emulation.virtualTimeBudgetExpired",
                                 "params":{},"sessionId":capture_session
@@ -5136,23 +5914,23 @@ mod chromium_backend {
                             (6, marker),
                         ] {
                             send_json(
-                                &mut server_socket,
+                                &mut browser,
                                 json!({
                                     "method":"Page.screencastFrame",
                                     "params":{"data":encoded(current,seed,seed_marker),"metadata":{},"sessionId":session_id},
                                     "sessionId":capture_session
                                 }),
                             );
-                            let ack = read_json(&mut server_socket);
+                            let ack = read_json(&mut browser);
                             assert_eq!(
                                 ack,
                                 json!({"id":next_id,"method":"Page.screencastFrameAck","params":{"sessionId":session_id},"sessionId":capture_session})
                             );
-                            send_json(&mut server_socket, json!({"id":next_id,"result":{}}));
+                            send_json(&mut browser, json!({"id":next_id,"result":{}}));
                             next_id += 1;
                         }
 
-                        let transition_command = read_json(&mut server_socket);
+                        let transition_command = read_json(&mut browser);
                         assert_eq!(
                             transition_command,
                             json!({
@@ -5166,12 +5944,12 @@ mod chromium_backend {
                             })
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"id": next_id, "result": {"result": {"type": "boolean", "value": true}}}),
                         );
                         next_id += 1;
 
-                        let transition_fence = read_json(&mut server_socket);
+                        let transition_fence = read_json(&mut browser);
                         assert_eq!(
                             transition_fence,
                             json!({
@@ -5185,10 +5963,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Emulation.virtualTimeBudgetExpired",
                                 "params": {},
@@ -5198,7 +5976,7 @@ mod chromium_backend {
 
                         if let Some(prior) = previous_capture_session.as_deref() {
                             send_json(
-                                &mut server_socket,
+                                &mut browser,
                                 json!({
                                     "method": "Page.screencastFrame",
                                     "params": {"data": desired_frame.clone(), "metadata": {}, "sessionId": 6},
@@ -5207,7 +5985,7 @@ mod chromium_backend {
                             );
                         }
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Page.screencastFrame",
                                 "params": {"data": transition_frame, "metadata": {}, "sessionId": 7},
@@ -5215,7 +5993,7 @@ mod chromium_backend {
                             }),
                         );
 
-                        let ack = read_json(&mut server_socket);
+                        let ack = read_json(&mut browser);
                         assert_eq!(
                             ack,
                             json!({
@@ -5225,10 +6003,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
 
-                        let desired = read_json(&mut server_socket);
+                        let desired = read_json(&mut browser);
                         assert_eq!(
                             desired,
                             json!({
@@ -5242,12 +6020,12 @@ mod chromium_backend {
                             })
                         );
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({"id": next_id, "result": {"result": {"type": "boolean", "value": true}}}),
                         );
                         next_id += 1;
 
-                        let desired_fence = read_json(&mut server_socket);
+                        let desired_fence = read_json(&mut browser);
                         assert_eq!(
                             desired_fence,
                             json!({
@@ -5261,10 +6039,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Emulation.virtualTimeBudgetExpired",
                                 "params": {},
@@ -5273,7 +6051,7 @@ mod chromium_backend {
                         );
 
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Page.screencastFrame",
                                 "params": {
@@ -5284,7 +6062,7 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             }),
                         );
-                        let wrong_guard_ack = read_json(&mut server_socket);
+                        let wrong_guard_ack = read_json(&mut browser);
                         assert_eq!(
                             wrong_guard_ack,
                             json!({
@@ -5294,11 +6072,11 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
 
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Page.screencastFrame",
                                 "params": {
@@ -5309,7 +6087,7 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             }),
                         );
-                        let wrong_marker_ack = read_json(&mut server_socket);
+                        let wrong_marker_ack = read_json(&mut browser);
                         assert_eq!(
                             wrong_marker_ack,
                             json!({
@@ -5319,11 +6097,11 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
 
                         send_json(
-                            &mut server_socket,
+                            &mut browser,
                             json!({
                                 "method": "Page.screencastFrame",
                                 "params": {
@@ -5334,7 +6112,7 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             }),
                         );
-                        let desired_ack = read_json(&mut server_socket);
+                        let desired_ack = read_json(&mut browser);
                         assert_eq!(
                             desired_ack,
                             json!({
@@ -5344,10 +6122,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
 
-                        let stop = read_json(&mut server_socket);
+                        let stop = read_json(&mut browser);
                         assert_eq!(
                             stop,
                             json!({
@@ -5357,10 +6135,10 @@ mod chromium_backend {
                                 "sessionId": capture_session
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
 
-                        let detach = read_json(&mut server_socket);
+                        let detach = read_json(&mut browser);
                         assert_eq!(
                             detach,
                             json!({
@@ -5369,12 +6147,12 @@ mod chromium_backend {
                                 "params": {"sessionId": capture_session}
                             })
                         );
-                        send_json(&mut server_socket, json!({"id": next_id, "result": {}}));
+                        send_json(&mut browser, json!({"id": next_id, "result": {}}));
                         next_id += 1;
                         previous_capture_session = Some(capture_session);
                     }
                 }
-                let clear = read_json(&mut server_socket);
+                let clear = read_json(&mut browser);
                 assert_eq!(
                     clear,
                     json!({
@@ -5389,14 +6167,14 @@ mod chromium_backend {
                     })
                 );
                 send_json(
-                    &mut server_socket,
+                    &mut browser,
                     json!({"id": next_id, "result": {"result": {"type": "boolean", "value": true}}}),
                 );
                 assert_eq!(capture_index, 6);
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::offline_with_timeout(Duration::from_secs(1)),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -5479,17 +6257,9 @@ mod chromium_backend {
 
         #[test]
         fn target_close_fails_closed_on_a_late_blocked_request() {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server_stream, _) = listener.accept().unwrap();
-            let client_socket = WebSocket::from_raw_socket(
-                MaybeTlsStream::Plain(client_stream),
-                Role::Client,
-                None,
-            );
-            let mut server_socket = WebSocket::from_raw_socket(server_stream, Role::Server, None);
+            let (client, mut browser) = fake_cdp_transport();
             let server = thread::spawn(move || {
-                let close = match server_socket.read().unwrap() {
+                let close = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected closeTarget request, got {other:?}"),
                 };
@@ -5501,7 +6271,7 @@ mod chromium_backend {
                         "params": {"targetId": "render-target"}
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Fetch.requestPaused",
@@ -5514,12 +6284,12 @@ mod chromium_backend {
                         .to_string(),
                     ))
                     .unwrap();
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 1, "result": {"success": true}}).to_string(),
                     ))
                     .unwrap();
-                let failed = match server_socket.read().unwrap() {
+                let failed = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected Fetch.failRequest, got {other:?}"),
                 };
@@ -5527,7 +6297,7 @@ mod chromium_backend {
             });
 
             let mut cdp = Cdp::new(
-                client_socket,
+                client,
                 SandboxPolicy::default(),
                 MotionCancellationToken::new(),
                 Instant::now() + Duration::from_secs(1),
@@ -5541,11 +6311,11 @@ mod chromium_backend {
 
         #[test]
         fn target_close_rejects_a_false_success_result() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = server_socket.read().unwrap();
+                let request = browser.read().unwrap();
                 assert!(matches!(request, Message::Text(_)));
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 1, "result": {"success": false}}).to_string(),
                     ))
@@ -5562,9 +6332,9 @@ mod chromium_backend {
 
         #[test]
         fn render_browser_context_is_disposable_and_root_scoped() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let create = match server_socket.read().unwrap() {
+                let create = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected createBrowserContext request, got {other:?}"),
                 };
@@ -5576,13 +6346,13 @@ mod chromium_backend {
                         "params": {"disposeOnDetach": true}
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({"id": 1, "result": {"browserContextId": "context-1"}}).to_string(),
                     ))
                     .unwrap();
 
-                let dispose = match server_socket.read().unwrap() {
+                let dispose = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected disposeBrowserContext request, got {other:?}"),
                 };
@@ -5594,7 +6364,7 @@ mod chromium_backend {
                         "params": {"browserContextId": "context-1"}
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 2, "result": {}}).to_string()))
                     .unwrap();
             });
@@ -5607,9 +6377,9 @@ mod chromium_backend {
 
         #[test]
         fn gpu_backend_trace_uses_root_session_and_bounds_safe_fields() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = match server_socket.read().unwrap() {
+                let request = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected SystemInfo.getInfo request, got {other:?}"),
                 };
@@ -5622,7 +6392,7 @@ mod chromium_backend {
                     }),
                     "GPU diagnostics must run on the root CDP session"
                 );
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "id": 1,
@@ -5666,9 +6436,9 @@ mod chromium_backend {
 
         #[test]
         fn disabled_gpu_backend_trace_leaves_the_root_socket_untouched() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = match server_socket.read().unwrap() {
+                let request = match browser.read().unwrap() {
                     Message::Text(text) => serde_json::from_str::<Value>(text.as_ref()).unwrap(),
                     other => panic!("expected Target.getTargets request, got {other:?}"),
                 };
@@ -5680,7 +6450,7 @@ mod chromium_backend {
                         "params": {}
                     })
                 );
-                server_socket
+                browser
                     .send(Message::text(json!({"id": 1, "result": {}}).to_string()))
                     .unwrap();
             });
@@ -5692,11 +6462,11 @@ mod chromium_backend {
 
         #[test]
         fn gpu_backend_trace_treats_only_the_diagnostic_rejection_as_unavailable() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = server_socket.read().unwrap();
+                let request = browser.read().unwrap();
                 assert!(matches!(request, Message::Text(_)));
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "id": 1,
@@ -5716,11 +6486,11 @@ mod chromium_backend {
             );
             server.join().unwrap();
 
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = server_socket.read().unwrap();
+                let request = browser.read().unwrap();
                 assert!(matches!(request, Message::Text(_)));
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "method": "Inspector.targetCrashed",
@@ -5738,17 +6508,17 @@ mod chromium_backend {
             ));
             server.join().unwrap();
 
-            let (mut cdp, server_socket) = fake_cdp_pair();
-            drop(server_socket);
+            let (mut cdp, browser) = fake_cdp_pair();
+            drop(browser);
             assert!(matches!(
                 cdp.gpu_backend_trace(),
                 Err(MotionError::RenderFailed(_))
             ));
 
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             cdp.cancellation.cancel();
             let server = thread::spawn(move || {
-                let request = server_socket.read().unwrap();
+                let request = browser.read().unwrap();
                 assert!(matches!(request, Message::Text(_)));
             });
             assert!(matches!(
@@ -5760,11 +6530,11 @@ mod chromium_backend {
 
         #[test]
         fn gpu_backend_trace_reports_incomplete_results_without_exposing_payloads() {
-            let (mut cdp, mut server_socket) = fake_cdp_pair();
+            let (mut cdp, mut browser) = fake_cdp_pair();
             let server = thread::spawn(move || {
-                let request = server_socket.read().unwrap();
+                let request = browser.read().unwrap();
                 assert!(matches!(request, Message::Text(_)));
-                server_socket
+                browser
                     .send(Message::text(
                         json!({
                             "id": 1,

@@ -409,6 +409,224 @@ mod live {
         assert_eq!(live_profiles(), profiles_before);
     }
 
+    /// Every frame paints a different, spatially uniform colour.
+    const STEPPED: &str = r#"<!doctype html><html><body style="margin:0;background:rgb(3,4,5)">
+      <div id="box" style="position:fixed;inset:0"></div>
+      <script>
+        OpenTake.onSeek((t) => {
+          box.style.background = `rgb(${Math.round(t * 100) % 256}, 60, 90)`;
+        });
+      </script></body></html>"#;
+
+    pub(super) fn idle_browser_probe() {
+        let profiles_before = live_profiles();
+        let root = tempfile::tempdir().unwrap();
+        let renderer = renderer(root.path()).with_browser_idle_timeout(Duration::from_millis(800));
+        renderer
+            .render(&request(STEPPED).with_transparent(false))
+            .unwrap();
+        assert_eq!(
+            live_profiles().difference(&profiles_before).count(),
+            1,
+            "the browser is retained right after a render"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live_profiles() != profiles_before {
+            assert!(
+                Instant::now() < deadline,
+                "the idle browser was not closed after its idle timeout"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        renderer
+            .render(&request(
+                r#"<!doctype html><style>body{background:rgb(9,8,7)}</style>"#,
+            ))
+            .expect("a later render launches a new browser");
+        assert_eq!(live_profiles().difference(&profiles_before).count(), 1);
+        drop(renderer);
+        assert_eq!(live_profiles(), profiles_before);
+    }
+
+    /// `(pid, parent pid, process group, state)` of every process, per `ps`.
+    #[cfg(unix)]
+    fn processes() -> Vec<(u32, u32, u32, String)> {
+        let listed = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,pgid=,stat="])
+            .output()
+            .expect("list processes with ps");
+        assert!(listed.status.success());
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((
+                    fields.next()?.parse().ok()?,
+                    fields.next()?.parse().ok()?,
+                    fields.next()?.parse().ok()?,
+                    fields.next()?.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Processes of the browser's process group that have not exited.
+    /// Zombies are ignored: reaping orphans is the init process's job.
+    #[cfg(unix)]
+    fn live_process_group(group: u32) -> Vec<u32> {
+        processes()
+            .into_iter()
+            .filter(|(_, _, pgid, state)| *pgid == group && !state.starts_with('Z'))
+            .map(|(pid, ..)| pid)
+            .collect()
+    }
+
+    /// The browser a renderer in this process retained: the only child that
+    /// leads its own process group (`ps` itself shares this process's group).
+    #[cfg(unix)]
+    fn retained_browser_pid() -> u32 {
+        let own = std::process::id();
+        let children = processes()
+            .into_iter()
+            .filter(|(pid, ppid, pgid, state)| {
+                *ppid == own && pgid == pid && !state.starts_with('Z')
+            })
+            .map(|(pid, ..)| pid)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            1,
+            "expected one retained browser: {children:?}"
+        );
+        children[0]
+    }
+
+    /// Linux: the CDP pipe replaces the debugging port, so no process of
+    /// the browser tree holds a listening TCP socket.
+    #[cfg(target_os = "linux")]
+    pub(super) fn no_listening_socket_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let renderer = renderer(root.path());
+        renderer.render(&request(STEPPED)).unwrap();
+        let browser = retained_browser_pid();
+
+        let arguments = fs::read(format!("/proc/{browser}/cmdline")).unwrap();
+        let arguments = arguments
+            .split(|byte| *byte == 0)
+            .map(String::from_utf8_lossy)
+            .collect::<Vec<_>>();
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--remote-debugging-pipe"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.starts_with("--remote-debugging-port")),
+            "{arguments:?}"
+        );
+
+        let mut listening = BTreeSet::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(table) = fs::read_to_string(table) else {
+                continue;
+            };
+            for line in table.lines().skip(1) {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                // st 0A is TCP_LISTEN; field 9 is the socket inode.
+                if fields.len() > 9 && fields[3] == "0A" {
+                    listening.insert(fields[9].to_owned());
+                }
+            }
+        }
+        let tree = live_process_group(browser);
+        assert!(tree.contains(&browser));
+        for pid in tree {
+            let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            for descriptor in descriptors.flatten() {
+                let Ok(target) = fs::read_link(descriptor.path()) else {
+                    continue;
+                };
+                let target = target.to_string_lossy().into_owned();
+                if let Some(inode) = target
+                    .strip_prefix("socket:[")
+                    .and_then(|rest| rest.strip_suffix(']'))
+                {
+                    assert!(
+                        !listening.contains(inode),
+                        "Chromium process {pid} listens on a TCP socket (inode {inode})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) const EXIT_HELPER_ENV: &str = "OPENTAKE_MOTION_EXIT_HELPER_DIR";
+
+    /// Helper process: render once, record the retained browser, then exit
+    /// without dropping the renderer, as Tauri's `process::exit` does.
+    #[cfg(unix)]
+    pub(super) fn render_then_exit(dir: PathBuf) -> ! {
+        let renderer = renderer(&dir.join("cache"));
+        renderer.render(&request(STEPPED)).unwrap();
+        fs::write(dir.join("browser.pid"), retained_browser_pid().to_string()).unwrap();
+        std::process::exit(0);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn process_exit_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_exit_leaves_no_browser_behind",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EXIT_HELPER_ENV, dir.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let helper_pid = helper.id();
+        assert!(helper.wait().unwrap().success());
+        let browser: u32 = fs::read_to_string(dir.path().join("browser.pid"))
+            .expect("the helper recorded its browser")
+            .trim()
+            .parse()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let survivors = live_process_group(browser);
+            if survivors.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Chromium outlived its exited parent by 2 s: {survivors:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // The exiting helper could not remove its profile; the next launch's
+        // sweep removes it because its owner no longer exists.
+        let prefix = format!("opentake-chromium-{helper_pid}-");
+        let leftovers = || {
+            fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .count()
+        };
+        assert_eq!(leftovers(), 1, "process::exit leaves the profile behind");
+        assert!(HeadlessChromiumRenderer::remove_stale_browser_profiles() >= 1);
+        assert_eq!(leftovers(), 0);
+    }
+
     pub(super) fn four_k_budget_smoke() {
         const WIDTH: u32 = 3840;
         const HEIGHT: u32 = 2160;
@@ -927,6 +1145,30 @@ fn browser_pool_invalidates_on_blocked_or_cancelled_render() {
 fn concurrent_error_invalidates_an_active_browser_lease() {
     let _live_test_guard = live_test_guard();
     live::concurrent_browser_pool_invalidation_probe();
+}
+
+#[cfg(feature = "chromium")]
+#[test]
+fn idle_browser_is_closed_after_its_idle_timeout() {
+    let _live_test_guard = live_test_guard();
+    live::idle_browser_probe();
+}
+
+#[cfg(all(feature = "chromium", target_os = "linux"))]
+#[test]
+fn chromium_speaks_cdp_over_pipes_without_a_listening_socket() {
+    let _live_test_guard = live_test_guard();
+    live::no_listening_socket_probe();
+}
+
+#[cfg(all(feature = "chromium", unix))]
+#[test]
+fn process_exit_leaves_no_browser_behind() {
+    if let Some(dir) = std::env::var_os(live::EXIT_HELPER_ENV) {
+        live::render_then_exit(dir.into());
+    }
+    let _live_test_guard = live_test_guard();
+    live::process_exit_probe();
 }
 
 #[cfg(feature = "chromium")]
