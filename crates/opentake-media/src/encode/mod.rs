@@ -13,6 +13,7 @@ pub mod preset;
 pub use mix::{mix_clips, mono_f32_to_s16le, ClipAudio, MIX_SAMPLE_RATE};
 pub use preset::{even_dimension, ExportPreset, ExportResolution, VideoCodec};
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -31,8 +32,8 @@ use crate::frame::RgbaFrame;
 ///
 /// Layout: `-f rawvideo -pix_fmt rgba -s {w}x{h} -r {fps} -i -` for video,
 /// followed by codec/pixfmt/color args, then `out`.
-fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
     args.push("-y".into()); // overwrite
                             // Raw video input from stdin.
     args.push("-f".into());
@@ -40,9 +41,9 @@ fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> V
     args.push("-pix_fmt".into());
     args.push("rgba".into());
     args.push("-s".into());
-    args.push(format!("{w}x{h}"));
+    args.push(format!("{w}x{h}").into());
     args.push("-r".into());
-    args.push(fps.to_string());
+    args.push(fps.to_string().into());
     args.push("-i".into());
     args.push("-".into());
 
@@ -55,9 +56,9 @@ fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> V
         args.push("-profile:v".into());
         args.push("4444".into());
     }
-    args.extend(preset.color_args());
+    args.extend(preset.color_args().into_iter().map(OsString::from));
 
-    args.push(out.to_string_lossy().into_owned());
+    args.push(out.as_os_str().to_owned());
     args
 }
 
@@ -79,21 +80,21 @@ fn mux_args(
     sample_rate: u32,
     acodec: &str,
     video_duration: Option<&str>,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec![
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
         "-y".into(),
         // Input 0: the encoded video (audio-less).
         "-i".into(),
-        video_in.to_string_lossy().into_owned(),
+        video_in.as_os_str().to_owned(),
         // Input 1: raw mono s16le PCM (the mixed audio).
         "-f".into(),
         "s16le".into(),
         "-ar".into(),
-        sample_rate.to_string(),
+        sample_rate.to_string().into(),
         "-ac".into(),
         "1".into(),
         "-i".into(),
-        pcm_in.to_string_lossy().into_owned(),
+        pcm_in.as_os_str().to_owned(),
         // Copy the video stream verbatim; (re-)encode the audio.
         "-c:v".into(),
         "copy".into(),
@@ -103,7 +104,7 @@ fn mux_args(
     if let Some(duration) = video_duration {
         args.extend(["-af".into(), "apad".into(), "-t".into(), duration.into()]);
     }
-    args.push(out.to_string_lossy().into_owned());
+    args.push(out.as_os_str().to_owned());
     args
 }
 
@@ -887,9 +888,10 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-c:v", "prores_ks"]));
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv422p10le"]));
         assert!(args.windows(2).any(|w| w == ["-colorspace", "bt709"]));
-        assert!(args
-            .iter()
-            .any(|arg| arg.contains("setparams=color_primaries=bt709")));
+        assert!(args.iter().any(|arg| arg
+            .to_str()
+            .unwrap()
+            .contains("setparams=color_primaries=bt709")));
     }
 
     #[test]

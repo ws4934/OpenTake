@@ -6,7 +6,8 @@
 //! project-frame PTS, and pushes frames through a bounded queue.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -350,36 +351,40 @@ fn frame_to_secs(frame: i64, fps: i32) -> f64 {
 }
 
 #[cfg(test)]
-fn video_stream_args(req: &VideoStreamRequest) -> Vec<String> {
+fn video_stream_args(req: &VideoStreamRequest) -> Vec<OsString> {
     video_stream_args_with_color(req, None)
 }
 
 fn video_stream_args_with_color(
     req: &VideoStreamRequest,
     color: Option<&MediaColorMetadata>,
-) -> Vec<String> {
+) -> Vec<OsString> {
     let mut args = Vec::new();
     // Keyframe seek with source timestamps kept (relative to the container
     // start) so the fps grid below is the absolute project-frame grid. Accurate
     // seek is off because it drops the frame still on screen at the start.
-    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
-    args.push(format!("{:.6}", req.start_secs()));
+    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(OsString::from));
+    args.push(format!("{:.6}", req.start_secs()).into());
     if let Some(color) = color {
-        args.extend(crate::color::hdr_decode_input_args(color));
+        args.extend(
+            crate::color::hdr_decode_input_args(color)
+                .into_iter()
+                .map(OsString::from),
+        );
     }
     if !req.apply_rotation {
-        args.push("-noautorotate".to_string());
+        args.push("-noautorotate".into());
     }
-    args.push("-i".to_string());
-    args.push(path_to_string(&req.path));
-    args.push("-map".to_string());
-    args.push("0:v:0".to_string());
-    args.push("-an".to_string());
-    args.push("-sn".to_string());
+    args.push("-i".into());
+    args.push(req.path.as_os_str().to_owned());
+    args.push("-map".into());
+    args.push("0:v:0".into());
+    args.push("-an".into());
+    args.push("-sn".into());
 
     if let Some(frame_limit) = req.frame_limit() {
-        args.push("-frames:v".to_string());
-        args.push(frame_limit.to_string());
+        args.push("-frames:v".into());
+        args.push(frame_limit.to_string().into());
     }
 
     // `round=up` maps a source frame to the first slot at/after its pts, so
@@ -410,20 +415,16 @@ fn video_stream_args_with_color(
             "scale=w={mw}:h={mh}:force_original_aspect_ratio=decrease"
         ));
     }
-    args.push("-vf".to_string());
-    args.push(filters.join(","));
-    args.push("-fps_mode".to_string());
-    args.push("passthrough".to_string());
-    args.push("-pix_fmt".to_string());
-    args.push("rgba".to_string());
-    args.push("-f".to_string());
-    args.push("rawvideo".to_string());
-    args.push("-".to_string());
+    args.push("-vf".into());
+    args.push(filters.join(",").into());
+    args.push("-fps_mode".into());
+    args.push("passthrough".into());
+    args.push("-pix_fmt".into());
+    args.push("rgba".into());
+    args.push("-f".into());
+    args.push("rawvideo".into());
+    args.push("-".into());
     args
-}
-
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -517,10 +518,10 @@ mod tests {
     fn stream_args_force_project_fps_rgba_rawvideo() {
         let args = video_stream_args(&request());
         let vf = args.iter().position(|arg| arg == "-vf").unwrap();
-        assert!(args[vf + 1].starts_with(
+        assert!(args[vf + 1].to_str().unwrap().starts_with(
             "setpts='if(eq(N,0),min(PTS,1.983333/TB),PTS)',fps=fps=30:round=up,trim=start_pts=60,"
         ));
-        assert!(args[vf + 1].contains("force_original_aspect_ratio=decrease"));
+        assert!(args[vf + 1].to_str().unwrap().contains("force_original_aspect_ratio=decrease"));
         assert!(args.windows(2).any(|w| w == ["-fps_mode", "passthrough"]));
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "rgba"]));
         assert!(args.windows(2).any(|w| w == ["-f", "rawvideo"]));
