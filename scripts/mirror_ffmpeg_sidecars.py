@@ -7,9 +7,10 @@ an archive, extracted-binary SHA-256 always) and uploaded unchanged as an
 asset of the `ffmpeg-sidecars-v1` prerelease. The lock's `mirror_urls` point at
 those assets, so the provisioner downloads from the mirror first.
 
-The release is append-only: an existing asset with the same bytes is skipped,
-an existing asset with different bytes fails the run, and nothing is ever
-deleted or replaced. `.github/workflows/mirror-ffmpeg-sidecars.yml` runs this
+Asset names carry the first 16 hex digits of the pinned SHA-256 of the file,
+so a pin change adds a new asset instead of reusing a name. This script only
+appends: an existing asset with the same bytes is skipped, an existing asset
+with different bytes fails the run, and it never deletes or replaces one. `.github/workflows/mirror-ffmpeg-sidecars.yml` runs this
 script; `--dry-run` downloads and verifies without touching any release.
 """
 
@@ -37,14 +38,26 @@ TOOLS = ("ffmpeg", "ffprobe")
 GhRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 
+def asset_sha256(record: dict[str, object]) -> str:
+    """Pinned SHA-256 of the file the mirror holds: the archive pin for a
+    zip record, the binary pin for a raw binary."""
+    archive = record.get("archive")
+    pin = archive.get("sha256") if isinstance(archive, dict) else record.get("sha256")
+    if not isinstance(pin, str) or len(pin) != 64:
+        raise RuntimeError("sidecar lock record has no SHA-256 pin for its download")
+    return pin
+
+
 def asset_name(target: str, tool: str, record: dict[str, object]) -> str:
-    """Deterministic release asset name: `<tool>-<target>` plus the extension
-    of the upstream file (`.zip` for an archive, none for a raw binary)."""
+    """Content-addressed release asset name: `<tool>-<target>-<sha256[:16]>`
+    plus the extension of the upstream file (`.zip` for an archive, none for a
+    raw binary). A pin change yields a new name, so a stale asset can never be
+    served under a bumped pin."""
     url = record.get("url")
     if not isinstance(url, str):
         raise RuntimeError(f"invalid sidecar lock record for {tool}/{target}")
     suffix = PurePosixPath(urllib.parse.urlsplit(url).path).suffix
-    return f"{tool}-{target}{suffix}"
+    return f"{tool}-{target}-{asset_sha256(record)[:16]}{suffix}"
 
 
 def mirror_url(
@@ -76,7 +89,9 @@ def lock_records(lock: dict[str, object]) -> list[tuple[str, str, dict[str, obje
 
 def check_lock_mirrors(lock: dict[str, object], repository: str, tag: str) -> None:
     """Fail unless every record lists this release's asset as its first
-    mirror, so the uploaded names are exactly the ones the provisioner uses."""
+    mirror, so the uploaded names are exactly the ones the provisioner uses,
+    and every mirror entry names the asset of the record's current pin, so a
+    pin bump cannot keep a stale mirror URL."""
     for target, tool, record in lock_records(lock):
         expected = mirror_url(target, tool, record, repository, tag)
         mirrors = record.get("mirror_urls")
@@ -87,6 +102,14 @@ def check_lock_mirrors(lock: dict[str, object], repository: str, tag: str) -> No
             raise RuntimeError(
                 f"{tool}/{target} mirror_urls[0] is {first!r}, expected {expected!r}"
             )
+        name = asset_name(target, tool, record)
+        for mirror in mirrors:
+            path = urllib.parse.urlsplit(mirror).path if isinstance(mirror, str) else ""
+            if PurePosixPath(path).name != name:
+                raise RuntimeError(
+                    f"{tool}/{target} mirror {mirror!r} does not name the pinned "
+                    f"asset {name!r}"
+                )
 
 
 def fetch_upstream(
@@ -125,14 +148,14 @@ def release_notes(lock: dict[str, object], repository: str) -> str:
         "|---|---|---|",
     ]
     for target, tool, record in lock_records(lock):
-        archive = record.get("archive")
-        asset_sha = archive.get("sha256") if isinstance(archive, dict) else record.get("sha256")
         lines.append(
-            f"| `{asset_name(target, tool, record)}` | {record.get('url')} | `{asset_sha}` |"
+            f"| `{asset_name(target, tool, record)}` | {record.get('url')} "
+            f"| `{asset_sha256(record)}` |"
         )
     lines += [
         "",
-        "This prerelease is append-only and is never marked as the latest release.",
+        "The mirror workflow only appends assets to this prerelease, which is never marked",
+        "as the latest release. Every download is checked against the lock's SHA-256 pins.",
     ]
     return "\n".join(lines) + "\n"
 

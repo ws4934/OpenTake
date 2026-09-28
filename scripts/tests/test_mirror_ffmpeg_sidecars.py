@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import sys
 import zipfile
 
 
@@ -20,6 +21,9 @@ SPEC = importlib.util.spec_from_file_location("mirror_ffmpeg_sidecars", MODULE_P
 assert SPEC is not None and SPEC.loader is not None
 mirror = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mirror)
+
+sys.path.insert(0, str(ROOT / "scripts"))
+from workflow_yaml import parse_workflow_yaml  # noqa: E402
 
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "mirror-ffmpeg-sidecars.yml"
 TAG = "ffmpeg-sidecars-v1"
@@ -81,7 +85,10 @@ class MirrorFfmpegSidecarsTests(unittest.TestCase):
             with self.subTest(target=target, tool=tool):
                 name = mirror.asset_name(target, tool, record)
                 names.add(name)
-                self.assertTrue(name.startswith(f"{tool}-{target}"))
+                archive = record.get("archive")
+                pin = archive["sha256"] if archive else record["sha256"]
+                suffix = ".zip" if archive else ""
+                self.assertEqual(name, f"{tool}-{target}-{pin[:16]}{suffix}")
                 self.assertEqual(
                     record["mirror_urls"],
                     [
@@ -104,6 +111,41 @@ class MirrorFfmpegSidecarsTests(unittest.TestCase):
         del record["mirror_urls"]
         with self.assertRaisesRegex(RuntimeError, "has no mirror_urls"):
             mirror.check_lock_mirrors(data, REPOSITORY, TAG)
+
+    def test_lock_check_rejects_a_pin_bump_that_keeps_the_old_mirror(self) -> None:
+        for target, tool, pin_path in (
+            ("x86_64-unknown-linux-gnu", "ffmpeg", ("sha256",)),
+            ("aarch64-apple-darwin", "ffprobe", ("archive", "sha256")),
+        ):
+            with self.subTest(target=target, tool=tool):
+                data = lock()
+                record = data["targets"][target][tool]
+                pinned = record
+                for key in pin_path[:-1]:
+                    pinned = pinned[key]
+                pinned[pin_path[-1]] = "f" * 64
+                with self.assertRaisesRegex(RuntimeError, "mirror_urls\\[0\\]"):
+                    mirror.check_lock_mirrors(data, REPOSITORY, TAG)
+
+    def test_lock_check_rejects_a_later_mirror_with_a_stale_name(self) -> None:
+        data = lock()
+        record = data["targets"]["x86_64-apple-darwin"]["ffmpeg"]
+        record["mirror_urls"].append(
+            "https://other.invalid/ffmpeg-x86_64-apple-darwin-0000000000000000"
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not name the pinned asset"):
+            mirror.check_lock_mirrors(data, REPOSITORY, TAG)
+
+    def test_workflow_writes_only_from_main_with_job_scoped_permission(self) -> None:
+        workflow = parse_workflow_yaml(WORKFLOW_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(list(workflow["on"]), ["workflow_dispatch"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(list(workflow["jobs"]), ["mirror"])
+        job = workflow["jobs"]["mirror"]
+        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(job["permissions"], {"contents": "write"})
+        checkout = job["steps"][0]
+        self.assertEqual(checkout["with"], {"persist-credentials": False})
 
     def test_workflow_uses_the_script_tag_and_never_marks_latest(self) -> None:
         text = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -191,9 +233,45 @@ class MirrorFfmpegSidecarsTests(unittest.TestCase):
                     "aarch64-apple-darwin", "ffprobe", record, assets
                 )
 
-            self.assertEqual(path.name, "ffprobe-aarch64-apple-darwin.zip")
+            self.assertEqual(
+                path.name,
+                "ffprobe-aarch64-apple-darwin-"
+                f"{hashlib.sha256(archive_bytes).hexdigest()[:16]}.zip",
+            )
             self.assertEqual(path.read_bytes(), archive_bytes)
             self.assertEqual([item.name for item in assets.iterdir()], [path.name])
+
+    def test_upstream_raw_binary_is_fetched_again_and_kept_unchanged(self) -> None:
+        binary = b"pinned ffmpeg"
+        pin = hashlib.sha256(binary).hexdigest()
+        record = {
+            "url": "https://upstream.invalid/b6.1.1/ffmpeg-linux-x64",
+            "sha256": pin,
+            "version": "6.1.1",
+        }
+        responses = [b"replaced upstream", binary]
+        requested: list[str] = []
+
+        def download_fixture(url: str, path: Path) -> None:
+            requested.append(url)
+            path.write_bytes(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            with (
+                mock.patch.object(mirror.provisioner, "download", download_fixture),
+                mock.patch.object(mirror.provisioner.time, "sleep"),
+                mock.patch.object(mirror.provisioner.sys, "stderr", mock.MagicMock()),
+            ):
+                path = mirror.fetch_upstream(
+                    "x86_64-unknown-linux-gnu", "ffmpeg", record, assets
+                )
+
+            self.assertEqual(path.name, f"ffmpeg-x86_64-unknown-linux-gnu-{pin[:16]}")
+            self.assertEqual(path.read_bytes(), binary)
+            self.assertEqual([item.name for item in assets.iterdir()], [path.name])
+        self.assertEqual(requested, [record["url"]] * 2)
+        self.assertEqual(responses, [])
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@ name: Mirror FFmpeg sidecars
 # Copies every checksum-pinned FFmpeg sidecar download named by
 # scripts/ffmpeg-sidecars.lock.json, byte for byte, into the ffmpeg-sidecars-v1
 # prerelease of this repository. The provisioner downloads from that mirror
-# first and falls back to the upstream URLs. The release is append-only: an
-# asset that already exists with the same SHA-256 is kept, one with different
-# bytes fails the run, and nothing is deleted or replaced. See
-# src-tauri/resources/ffmpeg/SOURCE.md.
+# first and falls back to the upstream URLs. Asset names carry the pinned
+# SHA-256, and the script only appends: an asset that already exists with the
+# same SHA-256 is kept, one with different bytes fails the run, and nothing is
+# deleted or replaced. It can only run in the repository the lock's
+# mirror_urls point at. See src-tauri/resources/ffmpeg/SOURCE.md.
 on:
   workflow_dispatch:
 
