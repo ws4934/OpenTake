@@ -7,6 +7,12 @@
 //! a job is recorded here, in application data, so reopening the project
 //! resumes it (or finalizes the held result) instead of requiring a paid
 //! retry, even after the app quit or restarted.
+//!
+//! A submission is also recorded here, without a provider job id, from just
+//! before it is sent until its project records the answer. If the app quits
+//! or the project is replaced in between, or the answer never arrives,
+//! reopening the project reports that the provider may have accepted and
+//! billed the job instead of offering a plain retry.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +29,10 @@ const STORE_VERSION: u32 = 1;
 pub(crate) struct OrphanedGeneration {
     /// The local job id of the project's placeholders.
     pub job_id: String,
-    pub provider_job_id: String,
+    /// `None` while the submission's outcome is unknown: it was sent, and
+    /// the provider may have accepted and billed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_job_id: Option<String>,
     /// The bundle the job was working for (diagnostics only).
     pub project_path: String,
     /// Unix seconds when the job was recorded.
@@ -172,7 +181,7 @@ mod tests {
     fn record(job_id: &str, held_results: Vec<HeldResult>) -> OrphanedGeneration {
         OrphanedGeneration {
             job_id: job_id.into(),
-            provider_job_id: format!("fal::{job_id}"),
+            provider_job_id: Some(format!("fal::{job_id}")),
             project_path: "/projects/A.opentake".into(),
             recorded_at: 1,
             held_results,
@@ -203,6 +212,23 @@ mod tests {
         assert!(!reopened.held_path(&held).exists());
         assert!(reopened.get("job-2").unwrap().is_some());
         reopened.remove("job-unknown").unwrap();
+    }
+
+    #[test]
+    fn a_submission_with_an_unknown_outcome_is_recorded_without_a_provider_job_id() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OrphanedGenerationStore::new(root.path().to_path_buf());
+        let mut unknown = record("job-1", Vec::new());
+        unknown.provider_job_id = None;
+        store.record(unknown.clone()).unwrap();
+        let text = fs::read_to_string(root.path().join("orphans.json")).unwrap();
+        assert!(!text.contains("providerJobId"), "{text}");
+        assert_eq!(
+            OrphanedGenerationStore::new(root.path().to_path_buf())
+                .get("job-1")
+                .unwrap(),
+            Some(unknown)
+        );
     }
 
     #[test]
