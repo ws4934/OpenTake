@@ -27,8 +27,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Written next to each published copy's bundle (outside it) to identify the
 /// sample and the copy's content at publication.
 const COPY_RECORD_FILE: &str = "sample-copy.json";
-const MAX_COPY_RECORD_BYTES: u64 = 64 * 1024;
-const COPY_RECORD_VERSION: u32 = 1;
+const MAX_COPY_RECORD_BYTES: u64 = 4 * 1024 * 1024;
+const COPY_RECORD_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,8 +39,18 @@ struct SampleCopyRecord {
     source: String,
     /// The bundle directory name inside the copy's directory.
     bundle: String,
-    /// [`bundle_content_identity`] right after publication.
-    content: String,
+    /// [`document_identity`] right after publication.
+    documents: String,
+    /// Every other file right after publication, sorted by path.
+    files: Vec<SampleCopyFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleCopyFile {
+    path: String,
+    size: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,8 +177,10 @@ impl SampleProjectService {
         fs::create_dir_all(&self.storage_root)
             .map_err(|error| format!("create sample projects directory: {error}"))?;
         let source = sample_source_identity(slug, &resolved)?;
+        // Checking a candidate copy can hash its media, so progress starts
+        // before the reuse scan.
+        on_progress(0.0);
         if let Some(existing) = self.reusable_copy(slug, &source, &in_use) {
-            on_progress(0.0);
             on_progress(1.0);
             return Ok(existing);
         }
@@ -206,7 +218,6 @@ impl SampleProjectService {
         }
         validate_downloads(&downloads)?;
         let total = downloads.len().max(1);
-        on_progress(0.0);
         if downloads.is_empty() {
             on_progress(1.0);
         }
@@ -277,7 +288,7 @@ impl SampleProjectService {
             if in_use(&bundle) {
                 return None;
             }
-            (bundle_content_identity(&bundle).ok()? == record.content).then_some(bundle)
+            copy_is_unmodified(&bundle, &record).then_some(bundle)
         })
     }
 
@@ -382,63 +393,108 @@ fn sample_source_identity(slug: &str, resolved: &ResolvedSample) -> Result<Strin
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Content identity of a sample copy: the timeline, manifest and generation
-/// log as the project layer reads them (so a save that only re-encodes them
-/// keeps the identity), plus the path and bytes of every other file. Only the
-/// cover thumbnail, which saving regenerates, is left out. A symlink or any
-/// other non-regular entry fails, so such a copy is never reused.
-fn bundle_content_identity(bundle: &Path) -> Result<String, String> {
-    let kind = fs::symlink_metadata(bundle)
-        .map_err(|error| format!("inspect sample copy: {error}"))?
-        .file_type();
-    if !kind.is_dir() {
-        return Err("sample copy is not a directory".into());
+/// Identity of the copy's documents as the model types read them, so a save
+/// that only re-encodes them keeps it. The files are parsed directly rather
+/// than through `Project::open`, which may repair or move files in the
+/// user's copy. A missing manifest or generation log reads as the project
+/// layer reads it: empty, or absent.
+fn document_identity(bundle: &Path) -> Result<String, String> {
+    fn read(bundle: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(bundle.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read sample copy {name}: {error}")),
+        }
     }
-    let project = Project::open(bundle).map_err(|error| format!("open sample copy: {error}"))?;
+    fn parse<T: serde::de::DeserializeOwned>(name: &str, bytes: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(bytes).map_err(|error| format!("parse sample copy {name}: {error}"))
+    }
+    let timeline: Timeline = parse(
+        layout::TIMELINE_FILE,
+        &read(bundle, layout::TIMELINE_FILE)?.ok_or("sample copy has no timeline")?,
+    )?;
+    let manifest: MediaManifest = match read(bundle, layout::MANIFEST_FILE)? {
+        Some(bytes) => parse(layout::MANIFEST_FILE, &bytes)?,
+        None => MediaManifest::new(),
+    };
+    let generation_log: Option<opentake_project::GenerationLog> =
+        match read(bundle, layout::GENERATION_LOG_FILE)? {
+            Some(bytes) => Some(parse(layout::GENERATION_LOG_FILE, &bytes)?),
+            None => None,
+        };
     let mut hasher = Sha256::new();
     for (label, encoded) in [
-        ("timeline", serde_json::to_vec(&project.timeline)),
-        ("manifest", serde_json::to_vec(&project.manifest)),
-        (
-            "generation-log",
-            serde_json::to_vec(&project.generation_log),
-        ),
+        ("timeline", serde_json::to_vec(&timeline)),
+        ("manifest", serde_json::to_vec(&manifest)),
+        ("generation-log", serde_json::to_vec(&generation_log)),
     ] {
         let encoded = encoded.map_err(|error| format!("encode sample {label}: {error}"))?;
         hasher.update(label.as_bytes());
         hasher.update((encoded.len() as u64).to_le_bytes());
         hasher.update(&encoded);
     }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Every file of the copy except the documents and the cover thumbnail,
+/// which saving regenerates, with its size, sorted by path. A symlink or any
+/// other non-regular entry fails, so such a copy is never reused.
+fn bundle_files(bundle: &Path) -> Result<Vec<(String, u64)>, String> {
+    if !fs::symlink_metadata(bundle)
+        .map_err(|error| format!("inspect sample copy: {error}"))?
+        .file_type()
+        .is_dir()
+    {
+        return Err("sample copy is not a directory".into());
+    }
     let mut files = Vec::new();
     collect_bundle_files(bundle, "", &mut files)?;
-    files.sort();
-    for relative in files {
-        if matches!(
+    files.retain(|(relative, _)| {
+        !matches!(
             relative.as_str(),
             layout::TIMELINE_FILE
                 | layout::MANIFEST_FILE
                 | layout::GENERATION_LOG_FILE
                 | layout::THUMBNAIL_FILE
-        ) {
-            continue;
-        }
-        hasher.update(b"file");
-        hasher.update((relative.len() as u64).to_le_bytes());
-        hasher.update(relative.as_bytes());
-        let mut file = fs::File::open(bundle.join(&relative))
-            .map_err(|error| format!("read sample copy {relative}: {error}"))?;
-        let mut content = Sha256::new();
-        std::io::copy(&mut file, &mut content)
-            .map_err(|error| format!("read sample copy {relative}: {error}"))?;
-        hasher.update(content.finalize());
-    }
+        )
+    });
+    files.sort();
+    Ok(files)
+}
+
+fn file_sha256(bundle: &Path, relative: &str) -> Result<String, String> {
+    let mut file = fs::File::open(bundle.join(relative))
+        .map_err(|error| format!("read sample copy {relative}: {error}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| format!("read sample copy {relative}: {error}"))?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Whether the copy still matches its record. The cheap checks run first
+/// (documents, then the file list with sizes), so an edited copy is usually
+/// rejected without hashing its media.
+fn copy_is_unmodified(bundle: &Path, record: &SampleCopyRecord) -> bool {
+    if document_identity(bundle).ok().as_ref() != Some(&record.documents) {
+        return false;
+    }
+    let Ok(files) = bundle_files(bundle) else {
+        return false;
+    };
+    files.len() == record.files.len()
+        && files
+            .iter()
+            .zip(&record.files)
+            .all(|((path, size), recorded)| *path == recorded.path && *size == recorded.size)
+        && record.files.iter().all(|recorded| {
+            file_sha256(bundle, &recorded.path).is_ok_and(|hash| hash == recorded.sha256)
+        })
 }
 
 fn collect_bundle_files(
     directory: &Path,
     prefix: &str,
-    files: &mut Vec<String>,
+    files: &mut Vec<(String, u64)>,
 ) -> Result<(), String> {
     for entry in fs::read_dir(directory).map_err(|error| format!("list sample copy: {error}"))? {
         let entry = entry.map_err(|error| format!("list sample copy: {error}"))?;
@@ -453,7 +509,11 @@ fn collect_bundle_files(
         if kind.is_dir() {
             collect_bundle_files(&entry.path(), &format!("{relative}/"), files)?;
         } else if kind.is_file() {
-            files.push(relative);
+            let size = entry
+                .metadata()
+                .map_err(|error| format!("inspect sample copy {relative}: {error}"))?
+                .len();
+            files.push((relative, size));
         } else {
             return Err(format!("sample copy holds a non-regular entry: {relative}"));
         }
@@ -471,11 +531,23 @@ fn write_copy_record(
         .to_str()
         .ok_or("sample bundle name is not UTF-8")?
         .to_string();
+    let root = directory.join(&bundle);
+    let files = bundle_files(&root)?
+        .into_iter()
+        .map(|(path, size)| {
+            Ok(SampleCopyFile {
+                sha256: file_sha256(&root, &path)?,
+                path,
+                size,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let record = SampleCopyRecord {
         version: COPY_RECORD_VERSION,
         slug: slug.to_string(),
         source: source.to_string(),
-        content: bundle_content_identity(&directory.join(&bundle))?,
+        documents: document_identity(&root)?,
+        files,
         bundle,
     };
     let bytes = serde_json::to_vec_pretty(&record)
