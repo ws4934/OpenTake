@@ -95,6 +95,21 @@ jobs:
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Resolve host target
+        id: host
+        run: |
+          $triple = ((rustc -vV | Select-String '^host: ').ToString() -replace '^host: ', '').Trim()
+          if (-not $triple) { throw 'Could not resolve the Rust host target' }
+          "triple=$triple" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # The provisioner re-verifies the SHA-256, version and licence of every
+      # restored sidecar before use and downloads any that do not match.
+      - name: Cache pinned FFmpeg sidecars
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-sidecars-${{ runner.os }}-${{ steps.host.outputs.triple }}-${{ hashFiles('scripts/ffmpeg-sidecars.lock.json', 'scripts/provision_ffmpeg_sidecars.py') }}
+
       - name: Provision pinned FFmpeg
         run: |
           $python = if ($IsWindows) { 'python' } else { 'python3' }
