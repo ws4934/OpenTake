@@ -72,6 +72,24 @@ pub fn probe_file_cancellable(
     Ok(parse_probe(&json))
 }
 
+/// Probe on behalf of a decoder that is about to run: cancellable through the
+/// caller's token, bounded by `timeout`, and queued for up to `admission_wait`
+/// when every ffprobe slot is busy instead of failing at once. `Ok(None)` means
+/// ffprobe read the input and rejected it as unreadable media.
+pub(crate) fn probe_for_decode(
+    target: ff::ProbeTarget<'_>,
+    cancel: &crate::MediaCancelToken,
+    timeout: Duration,
+    admission_wait: Duration,
+) -> Result<Option<MediaProbe>> {
+    Ok(
+        match ff::ffprobe_json_queued(target, cancel, timeout, admission_wait)? {
+            ff::QueuedProbe::Parsed(json) => Some(parse_probe(&json)),
+            ff::QueuedProbe::Rejected => None,
+        },
+    )
+}
+
 /// Parse the rate string ffprobe emits, e.g. `"30000/1001"` or `"25/1"`.
 /// `"0/0"` (unknown) → `None`.
 fn parse_rate(s: &str) -> Option<f64> {

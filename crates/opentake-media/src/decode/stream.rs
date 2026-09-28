@@ -15,6 +15,10 @@ use std::time::Duration;
 
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel, OutputVideoFrame};
 
+use opentake_domain::MediaColorMetadata;
+
+use crate::cancel::MediaCancelToken;
+use crate::decode::source_color::{resolve_path_color, ColorHint};
 use crate::error::{MediaError, Result};
 use crate::ff;
 use crate::frame::RgbaFrame;
@@ -110,11 +114,21 @@ pub struct StreamVideoFrame {
 #[derive(Clone, Debug)]
 pub struct StreamDecodeControl {
     stop: Arc<AtomicBool>,
+    /// Cancels the worker's pre-decode color probe on stop.
+    cancel: MediaCancelToken,
 }
 
 impl StreamDecodeControl {
+    fn new() -> Self {
+        StreamDecodeControl {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: MediaCancelToken::new(),
+        }
+    }
+
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -165,15 +179,24 @@ impl Drop for VideoStream {
 /// This is not wired into preview playback yet. It is the media-side primitive
 /// the render playback pipeline will consume in a later PR.
 pub fn spawn_video_stream(req: VideoStreamRequest) -> Result<VideoStream> {
+    spawn_video_stream_with_color(req, ColorHint::Unknown)
+}
+
+/// [`spawn_video_stream`] with the caller's knowledge of the source's color
+/// signalling. A [`ColorHint::Known`] skips the color probe; an unknown one is
+/// probed at most once per file identity, and a failed probe is reported on
+/// the stream instead of decoding HDR frames without tone mapping.
+pub fn spawn_video_stream_with_color(
+    req: VideoStreamRequest,
+    color: ColorHint,
+) -> Result<VideoStream> {
     req.validate()?;
     let (tx, rx) = sync_channel(req.queue_capacity);
-    let control = StreamDecodeControl {
-        stop: Arc::new(AtomicBool::new(false)),
-    };
+    let control = StreamDecodeControl::new();
     let worker_control = control.clone();
     let worker = thread::Builder::new()
         .name("opentake-video-decode".to_string())
-        .spawn(move || run_video_stream(req, tx, worker_control))
+        .spawn(move || run_video_stream(req, color, tx, worker_control))
         .map_err(MediaError::Io)?;
 
     Ok(VideoStream {
@@ -185,12 +208,19 @@ pub fn spawn_video_stream(req: VideoStreamRequest) -> Result<VideoStream> {
 
 fn run_video_stream(
     req: VideoStreamRequest,
+    color: ColorHint,
     tx: SyncSender<Result<StreamVideoFrame>>,
     control: StreamDecodeControl,
 ) {
-    let color = crate::probe::probe(&req.path)
-        .ok()
-        .and_then(|probe| probe.color);
+    let color = match resolve_path_color(&req.path, &color, &control.cancel) {
+        Ok(color) => color,
+        // A stop request cancelled the probe; stopped workers stay silent.
+        Err(MediaError::Cancelled) => return,
+        Err(error) => {
+            let _ = send_with_backpressure(&tx, Err(error), &control);
+            return;
+        }
+    };
     let args = video_stream_args_with_color(&req, color.as_ref());
     let mut child = match ff::ffmpeg().args(args).spawn() {
         Ok(child) => child,
@@ -321,7 +351,7 @@ fn video_stream_args(req: &VideoStreamRequest) -> Vec<String> {
 
 fn video_stream_args_with_color(
     req: &VideoStreamRequest,
-    color: Option<&opentake_domain::MediaColorMetadata>,
+    color: Option<&MediaColorMetadata>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     // Keyframe seek with source timestamps kept (relative to the container
@@ -526,9 +556,7 @@ mod tests {
     #[test]
     fn bounded_send_stops_instead_of_waiting_forever() {
         let (tx, _rx) = sync_channel(1);
-        let control = StreamDecodeControl {
-            stop: Arc::new(AtomicBool::new(false)),
-        };
+        let control = StreamDecodeControl::new();
         assert!(send_with_backpressure(
             &tx,
             Ok(stream_frame_from_output(&request(), black_output(0))),

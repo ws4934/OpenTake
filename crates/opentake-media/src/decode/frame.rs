@@ -19,7 +19,10 @@ use ffmpeg_sidecar::event::FfmpegEvent;
 use image::ImageEncoder;
 use rayon::prelude::*;
 
+use opentake_domain::MediaColorMetadata;
+
 use crate::cancel::MediaCancelToken;
+use crate::decode::source_color::{resolve_file_color, resolve_path_color, ColorHint};
 use crate::error::{MediaError, Result};
 use crate::ff;
 use crate::frame::RgbaFrame;
@@ -444,21 +447,11 @@ fn frame_args(path: &Path, req: &FrameRequest) -> Vec<String> {
 fn frame_args_with_color(
     path: &Path,
     req: &FrameRequest,
-    color: Option<&opentake_domain::MediaColorMetadata>,
+    color: Option<&MediaColorMetadata>,
 ) -> Vec<String> {
     let time_secs = req.time_secs.max(0.0);
     let target_us = target_micros(req);
-    let mut args: Vec<String> = Vec::new();
-    if let Some(color) = color {
-        args.extend(crate::color::hdr_decode_input_args(color));
-    }
-    // Keyframe seek at/before the target with source timestamps kept (relative
-    // to the container start). Accurate seek is off because it drops every
-    // frame before the target, including the one still on screen at it.
-    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
-    args.push(format!("{time_secs:.6}"));
-    args.push("-i".into());
-    args.push(path.to_string_lossy().into_owned());
+    let mut args = seek_input_args(path, time_secs, color);
     args.push("-frames:v".into());
     args.push("1".into());
 
@@ -473,6 +466,34 @@ fn frame_args_with_color(
         format!("setpts=PTS-{target_us}"),
         "fps=fps=1:start_time=0:round=up".to_string(),
     ];
+    push_conversion_filters(&mut filters, req, color);
+    push_rgba_output_args(&mut args, &filters);
+    args
+}
+
+/// Input options shared by single-frame and batched decodes: a keyframe seek
+/// at/before `time_secs` with source timestamps kept (relative to the
+/// container start). Accurate seek is off because it drops every frame before
+/// the target, including the one still on screen at it.
+fn seek_input_args(path: &Path, time_secs: f64, color: Option<&MediaColorMetadata>) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(color) = color {
+        args.extend(crate::color::hdr_decode_input_args(color));
+    }
+    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
+    args.push(format!("{time_secs:.6}"));
+    args.push("-i".into());
+    args.push(path.to_string_lossy().into_owned());
+    args
+}
+
+/// HDR tone mapping and the downscale box, applied after frame selection so
+/// only emitted frames pay for them.
+fn push_conversion_filters(
+    filters: &mut Vec<String>,
+    req: &FrameRequest,
+    color: Option<&MediaColorMetadata>,
+) {
     if let Some(filter) = color.and_then(crate::color::hdr_tonemap_filter) {
         filters.push(filter);
     }
@@ -498,6 +519,9 @@ fn frame_args_with_color(
             "scale=w={mw}:h={mh}:force_original_aspect_ratio=decrease"
         ));
     }
+}
+
+fn push_rgba_output_args(args: &mut Vec<String>, filters: &[String]) {
     args.push("-vf".into());
     args.push(filters.join(","));
     args.push("-fps_mode".into());
@@ -507,7 +531,6 @@ fn frame_args_with_color(
     args.push("-f".into());
     args.push("rawvideo".into());
     args.push("-".into());
-    args
 }
 
 fn frame_args_for_input(
@@ -590,18 +613,24 @@ pub fn decode_frame_at_cancellable(
     req: &FrameRequest,
     cancel: &MediaCancelToken,
 ) -> Result<(f64, RgbaFrame)> {
+    decode_frame_at_with_color_cancellable(path, req, &ColorHint::Unknown, cancel)
+}
+
+/// [`decode_frame_at_cancellable`] with the caller's knowledge of the source's
+/// color signalling. A [`ColorHint::Known`] (for example from the media
+/// manifest) skips the color probe entirely; an unknown one is probed at most
+/// once per file identity, and a failed probe fails the decode instead of
+/// silently skipping HDR tone mapping.
+pub fn decode_frame_at_with_color_cancellable(
+    path: &Path,
+    req: &FrameRequest,
+    color: &ColorHint,
+    cancel: &MediaCancelToken,
+) -> Result<(f64, RgbaFrame)> {
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    // Probe color only for ordinary files. FIFOs/device inputs are valid FFmpeg
-    // sources too; opening them once for ffprobe would consume or block the
-    // stream before the actual cancellable decoder child is spawned.
-    let color = path
-        .metadata()
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .and_then(|_| crate::probe::probe(path).ok())
-        .and_then(|probe| probe.color);
+    let color = resolve_path_color(path, color, cancel)?;
     let mut child = ff::ffmpeg()
         .args(frame_args_with_color(path, req, color.as_ref()))
         .spawn()
@@ -688,12 +717,21 @@ pub fn decode_frame_file_at_cancellable(
     req: &FrameRequest,
     cancel: &MediaCancelToken,
 ) -> Result<(f64, RgbaFrame)> {
+    decode_frame_file_at_with_color_cancellable(file, req, &ColorHint::Unknown, cancel)
+}
+
+/// [`decode_frame_file_at_cancellable`] with the caller's color hint; see
+/// [`decode_frame_at_with_color_cancellable`].
+pub fn decode_frame_file_at_with_color_cancellable(
+    file: &std::fs::File,
+    req: &FrameRequest,
+    color: &ColorHint,
+    cancel: &MediaCancelToken,
+) -> Result<(f64, RgbaFrame)> {
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    let color = crate::probe::probe_file(file)
-        .ok()
-        .and_then(|probe| probe.color);
+    let color = resolve_file_color(file, color, cancel)?;
     let mut input = file.try_clone()?;
     input.seek(SeekFrom::Start(0))?;
     let mut child = ff::ffmpeg()
@@ -815,27 +853,7 @@ pub fn decode_frames_at_cancellable(
     base: &FrameRequest,
     cancel: &MediaCancelToken,
 ) -> Vec<Result<(f64, RgbaFrame)>> {
-    let mut out = Vec::with_capacity(times_secs.len());
-    let mut last_time = f64::NEG_INFINITY;
-    for &time in times_secs {
-        if cancel.checkpoint() {
-            out.push(Err(MediaError::Cancelled));
-            break;
-        }
-        let request = FrameRequest {
-            time_secs: time,
-            ..base.clone()
-        };
-        match decode_frame_at_cancellable(path, &request, cancel) {
-            Ok((actual, frame)) if actual > last_time => {
-                last_time = actual;
-                out.push(Ok((actual, frame)));
-            }
-            Ok(_) | Err(MediaError::Decode(_)) => {}
-            Err(error) => out.push(Err(error)),
-        }
-    }
-    out
+    decode_frames_at_with_color_cancellable(path, times_secs, base, &ColorHint::Unknown, cancel)
 }
 
 /// Decode a batch of ascending `times_secs`. De-duplicates frames whose decoded
@@ -847,26 +865,363 @@ pub fn decode_frames_at(
     times_secs: &[f64],
     base: &FrameRequest,
 ) -> Vec<Result<(f64, RgbaFrame)>> {
+    decode_frames_at_with_color_cancellable(
+        path,
+        times_secs,
+        base,
+        &ColorHint::Unknown,
+        &MediaCancelToken::new(),
+    )
+}
+
+/// Batch decode with the caller's color hint. The source color is resolved
+/// once for the whole batch. Dense runs of targets on a common time grid
+/// (thumbnail strips, sampling cadences) are decoded by one forward ffmpeg
+/// pass that selects the displayed frame at every target; isolated or
+/// irregular targets fall back to one keyframe seek each.
+pub fn decode_frames_at_with_color_cancellable(
+    path: &Path,
+    times_secs: &[f64],
+    base: &FrameRequest,
+    color: &ColorHint,
+    cancel: &MediaCancelToken,
+) -> Vec<Result<(f64, RgbaFrame)>> {
     let mut out = Vec::with_capacity(times_secs.len());
+    if times_secs.is_empty() {
+        return out;
+    }
+    if cancel.checkpoint() {
+        out.push(Err(MediaError::Cancelled));
+        return out;
+    }
+    let color = match resolve_path_color(path, color, cancel) {
+        Ok(color) => color,
+        Err(error) => {
+            out.push(Err(error));
+            return out;
+        }
+    };
+    let known = ColorHint::Known(color.clone());
     let mut last_time = f64::NEG_INFINITY;
-    for &t in times_secs {
-        let req = FrameRequest {
-            time_secs: t,
-            ..base.clone()
-        };
-        match decode_frame_at(path, &req) {
-            Ok((actual, frame)) => {
-                if actual <= last_time {
-                    continue; // duplicate of an already-emitted keyframe
-                }
-                last_time = actual;
-                out.push(Ok((actual, frame)));
+    for plan in plan_frame_batches(times_secs) {
+        if cancel.checkpoint() {
+            out.push(Err(MediaError::Cancelled));
+            break;
+        }
+        let decoded = match plan {
+            FramePlan::Single(index) => {
+                let request = FrameRequest {
+                    time_secs: times_secs[index],
+                    ..base.clone()
+                };
+                vec![decode_frame_at_with_color_cancellable(
+                    path, &request, &known, cancel,
+                )]
             }
-            Err(MediaError::Decode(_)) => continue, // skip undecodable point
-            Err(e) => out.push(Err(e)),
+            FramePlan::Grid(run) => match decode_grid_run(path, base, color.as_ref(), &run, cancel)
+            {
+                Ok(frames) => frames.into_iter().map(Ok).collect(),
+                Err(error) => vec![Err(error)],
+            },
+        };
+        for result in decoded {
+            match result {
+                Ok((actual, frame)) if actual > last_time => {
+                    last_time = actual;
+                    out.push(Ok((actual, frame)));
+                }
+                // A duplicate of an already-emitted frame, or an undecodable
+                // point: skip it.
+                Ok(_) | Err(MediaError::Decode(_)) => {}
+                Err(MediaError::Cancelled) => {
+                    out.push(Err(MediaError::Cancelled));
+                    return out;
+                }
+                Err(error) => out.push(Err(error)),
+            }
         }
     }
     out
+}
+
+/// Consecutive batch targets at most this far apart share one forward
+/// decode. Wider gaps seek per frame, which decodes less than running through
+/// the gap.
+const BATCH_MAX_GAP_US: i64 = 2 * MICROS_PER_SEC;
+/// Targets decoded by one forward pass; bounds the selection expression.
+const BATCH_MAX_TARGETS: usize = 240;
+/// Finest grid a forward pass selects on; finer common steps (irregular
+/// targets) fall back to per-frame seeks.
+const BATCH_MIN_STEP_US: i64 = 1_000;
+/// Grid slots one forward pass may step through.
+const BATCH_MAX_SLOTS: i64 = 100_000;
+
+/// How one batch target is decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FramePlan {
+    /// Keyframe-seek decode of `times[index]` alone.
+    Single(usize),
+    /// One forward pass over the next `slots.len()` targets.
+    Grid(GridRun),
+}
+
+/// Consecutive ascending targets that lie on the grid
+/// `origin_us + slot * step_us`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GridRun {
+    origin_us: i64,
+    step_us: i64,
+    /// Grid slot of each target: strictly increasing, starting at 0.
+    slots: Vec<i64>,
+}
+
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.abs()
+}
+
+/// Split `times` into forward-pass grid runs and single seeks, preserving
+/// order. A run is a maximal sequence of strictly ascending, finite,
+/// non-negative targets whose consecutive gaps are at most
+/// [`BATCH_MAX_GAP_US`] and whose offsets share a grid step of at least
+/// [`BATCH_MIN_STEP_US`].
+fn plan_frame_batches(times: &[f64]) -> Vec<FramePlan> {
+    let micros = times
+        .iter()
+        .map(|&time| {
+            (time.is_finite() && time >= 0.0).then(|| (time * MICROS_PER_SEC as f64).round() as i64)
+        })
+        .collect::<Vec<_>>();
+    let mut plans = Vec::new();
+    let mut index = 0;
+    while index < times.len() {
+        if micros[index].is_none() {
+            plans.push(FramePlan::Single(index));
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < times.len() && end - index < BATCH_MAX_TARGETS {
+            let (Some(previous), Some(next)) = (micros[end - 1], micros[end]) else {
+                break;
+            };
+            if next <= previous || next - previous > BATCH_MAX_GAP_US {
+                break;
+            }
+            end += 1;
+        }
+        match grid_run(&micros[index..end]) {
+            Some(run) => plans.push(FramePlan::Grid(run)),
+            None => plans.extend((index..end).map(FramePlan::Single)),
+        }
+        index = end;
+    }
+    plans
+}
+
+fn grid_run(micros: &[Option<i64>]) -> Option<GridRun> {
+    if micros.len() < 2 {
+        return None;
+    }
+    let origin_us = micros[0]?;
+    let offsets = micros
+        .iter()
+        .map(|micros| micros.map(|micros| micros - origin_us))
+        .collect::<Option<Vec<_>>>()?;
+    let step_us = offsets[1..]
+        .iter()
+        .fold(0, |step, &offset| gcd(step, offset));
+    if step_us < BATCH_MIN_STEP_US || offsets.last()? / step_us >= BATCH_MAX_SLOTS {
+        return None;
+    }
+    Some(GridRun {
+        origin_us,
+        step_us,
+        slots: offsets.iter().map(|offset| offset / step_us).collect(),
+    })
+}
+
+/// `select` filter keeping only the grid slots that are targets, or `None`
+/// when every slot is one.
+fn grid_selection(slots: &[i64]) -> Option<String> {
+    let contiguous = slots
+        .iter()
+        .enumerate()
+        .all(|(index, &slot)| slot == index as i64);
+    if contiguous {
+        return None;
+    }
+    let mut terms = Vec::new();
+    let mut index = 0;
+    while index < slots.len() {
+        let start = slots[index];
+        let mut end = start;
+        while index + 1 < slots.len() && slots[index + 1] == end + 1 {
+            index += 1;
+            end += 1;
+        }
+        terms.push(if start == end {
+            format!("eq(n,{start})")
+        } else {
+            format!("between(n,{start},{end})")
+        });
+        index += 1;
+    }
+    Some(format!("select='{}'", terms.join("+")))
+}
+
+/// One forward decode emitting the frame displayed at every target of `run`.
+/// The same selection as single-frame decode, generalized to a grid: shift
+/// the first target to 0, let `fps` at the grid rate put the last frame with
+/// pts <= each grid time into that slot, then keep only the target slots.
+fn grid_frame_args(
+    path: &Path,
+    base: &FrameRequest,
+    color: Option<&MediaColorMetadata>,
+    run: &GridRun,
+) -> Vec<String> {
+    let origin_secs = run.origin_us as f64 / MICROS_PER_SEC as f64;
+    let mut args = seek_input_args(path, origin_secs, color);
+    args.push("-frames:v".into());
+    args.push(run.slots.len().to_string());
+    let mut filters: Vec<String> = vec![
+        format!("settb=1/{MICROS_PER_SEC}"),
+        "showinfo=checksum=0".to_string(),
+        format!("setpts=PTS-{}", run.origin_us),
+        format!(
+            "fps=fps={MICROS_PER_SEC}/{}:start_time=0:round=up",
+            run.step_us
+        ),
+    ];
+    filters.extend(grid_selection(&run.slots));
+    push_conversion_filters(&mut filters, base, color);
+    push_rgba_output_args(&mut args, &filters);
+    args
+}
+
+/// Every output frame (up to `expected`) plus every logged source pts.
+fn read_grid_frames(
+    events: impl IntoIterator<Item = FfmpegEvent>,
+    expected: usize,
+) -> (Vec<RgbaFrame>, Vec<i64>) {
+    let mut frames = Vec::with_capacity(expected);
+    let mut pts = Vec::new();
+    for event in events {
+        match event {
+            FfmpegEvent::OutputFrame(output)
+                if frames.len() < expected && output.width > 0 && output.height > 0 =>
+            {
+                frames.push(RgbaFrame::new(output.width, output.height, output.data));
+            }
+            FfmpegEvent::Log(_, line) => pts.extend(showinfo_pts(&line)),
+            _ => {}
+        }
+    }
+    (frames, pts)
+}
+
+/// The real pts of the frame shown at `target_us`: the last logged pts at or
+/// before it, else the first one after it (the padded first frame).
+fn displayed_pts(sorted_pts: &[i64], target_us: i64) -> i64 {
+    match sorted_pts.partition_point(|&pts| pts <= target_us) {
+        0 => sorted_pts.first().copied().unwrap_or(target_us),
+        after => sorted_pts[after - 1],
+    }
+}
+
+fn decode_grid_run(
+    path: &Path,
+    base: &FrameRequest,
+    color: Option<&MediaColorMetadata>,
+    run: &GridRun,
+    cancel: &MediaCancelToken,
+) -> Result<Vec<(f64, RgbaFrame)>> {
+    if cancel.is_cancelled() {
+        return Err(MediaError::Cancelled);
+    }
+    let mut child = ff::ffmpeg()
+        .args(grid_frame_args(path, base, color, run))
+        .spawn()
+        .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
+    cancel.child_spawned();
+    let iter = match child.iter() {
+        Ok(iter) => iter,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::Ffmpeg(format!("iter: {error}")));
+        }
+    };
+    let reader_cancel = cancel.clone();
+    let expected = run.slots.len();
+    let reader = match thread::Builder::new()
+        .name("opentake-frame-batch-events".to_string())
+        .spawn(move || {
+            reader_cancel.reader_started();
+            let result = read_grid_frames(iter, expected);
+            reader_cancel.reader_finished();
+            result
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::Ffmpeg(format!(
+                "spawn frame batch event reader: {error}"
+            )));
+        }
+    };
+
+    loop {
+        if cancel.checkpoint() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(MediaError::Cancelled);
+        }
+        if reader.is_finished() {
+            break;
+        }
+        match child.as_inner_mut().try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(FRAME_CHILD_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(MediaError::Io(error));
+            }
+        }
+    }
+    // Both pipes reach EOF once the command exits after its last frame; the
+    // reader drains every remaining event, so joining it cannot block on a
+    // producer. Reap the child explicitly afterwards.
+    let joined = reader.join();
+    let _ = child.kill();
+    let _ = child.wait();
+    let (frames, mut pts) =
+        joined.map_err(|_| MediaError::Ffmpeg("frame batch event reader panicked".to_string()))?;
+    if cancel.is_cancelled() {
+        return Err(MediaError::Cancelled);
+    }
+    if frames.is_empty() {
+        return Err(MediaError::Decode(format!(
+            "no frame at {:.3}s",
+            run.origin_us as f64 / MICROS_PER_SEC as f64
+        )));
+    }
+    pts.sort_unstable();
+    Ok(frames
+        .into_iter()
+        .zip(&run.slots)
+        .map(|(frame, slot)| {
+            let target_us = run.origin_us + slot * run.step_us;
+            let actual = displayed_pts(&pts, target_us) as f64 / MICROS_PER_SEC as f64;
+            (actual, frame)
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1166,5 +1521,351 @@ mod tests {
         assert!(boxed[vf + 1].contains("force_original_aspect_ratio=decrease"));
         assert!(boxed[vf + 1].contains("w=120"));
         assert!(boxed[vf + 1].contains("h=68"));
+    }
+
+    // --- batched decode planning ---
+
+    fn grid(origin_us: i64, step_us: i64, slots: &[i64]) -> FramePlan {
+        FramePlan::Grid(GridRun {
+            origin_us,
+            step_us,
+            slots: slots.to_vec(),
+        })
+    }
+
+    #[test]
+    fn thumbnail_cadence_is_one_forward_pass() {
+        assert_eq!(
+            plan_frame_batches(&[0.0, 1.0, 2.0, 3.0, 4.0]),
+            vec![grid(0, 1_000_000, &[0, 1, 2, 3, 4])]
+        );
+        // A sampling cadence offset from zero keeps its own origin.
+        assert_eq!(
+            plan_frame_batches(&[0.5, 2.5, 4.5]),
+            vec![grid(500_000, 2_000_000, &[0, 1, 2])]
+        );
+    }
+
+    #[test]
+    fn subsets_of_a_grid_select_only_their_slots() {
+        assert_eq!(
+            plan_frame_batches(&[0.0, 1.0, 1.01]),
+            vec![grid(0, 10_000, &[0, 100, 101])]
+        );
+        assert_eq!(grid_selection(&[0, 1, 2]), None);
+        assert_eq!(
+            grid_selection(&[0, 100, 101]).as_deref(),
+            Some("select='eq(n,0)+between(n,100,101)'")
+        );
+    }
+
+    #[test]
+    fn sparse_irregular_or_unordered_targets_seek_per_frame() {
+        // Gaps wider than the forward-pass limit.
+        assert_eq!(
+            plan_frame_batches(&[0.0, 10.0, 20.0]),
+            (0..3).map(FramePlan::Single).collect::<Vec<_>>()
+        );
+        // No common grid step of at least a millisecond.
+        assert_eq!(
+            plan_frame_batches(&[0.0, 1.0 / 3.0, 2.0 / 3.0]),
+            (0..3).map(FramePlan::Single).collect::<Vec<_>>()
+        );
+        // Non-finite, negative, and non-ascending targets end a run.
+        assert_eq!(
+            plan_frame_batches(&[f64::NAN, -1.0, 2.0, 1.0, 2.0, 3.0]),
+            vec![
+                FramePlan::Single(0),
+                FramePlan::Single(1),
+                FramePlan::Single(2),
+                grid(1_000_000, 1_000_000, &[0, 1, 2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_batches_split_into_bounded_runs() {
+        let times = (0..300).map(f64::from).collect::<Vec<_>>();
+        let plans = plan_frame_batches(&times);
+        assert_eq!(plans.len(), 2);
+        let FramePlan::Grid(first) = &plans[0] else {
+            panic!("expected a grid run: {plans:?}");
+        };
+        let FramePlan::Grid(second) = &plans[1] else {
+            panic!("expected a grid run: {plans:?}");
+        };
+        assert_eq!(first.slots.len(), BATCH_MAX_TARGETS);
+        assert_eq!(second.origin_us, BATCH_MAX_TARGETS as i64 * 1_000_000);
+        assert_eq!(second.slots.len(), 300 - BATCH_MAX_TARGETS);
+    }
+
+    #[test]
+    fn grid_args_seek_to_the_first_target_and_select_on_the_grid() {
+        let run = GridRun {
+            origin_us: 1_500_000,
+            step_us: 500_000,
+            slots: vec![0, 1, 4],
+        };
+        let base = FrameRequest {
+            max_size: (120, 68),
+            ..FrameRequest::default()
+        };
+        let args = grid_frame_args(Path::new("/x.mp4"), &base, None, &run);
+        let ss = args.iter().position(|a| a == "-ss").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(ss < input);
+        assert_eq!(args[ss + 1], "1.500000");
+        assert!(args.windows(2).any(|w| w == ["-frames:v", "3"]));
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(
+            args[vf + 1],
+            "settb=1/1000000,showinfo=checksum=0,setpts=PTS-1500000,\
+             fps=fps=1000000/500000:start_time=0:round=up,\
+             select='between(n,0,1)+eq(n,4)',\
+             scale=w=120:h=68:force_original_aspect_ratio=decrease"
+        );
+    }
+
+    #[test]
+    fn batch_frames_report_the_real_pts_on_screen_at_each_target() {
+        let pts = [900_000, 966_667, 1_033_333, 2_000_000];
+        assert_eq!(displayed_pts(&pts, 1_000_000), 966_667);
+        assert_eq!(displayed_pts(&pts, 1_500_000), 1_033_333);
+        assert_eq!(displayed_pts(&pts, 0), 900_000);
+        assert_eq!(displayed_pts(&[], 42), 42);
+
+        let events = [
+            showinfo_event(900_000),
+            output_event(1),
+            showinfo_event(966_667),
+            output_event(2),
+            output_event(3),
+        ];
+        let (frames, logged) = read_grid_frames(events, 2);
+        assert_eq!(frames.len(), 2, "frames beyond the targets are ignored");
+        assert_eq!(logged, vec![900_000, 966_667]);
+    }
+
+    // --- color probing (#47) ---
+
+    fn run_ffmpeg(args: &[&str], output: &Path) -> bool {
+        Command::new(crate::ff::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(args)
+            .arg(output)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn small_clip(path: &Path, seconds: u32) {
+        let duration = seconds.to_string();
+        assert!(
+            run_ffmpeg(
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x36:rate=5",
+                    "-t",
+                    &duration,
+                    "-c:v",
+                    "mpeg4",
+                ],
+                path,
+            ),
+            "generate clip fixture"
+        );
+    }
+
+    #[test]
+    fn decoding_many_frames_of_one_file_probes_color_at_most_once() {
+        assert!(
+            crate::ff::ffmpeg_available(),
+            "color probe accounting test needs a runnable FFmpeg"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let clip = temp.path().join("frames.mp4");
+        small_clip(&clip, 22);
+        let probes = crate::ff::test_seams::probe_requests;
+
+        let before = probes();
+        for time_secs in [0.0, 1.0, 2.5, 4.0] {
+            let request = FrameRequest {
+                time_secs,
+                max_size: (32, 18),
+                ..FrameRequest::default()
+            };
+            decode_frame_at_cancellable(&clip, &request, &MediaCancelToken::new()).unwrap();
+        }
+        assert_eq!(probes() - before, 1, "single-frame decodes share one probe");
+
+        // A caller that knows the signalling never probes.
+        let other = temp.path().join("hinted.mp4");
+        std::fs::copy(&clip, &other).unwrap();
+        let before = probes();
+        for time_secs in [0.0, 3.0] {
+            let request = FrameRequest {
+                time_secs,
+                ..FrameRequest::default()
+            };
+            decode_frame_at_with_color_cancellable(
+                &other,
+                &request,
+                &ColorHint::Known(None),
+                &MediaCancelToken::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(probes(), before, "a known color hint skips ffprobe");
+
+        // Twenty thumbnails of a not-yet-probed file: one ffprobe plus one
+        // forward ffmpeg pass, instead of two processes per thumbnail.
+        let fresh = temp.path().join("thumbnails.mp4");
+        std::fs::copy(&clip, &fresh).unwrap();
+        let times = (0..20).map(f64::from).collect::<Vec<_>>();
+        let cancel = MediaCancelToken::new();
+        let before = probes();
+        let thumbs = decode_frames_at_cancellable(
+            &fresh,
+            &times,
+            &FrameRequest {
+                max_size: (32, 18),
+                ..FrameRequest::default()
+            },
+            &cancel,
+        );
+        assert_eq!(thumbs.len(), 20);
+        assert!(thumbs.iter().all(Result::is_ok));
+        assert_eq!(probes() - before, 1);
+        assert_eq!(cancel.spawned_child_count(), 2, "one ffprobe + one ffmpeg");
+    }
+
+    #[test]
+    fn saturated_probe_admission_never_yields_untonemapped_hdr_frames() {
+        assert!(
+            crate::ff::ffmpeg_available(),
+            "HDR admission test needs a runnable FFmpeg"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let clip = temp.path().join("pq.mp4");
+        let generated = run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=24",
+                "-frames:v",
+                "1",
+                "-vf",
+                "format=yuv420p10le",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "log-level=error:hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+            ],
+            &clip,
+        );
+        if !generated {
+            eprintln!("skip: this FFmpeg cannot encode a PQ HEVC fixture");
+            return;
+        }
+        let request = FrameRequest {
+            max_size: (160, 90),
+            ..FrameRequest::default()
+        };
+        let cancel = MediaCancelToken::new();
+        let hdr = crate::probe::probe(&clip).unwrap().color.unwrap();
+        assert!(hdr.is_hdr());
+
+        let (_, probed) = decode_frame_at_cancellable(&clip, &request, &cancel).unwrap();
+        let (_, as_sdr) = decode_frame_at_with_color_cancellable(
+            &clip,
+            &request,
+            &ColorHint::Known(None),
+            &cancel,
+        )
+        .unwrap();
+        if crate::color::hdr_tonemap_filter(&hdr).is_some() {
+            assert_ne!(probed.rgba, as_sdr.rgba, "PQ frames must be tone-mapped");
+        }
+
+        crate::ff::test_seams::saturate_admission(true);
+        crate::ff::test_seams::override_admission_wait(Some(Duration::from_millis(50)));
+        let hinted = decode_frame_at_with_color_cancellable(
+            &clip,
+            &request,
+            &ColorHint::Known(Some(hdr)),
+            &cancel,
+        );
+        // A different identity is not cached, so it has to probe and cannot.
+        let copy = temp.path().join("pq-copy.mp4");
+        std::fs::copy(&clip, &copy).unwrap();
+        let unknown = decode_frame_at_cancellable(&copy, &request, &cancel);
+        crate::ff::test_seams::saturate_admission(false);
+        crate::ff::test_seams::override_admission_wait(None);
+
+        let (_, hinted) = hinted.expect("a hinted HDR decode needs no probe admission");
+        assert_eq!(hinted.rgba, probed.rgba, "hinted decode is tone-mapped");
+        match unknown {
+            Err(MediaError::Ffmpeg(message)) => {
+                assert!(message.contains("source color probe failed"), "{message}");
+                assert!(message.contains("admission limit"), "{message}");
+            }
+            other => panic!("expected an explicit probe error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_during_the_color_probe_returns_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let entered = temp.path().join("probe-entered");
+        let script = temp.path().join("stuck-ffprobe");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexec sleep 60\n", entered.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source.mp4");
+        std::fs::write(&source, b"any regular file is probed first").unwrap();
+
+        let cancel = MediaCancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::ff::test_seams::override_ffprobe(Some(script.into_os_string()));
+            let result =
+                decode_frame_at_cancellable(&source, &FrameRequest::default(), &worker_cancel);
+            done_tx.send((result, Instant::now())).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(entered.exists(), "the stuck ffprobe must be running");
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let (result, returned_at) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation must not wait for the probe deadline");
+        worker.join().unwrap();
+        assert!(matches!(result, Err(MediaError::Cancelled)), "{result:?}");
+        let latency = returned_at.duration_since(cancelled_at);
+        eprintln!("color probe cancellation latency: {latency:?}");
+        // Bounded by the probe poll interval plus cleanup, not the 10 s probe
+        // deadline; generous for loaded CI runners.
+        assert!(latency < Duration::from_secs(1), "{latency:?}");
+        assert_eq!(cancel.spawned_child_count(), 1, "no decoder was spawned");
     }
 }

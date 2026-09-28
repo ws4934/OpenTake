@@ -677,6 +677,76 @@ fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
     assert!((actual - 3.0).abs() < 1e-5, "{actual}");
 }
 
+/// `(actual pts in µs, source frame)` per emitted frame of a batch decode.
+fn batched(path: &Path, times: &[f64]) -> Vec<(i64, i64)> {
+    decode_frames_at(path, times, &FrameRequest::default())
+        .into_iter()
+        .map(|result| {
+            let (actual, frame) = result.expect("batched frame");
+            ((actual * 1e6).round() as i64, source_index(&frame))
+        })
+        .collect()
+}
+
+/// The same selection made one seek-decode at a time, with the batch API's
+/// `t > lastTime` de-duplication.
+fn one_by_one(path: &Path, times: &[f64]) -> Vec<(i64, i64)> {
+    let mut last = f64::NEG_INFINITY;
+    let mut out = Vec::new();
+    for &time in times {
+        let (actual, index) = frame_at(path, time);
+        if actual > last {
+            last = actual;
+            out.push(((actual * 1e6).round() as i64, index));
+        }
+    }
+    out
+}
+
+#[test]
+fn batched_forward_decode_matches_single_frame_decodes() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfr = dir.path().join("numbered30.mp4");
+    let vfr = dir.path().join("vfr.mp4");
+    if !make_numbered(&cfr, "30", 150, None)
+        || !make_numbered(&vfr, "30", 60, Some("setpts='if(gte(N,30),PTS+1/TB,PTS)'"))
+    {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+
+    let half_seconds = (0..10).map(|i| i as f64 * 0.5).collect::<Vec<_>>();
+    for times in [
+        vec![0.0, 1.0, 2.0, 3.0, 4.0],
+        half_seconds,
+        // A grid subset whose last target repeats the frame at 1.0 s.
+        vec![0.0, 1.0, 1.01, 2.5, 4.9],
+    ] {
+        let expected = one_by_one(&cfr, &times);
+        assert_eq!(batched(&cfr, &times), expected, "targets {times:?}");
+    }
+    assert_eq!(
+        batched(&cfr, &[0.0, 1.0, 2.0])
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>(),
+        vec![0, 30, 60]
+    );
+
+    // Across a one-second VFR gap the frame before the gap stays on screen.
+    let times = [0.5, 1.0, 1.5, 2.0, 2.5];
+    let expected = one_by_one(&vfr, &times);
+    assert_eq!(
+        expected.iter().map(|(_, index)| *index).collect::<Vec<_>>(),
+        vec![15, 29, 30, 45]
+    );
+    assert_eq!(batched(&vfr, &times), expected);
+}
+
 #[test]
 fn vfr_gap_single_and_streamed_frames_hold_the_last_displayed_frame() {
     if !ffmpeg_available() || !ffprobe_available() {
