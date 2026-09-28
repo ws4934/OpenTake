@@ -1009,6 +1009,7 @@ impl TauriMotionDocumentOperation {
                     document_id: source_document.document_id,
                     revision_hash: source_document.revision_hash,
                 },
+                action_name: commit.action_name,
             },
         ))
     }

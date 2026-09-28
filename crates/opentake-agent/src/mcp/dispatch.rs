@@ -132,6 +132,9 @@ enum TimelineResultCompletion {
     MotionDocument {
         tool: ToolName,
         operation: Box<dyn AdmittedMotionDocumentOperation>,
+        /// Undo scope of the admitting dispatch. `finish_dispatch` runs
+        /// outside that scope, so a publish is recorded against it explicitly.
+        undo_scope: String,
     },
 }
 
@@ -525,7 +528,11 @@ impl Dispatcher {
             return match bridge.admit(request) {
                 Ok(operation) => DispatchReceipt {
                     result: ToolResult::ok(""),
-                    timeline_result: TimelineResultCompletion::MotionDocument { tool, operation },
+                    timeline_result: TimelineResultCompletion::MotionDocument {
+                        tool,
+                        operation,
+                        undo_scope: ActiveUndoScope::current(),
+                    },
                 },
                 Err(error) => DispatchReceipt::complete(motion_document_error(tool, error)),
             };
@@ -586,8 +593,21 @@ impl Dispatcher {
                     insert_timeline_result_warning(&mut receipt.result);
                     return receipt.result;
                 }
-                TimelineResultCompletion::MotionDocument { tool, operation } => {
-                    let result = finish_motion_document_operation(tool, operation, cancel);
+                TimelineResultCompletion::MotionDocument {
+                    tool,
+                    operation,
+                    undo_scope,
+                } => {
+                    let revision_before = self.handle.current_revision();
+                    let (result, commit) =
+                        finish_motion_document_operation(tool, operation, cancel);
+                    if let Some(commit) = commit {
+                        self.record_external_edit_in(
+                            &undo_scope,
+                            commit.action_name,
+                            revision_before,
+                        );
+                    }
                     return short_id::shorten_ids(result, || {
                         short_id::current_id_universe(&self.handle.timeline(), &self.handle.media())
                     });
@@ -3154,6 +3174,15 @@ impl Dispatcher {
     }
 
     fn record_external_edit(&self, action_name: String, before: Option<CoreRevision>) {
+        self.record_external_edit_in(&ActiveUndoScope::current(), action_name, before);
+    }
+
+    fn record_external_edit_in(
+        &self,
+        scope: &str,
+        action_name: String,
+        before: Option<CoreRevision>,
+    ) {
         let (Some(before), Some((revision, head))) = (before, self.handle.revision_and_undo_head())
         else {
             return;
@@ -3167,7 +3196,7 @@ impl Dispatcher {
             return;
         }
         self.agent_undo_stacks()
-            .entry(ActiveUndoScope::current())
+            .entry(scope.to_string())
             .or_default()
             .push(AgentUndoMarker { revision, head });
     }
@@ -5453,6 +5482,172 @@ mod tests {
             Ok(Box::new(DeferredDocumentOperation {
                 executed: Arc::new(AtomicUsize::new(0)),
             }))
+        }
+    }
+
+    /// Publishes by moving `clip-1` on the shared handle, standing in for the
+    /// host's single render-and-commit timeline transaction.
+    struct CommittingPublishBridge {
+        handle: Arc<StateHandle>,
+        to_frame: i32,
+        fail: bool,
+    }
+
+    struct CommittingPublishOperation {
+        handle: Arc<StateHandle>,
+        to_frame: i32,
+        fail: bool,
+    }
+
+    impl AdmittedMotionDocumentOperation for CommittingPublishOperation {
+        fn execute(
+            self: Box<Self>,
+            cancel: &opentake_media::MediaCancelToken,
+        ) -> Result<
+            crate::mcp::motion_documents::MotionDocumentResponse,
+            crate::mcp::motion_documents::MotionDocumentBridgeError,
+        > {
+            use crate::mcp::motion_documents::{
+                MotionDocumentBridgeError, MotionDocumentBridgeErrorKind, MotionDocumentPublish,
+                MotionDocumentReference, MotionDocumentResponse,
+            };
+            if self.fail || cancel.is_cancelled() {
+                return Err(MotionDocumentBridgeError::new(
+                    if self.fail {
+                        MotionDocumentBridgeErrorKind::RenderFailed
+                    } else {
+                        MotionDocumentBridgeErrorKind::Cancelled
+                    },
+                    "publish did not commit",
+                ));
+            }
+            let result = self
+                .handle
+                .apply(EditCommand::MoveClips {
+                    moves: vec![ClipMove {
+                        clip_id: "clip-1".into(),
+                        to_track: 0,
+                        to_frame: self.to_frame,
+                    }],
+                })
+                .expect("publish commit");
+            Ok(MotionDocumentResponse::Published(MotionDocumentPublish {
+                clip_id: "clip-1".into(),
+                asset_id: "asset-1".into(),
+                duration_frames: 30,
+                duration_seconds: 1.0,
+                fps: 30.0,
+                width: 640,
+                height: 360,
+                source_document: MotionDocumentReference {
+                    document_id: "0b8f4c2e-6a1d-4e3b-9c7f-5d2a8e1b0c94".into(),
+                    revision_hash: "a".repeat(64),
+                },
+                action_name: result.action_name,
+            }))
+        }
+    }
+
+    impl MotionDocumentBridge for CommittingPublishBridge {
+        fn can_edit_motion_documents(&self) -> bool {
+            true
+        }
+
+        fn admit(
+            &self,
+            _request: crate::mcp::motion_documents::MotionDocumentRequest,
+        ) -> Result<
+            Box<dyn AdmittedMotionDocumentOperation>,
+            crate::mcp::motion_documents::MotionDocumentBridgeError,
+        > {
+            Ok(Box::new(CommittingPublishOperation {
+                handle: self.handle.clone(),
+                to_frame: self.to_frame,
+                fail: self.fail,
+            }))
+        }
+    }
+
+    fn publish_args() -> Value {
+        serde_json::json!({
+            "documentId": "0b8f4c2e-6a1d-4e3b-9c7f-5d2a8e1b0c94",
+            "revisionHash": "a".repeat(64),
+            "width": 640,
+            "height": 360,
+            "fps": 30,
+            "durationFrames": 30,
+            "startFrame": 0,
+        })
+    }
+
+    fn publishing_dispatcher(handle: Arc<StateHandle>, fail: bool) -> Dispatcher {
+        dispatcher_with(handle.clone()).with_motion_document_bridge(Some(Arc::new(
+            CommittingPublishBridge {
+                handle,
+                to_frame: 40,
+                fail,
+            },
+        )))
+    }
+
+    #[test]
+    fn published_motion_document_is_undoable_before_earlier_assistant_edits() {
+        let handle = seeded_handle();
+        let dispatcher = publishing_dispatcher(handle.clone(), false);
+        let moved = scoped_dispatch(
+            &dispatcher,
+            "chat-session-x",
+            "move_clips",
+            serde_json::json!({"moves":[{"clipId":"clip-1","toFrame":10}]}),
+        );
+        assert!(!moved.is_error, "{}", moved.text_joined());
+
+        let cancel = opentake_media::MediaCancelToken::new();
+        let receipt = dispatcher.dispatch_cancellable_scoped_deferred(
+            "chat-session-x",
+            "publish_motion_document",
+            publish_args(),
+            &cancel,
+        );
+        // Hosts finish outside the dispatch's undo scope.
+        let published = dispatcher.finish_dispatch(receipt, &cancel);
+        assert!(!published.is_error, "{}", published.text_joined());
+        assert!(!published.text_joined().contains("actionName"));
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 40);
+
+        let other = scoped_dispatch(&dispatcher, "chat-session-y", "undo", serde_json::json!({}));
+        assert!(other.is_error, "another session must not own the publish");
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 40);
+
+        let first = scoped_dispatch(&dispatcher, "chat-session-x", "undo", serde_json::json!({}));
+        assert!(!first.is_error, "{}", first.text_joined());
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 10);
+
+        let second = scoped_dispatch(&dispatcher, "chat-session-x", "undo", serde_json::json!({}));
+        assert!(!second.is_error, "{}", second.text_joined());
+        assert_eq!(handle.timeline().tracks[0].clips[0].start_frame, 0);
+    }
+
+    #[test]
+    fn failed_or_cancelled_motion_publish_records_no_undo_marker() {
+        for fail in [true, false] {
+            let handle = seeded_handle();
+            let dispatcher = publishing_dispatcher(handle.clone(), fail);
+            let cancel = opentake_media::MediaCancelToken::new();
+            let receipt = dispatcher.dispatch_cancellable_scoped_deferred(
+                "chat-session-x",
+                "publish_motion_document",
+                publish_args(),
+                &cancel,
+            );
+            if !fail {
+                cancel.cancel();
+            }
+            let result = dispatcher.finish_dispatch(receipt, &cancel);
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(!dispatcher
+                .agent_undo_stacks()
+                .contains_key("chat-session-x"));
         }
     }
 
