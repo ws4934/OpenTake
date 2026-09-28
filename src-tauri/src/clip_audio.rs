@@ -21,6 +21,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "playback-engine")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -41,6 +42,7 @@ const RENDER_CHUNK_FRAMES: usize = 4 * 1024;
 const PROFILE_CACHE_CAPACITY: usize = 256;
 /// Background profile passes waiting at once; the oldest is dropped beyond
 /// this (a later window asks again if its clip still plays).
+#[cfg(feature = "playback-engine")]
 const PROFILE_QUEUE_CAPACITY: usize = 64;
 /// How often a caller waiting for another caller's profile pass checks its
 /// own cancellation.
@@ -284,11 +286,13 @@ impl ClipAudioReader {
     }
 
     /// The next clip frame [`ClipAudioReader::read`] returns.
+    #[cfg(feature = "playback-engine")]
     pub(crate) fn position(&self) -> usize {
         self.position
     }
 
     /// Whether this reader denoises its output.
+    #[cfg(feature = "playback-engine")]
     pub(crate) fn is_denoised(&self) -> bool {
         self.denoise.is_some()
     }
@@ -429,6 +433,7 @@ pub(crate) fn clip_denoise(
 }
 
 /// What preview playback should do with a clip's denoise right now.
+#[cfg(feature = "playback-engine")]
 #[derive(Debug)]
 pub(crate) enum PreviewDenoise {
     /// The clip is not denoised in preview.
@@ -442,14 +447,17 @@ pub(crate) enum PreviewDenoise {
 /// The owner of preview's background profile passes (one per playback
 /// state). Cancelling a scope, when its project closes, cancels only the
 /// passes it requested; other owners' passes keep running.
+#[cfg(feature = "playback-engine")]
 #[derive(Clone)]
 pub(crate) struct ProfileScope(Arc<ScopeInner>);
 
+#[cfg(feature = "playback-engine")]
 struct ScopeInner {
     id: u64,
     cancel: Mutex<MediaCancelToken>,
 }
 
+#[cfg(feature = "playback-engine")]
 impl ProfileScope {
     pub(crate) fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -494,6 +502,7 @@ impl ProfileScope {
     }
 }
 
+#[cfg(feature = "playback-engine")]
 impl Default for ProfileScope {
     fn default() -> Self {
         ProfileScope::new()
@@ -505,6 +514,7 @@ impl Default for ProfileScope {
 /// per layout, however many windows or playback sessions ask) and the clip
 /// plays undenoised until it is ready. A newer request for the same clip (a
 /// trim changed its layout) replaces the queued one.
+#[cfg(feature = "playback-engine")]
 pub(crate) fn preview_clip_denoise(
     config: Option<AudioDenoise>,
     clip_id: &str,
@@ -593,12 +603,18 @@ impl ProfileKey {
 struct ProfileJob {
     key: ProfileKey,
     /// The clip that asked; a newer request for it replaces this one.
+    #[cfg(feature = "playback-engine")]
     clip_id: String,
+    #[cfg(feature = "playback-engine")]
     layout: ClipAudioLayout,
+    #[cfg(feature = "playback-engine")]
     path: PathBuf,
+    #[cfg(feature = "playback-engine")]
     channels: usize,
     /// The [`ProfileScope`] that asked, and its cancellation.
+    #[cfg(feature = "playback-engine")]
     scope: u64,
+    #[cfg(feature = "playback-engine")]
     cancel: MediaCancelToken,
 }
 
@@ -641,6 +657,7 @@ impl ProfileStore {
     /// in its scope, replacing the queued passes of the same clip. Without a
     /// worker the pass counts as failed, so the clip plays undenoised.
     /// Returns whether queued passes were dropped (waiters must re-check).
+    #[cfg(feature = "playback-engine")]
     fn request(&mut self, job: ProfileJob, worker_running: bool) -> bool {
         if self.in_flight.contains(&job.key)
             || self
@@ -707,8 +724,10 @@ struct ProfileService {
     /// Signalled whenever a pass ends or leaves the queue.
     finished: Condvar,
     /// Signalled whenever a pass is queued.
+    #[cfg(feature = "playback-engine")]
     queued: Condvar,
     /// Whether the worker thread started.
+    #[cfg(feature = "playback-engine")]
     worker: OnceLock<bool>,
 }
 
@@ -722,6 +741,7 @@ impl ProfileService {
     /// Start the background worker on first use; false if it could not
     /// start. One worker runs the passes one at a time, so preview never
     /// runs more than one extra decode however many denoised clips it plays.
+    #[cfg(feature = "playback-engine")]
     fn start_worker(&'static self) -> bool {
         *self.worker.get_or_init(|| {
             match std::thread::Builder::new()
@@ -743,11 +763,14 @@ fn profiles() -> &'static ProfileService {
     SERVICE.get_or_init(|| ProfileService {
         store: Mutex::new(ProfileStore::new()),
         finished: Condvar::new(),
+        #[cfg(feature = "playback-engine")]
         queued: Condvar::new(),
+        #[cfg(feature = "playback-engine")]
         worker: OnceLock::new(),
     })
 }
 
+#[cfg(feature = "playback-engine")]
 fn run_profile_worker(service: &'static ProfileService) {
     loop {
         let job = {
@@ -845,7 +868,7 @@ fn compute_profile(
     cancel: &MediaCancelToken,
     progress: Option<&dyn Fn(usize)>,
 ) -> Result<Arc<DenoiseProfile>, MediaError> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "playback-engine"))]
     test_hooks::record_pass(path);
     let mut reader = ClipAudioReader::open(*layout, path, channels, 0, None, cancel)?;
     let mut builder =
@@ -933,7 +956,7 @@ pub(crate) mod reader_census {
 
 /// Test seams for the background profile worker: count passes and requests
 /// per source path, and hold a path's background pass until released.
-#[cfg(test)]
+#[cfg(all(test, feature = "playback-engine"))]
 pub(crate) mod test_hooks {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1089,6 +1112,7 @@ mod tests {
     use super::fixtures::{encode_sine, ffmpeg_ready, noisy_tone, write_wav, RATE};
     use super::*;
     use opentake_domain::DenoiseMode;
+    #[cfg(feature = "playback-engine")]
     use std::time::Duration;
 
     fn clip(start_frame: i32, duration_frames: i32) -> Clip {
@@ -1157,6 +1181,16 @@ mod tests {
         Arc::new(builder.finish(&cancel).unwrap())
     }
 
+    fn test_key(frames: i32) -> ProfileKey {
+        let layout = ClipAudioLayout::new(&clip(0, frames), 30, RATE).unwrap();
+        ProfileKey::new(
+            &layout,
+            Path::new("/nonexistent/opentake-profile-test.wav"),
+            1,
+        )
+    }
+
+    #[cfg(feature = "playback-engine")]
     fn test_job(clip_id: &str, frames: i32, scope: u64) -> ProfileJob {
         let layout = ClipAudioLayout::new(&clip(0, frames), 30, RATE).unwrap();
         let path = PathBuf::from("/nonexistent/opentake-profile-test.wav");
@@ -1176,7 +1210,7 @@ mod tests {
         let mut store = ProfileStore::new();
         let profile = test_profile();
         let keys = (1..=PROFILE_CACHE_CAPACITY as i32 + 1)
-            .map(|frames| test_job("clip", frames, 0).key)
+            .map(test_key)
             .collect::<Vec<_>>();
         for key in &keys[..PROFILE_CACHE_CAPACITY] {
             store.finish(key, Some(&profile));
@@ -1194,6 +1228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "playback-engine")]
     fn a_newer_request_for_a_clip_replaces_its_queued_pass_and_runs_first() {
         let mut store = ProfileStore::new();
         let old_layout = test_job("speech", 90, 7);
@@ -1224,6 +1259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "playback-engine")]
     fn preview_plays_undenoised_when_the_profile_worker_is_not_running() {
         let mut store = ProfileStore::new();
         let job = test_job("speech", 90, 3);
@@ -1238,6 +1274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "playback-engine")]
     fn cancelling_a_profile_scope_leaves_other_scopes_passes_running() {
         if !ffmpeg_ready() {
             eprintln!("skip: ffmpeg/ffprobe not available");
