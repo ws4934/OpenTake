@@ -141,8 +141,8 @@ impl UrlFetcher for ReqwestUrlFetcher {
             .no_proxy()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(5 * 60));
-        if let Some(pinned) = pinned {
-            builder = builder.resolve(&host, pinned);
+        if !pinned.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &pinned);
         }
         let client = builder
             .build()
@@ -250,7 +250,7 @@ async fn wait_for_media_cancel(cancel: &opentake_media::MediaCancelToken) {
 async fn resolve_public_target(
     url: &reqwest::Url,
     cancel: &opentake_media::MediaCancelToken,
-) -> Result<(String, Option<SocketAddr>), BridgeError> {
+) -> Result<(String, Vec<SocketAddr>), BridgeError> {
     crate::public_net::resolve_public_target(url, cancel, crate::public_net::system_lookup)
         .await
         .map_err(public_target_error)
@@ -270,8 +270,8 @@ fn public_target_error(error: PublicTargetError) -> BridgeError {
 }
 
 #[cfg(test)]
-fn pin_public_address(addresses: Vec<SocketAddr>) -> Result<SocketAddr, BridgeError> {
-    crate::public_net::pin_public_address(addresses).map_err(public_target_error)
+fn pin_public_addresses(addresses: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BridgeError> {
+    crate::public_net::pin_public_addresses(addresses).map_err(public_target_error)
 }
 
 fn ensure_public_ip(ip: IpAddr) -> Result<(), BridgeError> {
@@ -5187,11 +5187,17 @@ mod tests {
 
         let public_v4 = "93.184.216.34:443".parse::<SocketAddr>().unwrap();
         let public_v6 = "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap();
-        assert_eq!(pin_public_address(vec![public_v4]).unwrap(), public_v4);
-        assert_eq!(pin_public_address(vec![public_v6]).unwrap(), public_v6);
-        assert!(pin_public_address(Vec::new()).is_err());
-        assert!(pin_public_address(vec![public_v4, "127.0.0.1:443".parse().unwrap(),]).is_err());
-        assert!(pin_public_address(vec![public_v6, "[fc00::1]:443".parse().unwrap(),]).is_err());
+        assert_eq!(
+            pin_public_addresses(vec![public_v4]).unwrap(),
+            vec![public_v4]
+        );
+        assert_eq!(
+            pin_public_addresses(vec![public_v4, public_v6]).unwrap(),
+            vec![public_v4, public_v6]
+        );
+        assert!(pin_public_addresses(Vec::new()).is_err());
+        assert!(pin_public_addresses(vec![public_v4, "127.0.0.1:443".parse().unwrap(),]).is_err());
+        assert!(pin_public_addresses(vec![public_v6, "[fc00::1]:443".parse().unwrap(),]).is_err());
     }
 
     #[test]

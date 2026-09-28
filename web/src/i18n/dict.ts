@@ -334,6 +334,9 @@ const zh: Dict = {
   "media.folderItemCount": "{count} 项",
   "media.folderEmpty": "此文件夹为空。",
   "media.importing": "正在导入…",
+  "generation.outcomeUnknown": "提交结果未知：服务商可能已接受并计费，重试前请先在服务商控制台确认",
+  "generation.outcomeUnknownRetryConfirm":
+    "此任务的提交没有收到应答，服务商可能已经生成并计费。请先在服务商控制台确认没有该任务，再重试。重试会再次调用生成服务并可能再次产生费用。是否继续？",
   "media.importFailed": "导入失败:{error}",
   "media.placeFailed": "放置到时间线失败：{error}",
   "media.dropToAdd": "松开以添加到时间线",
@@ -1571,6 +1574,10 @@ const en: Dict = {
   "media.folderItemCount": "{count} items",
   "media.folderEmpty": "This folder is empty.",
   "media.importing": "Importing…",
+  "generation.outcomeUnknown":
+    "Submission outcome unknown: the provider may have accepted and billed it. Check the provider console before retrying",
+  "generation.outcomeUnknownRetryConfirm":
+    "This submission got no answer, so the provider may already have generated and billed it. Check the provider console for the job before retrying. Retrying calls the provider again and may be billed again. Continue?",
   "media.importFailed": "Import failed: {error}",
   "media.placeFailed": "Failed to place on timeline: {error}",
   "media.dropToAdd": "Release to add to the timeline",

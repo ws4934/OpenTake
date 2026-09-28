@@ -4,7 +4,8 @@
 //! A host is resolved before anything is sent, every answer must be a public
 //! unicast address (a mixed public/private answer is refused, which also
 //! defeats DNS rebinding), and the caller pins the connection to the checked
-//! address instead of letting the HTTP client resolve the name again.
+//! addresses (all of them, so a dead edge falls back to the next) instead of
+//! letting the HTTP client resolve the name again.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -27,13 +28,28 @@ pub(crate) enum PublicTargetError {
 }
 
 /// Resolve `url`'s host and check every address. Returns the host and, for a
-/// DNS name, the address to pin the connection to (`None` for an IP literal,
-/// which the client connects to directly).
+/// DNS name, the checked addresses to pin the connection to (empty for an IP
+/// literal, which the client connects to directly).
 pub(crate) async fn resolve_public_target<F, Fut>(
     url: &reqwest::Url,
     cancel: &MediaCancelToken,
     lookup: F,
-) -> Result<(String, Option<SocketAddr>), PublicTargetError>
+) -> Result<(String, Vec<SocketAddr>), PublicTargetError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    resolve_target_with_policy(url, cancel, lookup, public_ip).await
+}
+
+/// [`resolve_public_target`] with the address policy supplied (tests accept
+/// a loopback server as "public").
+pub(crate) async fn resolve_target_with_policy<F, Fut>(
+    url: &reqwest::Url,
+    cancel: &MediaCancelToken,
+    lookup: F,
+    allowed: fn(IpAddr) -> bool,
+) -> Result<(String, Vec<SocketAddr>), PublicTargetError>
 where
     F: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
@@ -45,8 +61,10 @@ where
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
     if let Some(ip) = literal_host_ip(&host) {
-        ensure_public_ip(ip)?;
-        return Ok((host, None));
+        if !allowed(ip) {
+            return Err(PublicTargetError::NonPublicAddress);
+        }
+        return Ok((host, Vec::new()));
     }
     let lookup = lookup(host.clone(), port);
     tokio::pin!(lookup);
@@ -57,7 +75,7 @@ where
         () = wait_for_cancel(cancel) => return Err(PublicTargetError::Cancelled),
         () = &mut timeout => return Err(PublicTargetError::LookupTimedOut),
     };
-    Ok((host, Some(pin_public_address(addresses)?)))
+    Ok((host, checked_addresses(addresses, allowed)?))
 }
 
 /// The system resolver.
@@ -67,22 +85,34 @@ pub(crate) async fn system_lookup(host: String, port: u16) -> std::io::Result<Ve
         .collect())
 }
 
-/// Pick the connection address from a DNS answer in which every address must
-/// be public.
-pub(crate) fn pin_public_address(
-    mut addresses: Vec<SocketAddr>,
-) -> Result<SocketAddr, PublicTargetError> {
-    addresses.sort_unstable();
-    addresses.dedup();
-    if addresses.is_empty() {
+/// The addresses of a DNS answer in which every address must be public, in
+/// the resolver's order (duplicates removed).
+#[cfg(test)]
+pub(crate) fn pin_public_addresses(
+    addresses: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, PublicTargetError> {
+    checked_addresses(addresses, public_ip)
+}
+
+fn checked_addresses(
+    addresses: Vec<SocketAddr>,
+    allowed: fn(IpAddr) -> bool,
+) -> Result<Vec<SocketAddr>, PublicTargetError> {
+    let mut unique = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if !unique.contains(&address) {
+            unique.push(address);
+        }
+    }
+    if unique.is_empty() {
         return Err(PublicTargetError::NoAddresses);
     }
     // Reject mixed public/private answers rather than choosing the public one:
     // this makes split-horizon and rebinding responses fail closed.
-    for address in &addresses {
-        ensure_public_ip(address.ip())?;
+    if unique.iter().any(|address| !allowed(address.ip())) {
+        return Err(PublicTargetError::NonPublicAddress);
     }
-    Ok(addresses[0])
+    Ok(unique)
 }
 
 pub(crate) fn ensure_public_ip(ip: IpAddr) -> Result<(), PublicTargetError> {
@@ -134,6 +164,13 @@ fn public_ipv6(ip: Ipv6Addr) -> bool {
         return public_ipv4(ipv4);
     }
     let segments = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): on a DNS64 network
+    // every IPv4 destination is reached through it, so the IPv4 policy
+    // applies to the embedded address.
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        let [.., high, low] = segments;
+        return public_ipv4(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low)));
+    }
     let first = segments[0];
     if ip.is_unspecified()
         || ip.is_loopback()
@@ -173,6 +210,8 @@ mod tests {
             "192.0.0.8",
             "192.88.99.1",
             "64:ff9b::a00:1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::5db8:d822",
             "2002:a00:1::1",
             "2001::1",
             "::a00:1",
@@ -181,7 +220,12 @@ mod tests {
             let ip = ip.parse::<IpAddr>().unwrap();
             assert!(!public_ip(ip), "{ip} must not be treated as public");
         }
-        for ip in ["93.184.216.34", "2606:4700:4700::1111"] {
+        for ip in [
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            // NAT64 of 93.184.216.34.
+            "64:ff9b::5db8:d822",
+        ] {
             assert!(public_ip(ip.parse().unwrap()), "{ip} is public");
         }
     }
@@ -191,13 +235,16 @@ mod tests {
         let url = reqwest::Url::parse("https://cdn.example.test/result.png").unwrap();
         let cancel = MediaCancelToken::new();
         let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let second: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
         let (host, pinned) = resolve_public_target(&url, &cancel, |host, port| async move {
             assert_eq!((host.as_str(), port), ("cdn.example.test", 443));
-            Ok(vec![public])
+            Ok(vec![public, second, public])
         })
         .await
         .unwrap();
-        assert_eq!((host.as_str(), pinned), ("cdn.example.test", Some(public)));
+        // Every checked address is pinned, in the resolver's order.
+        assert_eq!(host, "cdn.example.test");
+        assert_eq!(pinned, vec![public, second]);
 
         let mixed = resolve_public_target(&url, &cancel, |_, _| async move {
             Ok(vec![public, "10.0.0.1:443".parse().unwrap()])

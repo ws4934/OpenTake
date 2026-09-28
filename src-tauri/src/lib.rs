@@ -17,6 +17,7 @@ mod dialog_output;
 // `pub` so the ffmpeg-gated integration test (`tests/export_integration.rs`) can
 // drive the export orchestrator (`export::run_export`) against the library
 // target. The Tauri command itself is registered below like the other modules.
+mod durable_list;
 pub mod export;
 #[cfg(not(feature = "external-mcp-integration"))]
 mod external_mcp;
@@ -25,6 +26,7 @@ pub mod external_mcp;
 pub mod feedback;
 mod fs_availability;
 mod generation;
+mod generation_orphans;
 mod haptic;
 mod home;
 mod instance_lock;
@@ -208,10 +210,15 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("workflows");
             let install_admission = updater::InstallAdmissionGate::default();
+            // Paid jobs and abandoned voice clones recorded outside any
+            // project must survive restarts, so they need the real
+            // application data directory: never fall back to a temporary one.
+            let app_data_dir = app.path().app_data_dir()?;
             let generation_bridge = generation::build_bridge(
                 core.clone(),
                 cache_root.clone(),
                 models_dir.clone(),
+                app_data_dir.join("generation-orphans"),
                 install_admission.clone(),
             );
             // Save As rebinds running generation jobs to the new bundle;
@@ -225,10 +232,7 @@ pub fn run() {
             // Abandoned voice clones whose provider removal failed. They have
             // no project record, so the queue lives in application data.
             let voice_revocations = Arc::new(voice_revocations::VoiceRevocationStore::new(
-                app.path()
-                    .app_data_dir()
-                    .unwrap_or_else(|_| std::env::temp_dir())
-                    .join("voice-revocations.json"),
+                app_data_dir.join("voice-revocations.json"),
             ));
             let advanced_bridge = Arc::new(advanced::TauriAdvancedWorkflowBridge::new(
                 core.clone(),
