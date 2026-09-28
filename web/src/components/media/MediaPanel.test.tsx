@@ -659,42 +659,45 @@ describe("media grid interaction consistency", () => {
     await act(async () => root.unmount());
   });
 
-  it("tells the user to check the provider before retrying an unknown submission", async () => {
-    const container = document.createElement("div");
-    document.body.append(container);
-    const root = createRoot(container);
-    const confirm = vi.fn(() => false);
-    vi.stubGlobal("confirm", confirm);
-    await act(async () =>
-      root.render(
-        <MediaCard
-          item={{
-            ...mediaItem("unknown"),
-            generationStatus: "failed",
-            generationErrorCode: "GENERATION_SUBMIT_OUTCOME_UNKNOWN",
-            generationInput: {
-              prompt: "mountains",
-              model: "test",
-              duration: 1,
-              aspectRatio: "16:9",
-              provider: "local",
-              jobId: "job-3",
-            },
-          }}
-        />,
-      ),
-    );
-    expect(container.textContent).not.toContain("GENERATION_SUBMIT_OUTCOME_UNKNOWN");
-    expect(container.textContent).toContain("服务商控制台");
-    const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
-      (button) => button.textContent === "重试",
-    );
-    await act(async () => retry?.click());
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(String((confirm.mock.calls[0] as unknown[])[0])).toContain("服务商控制台");
-    vi.unstubAllGlobals();
-    await act(async () => root.unmount());
-  });
+  it.each(["GENERATION_SUBMIT_OUTCOME_UNKNOWN", "GENERATION_RESTART_RETRY_REQUIRED"])(
+    "tells the user to check the provider before retrying %s",
+    async (code) => {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const confirm = vi.fn(() => false);
+      vi.stubGlobal("confirm", confirm);
+      await act(async () =>
+        root.render(
+          <MediaCard
+            item={{
+              ...mediaItem("unknown"),
+              generationStatus: "failed",
+              generationErrorCode: code,
+              generationInput: {
+                prompt: "mountains",
+                model: "test",
+                duration: 1,
+                aspectRatio: "16:9",
+                provider: "local",
+                jobId: "job-3",
+              },
+            }}
+          />,
+        ),
+      );
+      expect(container.textContent).not.toContain(code);
+      expect(container.textContent).toContain("服务商控制台");
+      const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "重试",
+      );
+      await act(async () => retry?.click());
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(String((confirm.mock.calls[0] as unknown[])[0])).toContain("服务商控制台");
+      vi.unstubAllGlobals();
+      await act(async () => root.unmount());
+    },
+  );
 
   it("keeps extract audio keyboard-reachable from zero hover without adding idle visual noise", async () => {
     dialogMocks.saveDialog.mockResolvedValue(dialogMocks.save);

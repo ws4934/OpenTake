@@ -7047,17 +7047,48 @@ mod tests {
 
     #[test]
     fn a_partially_saved_enrollment_keeps_its_voice_and_record() {
+        // The project save commits the record, then cannot confirm that its
+        // directory was flushed (`DurabilityUnconfirmed`).
+        assert_partially_saved_enrollment_keeps_its_voice(
+            |_| {},
+            Box::new(|| {
+                opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
+            }),
+        );
+    }
+
+    #[test]
+    fn an_enrollment_whose_manifest_cleanup_fails_keeps_its_voice_and_record() {
+        // The saved manifest lists an asset the project no longer has, so the
+        // save commits the timeline with the record first and then fails to
+        // write the final manifest (`PartialCommit`).
+        assert_partially_saved_enrollment_keeps_its_voice(
+            |fixture| {
+                let path = fixture.bundle.join("media.json");
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let entries = manifest["entries"].as_array_mut().unwrap();
+                let mut stale = entries[0].clone();
+                stale["id"] = json!("stale-asset");
+                entries.push(stale);
+                std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+            },
+            Box::new(opentake_project::bundle::test_hooks::fail_next_final_manifest_write),
+        );
+    }
+
+    fn assert_partially_saved_enrollment_keeps_its_voice(
+        prepare: impl FnOnce(&IdentityFixture),
+        during_enroll: Box<dyn Fn() + Send + Sync>,
+    ) {
         let Some(fixture) = identity_fixture() else {
             return;
         };
+        prepare(&fixture);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let revoked = Arc::new(Mutex::new(HashSet::new()));
-        // The project save commits the record, then cannot confirm that its
-        // directory was flushed.
         let voice = Arc::new(FixtureVoiceProvider {
-            during_enroll: Some(Box::new(|| {
-                opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
-            })),
+            during_enroll: Some(during_enroll),
             ..FixtureVoiceProvider::new(
                 fixture.generated_voice.clone(),
                 revoked.clone(),

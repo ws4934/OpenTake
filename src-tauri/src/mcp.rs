@@ -144,6 +144,7 @@ impl UrlFetcher for ReqwestUrlFetcher {
         if !pinned.is_empty() {
             builder = builder.resolve_to_addrs(&host, &pinned);
         }
+        let expected = crate::public_net::expected_peers(&host, &pinned);
         let client = builder
             .build()
             .map_err(|_| BridgeError::new("Failed to initialize the secure HTTPS client"))?;
@@ -155,6 +156,17 @@ impl UrlFetcher for ReqwestUrlFetcher {
                 }
             }
         })?;
+        // Defense in depth: the connection must have gone to one of the
+        // checked addresses; an unknown peer is refused.
+        if !crate::public_net::peer_is_expected(
+            response.remote_addr(),
+            &expected,
+            crate::public_net::public_ip,
+        ) {
+            return Err(BridgeError::new(
+                "source.url connection did not reach the checked public address",
+            ));
+        }
         let status = response.status();
         let location = response
             .headers()

@@ -213,7 +213,7 @@ pub fn run() {
             // Paid jobs and abandoned voice clones recorded outside any
             // project must survive restarts, so they need the real
             // application data directory: never fall back to a temporary one.
-            let app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = durable_app_data_dir(app.path().app_data_dir())?;
             let generation_bridge = generation::build_bridge(
                 core.clone(),
                 cache_root.clone(),
@@ -580,6 +580,30 @@ pub fn run_safe_asset_helper_if_requested() -> bool {
     safe_asset_protocol::run_helper_if_requested()
 }
 
+/// The application data directory that paid generation jobs and abandoned
+/// voice clones are recorded in. They must survive restarts, so startup
+/// fails when it cannot be resolved or created instead of falling back to a
+/// temporary directory.
+fn durable_app_data_dir(
+    resolved: tauri::Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = resolved
+        .map_err(|error| format!("the application data directory is unavailable: {error}"))?;
+    if !dir.is_absolute() {
+        return Err(format!(
+            "the application data directory is not absolute: {}",
+            dir.display()
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "the application data directory {} cannot be created: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
 /// Map a [`CoreEvent`] onto a front-end Tauri event. The event name matches the
 /// `kind` tag the front end listens for; the payload is the event itself
 /// (serialized with its `kind`-tagged shape).
@@ -587,11 +611,6 @@ fn forward_event(app: &tauri::AppHandle, event: &CoreEvent) {
     if let CoreEvent::ProjectOpened { project_epoch, .. } = event {
         if let Some(prewarm) = app.try_state::<PrewarmScheduler>() {
             prewarm.activate_project(*project_epoch);
-        }
-        if let Some(generation) =
-            app.try_state::<std::sync::Arc<generation::TauriGenerationBridge>>()
-        {
-            generation.recover_current_project();
         }
     }
     #[cfg(feature = "playback-engine")]
@@ -639,6 +658,19 @@ mod id_tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn startup_requires_a_usable_application_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(durable_app_data_dir(Err(tauri::Error::UnknownPath)).is_err());
+        assert!(durable_app_data_dir(Ok("relative/app-data".into())).is_err());
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"a file").unwrap();
+        assert!(durable_app_data_dir(Ok(blocked.join("app-data"))).is_err());
+        let usable = root.path().join("app-data");
+        assert_eq!(durable_app_data_dir(Ok(usable.clone())).unwrap(), usable);
+        assert!(usable.is_dir());
+    }
 
     #[test]
     fn production_ids_are_unique_and_uuid_shaped() {

@@ -2431,9 +2431,12 @@ export function MediaCard({
     item.generationStatus === "generating" || item.generationStatus === "downloading";
   const generationFailed =
     item.generationStatus === "failed" || item.generationStatus === "cancelled";
+  // A submission that never answered, or that the app could not follow to
+  // its answer (it quit or switched projects first), may have been billed.
   const submitOutcomeUnknown =
     item.generationStatus === "failed" &&
-    item.generationErrorCode === "GENERATION_SUBMIT_OUTCOME_UNKNOWN";
+    (item.generationErrorCode === "GENERATION_SUBMIT_OUTCOME_UNKNOWN" ||
+      item.generationErrorCode === "GENERATION_RESTART_RETRY_REQUIRED");
   const thumbnailKey = mediaThumbnailKey(item);
   const [lazyThumbnail, setLazyThumbnail] = useState<string | null>(
     item.thumbnail ?? mediaThumbnailCache.get(thumbnailKey) ?? null,

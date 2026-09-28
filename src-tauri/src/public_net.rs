@@ -131,6 +131,26 @@ pub(crate) fn literal_host_ip(host: &str) -> Option<IpAddr> {
         .ok()
 }
 
+/// The peers a connection to `host` may reach: every address of its checked
+/// DNS answer (`pinned`), or the host itself when it is an IP literal.
+pub(crate) fn expected_peers(host: &str, pinned: &[SocketAddr]) -> Vec<IpAddr> {
+    if pinned.is_empty() {
+        literal_host_ip(host).into_iter().collect()
+    } else {
+        pinned.iter().map(SocketAddr::ip).collect()
+    }
+}
+
+/// Defense in depth after a pinned request: the connection must have reached
+/// one of the expected peers, and that peer must still pass `allowed`.
+pub(crate) fn peer_is_expected(
+    remote: Option<SocketAddr>,
+    expected: &[IpAddr],
+    allowed: fn(IpAddr) -> bool,
+) -> bool {
+    remote.is_some_and(|remote| allowed(remote.ip()) && expected.contains(&remote.ip()))
+}
+
 pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => public_ipv4(ip),
@@ -202,6 +222,31 @@ async fn wait_for_cancel(cancel: &MediaCancelToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_response_must_come_from_a_checked_peer() {
+        let pinned: Vec<SocketAddr> = vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "[2606:2800:220:1::1]:443".parse().unwrap(),
+        ];
+        let expected = expected_peers("example.test", &pinned);
+        assert_eq!(expected.len(), 2);
+        assert!(peer_is_expected(Some(pinned[1]), &expected, public_ip));
+        assert!(!peer_is_expected(None, &expected, public_ip));
+        assert!(!peer_is_expected(
+            Some("93.184.216.35:443".parse().unwrap()),
+            &expected,
+            public_ip
+        ));
+        // An expected peer that is not allowed is still refused.
+        let loopback: Vec<SocketAddr> = vec!["127.0.0.1:443".parse().unwrap()];
+        let expected = expected_peers("example.test", &loopback);
+        assert!(!peer_is_expected(Some(loopback[0]), &expected, public_ip));
+        // An IP-literal host is its own peer.
+        let literal = expected_peers("93.184.216.34", &[]);
+        assert_eq!(literal, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
+        assert!(expected_peers("example.test", &[]).is_empty());
+    }
 
     #[test]
     fn transition_and_reserved_ranges_are_not_public() {

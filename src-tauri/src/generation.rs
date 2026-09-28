@@ -3072,15 +3072,11 @@ impl SecureResultDownloader {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(10 * 60));
-        let expected = if pinned.is_empty() {
-            crate::public_net::literal_host_ip(&host)
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
+        if !pinned.is_empty() {
             // Every checked address, so a dead edge falls back to the next.
             builder = builder.resolve_to_addrs(&host, &pinned);
-            pinned.iter().map(std::net::SocketAddr::ip).collect()
-        };
+        }
+        let expected = crate::public_net::expected_peers(&host, &pinned);
         let client = builder
             .build()
             .map_err(|_| "generation result client initialization failed".to_string())?;
@@ -3156,15 +3152,15 @@ impl GenerationArtifactDownloader for SecureResultDownloader {
                 .map_err(|_| "generation result download failed".to_string())?;
             // Defense in depth: the connection must have gone to one of the
             // checked addresses; an unknown peer is refused.
-            match response.remote_addr() {
-                Some(remote)
-                    if (self.address_policy)(remote.ip()) && expected.contains(&remote.ip()) => {}
-                _ => {
-                    return Err(
-                        "generation result connection did not reach the checked public address"
-                            .to_string(),
-                    )
-                }
+            if !crate::public_net::peer_is_expected(
+                response.remote_addr(),
+                &expected,
+                self.address_policy,
+            ) {
+                return Err(
+                    "generation result connection did not reach the checked public address"
+                        .to_string(),
+                );
             }
             if response.status().is_redirection() {
                 if redirect_count == RESULT_REDIRECT_MAX {
