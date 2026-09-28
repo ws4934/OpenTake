@@ -13,6 +13,13 @@
 //! Cues are flattened (no shared/deviant style folding — that lives in the
 //! encode-timeline compaction layer), sorted by `start_frame` (ties broken by
 //! `id` for stable, deterministic output), numbered from 1, and emitted in order.
+//!
+//! Caption text is free-form, but both formats give some text a structural
+//! meaning: a blank line ends a cue and a line containing `-->` reads as a
+//! timing line; WebVTT additionally parses `<` as a tag and `&` as a character
+//! reference. Text is therefore sanitized so every caption stays one complete
+//! cue — see [`SubtitleCue::text`] for the format-independent part, and
+//! [`export_srt`] / [`export_vtt`] for the per-format escaping.
 
 use crate::timeline::Timeline;
 
@@ -25,15 +32,22 @@ pub struct SubtitleCue {
     pub start_frame: i32,
     /// Exclusive end frame on the timeline (`clip.end_frame()`).
     pub end_frame: i32,
-    /// Caption text, with any embedded newlines preserved verbatim.
+    /// Caption text normalized to fit in a single cue: `\r\n` and lone `\r`
+    /// become `\n`, trailing whitespace is removed from every line, blank and
+    /// whitespace-only lines are dropped (a blank line would end the cue), and
+    /// the result is trimmed. Single newlines between lines are preserved; it
+    /// is never empty. Format-specific escaping happens at serialization.
     pub text: String,
 }
 
 /// Collect every caption clip across all tracks into a flat, ordered cue list.
 ///
-/// A clip qualifies when it has a `caption_group_id` and non-empty `text_content`.
-/// Clips are sorted by `start_frame` (then `id` for a stable tie-break) and
-/// numbered from 1. Empty / whitespace-only text is skipped.
+/// A clip qualifies when it has a `caption_group_id` and `text_content` that is
+/// still non-empty after normalization (see [`SubtitleCue::text`]). Clips are
+/// sorted by `start_frame` (then `id` for a stable tie-break) and numbered from
+/// 1, so skipping an empty caption keeps the numbering contiguous. [`export_srt`]
+/// and [`export_vtt`] serialize exactly this list, so its length is the number
+/// of cues in either file.
 pub fn collect_caption_cues(timeline: &Timeline) -> Vec<SubtitleCue> {
     let mut captions: Vec<(i32, &str, i32, String)> = Vec::new();
     for track in &timeline.tracks {
@@ -44,10 +58,11 @@ pub fn collect_caption_cues(timeline: &Timeline) -> Vec<SubtitleCue> {
             let Some(text) = clip.text_content.as_ref() else {
                 continue;
             };
-            if text.trim().is_empty() {
+            let text = normalize_cue_text(text);
+            if text.is_empty() {
                 continue;
             }
-            captions.push((clip.start_frame, &clip.id, clip.end_frame(), text.clone()));
+            captions.push((clip.start_frame, &clip.id, clip.end_frame(), text));
         }
     }
     // Sort by start frame; break ties on id so output is deterministic.
@@ -63,6 +78,40 @@ pub fn collect_caption_cues(timeline: &Timeline) -> Vec<SubtitleCue> {
             text,
         })
         .collect()
+}
+
+/// The format-independent cleanup documented on [`SubtitleCue::text`]. Returns
+/// an empty string when nothing but whitespace remains.
+fn normalize_cue_text(text: &str) -> String {
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = unified
+        .split('\n')
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.join("\n").trim().to_string()
+}
+
+/// SubRip cue text. SRT has no escape syntax, so every `-->` is shortened to
+/// `->` (repeatedly, since `--->` would otherwise re-form one) and no text line
+/// can read as a timing line. `<` and `&` pass through unchanged: SRT players
+/// treat simple tags such as `<i>` as styling, and SRT cannot escape them.
+fn srt_cue_text(text: &str) -> String {
+    let mut text = text.to_string();
+    while text.contains("-->") {
+        text = text.replace("-->", "->");
+    }
+    text
+}
+
+/// WebVTT cue text: `&`, `<` and `>` become character references (`&` first so
+/// the others are not double-escaped). This keeps `<` from opening a tag and
+/// `&` from starting a reference, and since `-->` cannot survive `>` escaping,
+/// the text keeps its original characters when a player renders it.
+fn vtt_cue_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Frame -> milliseconds. `fps` is floored at 1 to avoid division by zero.
@@ -94,8 +143,9 @@ fn format_timestamp_vtt(ms: i64) -> String {
 
 /// Serialize all caption cues to a SubRip (`.srt`) document.
 ///
-/// Each cue is `{index}\n{start} --> {end}\n{text}\n\n`. An empty timeline (no
-/// caption clips) yields an empty string.
+/// Each cue is `{index}\n{start} --> {end}\n{text}\n\n`, with any `-->` in the
+/// text shortened to `->`. An empty timeline (no caption clips) yields an empty
+/// string.
 pub fn export_srt(timeline: &Timeline) -> String {
     let fps = timeline.fps;
     let mut out = String::new();
@@ -104,7 +154,10 @@ pub fn export_srt(timeline: &Timeline) -> String {
         let end = format_timestamp_srt(frame_to_ms(cue.end_frame, fps));
         out.push_str(&format!(
             "{}\n{} --> {}\n{}\n\n",
-            cue.index, start, end, cue.text
+            cue.index,
+            start,
+            end,
+            srt_cue_text(&cue.text)
         ));
     }
     out
@@ -113,15 +166,21 @@ pub fn export_srt(timeline: &Timeline) -> String {
 /// Serialize all caption cues to a WebVTT (`.vtt`) document.
 ///
 /// The document always opens with `WEBVTT\n\n`. Each cue follows as
-/// `{start} --> {end}\n{text}\n\n` (the optional numeric cue id is omitted).
-/// An empty timeline yields just the `WEBVTT\n\n` header.
+/// `{start} --> {end}\n{text}\n\n` (the optional numeric cue id is omitted),
+/// with `&`, `<` and `>` in the text escaped as character references. An empty
+/// timeline yields just the `WEBVTT\n\n` header.
 pub fn export_vtt(timeline: &Timeline) -> String {
     let fps = timeline.fps;
     let mut out = String::from("WEBVTT\n\n");
     for cue in collect_caption_cues(timeline) {
         let start = format_timestamp_vtt(frame_to_ms(cue.start_frame, fps));
         let end = format_timestamp_vtt(frame_to_ms(cue.end_frame, fps));
-        out.push_str(&format!("{} --> {}\n{}\n\n", start, end, cue.text));
+        out.push_str(&format!(
+            "{} --> {}\n{}\n\n",
+            start,
+            end,
+            vtt_cue_text(&cue.text)
+        ));
     }
     out
 }
@@ -335,5 +394,142 @@ mod tests {
         let vtt = export_vtt(&tl);
         assert!(srt.contains("X"));
         assert!(vtt.starts_with("WEBVTT"));
+    }
+
+    // --- cue text sanitizing ---
+
+    /// Minimal reader for the documents this module writes. Splits `doc` into
+    /// blank-line separated blocks and returns each cue's text lines, asserting
+    /// the shape a strict parser needs: a numeric index (SRT only), exactly one
+    /// timing line, then non-blank text lines that never contain `-->` or a
+    /// carriage return.
+    fn parse_cues(doc: &str, srt: bool) -> Vec<Vec<String>> {
+        let body = if srt {
+            doc
+        } else {
+            doc.strip_prefix("WEBVTT\n\n").expect("WebVTT header")
+        };
+        body.split("\n\n")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut lines = block.split('\n');
+                if srt {
+                    let index = lines.next().unwrap_or_default();
+                    assert!(
+                        index.parse::<usize>().is_ok(),
+                        "block without a cue index {block:?} in {doc:?}"
+                    );
+                }
+                let timing = lines.next().unwrap_or_default();
+                assert!(
+                    timing.contains(" --> "),
+                    "block without a timing line {block:?} in {doc:?}"
+                );
+                let text: Vec<String> = lines.map(str::to_string).collect();
+                assert!(!text.is_empty(), "cue without text in {doc:?}");
+                for line in &text {
+                    assert!(!line.trim().is_empty(), "blank cue line in {doc:?}");
+                    assert!(!line.contains("-->"), "timing arrow in cue text {line:?}");
+                    assert!(!line.contains('\r'), "carriage return in cue text {line:?}");
+                }
+                text
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blank_lines_inside_a_caption_do_not_split_the_cue() {
+        let tl = timeline_with(
+            30,
+            vec![
+                caption("c1", "g1", 30, 30, "Line one\n\nLine two"),
+                caption("c2", "g1", 60, 30, "Next"),
+            ],
+        );
+        let expected = vec![vec!["Line one", "Line two"], vec!["Next"]];
+        assert_eq!(parse_cues(&export_srt(&tl), true), expected);
+        assert_eq!(parse_cues(&export_vtt(&tl), false), expected);
+
+        let cues = collect_caption_cues(&tl);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Line one\nLine two");
+    }
+
+    #[test]
+    fn timing_arrows_and_markup_cannot_break_a_cue() {
+        let tl = timeline_with(30, vec![caption("c1", "g1", 30, 30, "a <b & c --> d")]);
+        // SubRip has no escape syntax: the arrow is shortened, markup is kept.
+        assert_eq!(
+            parse_cues(&export_srt(&tl), true),
+            vec![vec!["a <b & c -> d"]]
+        );
+        // WebVTT escapes `&`, `<` and `>`; escaping `>` also defuses the arrow.
+        assert_eq!(
+            parse_cues(&export_vtt(&tl), false),
+            vec![vec!["a &lt;b &amp; c --&gt; d"]]
+        );
+    }
+
+    #[test]
+    fn longer_arrows_cannot_reassemble_a_timing_arrow_in_srt() {
+        let tl = timeline_with(
+            30,
+            vec![
+                caption("c1", "g1", 0, 30, "--->"),
+                caption("c2", "g1", 30, 30, "a ----> b -->--> c"),
+            ],
+        );
+        assert_eq!(
+            parse_cues(&export_srt(&tl), true),
+            vec![vec!["->"], vec!["a -> b ->-> c"]]
+        );
+        assert_eq!(
+            parse_cues(&export_vtt(&tl), false),
+            vec![vec!["---&gt;"], vec!["a ----&gt; b --&gt;--&gt; c"]]
+        );
+    }
+
+    #[test]
+    fn line_endings_and_whitespace_only_lines_are_normalized() {
+        let tl = timeline_with(
+            30,
+            vec![caption(
+                "c1",
+                "g1",
+                30,
+                30,
+                "  One\r\nTwo\rThree  \n \t \r\n\r\nFour\t\n",
+            )],
+        );
+        let expected = vec![vec!["One", "Two", "Three", "Four"]];
+        let srt = export_srt(&tl);
+        let vtt = export_vtt(&tl);
+        assert!(!srt.contains('\r') && !vtt.contains('\r'));
+        assert_eq!(parse_cues(&srt, true), expected);
+        assert_eq!(parse_cues(&vtt, false), expected);
+        assert_eq!(collect_caption_cues(&tl)[0].text, "One\nTwo\nThree\nFour");
+    }
+
+    #[test]
+    fn caption_empty_after_sanitizing_is_skipped_and_numbering_stays_contiguous() {
+        let tl = timeline_with(
+            30,
+            vec![
+                caption("c1", "g1", 0, 30, "First"),
+                caption("c2", "g1", 30, 30, "\r\n \r\n\t"),
+                caption("c3", "g1", 60, 30, "Third"),
+            ],
+        );
+        let cues = collect_caption_cues(&tl);
+        assert_eq!(
+            cues.iter()
+                .map(|c| (c.index, c.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "First"), (2, "Third")]
+        );
+        let srt = export_srt(&tl);
+        assert!(srt.starts_with("1\n00:00:00,000 --> 00:00:01,000\nFirst\n\n2\n"));
+        assert_eq!(parse_cues(&srt, true).len(), cues.len());
+        assert_eq!(parse_cues(&export_vtt(&tl), false).len(), cues.len());
     }
 }

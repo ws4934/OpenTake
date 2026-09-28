@@ -4773,4 +4773,37 @@ mod subtitle_export_tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(summary.cue_count, 0);
     }
+
+    /// `cueCount` must match the cue blocks actually written, even when caption
+    /// text holds blank lines, a timing arrow or nothing printable at all.
+    #[test]
+    fn cue_count_matches_cue_blocks_written() {
+        let tl = timeline_with(
+            30,
+            vec![
+                caption("c1", "g1", 0, 30, "Line one\n\nLine two"),
+                caption("c2", "g1", 30, 30, " \r\n \r\n"),
+                caption("c3", "g1", 60, 30, "a <b & c --> d"),
+            ],
+        );
+        for (format, ext) in [(SubtitleFormat::Srt, "srt"), (SubtitleFormat::Vtt, "vtt")] {
+            let path = std::env::temp_dir()
+                .join(format!("opentake-subs-count-{}.{ext}", std::process::id()))
+                .to_string_lossy()
+                .into_owned();
+            let summary = write_subtitles(&tl, path.clone(), format).expect("subtitle export ok");
+            let written = std::fs::read_to_string(&path).expect("read back subtitles");
+            let _ = std::fs::remove_file(&path);
+
+            let body = written.strip_prefix("WEBVTT\n\n").unwrap_or(&written);
+            let blocks: Vec<&str> = body.split("\n\n").filter(|b| !b.is_empty()).collect();
+            assert_eq!(summary.cue_count, 2, "got: {written:?}");
+            assert_eq!(blocks.len(), summary.cue_count, "got: {written:?}");
+            // Exactly one timing line per block: cue text never contains `-->`.
+            assert!(
+                blocks.iter().all(|block| block.matches("-->").count() == 1),
+                "got: {written:?}"
+            );
+        }
+    }
 }
