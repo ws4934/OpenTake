@@ -204,7 +204,7 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
             mock.patch.object(provisioner.time, "sleep", delays.append),
         ):
             provisioner.provision("ffmpeg", record, "x86_64-unknown-linux-gnu")
-        return binary_dir / "ffmpeg-x86_64-unknown-linux-gnu"
+            return provisioner.destination("ffmpeg", "x86_64-unknown-linux-gnu")
 
     def test_download_with_the_wrong_bytes_is_fetched_again(self) -> None:
         binary = b"pinned ffmpeg"
