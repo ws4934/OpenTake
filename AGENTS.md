@@ -21,7 +21,7 @@ These apply even if you have not opened the files above.
 3. Issue titles use `[P0-P3][<area>] <summary>` and carry a type label, a priority label and an area or platform label.
 4. PR descriptions start from `.github/pull_request_template.md` and keep only sections with real content: delete sections that do not apply instead of writing `None`, `N/A` or `TBD`. Use `Closes #N` for a complete fix; use `Refs #N` plus `(partial #N)` in the title and a `## Follow-ups` list for a partial fix.
 5. No tool attribution ("Generated with …" lines) or agent session links in PRs, issues, review comments or commit messages; a standard `Co-authored-by:` commit trailer is fine.
-6. PR CI does not build `src-tauri`, `opentake-media`, `opentake-render`, `opentake-motion`, `opentake-agent` or `opentake-gen`. If you change them, run `cargo clippy --workspace --all-targets --locked -- -D warnings` and the affected tests locally, and record the actual commands and results in the PR.
+6. PR CI picks its checks from the change: `pr.yml` builds the core crates and the web frontend on Linux, and `pr-native.yml` lints the whole workspace and tests every affected crate on Linux, Windows and macOS when Rust code changes. Tests that need a GPU, an audio device or a real browser skip on CI runners; verify those paths yourself and record the actual commands and results in the PR.
 7. Open PRs as drafts until they are complete and verified. One PR per issue. Never push to `main`, never force-push someone else's branch, never skip or delete tests to get CI green.
 8. Squash-merge, then delete the head branch on GitHub and locally.
 
