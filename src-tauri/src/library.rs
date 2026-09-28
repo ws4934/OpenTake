@@ -703,10 +703,25 @@ impl ProjectMediaCapability {
         )
         .map_err(|error| error.to_string())?;
         // hard_link creates a new name only when the destination is absent;
-        // rename would overwrite a concurrently created media leaf.
-        self.parent
-            .hard_link(&stage.name, &media, imported_name)
-            .map_err(|error| error.to_string())?;
+        // rename would overwrite a concurrently created media leaf. FAT and
+        // exFAT volumes cannot hard-link, so there the stage is renamed once
+        // its unique destination name is confirmed free.
+        let renamed = match link_staged_import(&self.parent, &stage.name, &media, imported_name) {
+            Ok(()) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(error.to_string());
+            }
+            Err(link_error) => {
+                match media.symlink_metadata(imported_name) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(link_error.to_string()),
+                }
+                self.parent
+                    .rename(&stage.name, &media, imported_name)
+                    .map_err(|error| error.to_string())?;
+                true
+            }
+        };
         let imported = ProjectImportGuard {
             path: self.absolute_path(Path::new(imported_name)),
             name: imported_name.into(),
@@ -714,6 +729,11 @@ impl ProjectMediaCapability {
             handle,
             committed: false,
         };
+        if renamed {
+            // The stage name moved with the file; the media guard owns it now.
+            stage.committed = true;
+            return Ok(imported);
+        }
         if !stage.owns_name() {
             return Err("project import staging identity changed during publication".to_string());
         }
@@ -989,6 +1009,24 @@ impl ProjectImportGuard {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static HARD_LINKS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn link_staged_import(
+    parent: &Dir,
+    stage_name: &std::ffi::OsStr,
+    media: &Dir,
+    imported_name: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if HARD_LINKS_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    parent.hard_link(stage_name, media, imported_name)
+}
+
 impl Drop for ProjectImportGuard {
     fn drop(&mut self) {
         if self.committed {
@@ -1245,6 +1283,54 @@ mod tests {
     }
 
     #[test]
+    fn library_import_publishes_by_rename_where_hard_links_are_unsupported() {
+        struct AllowHardLinks;
+        impl Drop for AllowHardLinks {
+            fn drop(&mut self) {
+                HARD_LINKS_UNSUPPORTED.with(|flag| flag.set(false));
+            }
+        }
+        HARD_LINKS_UNSUPPORTED.with(|flag| flag.set(true));
+        let _reset = AllowHardLinks;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"library bytes").unwrap();
+        let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
+        let entry = favorite_video(&library, &source);
+        let bundle = tmp.path().join("NoHardLinks.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+
+        let imported =
+            library_import_to_project_impl(&core, &engine_for(tmp.path()), &library, &entry.id)
+                .expect("import without hard links");
+
+        let resolved = core
+            .media()
+            .entries
+            .into_iter()
+            .find(|candidate| candidate.id == imported.id)
+            .unwrap();
+        let opentake_domain::MediaSource::Project { relative_path } = resolved.source else {
+            panic!("library import must be project media");
+        };
+        assert_eq!(
+            std::fs::read(bundle.join(relative_path)).unwrap(),
+            b"library bytes"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .starts_with(".opentake-library-stage-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "stage left behind: {leftovers:?}");
+    }
+
+    #[test]
     fn deferred_import_events_allow_core_and_library_reentry() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("clip.mp4");
@@ -1386,6 +1472,7 @@ mod tests {
         let core = AppCore::new();
         core.save_project(Some(bundle)).unwrap();
         let mut events = DeferredCoreEvents::default();
+        let probed_name = std::cell::RefCell::new(None);
 
         let imported = library_import_to_project_with_hook(
             &core,
@@ -1395,6 +1482,7 @@ mod tests {
             &mut events,
             |phase, path| match phase {
                 ImportHookPhase::BeforeProbe => {
+                    *probed_name.borrow_mut() = path.file_name().map(ToOwned::to_owned);
                     std::fs::rename(&projects, &retained_projects).unwrap();
                     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                     std::fs::copy(&replacement_video, path).unwrap();
@@ -1416,11 +1504,9 @@ mod tests {
 
         assert_eq!(imported_entry.source_width, Some(32));
         assert_eq!(imported_entry.source_height, Some(18));
-        assert!(
-            std::fs::metadata(replacement_projects.join("ProbeAba.opentake/media"))
-                .unwrap()
-                .is_dir()
-        );
+        // The probe ran while the ambient path named the replacement video.
+        let probed_name = probed_name.into_inner().expect("probe hook ran");
+        assert!(replacement_projects.join(probed_name).is_file());
     }
 
     #[cfg(unix)]
@@ -1909,7 +1995,7 @@ mod tests {
                 .join()
                 .unwrap()
                 .expect_err("old project cannot commit");
-            assert_eq!(saved_without_waiting.unwrap(), true);
+            assert!(saved_without_waiting.unwrap());
             assert!(error.contains("project changed"), "{error}");
             assert!(!staging_path.exists());
         });

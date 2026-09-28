@@ -5495,7 +5495,7 @@ mod tests {
                 .join()
                 .unwrap()
                 .expect_err("old project cannot commit");
-            assert_eq!(saved_without_waiting.unwrap(), true);
+            assert!(saved_without_waiting.unwrap());
             assert!(error.contains("project changed"), "{error}");
         });
         assert!(store.entries().unwrap().is_empty());
