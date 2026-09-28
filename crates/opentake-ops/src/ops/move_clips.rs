@@ -6,10 +6,11 @@
 //! frame (overwrite-style). Tracks are pinned by id across the clears because
 //! pruning could otherwise shift indices.
 
-use opentake_domain::{Clip, ClipType, Timeline};
+use opentake_domain::{Clip, Timeline};
 
 use crate::id::IdGen;
 use crate::ops::clear_region::clear_region_validated;
+use crate::ops::clip_arithmetic_is_safe;
 use crate::ops::place::sort_clips;
 use crate::ops::tracks::prune_empty_tracks;
 
@@ -130,36 +131,6 @@ pub(crate) fn move_clips_from_plans(
     }
     prune_empty_tracks(timeline);
     moved
-}
-
-fn clip_arithmetic_is_safe(clip: &Clip) -> bool {
-    if clip.start_frame < 0
-        || clip.duration_frames < 1
-        || (!matches!(clip.media_type, ClipType::Image | ClipType::Text)
-            && (clip.trim_start_frame < 0 || clip.trim_end_frame < 0))
-        || !clip.speed.is_finite()
-        || clip.speed <= 0.0
-        || clip.start_frame.checked_add(clip.duration_frames).is_none()
-        || clip
-            .duration_frames
-            .checked_add(clip.trim_start_frame)
-            .and_then(|value| value.checked_add(clip.trim_end_frame))
-            .is_none()
-    {
-        return false;
-    }
-    let consumed = (clip.duration_frames as f64 * clip.speed).round();
-    if !(0.0..=i32::MAX as f64).contains(&consumed) {
-        return false;
-    }
-    let consumed = consumed as i32;
-    clip.trim_start_frame.checked_add(consumed).is_some()
-        && clip.trim_end_frame.checked_add(consumed).is_some()
-        && clip
-            .trim_start_frame
-            .checked_add(consumed)
-            .and_then(|value| value.checked_add(clip.trim_end_frame))
-            .is_some()
 }
 
 fn find(timeline: &Timeline, clip_id: &str) -> Option<(usize, usize)> {

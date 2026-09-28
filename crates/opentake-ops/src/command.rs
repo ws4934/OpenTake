@@ -2614,6 +2614,142 @@ mod transaction_tests {
     }
 }
 
+#[cfg(test)]
+mod frame_arithmetic_tests {
+    use super::*;
+
+    // The command layer's own checks before they moved to the domain rule
+    // shared with the ops and the project loader, kept as the reference for
+    // every error message they produce.
+    fn previous_checked_frame_arithmetic(
+        start_frame: i32,
+        duration_frames: i32,
+        trim_start_frame: i32,
+        trim_end_frame: i32,
+        speed: f64,
+        label: &str,
+    ) -> Result<i32, EditError> {
+        if start_frame < 0 || duration_frames < 1 {
+            return Err(EditError::Invalid(format!(
+                "{label}: startFrame must be >= 0 and durationFrames >= 1"
+            )));
+        }
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(EditError::Invalid(format!(
+                "{label}: speed must be finite and > 0"
+            )));
+        }
+        let end_frame = start_frame.checked_add(duration_frames).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: startFrame + durationFrames overflows"))
+        })?;
+        duration_frames
+            .checked_add(trim_start_frame)
+            .and_then(|value| value.checked_add(trim_end_frame))
+            .ok_or_else(|| {
+                EditError::Invalid(format!("{label}: durationFrames + trim frames overflows"))
+            })?;
+        let consumed = (duration_frames as f64 * speed).round();
+        if !(0.0..=i32::MAX as f64).contains(&consumed) {
+            return Err(EditError::Invalid(format!(
+                "{label}: visible source-frame extent is out of range"
+            )));
+        }
+        let consumed = consumed as i32;
+        trim_start_frame.checked_add(consumed).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: trimStart source-frame extent overflows"))
+        })?;
+        trim_end_frame.checked_add(consumed).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: trimEnd source-frame extent overflows"))
+        })?;
+        trim_start_frame
+            .checked_add(consumed)
+            .and_then(|value| value.checked_add(trim_end_frame))
+            .ok_or_else(|| EditError::Invalid(format!("{label}: source-frame extent overflows")))?;
+        Ok(end_frame)
+    }
+
+    fn previous_checked_clip_frame_arithmetic(
+        start_frame: i32,
+        duration_frames: i32,
+        trim_start_frame: i32,
+        trim_end_frame: i32,
+        speed: f64,
+        media_type: ClipType,
+        label: &str,
+    ) -> Result<i32, EditError> {
+        if !matches!(media_type, ClipType::Image | ClipType::Text)
+            && (trim_start_frame < 0 || trim_end_frame < 0)
+        {
+            return Err(EditError::Invalid(format!(
+                "{label}: trim frames must be >= 0 for audio/video clips"
+            )));
+        }
+        previous_checked_frame_arithmetic(
+            start_frame,
+            duration_frames,
+            trim_start_frame,
+            trim_end_frame,
+            speed,
+            label,
+        )
+    }
+
+    #[test]
+    fn shared_rule_keeps_every_command_error_message() {
+        let starts = [-1, 0, 7, i32::MAX - 3, i32::MAX];
+        let durations = [-2, 0, 1, 9, i32::MAX - 1, i32::MAX];
+        let trims = [i32::MIN, -4, 0, 5, i32::MAX - 8, i32::MAX];
+        let speeds = [
+            f64::NAN,
+            -1.0,
+            0.0,
+            1e-300,
+            0.5,
+            1.0,
+            2.5,
+            1e12,
+            f64::INFINITY,
+        ];
+        let kinds = [
+            ClipType::Video,
+            ClipType::Audio,
+            ClipType::Image,
+            ClipType::Text,
+        ];
+        for start in starts {
+            for duration in durations {
+                for trim_start in trims {
+                    for trim_end in trims {
+                        for speed in speeds {
+                            let args = (start, duration, trim_start, trim_end, speed);
+                            assert_eq!(
+                                checked_frame_arithmetic(
+                                    start, duration, trim_start, trim_end, speed, "x"
+                                ),
+                                previous_checked_frame_arithmetic(
+                                    start, duration, trim_start, trim_end, speed, "x"
+                                ),
+                                "{args:?}"
+                            );
+                            for kind in kinds {
+                                assert_eq!(
+                                    checked_clip_frame_arithmetic(
+                                        start, duration, trim_start, trim_end, speed, kind, "x"
+                                    ),
+                                    previous_checked_clip_frame_arithmetic(
+                                        start, duration, trim_start, trim_end, speed, kind, "x"
+                                    ),
+                                    "{args:?} {kind:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Command implementations
 
 fn checked_frame_arithmetic(
@@ -2624,43 +2760,14 @@ fn checked_frame_arithmetic(
     speed: f64,
     label: &str,
 ) -> Result<i32, EditError> {
-    if start_frame < 0 || duration_frames < 1 {
-        return Err(EditError::Invalid(format!(
-            "{label}: startFrame must be >= 0 and durationFrames >= 1"
-        )));
-    }
-    if !speed.is_finite() || speed <= 0.0 {
-        return Err(EditError::Invalid(format!(
-            "{label}: speed must be finite and > 0"
-        )));
-    }
-    let end_frame = start_frame.checked_add(duration_frames).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: startFrame + durationFrames overflows"))
-    })?;
-    duration_frames
-        .checked_add(trim_start_frame)
-        .and_then(|value| value.checked_add(trim_end_frame))
-        .ok_or_else(|| {
-            EditError::Invalid(format!("{label}: durationFrames + trim frames overflows"))
-        })?;
-    let consumed = (duration_frames as f64 * speed).round();
-    if !(0.0..=i32::MAX as f64).contains(&consumed) {
-        return Err(EditError::Invalid(format!(
-            "{label}: visible source-frame extent is out of range"
-        )));
-    }
-    let consumed = consumed as i32;
-    trim_start_frame.checked_add(consumed).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: trimStart source-frame extent overflows"))
-    })?;
-    trim_end_frame.checked_add(consumed).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: trimEnd source-frame extent overflows"))
-    })?;
-    trim_start_frame
-        .checked_add(consumed)
-        .and_then(|value| value.checked_add(trim_end_frame))
-        .ok_or_else(|| EditError::Invalid(format!("{label}: source-frame extent overflows")))?;
-    Ok(end_frame)
+    opentake_domain::frame_arithmetic(
+        start_frame,
+        duration_frames,
+        trim_start_frame,
+        trim_end_frame,
+        speed,
+    )
+    .map_err(|error| EditError::Invalid(format!("{label}: {error}")))
 }
 
 fn checked_clip_frame_arithmetic(
@@ -2672,21 +2779,15 @@ fn checked_clip_frame_arithmetic(
     media_type: ClipType,
     label: &str,
 ) -> Result<i32, EditError> {
-    if !matches!(media_type, ClipType::Image | ClipType::Text)
-        && (trim_start_frame < 0 || trim_end_frame < 0)
-    {
-        return Err(EditError::Invalid(format!(
-            "{label}: trim frames must be >= 0 for audio/video clips"
-        )));
-    }
-    checked_frame_arithmetic(
+    opentake_domain::clip_frame_arithmetic(
         start_frame,
         duration_frames,
         trim_start_frame,
         trim_end_frame,
         speed,
-        label,
+        media_type,
     )
+    .map_err(|error| EditError::Invalid(format!("{label}: {error}")))
 }
 
 fn validate_clip_frame_arithmetic_at(
