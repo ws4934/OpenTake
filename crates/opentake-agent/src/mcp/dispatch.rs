@@ -548,10 +548,11 @@ impl Dispatcher {
         drop(plugin_guard);
 
         // 7. Shorten outbound ids against the post-run id universe (so newly
-        //    created ids in summaries shorten too).
-        let post_manifest = self.handle.media();
-        let post_universe = short_id::current_id_universe(&after, &post_manifest);
-        let result = short_id::shorten_ids(result, &post_universe);
+        //    created ids in summaries shorten too). The universe is only
+        //    collected when the result text carries a UUID.
+        let result = short_id::shorten_ids(result, || {
+            short_id::current_id_universe(&after, &self.handle.media())
+        });
         let timeline_result =
             self.timeline_result_completion(tool, &args, &before, &after, &result, cancel);
         DispatchReceipt {
@@ -587,11 +588,9 @@ impl Dispatcher {
                 }
                 TimelineResultCompletion::MotionDocument { tool, operation } => {
                     let result = finish_motion_document_operation(tool, operation, cancel);
-                    let universe = short_id::current_id_universe(
-                        &self.handle.timeline(),
-                        &self.handle.media(),
-                    );
-                    return short_id::shorten_ids(result, &universe);
+                    return short_id::shorten_ids(result, || {
+                        short_id::current_id_universe(&self.handle.timeline(), &self.handle.media())
+                    });
                 }
                 TimelineResultCompletion::Capture(request) => request,
             };
