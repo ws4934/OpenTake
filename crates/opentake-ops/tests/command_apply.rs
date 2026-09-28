@@ -1062,6 +1062,74 @@ fn add_clips_auto_track_places_visual_media_on_a_fresh_top_track() {
     assert_eq!(st.timeline.tracks[2].id, "existing-audio");
 }
 
+/// The audio part of a video asset: an audio clip that still resolves its
+/// sound from the video source.
+fn audio_of_video(start: i32, dur: i32) -> ClipEntry {
+    ClipEntry {
+        source_clip_type: ClipType::Video,
+        ..entry(0, ClipType::Audio, start, dur)
+    }
+}
+
+#[test]
+fn add_clips_auto_track_routes_by_the_placed_clip_type() {
+    // Routing used `source_clip_type`: this entry went to a new video track
+    // that cannot hold an audio clip, was dropped, and an empty track and an
+    // undo step were committed as "Added 0 clip(s)".
+    let mut st = state(vec![]);
+    let g = SeqIdGen::new("n-");
+    let res = apply(
+        &mut st,
+        EditCommand::AddClipsAutoTrack {
+            entries: vec![entry(0, ClipType::Video, 0, 30), audio_of_video(0, 30)],
+        },
+        &g,
+    )
+    .unwrap();
+
+    assert_eq!(res.affected_clip_ids.len(), 2);
+    let kinds: Vec<(ClipType, Vec<(ClipType, ClipType)>)> = st
+        .timeline
+        .tracks
+        .iter()
+        .map(|track| {
+            let clips = track
+                .clips
+                .iter()
+                .map(|clip| (clip.media_type, clip.source_clip_type))
+                .collect();
+            (track.kind, clips)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (ClipType::Video, vec![(ClipType::Video, ClipType::Video)]),
+            (ClipType::Audio, vec![(ClipType::Audio, ClipType::Video)]),
+        ]
+    );
+    assert_eq!(st.undo_depth(), 1);
+}
+
+#[test]
+fn add_clips_to_separate_auto_tracks_routes_by_the_placed_clip_type() {
+    let mut st = state(vec![]);
+    let res = apply(
+        &mut st,
+        EditCommand::AddClipsToSeparateAutoTracks {
+            entries: vec![audio_of_video(10, 40)],
+        },
+        &SeqIdGen::new("n-"),
+    )
+    .unwrap();
+
+    assert_eq!(res.affected_clip_ids.len(), 1);
+    assert_eq!(st.timeline.tracks.len(), 1);
+    assert_eq!(st.timeline.tracks[0].kind, ClipType::Audio);
+    assert_eq!(st.timeline.tracks[0].clips[0].id, res.affected_clip_ids[0]);
+    assert_eq!(st.undo_depth(), 1);
+}
+
 // ---- split + keyframes ----------------------------------------------------
 
 #[test]

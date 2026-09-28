@@ -3053,12 +3053,15 @@ fn add_clips_auto_track(
         .enumerate()
         .map(|(index, entry)| validate_auto_track_entry(entry, index))
         .collect::<Result<_, _>>()?;
+    // Route by the placed clip's own type, as validation and track
+    // compatibility do: the audio part of a video asset (`media_type` audio,
+    // `source_clip_type` video) belongs on the audio track.
     let has_visual = entries
         .iter()
-        .any(|entry| entry.source_clip_type != ClipType::Audio);
+        .any(|entry| entry.media_type != ClipType::Audio);
     let has_audio = entries
         .iter()
-        .any(|entry| entry.source_clip_type == ClipType::Audio);
+        .any(|entry| entry.media_type == ClipType::Audio);
     let action_name = if entries.len() == 1 {
         "Add Clip"
     } else {
@@ -3079,8 +3082,8 @@ fn add_clips_auto_track(
                 ops::insert_track(&mut st.timeline, at, ClipType::Audio, ids)
             });
             let mut placed = Vec::new();
-            for (entry, end_frame) in entries.iter().zip(&entry_ends) {
-                let track_index = if entry.source_clip_type == ClipType::Audio {
+            for (index, (entry, end_frame)) in entries.iter().zip(&entry_ends).enumerate() {
+                let track_index = if entry.media_type == ClipType::Audio {
                     audio_track_index
                 } else {
                     visual_track_index
@@ -3099,15 +3102,13 @@ fn add_clips_auto_track(
                         ids,
                     );
                 }
-                if let Some(ti) = st.track_index(&track_id) {
-                    placed.extend(ops::place_clip_validated(
-                        &mut st.timeline,
-                        &entry.to_spec(),
-                        ti,
-                        None,
-                        ids,
-                    ));
-                }
+                let clip_ids = st
+                    .track_index(&track_id)
+                    .map(|ti| {
+                        ops::place_clip_validated(&mut st.timeline, &entry.to_spec(), ti, None, ids)
+                    })
+                    .unwrap_or_default();
+                placed.extend(placed_or_refused(clip_ids, index)?);
             }
             Ok(placed)
         },
@@ -3139,8 +3140,8 @@ fn add_clips_to_separate_auto_tracks(
         },
         |current| {
             let mut placed = Vec::with_capacity(entries.len());
-            for entry in &entries {
-                let kind = if entry.source_clip_type == ClipType::Audio {
+            for (index, entry) in entries.iter().enumerate() {
+                let kind = if entry.media_type == ClipType::Audio {
                     ClipType::Audio
                 } else {
                     ClipType::Video
@@ -3149,17 +3150,30 @@ fn add_clips_to_separate_auto_tracks(
                 let track_index = ops::insert_track(&mut current.timeline, at, kind, ids);
                 let mut entry = entry.clone();
                 entry.track_index = track_index;
-                placed.extend(ops::place_clip_validated(
+                let clip_ids = ops::place_clip_validated(
                     &mut current.timeline,
                     &entry.to_spec(),
                     track_index,
                     None,
                     ids,
-                ));
+                );
+                placed.extend(placed_or_refused(clip_ids, index)?);
             }
             Ok(placed)
         },
     )
+}
+
+/// An auto-placed entry must land: an empty placement fails the whole
+/// transaction instead of committing an empty track (upstream `add_clips`
+/// throws when `placeClip` returns no clip).
+fn placed_or_refused(clip_ids: Vec<String>, index: usize) -> Result<Vec<String>, EditError> {
+    if clip_ids.is_empty() {
+        return Err(EditError::Invalid(format!(
+            "entries[{index}]: clip could not be placed on its new track"
+        )));
+    }
+    Ok(clip_ids)
 }
 
 fn insert_track_cmd(
