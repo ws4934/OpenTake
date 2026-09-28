@@ -6,6 +6,8 @@ import type {
 } from "../lib/types";
 import {
   createMotionStudioStore,
+  MOTION_PREVIEW_DEBOUNCE_MS,
+  MOTION_PREVIEW_MAX_WAIT_MS,
   type MotionStudioBackend,
 } from "./motionStudioStore";
 import { useProjectStore } from "./projectStore";
@@ -391,11 +393,77 @@ describe("Motion Studio store", () => {
     expect(store.getState().lastGoodPreview?.frame).toBe(1);
 
     store.getState().setFrame(2);
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(MOTION_PREVIEW_DEBOUNCE_MS);
     expect(store.getState().lastGoodPreview?.pngDataUrl).toBe("data:image/png;base64,newest");
     expect(store.getState().diagnostics).toEqual([
       expect.objectContaining({ line: 7, column: 12 }),
     ]);
+  });
+
+  it("coalesces rapid frame scrubbing into at most two previews that end on the final frame", async () => {
+    const motionBackend = backend();
+    const store = createMotionStudioStore(motionBackend);
+    await store.getState().load();
+    await vi.waitFor(() => expect(store.getState().previewPhase).toBe("ready"));
+    const preview = vi.mocked(motionBackend.preview);
+    preview.mockClear();
+
+    for (let frame = 1; frame <= 20; frame += 1) {
+      store.getState().setFrame(frame);
+      await vi.advanceTimersByTimeAsync(16);
+    }
+    await vi.advanceTimersByTimeAsync(MOTION_PREVIEW_DEBOUNCE_MS);
+
+    expect(preview.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(preview.mock.calls.at(-1)?.[0].frame).toBe(20);
+    expect(store.getState()).toMatchObject({
+      frame: 20,
+      previewPhase: "ready",
+      lastGoodPreview: { frame: 20 },
+    });
+  });
+
+  it("keeps long scrubs responsive and flushes the final frame when the slider is released", async () => {
+    const motionBackend = backend();
+    const store = createMotionStudioStore(motionBackend);
+    await store.getState().load();
+    await vi.waitFor(() => expect(store.getState().previewPhase).toBe("ready"));
+    const preview = vi.mocked(motionBackend.preview);
+    preview.mockClear();
+
+    // A continuous drag still previews at least every MOTION_PREVIEW_MAX_WAIT_MS.
+    for (let frame = 1; frame <= 60; frame += 1) {
+      store.getState().setFrame(frame);
+      await vi.advanceTimersByTimeAsync(16);
+    }
+    const dragMs = 60 * 16;
+    expect(preview.mock.calls.length).toBeGreaterThanOrEqual(Math.floor(dragMs / MOTION_PREVIEW_MAX_WAIT_MS));
+    expect(preview.mock.calls.length).toBeLessThanOrEqual(Math.ceil(dragMs / MOTION_PREVIEW_MAX_WAIT_MS) + 1);
+
+    store.getState().setFrame(61);
+    store.getState().flushPreview();
+    expect(preview.mock.calls.at(-1)?.[0].frame).toBe(61);
+    const calls = preview.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(MOTION_PREVIEW_MAX_WAIT_MS);
+    expect(preview).toHaveBeenCalledTimes(calls);
+  });
+
+  it("coalesces typed parameter changes into one trailing preview", async () => {
+    const motionBackend = backend();
+    const store = createMotionStudioStore(motionBackend);
+    await store.getState().load();
+    await vi.waitFor(() => expect(store.getState().previewPhase).toBe("ready"));
+    const preview = vi.mocked(motionBackend.preview);
+    preview.mockClear();
+
+    for (const width of [1, 12, 128, 1280]) {
+      store.getState().setParameter("width", width);
+      await vi.advanceTimersByTimeAsync(30);
+    }
+    await vi.advanceTimersByTimeAsync(MOTION_PREVIEW_DEBOUNCE_MS);
+
+    expect(preview.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(preview.mock.calls.at(-1)?.[0].width).toBe(1280);
   });
 
   it("never carries a last-good frame across a document boundary", async () => {

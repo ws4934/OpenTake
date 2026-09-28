@@ -11,7 +11,9 @@
 //!   Re-downloads, NOT a lazily-rebuilt cache — gated behind an explicit
 //!   `modelsConfirmed` flag the UI only sets after a confirm step.
 //! - `other` = the remaining known derived-cache subdirs under the cache root
-//!   (transcripts, generation staging, advanced-workflow renders).
+//!   (transcripts, generation staging, advanced-workflow renders) plus the
+//!   Motion frame cache (`motion-frames`). Clearing it skips Motion frames that
+//!   a render, encode or preview is still using.
 //!
 //! NEVER touched: project bundles, the global media library
 //! (`<app_data_dir>/OpenTake/Library`), user media, credentials — this module
@@ -32,6 +34,7 @@ use opentake_media::transcribe::cache as transcript_cache;
 use opentake_media::waveform::store as waveform_store;
 
 use crate::media::MediaState;
+use crate::motion::MOTION_FRAMES_SUBDIR;
 
 /// One clearable cache category. The serialized ids are lowercase/camelCase
 /// strings (`thumbnails`, `waveforms`, `searchIndex`, `models`, `other`) that
@@ -121,6 +124,7 @@ pub(crate) fn usage_at(cache_root: &Path, models_dir: &Path) -> StorageUsageDto 
     let models = dir_bytes(models_dir);
     let other: u64 = OTHER_CACHE_SUBDIRS
         .iter()
+        .chain([&MOTION_FRAMES_SUBDIR])
         .map(|sub| dir_bytes(&cache_root.join(sub)))
         .sum();
 
@@ -182,9 +186,17 @@ pub(crate) fn clear_at(
                 clear_and_recreate(&cache_root.join(embed_store::CACHE_SUBDIR))
             }
             StorageCategoryId::Models => clear_models(models_dir, request.models_confirmed),
-            StorageCategoryId::Other => OTHER_CACHE_SUBDIRS
-                .iter()
-                .try_for_each(|sub| clear_and_recreate(&cache_root.join(sub))),
+            StorageCategoryId::Other => {
+                let subdirs = OTHER_CACHE_SUBDIRS
+                    .iter()
+                    .try_for_each(|sub| clear_and_recreate(&cache_root.join(sub)));
+                let motion = clear_motion_frames(cache_root);
+                match (subdirs, motion) {
+                    (Err(first), Err(second)) => Err(format!("{first}; {second}")),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Ok(()), Ok(())) => Ok(()),
+                }
+            }
         };
         if let Err(error) = result {
             failures.push(error);
@@ -300,6 +312,15 @@ fn clear_and_recreate(dir: &Path) -> Result<(), String> {
         Err(error) => return Err(format!("remove {}: {error}", dir.display())),
     }
     fs::create_dir_all(dir).map_err(|error| format!("recreate {}: {error}", dir.display()))
+}
+
+/// Remove every Motion frame directory that no render, encode or preview has
+/// pinned, and recreate the root. Pinned directories are left for their owner.
+fn clear_motion_frames(cache_root: &Path) -> Result<(), String> {
+    opentake_motion::MotionCache::new(cache_root.join(MOTION_FRAMES_SUBDIR))
+        .clear()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Models are re-downloads, not lazily-rebuilt caches: clearing them requires
@@ -514,6 +535,47 @@ mod tests {
             77
         );
         assert_eq!(bytes_of(&dto, StorageCategoryId::Thumbnails), 150);
+    }
+
+    #[test]
+    fn motion_frames_count_as_other_and_clearing_skips_active_renders() {
+        use opentake_motion::{MotionCache, MotionRenderRequest, MotionSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        seed_caches(tmp.path());
+        let frames = MotionCache::new(tmp.path().join(MOTION_FRAMES_SUBDIR));
+        let finished = MotionRenderRequest::new(MotionSource::code("<done/>"), 30, 1, 8, 8);
+        let active = MotionRenderRequest::new(MotionSource::code("<active/>"), 30, 1, 8, 8);
+        for (request, bytes) in [(&finished, 300), (&active, 40)] {
+            let dir = frames.ensure_dir(request).unwrap();
+            fs::write(MotionCache::frame_file(&dir, 0), vec![0u8; bytes]).unwrap();
+        }
+        assert_eq!(
+            bytes_of(&usage_of(tmp.path()), StorageCategoryId::Other),
+            210 + 340
+        );
+
+        let rendering = frames.pin(&active);
+        let request = StorageClearRequest {
+            categories: vec![StorageCategoryId::Other],
+            models_confirmed: false,
+        };
+        clear_at(tmp.path(), &tmp.path().join("models"), &request).unwrap();
+        assert!(!frames.dir_for(&finished).exists());
+        assert!(
+            MotionCache::frame_file(&frames.dir_for(&active), 0).is_file(),
+            "a render in progress keeps its frames"
+        );
+        assert_eq!(
+            bytes_of(&usage_of(tmp.path()), StorageCategoryId::Other),
+            40
+        );
+
+        drop(rendering);
+        clear_at(tmp.path(), &tmp.path().join("models"), &request).unwrap();
+        assert!(frames.root().is_dir(), "the Motion cache root is recreated");
+        assert_eq!(fs::read_dir(frames.root()).unwrap().count(), 0);
+        assert_eq!(bytes_of(&usage_of(tmp.path()), StorageCategoryId::Other), 0);
     }
 
     #[test]
