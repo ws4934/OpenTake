@@ -18,10 +18,11 @@ pub mod timeline;
 pub mod whisper;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::decode::pcm::{extract_pcm, PcmBuffer, PcmFormat, PcmSpec};
+use crate::decode::pcm::{PcmBuffer, PcmFormat, PcmSpec};
 use crate::error::Result;
 
 /// One token/word with optional timing. `start`/`end` may be `None` when the
@@ -163,6 +164,19 @@ pub struct TranscribeOptions {
     /// Absolute-seconds range to transcribe; the audio is extracted for this
     /// window and timestamps are shifted back via `offsetting(lower)`.
     pub source_range: Option<(f64, f64)>,
+    /// Cancel PCM extraction and Whisper inference without publishing a partial transcript.
+    pub cancel: Option<crate::MediaCancelToken>,
+    /// Fractional progress across PCM extraction and inference, for interactive jobs.
+    pub progress: Option<TranscriptionProgress>,
+}
+
+#[derive(Clone)]
+pub struct TranscriptionProgress(pub Arc<dyn Fn(f64) + Send + Sync>);
+
+impl std::fmt::Debug for TranscriptionProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TranscriptionProgress(..)")
+    }
 }
 
 /// Pluggable ASR backend. Implementations consume 16 kHz mono f32 PCM and return
@@ -193,8 +207,26 @@ pub fn transcribe_file(
     t: &dyn Transcriber,
     opts: &TranscribeOptions,
 ) -> Result<TranscriptionResult> {
-    let pcm = extract_pcm(path, &whisper_pcm_spec(), opts.source_range)?;
+    let cancel = opts.cancel.clone().unwrap_or_default();
+    if cancel.is_cancelled() {
+        return Err(crate::error::MediaError::Cancelled);
+    }
+    let progress = opts.progress.clone().map(|progress| {
+        Arc::new(move |done: usize, total: usize| {
+            (progress.0)(0.25 * done as f64 / total.max(1) as f64);
+        }) as crate::decode::pcm::PcmProgressCallback
+    });
+    let pcm = crate::decode::pcm::extract_pcm_cancellable_with_progress(
+        path,
+        &whisper_pcm_spec(),
+        opts.source_range,
+        &cancel,
+        progress,
+    )?;
     let result = t.transcribe_pcm(&pcm, opts)?;
+    if cancel.is_cancelled() {
+        return Err(crate::error::MediaError::Cancelled);
+    }
     let offset = opts.source_range.map(|(lo, _)| lo).unwrap_or(0.0);
     Ok(result.offsetting(offset))
 }
@@ -252,6 +284,22 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_transcription_does_not_open_source_or_run_inference() {
+        let cancel = crate::MediaCancelToken::new();
+        cancel.cancel();
+        let options = TranscribeOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        let result = transcribe_file(
+            Path::new("missing-transcription-input.wav"),
+            &super::test_support::MockTranscriber::default(),
+            &options,
+        );
+        assert!(matches!(result, Err(crate::error::MediaError::Cancelled)));
+    }
 
     fn sample() -> TranscriptionResult {
         TranscriptionResult {

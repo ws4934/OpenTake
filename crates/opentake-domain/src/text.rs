@@ -240,6 +240,18 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
+    pub const MIN_FONT_SIZE: f64 = 4.0;
+    pub const MAX_FONT_SIZE: f64 = 512.0;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.font_size.is_finite()
+            || !(Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE).contains(&self.font_size)
+        {
+            return Err("font size must be finite and between 4 and 512");
+        }
+        Ok(())
+    }
+
     /// Persisted keys owned by TextStyle's wire schema. Compatibility scanning
     /// consumes these constants so persistence does not maintain a second copy.
     pub const WIRE_FIELDS: &'static [&'static str] = &[

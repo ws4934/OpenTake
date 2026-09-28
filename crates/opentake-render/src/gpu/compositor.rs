@@ -6,6 +6,7 @@
 //! quad is 4 constant vertices — all geometry lives in the uniform affine.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -337,7 +338,7 @@ pub trait TextureResolver {
     fn resolve_lut(
         &mut self,
         _reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, RenderError> {
         Ok(None)
     }
 }
@@ -559,7 +560,7 @@ impl Compositor {
         struct Prepared {
             bind_group: wgpu::BindGroup,
             _tex: Rc<GpuTexture>,
-            _lut: Option<Rc<GpuLutTexture>>,
+            _lut: Option<Arc<GpuLutTexture>>,
         }
         let mut prepared: Vec<Prepared> = Vec::with_capacity(frame_plan.draws.len());
 
