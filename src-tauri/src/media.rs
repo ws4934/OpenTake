@@ -1681,8 +1681,8 @@ fn finalize_saved_media_with_hooks(
 ///   case-insensitive name order so ids mint deterministically.
 #[tauri::command]
 pub async fn import_folder(
+    app: AppHandle,
     core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
     prewarm: State<'_, prewarm::PrewarmScheduler>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
@@ -1691,12 +1691,12 @@ pub async fn import_folder(
     let activity = begin_direct_media_project_write(&admission)?;
     let core = core.inner().clone();
     let prewarm = prewarm.inner().clone();
-    let cache_root = media.engine().cache_root().to_path_buf();
-    let models_dir = media.engine().models_dir().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
-        let engine = MediaEngine::new(cache_root, models_dir);
-        import_folder_impl(&core, &engine, &prewarm, path, recursive)
+        // The app's engine, not a copy: it carries shared state such as the
+        // export pause that background media work observes.
+        let media = app.state::<MediaState>();
+        import_folder_impl(&core, media.engine(), &prewarm, path, recursive)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2817,8 +2817,8 @@ fn prepare_explicit_import_batch(
 
 #[tauri::command]
 pub async fn import_media(
+    app: AppHandle,
     core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
     prewarm: State<'_, prewarm::PrewarmScheduler>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     paths: Vec<String>,
@@ -2826,12 +2826,10 @@ pub async fn import_media(
     let activity = begin_direct_media_project_write(&admission)?;
     let core = core.inner().clone();
     let prewarm = prewarm.inner().clone();
-    let cache_root = media.engine().cache_root().to_path_buf();
-    let models_dir = media.engine().models_dir().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
-        let engine = MediaEngine::new(cache_root, models_dir);
-        import_media_impl(&core, &engine, &prewarm, paths)
+        let media = app.state::<MediaState>();
+        import_media_impl(&core, media.engine(), &prewarm, paths)
     })
     .await
     .map_err(|error| error.to_string())?
