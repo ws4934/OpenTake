@@ -1704,14 +1704,11 @@ impl Dispatcher {
         let mut explicit_count = 0usize;
         for (i, raw) in a.entries.iter().enumerate() {
             let e: AddClipEntry = decode_tool_args(raw, &format!("entries[{i}]"))?;
-            if let Some(entry) = manifest
-                .entries
-                .iter()
-                .find(|entry| entry.id == e.media_ref)
-            {
-                ensure_generation_output_ready(entry, &format!("entries[{i}]"))?;
-            }
-            let (media_type, has_audio) = resolve_media_kind(manifest, &e.media_ref);
+            let Some(media) = placement_media(manifest, &e.media_ref) else {
+                return Ok(media_not_found(ToolName::AddClips, i, &e.media_ref));
+            };
+            ensure_generation_output_ready(media, &format!("entries[{i}]"))?;
+            let (media_type, has_audio) = (media.kind, media.has_audio.unwrap_or(false));
             if e.track_index.is_some() {
                 explicit_count += 1;
             } else {
@@ -1774,21 +1771,15 @@ impl Dispatcher {
                     "entries[{i}]: trimStartFrame and trimEndFrame must be non-negative"
                 )));
             }
-            if let Some(entry) = manifest
-                .entries
-                .iter()
-                .find(|entry| entry.id == e.media_ref)
-            {
-                ensure_generation_output_ready(entry, &format!("entries[{i}]"))?;
-            }
-            let (media_type, has_audio) = resolve_media_kind(manifest, &e.media_ref);
+            let Some(media) = placement_media(manifest, &e.media_ref) else {
+                return Ok(media_not_found(ToolName::InsertClips, i, &e.media_ref));
+            };
+            ensure_generation_output_ready(media, &format!("entries[{i}]"))?;
+            let (media_type, has_audio) = (media.kind, media.has_audio.unwrap_or(false));
             let duration_frames = match e.duration_frames {
                 Some(d) => d,
                 None => {
-                    let full_frames = manifest
-                        .entries
-                        .iter()
-                        .find(|entry| entry.id == e.media_ref)
+                    let full_frames = Some(media)
                         .filter(|entry| entry.duration > 0.0)
                         .map(|entry| entry.duration * fps)
                         .ok_or_else(|| {
@@ -3469,9 +3460,6 @@ fn validate_optional_object<T: ToolArgs>(
 
 // MARK: - Free conversion helpers
 
-/// Resolve a clip's media type + has-audio from the manifest entry by id.
-/// Unknown refs fall back to video / no-audio; the ops layer then validates the
-/// id against the track and rejects an incompatible / missing asset.
 /// One caption-eligible clip located on the timeline: a borrowed [`Clip`] plus
 /// its track index and whether its source is video (drives audio extraction).
 /// The `get_transcript` body maps these through the pure timeline transcript
@@ -3726,16 +3714,22 @@ fn unique_transcript_sources(frags: &[TranscriptFrag<'_>]) -> Vec<TranscriptSour
     out
 }
 
-fn resolve_media_kind(
-    manifest: &MediaManifest,
+/// The manifest asset a clip-placing entry references (upstream `clipSource`).
+/// `None` means the asset does not exist; callers must reject the entry
+/// instead of placing a clip that references nothing.
+fn placement_media<'a>(
+    manifest: &'a MediaManifest,
     media_ref: &str,
-) -> (opentake_domain::ClipType, bool) {
-    manifest
-        .entries
-        .iter()
-        .find(|e| e.id == media_ref)
-        .map(|e| (e.kind, e.has_audio.unwrap_or(false)))
-        .unwrap_or((opentake_domain::ClipType::Video, false))
+) -> Option<&'a opentake_domain::MediaManifestEntry> {
+    manifest.entries.iter().find(|entry| entry.id == media_ref)
+}
+
+/// Not-found result for `entries[index].mediaRef`, returned before any edit.
+fn media_not_found(tool: ToolName, index: usize, media_ref: &str) -> ToolResult {
+    ToolResult::public_error(
+        PublicErrorKind::ResourceNotFound(tool),
+        format!("entries[{index}]: media asset not found: {media_ref}"),
+    )
 }
 
 fn generation_status_label(status: Option<GenerationJobStatus>) -> &'static str {
@@ -5267,17 +5261,24 @@ mod tests {
             TestHandle { core }
         }
 
-        /// Register a media asset directly on the manifest by applying through the
-        /// session is not exposed; instead we rely on `resolve_media_kind`'s
-        /// fallback (video) for unknown refs, which is what an un-imported ref
-        /// hits. For a known-asset path we inject via a manifest helper below.
-        fn with_asset(self, id: &str) -> Self {
-            // The public AppCore surface imports via probe; for a unit test we
-            // only need the manifest to contain the id so resolution succeeds.
-            // AppCore has no direct manifest setter, so we accept the video
-            // fallback (add_clips on a video track works regardless).
-            let _ = id;
-            self
+        /// Register a video asset through AppCore's real import path and
+        /// return its manifest id. The probe is supplied, so no file is read.
+        fn import_video(&self, name: &str) -> String {
+            self.core
+                .import_media_file(
+                    format!("/opentake-agent-test/{name}.mp4"),
+                    name,
+                    &opentake_core::ProbedMedia {
+                        duration_secs: 1.0,
+                        width: Some(1920),
+                        height: Some(1080),
+                        fps: Some(30.0),
+                        has_audio: false,
+                        color: None,
+                    },
+                )
+                .expect("import test video")
+                .id
         }
     }
 
@@ -5472,13 +5473,15 @@ mod tests {
 
     #[test]
     fn add_clips_then_get_timeline_reflects_clip() {
-        let d = dispatcher_with(Arc::new(TestHandle::new().with_asset("asset-1")));
+        let handle = TestHandle::new();
+        let media_ref = handle.import_video("asset-1");
+        let d = dispatcher_with(Arc::new(handle));
         // Track 0 is the seeded video track.
         let add = d.dispatch(
             "add_clips",
             serde_json::json!({
                 "entries": [{
-                    "mediaRef": "asset-1",
+                    "mediaRef": media_ref,
                     "trackIndex": 0,
                     "startFrame": 0,
                     "durationFrames": 30
@@ -6409,6 +6412,156 @@ mod tests {
             "no linked audio track should be created"
         );
         assert!(tl.tracks[0].clips[0].link_group_id.is_none());
+    }
+
+    /// The handle still holds `before` and has recorded no edit or undo step.
+    fn assert_unedited(handle: &StateHandle, before: &Timeline) {
+        assert_eq!(&handle.timeline(), before);
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.version(), 0);
+        assert!(!state.can_undo());
+    }
+
+    #[test]
+    fn add_clips_rejects_an_unknown_media_ref_without_editing() {
+        // Video and audio destinations, plus auto-track placement: none may
+        // fall back to a video stand-in or create a dangling clip.
+        for (handle, args) in [
+            (
+                seeded_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                seeded_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                linked_move_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","trackIndex":1,"startFrame":80,"durationFrames":30}]}),
+            ),
+        ] {
+            let dispatcher = dispatcher_with(handle.clone());
+            let before = handle.timeline();
+            let result = dispatcher.dispatch("add_clips", args);
+
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(
+                result
+                    .text_joined()
+                    .contains("entries[0]: media asset not found: does-not-exist"),
+                "{}",
+                result.text_joined()
+            );
+            assert_eq!(
+                result.public_error_kind(),
+                Some(PublicErrorKind::ResourceNotFound(ToolName::AddClips))
+            );
+            assert_unedited(&handle, &before);
+            assert!(dispatcher.agent_undo_stacks().is_empty());
+        }
+    }
+
+    #[test]
+    fn insert_clips_rejects_an_unknown_media_ref_without_editing() {
+        let handle = seeded_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "insert_clips",
+            serde_json::json!({
+                "trackIndex": 0,
+                "atFrame": 0,
+                "entries": [{"mediaRef": "does-not-exist", "durationFrames": 30}]
+            }),
+        );
+
+        assert!(result.is_error, "{}", result.text_joined());
+        assert!(
+            result
+                .text_joined()
+                .contains("entries[0]: media asset not found: does-not-exist"),
+            "{}",
+            result.text_joined()
+        );
+        assert_eq!(
+            result.public_error_kind(),
+            Some(PublicErrorKind::ResourceNotFound(ToolName::InsertClips))
+        );
+        assert_unedited(&handle, &before);
+        assert!(dispatcher.agent_undo_stacks().is_empty());
+    }
+
+    #[test]
+    fn clip_placement_resolves_a_short_media_ref_prefix() {
+        const ASSET: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        for (tool, args) in [
+            (
+                "add_clips",
+                serde_json::json!({"entries":[{"mediaRef":&ASSET[..8],"trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                "insert_clips",
+                serde_json::json!({"trackIndex":0,"atFrame":0,"entries":[{"mediaRef":&ASSET[..8],"durationFrames":30}]}),
+            ),
+        ] {
+            let mut timeline = Timeline::new();
+            let mut track = Track::new("track-1", ClipType::Video);
+            track.clips.push(Clip::new("clip-1", ASSET, 0, 30));
+            timeline.tracks.push(track);
+            let mut manifest = MediaManifest::new();
+            manifest.entries.push(entry(ASSET, "Hero"));
+            let handle = Arc::new(StateHandle::new(timeline, manifest));
+            let dispatcher = dispatcher_with(handle.clone());
+
+            let result = dispatcher.dispatch(tool, args);
+
+            assert!(!result.is_error, "{tool}: {}", result.text_joined());
+            let clips = &handle.timeline().tracks[0].clips;
+            assert_eq!(clips.len(), 2, "{tool}");
+            assert!(clips.iter().all(|clip| clip.media_ref == ASSET), "{tool}");
+        }
+    }
+
+    #[test]
+    fn clip_placement_still_rejects_a_generating_placeholder() {
+        let mut placeholder = entry("generated-asset", "Pending");
+        placeholder.generation_input = Some(opentake_domain::GenerationInput {
+            status: Some(GenerationJobStatus::Generating),
+            ..opentake_domain::GenerationInput::default()
+        });
+        let mut timeline = Timeline::new();
+        let mut track = Track::new("track-1", ClipType::Video);
+        track
+            .clips
+            .push(Clip::new("clip-1", "generated-asset", 0, 30));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(placeholder);
+        let handle = Arc::new(StateHandle::new(timeline, manifest));
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+
+        for (tool, args) in [
+            (
+                "add_clips",
+                serde_json::json!({"entries":[{"mediaRef":"generated-asset","trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                "insert_clips",
+                serde_json::json!({"trackIndex":0,"atFrame":0,"entries":[{"mediaRef":"generated-asset","durationFrames":30}]}),
+            ),
+        ] {
+            let result = dispatcher.dispatch(tool, args);
+            assert!(result.is_error, "{tool}: {}", result.text_joined());
+            assert!(
+                result.text_joined().contains(
+                    "entries[0]: generated media 'generated-asset' is not ready (status generating)"
+                ),
+                "{tool}: {}",
+                result.text_joined()
+            );
+        }
+        assert_unedited(&handle, &before);
     }
 
     #[test]
