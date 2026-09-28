@@ -1588,8 +1588,59 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         .iter()
         .filter_map(AudioPlanLike::true_peak_ceiling_dbtp)
         .min_by(f64::total_cmp);
+
+    // Noise profiles first: a denoised clip's profile covers the whole clip,
+    // even when the range covers only part of it, so its pass can take longer
+    // than the range's own mix. Progress spans the passes and the mix.
+    let pending_profile_frames: u64 = clips
+        .iter()
+        .zip(&layouts)
+        .filter_map(|(plan, layout)| {
+            let layout = layout.as_ref()?;
+            let path = &media[&plan.clip().media_ref].path;
+            clip_audio::denoise_profile_pending(plan.audio_denoise(), layout, path, 1)
+                .then_some(layout.len() as u64)
+        })
+        .sum();
+    let total_work = pending_profile_frames.saturating_add(total_samples).max(1);
+    let report_work = |done: u64| {
+        if let Some(report) = &on_progress {
+            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
+            let mapped = AUDIO_MIX_START + (done.min(total_work) * span / total_work) as i32;
+            report(mapped, AUDIO_PROGRESS_TOTAL);
+        }
+    };
+    let mut profile_done = 0_u64;
+    let mut denoise = Vec::with_capacity(clips.len());
+    for (plan, layout) in clips.iter().zip(&layouts) {
+        let Some(layout) = layout else {
+            denoise.push(None);
+            continue;
+        };
+        check_audio_cancel_with_external(control, external_cancel)?;
+        let media_ref = &plan.clip().media_ref;
+        let path = &media[media_ref].path;
+        let pending = clip_audio::denoise_profile_pending(plan.audio_denoise(), layout, path, 1);
+        let progress = |frames: usize| report_work(profile_done + frames as u64);
+        let input = clip_audio::clip_denoise(
+            plan.audio_denoise(),
+            layout,
+            path,
+            1,
+            &cancel,
+            Some(&progress),
+        )
+        .map_err(|error| decode_failure(media_ref, error))?;
+        if pending {
+            profile_done += layout.len() as u64;
+        }
+        denoise.push(input);
+    }
+
     // One forward decoder per audible clip, opened when the clip enters the
-    // range and reaped as soon as it ends (#3).
+    // range and reaped as soon as it ends (#3). At most
+    // `MAX_OPEN_CLIP_READERS` stay open; a clip beyond the cap reads each
+    // window through a reader opened for that window only.
     let mut readers: HashMap<usize, ClipAudioReader> = HashMap::new();
     let mut samples = Vec::new();
     for relative_start in (0..total_samples).step_by(AUDIO_STREAM_WINDOW_SAMPLES) {
@@ -1609,23 +1660,25 @@ fn stream_flattened_audio<T: AudioPlanLike>(
                 continue;
             }
             let media_ref = &plan.clip().media_ref;
+            let mut transient = None;
+            let open_readers = readers.len();
             let reader = match readers.entry(index) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    let path = &media[media_ref].path;
-                    let denoise =
-                        clip_audio::clip_denoise(plan.audio_denoise(), &layout, path, 1, &cancel)
-                            .map_err(|error| decode_failure(media_ref, error))?;
                     let reader = ClipAudioReader::open(
                         layout,
-                        path,
+                        &media[media_ref].path,
                         1,
                         layout.offset_of(overlap_start),
-                        denoise,
+                        denoise[index].clone(),
                         &cancel,
                     )
                     .map_err(|error| decode_failure(media_ref, error))?;
-                    entry.insert(reader)
+                    if overlap_end < clip_end && open_readers < clip_audio::MAX_OPEN_CLIP_READERS {
+                        entry.insert(reader)
+                    } else {
+                        transient.insert(reader)
+                    }
                 }
             };
             samples.clear();
@@ -1653,13 +1706,7 @@ fn stream_flattened_audio<T: AudioPlanLike>(
         }
         mix::apply_true_peak_ceiling(&mut mixed, true_peak_ceiling_dbtp);
         emit(&mixed)?;
-        if let Some(report) = &on_progress {
-            let completed = relative_start.saturating_add(window_len);
-            let span = (AUDIO_MIX_END - AUDIO_MIX_START) as u64;
-            let mapped =
-                AUDIO_MIX_START + (completed.saturating_mul(span) / total_samples.max(1)) as i32;
-            report(mapped, AUDIO_PROGRESS_TOTAL);
-        }
+        report_work(profile_done + relative_start.saturating_add(window_len));
         if cancel.checkpoint() || external_cancel.is_some_and(MediaCancelToken::is_cancelled) {
             return Err(CANCELLED_SENTINEL.to_string());
         }
@@ -5305,6 +5352,150 @@ mod tests {
 
         assert!((lo - 0.5).abs() < 0.0001);
         assert!((hi - 2.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn range_export_reports_progress_through_the_whole_clip_profile_pass() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("speech.wav");
+        write_wav(&source, &noisy_tone(20.0, 300.0, 9));
+        let media = HashMap::from([(
+            "speech".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        let mut clip = Clip::new("speech", "speech", 0, 600);
+        clip.media_type = ClipType::Audio;
+        clip.audio_denoise = Some(AudioDenoise {
+            mode: opentake_domain::DenoiseMode::Voice,
+            strength: 0.5,
+            preview_enabled: true,
+        });
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&reports);
+        let progress: AudioExportProgress = Arc::new(move |done, total| {
+            assert_eq!(total, AUDIO_PROGRESS_TOTAL);
+            recorder.lock().unwrap().push(done);
+        });
+        // Two seconds of a twenty-second denoised clip: the profile pass
+        // decodes all twenty and dominates the work.
+        let mut streamed = Vec::new();
+        stream_flattened_audio(
+            &[clip],
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 60,
+                control: None,
+                external_cancel: Some(&MediaCancelToken::new()),
+                on_progress: Some(progress),
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the range audio");
+        assert_eq!(streamed.len(), 2 * MIX_SAMPLE_RATE as usize);
+        let reports = reports.lock().unwrap();
+        assert!(
+            reports.windows(2).all(|pair| pair[0] <= pair[1]),
+            "progress never goes back"
+        );
+        assert_eq!(reports.last(), Some(&AUDIO_MIX_END));
+        let during_profile = reports
+            .iter()
+            .filter(|done| **done > AUDIO_MIX_START && **done < AUDIO_MIX_END - 20)
+            .count();
+        assert!(
+            during_profile >= 10,
+            "the profile pass reports progress ({during_profile} reports)"
+        );
+    }
+
+    #[test]
+    fn export_audio_caps_open_clip_decoders_without_changing_the_mix() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
+        use crate::clip_audio::MAX_OPEN_CLIP_READERS;
+
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tone.wav");
+        write_wav(&source, &noisy_tone(8.0, 440.0, 5));
+        let media = HashMap::from([(
+            "tone".to_string(),
+            MediaInfo {
+                path: source,
+                source_fps: None,
+            },
+        )]);
+        // Four more clips than the cap, all playing through three windows.
+        let extra = 4;
+        let clips = (0..MAX_OPEN_CLIP_READERS + extra)
+            .map(|index| {
+                let mut clip = Clip::new(format!("c{index}"), "tone", 0, 180);
+                clip.media_type = ClipType::Audio;
+                clip.trim_start_frame = index as i32;
+                clip.volume = 0.05;
+                clip
+            })
+            .collect::<Vec<_>>();
+        let cancel = MediaCancelToken::new();
+        let processes = opentake_media::ffmpeg_status::HelperProcessCount::start();
+        let mut streamed = Vec::new();
+        let has_audio = stream_flattened_audio(
+            &clips,
+            &media,
+            AudioStreamOptions {
+                timeline_fps: 30,
+                start_frame: 0,
+                end_frame: 180,
+                control: None,
+                external_cancel: Some(&cancel),
+                on_progress: None,
+            },
+            |samples| {
+                streamed.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .expect("stream the timeline audio");
+        let spawned = processes.count();
+        drop(processes);
+        assert!(has_audio);
+        assert_eq!(streamed.len(), 6 * MIX_SAMPLE_RATE as usize);
+        // One probe, one decoder for each clip under the cap, and one decoder
+        // per window for each clip beyond it.
+        let windows = 3;
+        assert_eq!(spawned, 1 + MAX_OPEN_CLIP_READERS + extra * windows);
+
+        let whole_clips = clips
+            .iter()
+            .map(|clip| {
+                project_clip_audio(clip, &media, 30, None, None)
+                    .unwrap()
+                    .expect("audible clip")
+            })
+            .collect::<Vec<_>>();
+        let reference = mix::mix_clips(&whole_clips).unwrap();
+        let max_difference = streamed
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 1.0e-6, "max difference {max_difference}");
     }
 
     #[test]

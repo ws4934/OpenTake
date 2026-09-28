@@ -730,6 +730,8 @@ impl PlaybackState {
         let transition = slot.sessions.begin_project_transition()?;
         slot.paused_prepare_restart = None;
         Self::cancel_prepare(&mut slot);
+        // Preview's background noise-profile passes belong to the old project.
+        crate::clip_audio::cancel_background_profiles();
         if let Some(running) = slot.running.as_ref() {
             running.proxy_check_cancel.cancel();
             running.close_publication();

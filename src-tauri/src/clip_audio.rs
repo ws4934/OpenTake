@@ -9,15 +9,21 @@
 //! the same timeline position.
 //!
 //! [`ClipAudioReader`] serves consecutive clip frames from one forward
-//! [`PcmStream`]. Export keeps one reader per audible clip for as long as the
-//! clip is in range (one decoder per clip, not per window). Preview mixes
-//! independent windows and opens a reader per window that starts a denoise
-//! warm-up before the window, which converges on the uninterrupted result.
+//! [`PcmStream`]. Export and preview playback keep one reader per audible clip
+//! for as long as the clip plays (one decoder per clip, not per window), up to
+//! [`MAX_OPEN_CLIP_READERS`] at a time. A reader opened mid-clip (after a
+//! seek) starts a denoise warm-up before its first frame, which converges on
+//! the uninterrupted result.
+//!
+//! Noise profiles are computed once per clip layout and cached. Export waits
+//! for them; preview asks a background worker and plays the clip undenoised
+//! until its profile is ready, so a profile pass never delays playback.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use opentake_domain::{AudioDenoise, Clip};
 use opentake_media::analysis::{
@@ -32,6 +38,14 @@ const RENDER_CHUNK_FRAMES: usize = 4 * 1024;
 /// Distinct clip noise profiles remembered across preview windows, playback
 /// sessions and exports.
 const PROFILE_CACHE_CAPACITY: usize = 32;
+/// How often a caller waiting for another caller's profile pass checks its
+/// own cancellation.
+const PROFILE_WAIT_POLL: Duration = Duration::from_millis(50);
+/// Clip decoders one mix keeps open across windows. Each is an FFmpeg process
+/// with three pipes; beyond this many overlapping clips, further clips are
+/// decoded by a reader opened for one window and closed again, which keeps a
+/// dense timeline well inside the default open-file limit (256 on macOS).
+pub(crate) const MAX_OPEN_CLIP_READERS: usize = 16;
 
 /// Timeline mix frame at the start of timeline frame `frame` (rounded, as the
 /// audio clock seeks). Negative before the timeline starts.
@@ -108,6 +122,11 @@ impl ClipAudioLayout {
     /// Clip-relative frame of timeline mix frame `position` (inside the span).
     pub(crate) fn offset_of(&self, position: u64) -> usize {
         (position as i64 - self.start) as usize
+    }
+
+    /// Clip length in mix frames.
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -215,6 +234,16 @@ impl ClipAudioReader {
         Ok(reader)
     }
 
+    /// The next clip frame [`ClipAudioReader::read`] returns.
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Whether this reader denoises its output.
+    pub(crate) fn is_denoised(&self) -> bool {
+        self.denoise.is_some()
+    }
+
     /// Append the next `frames` clip frames (interleaved) to `out`.
     pub(crate) fn read(&mut self, frames: usize, out: &mut Vec<f32>) -> Result<(), MediaError> {
         if frames > self.layout.len - self.position {
@@ -320,24 +349,117 @@ impl ClipAudioReader {
     }
 }
 
-/// The denoiser input for a clip reader: `None` when the clip is not denoised
-/// (zero strength is a bit-exact bypass), else the validated settings and the
-/// clip's noise profile.
-pub(crate) fn clip_denoise(
-    config: Option<AudioDenoise>,
-    layout: &ClipAudioLayout,
-    path: &Path,
-    channels: usize,
-    cancel: &MediaCancelToken,
-) -> Result<Option<(DenoiseProfile, AudioDenoise)>, MediaError> {
+/// Validated denoise settings for a clip, or `None` when the clip is not
+/// denoised (zero strength is a bit-exact bypass).
+fn active_denoise(config: Option<AudioDenoise>) -> Result<Option<AudioDenoise>, MediaError> {
     let Some(config) = config.filter(|config| config.strength != 0.0) else {
         return Ok(None);
     };
     config
         .validate()
         .map_err(|error| denoise_error(DenoiseError::InvalidConfig(error.to_string())))?;
-    let profile = clip_denoise_profile(layout, path, channels, cancel)?;
+    Ok(Some(config))
+}
+
+/// The denoiser input for a clip reader: `None` when the clip is not denoised,
+/// else the validated settings and the clip's noise profile, computed now if
+/// it is not cached (`progress` reports the profile pass in clip frames).
+pub(crate) fn clip_denoise(
+    config: Option<AudioDenoise>,
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+    cancel: &MediaCancelToken,
+    progress: Option<&dyn Fn(usize)>,
+) -> Result<Option<(DenoiseProfile, AudioDenoise)>, MediaError> {
+    let Some(config) = active_denoise(config)? else {
+        return Ok(None);
+    };
+    let profile = clip_denoise_profile(layout, path, channels, cancel, progress)?;
     Ok(Some((DenoiseProfile::clone(&profile), config)))
+}
+
+/// What preview playback should do with a clip's denoise right now.
+#[derive(Debug)]
+pub(crate) enum PreviewDenoise {
+    /// The clip is not denoised in preview.
+    Off,
+    /// The profile is still being computed in the background: play the clip
+    /// undenoised meanwhile.
+    Pending,
+    Ready(DenoiseProfile, AudioDenoise),
+}
+
+/// Preview's denoise input for a clip. Never runs a profile pass on the
+/// caller's thread: a missing profile is queued on the background worker (once
+/// per layout, however many windows or playback sessions ask) and the clip
+/// plays undenoised until it is ready.
+pub(crate) fn preview_clip_denoise(
+    config: Option<AudioDenoise>,
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+) -> Result<PreviewDenoise, MediaError> {
+    let Some(config) = active_denoise(config)? else {
+        return Ok(PreviewDenoise::Off);
+    };
+    let key = ProfileKey::new(layout, path, channels);
+    let service = profiles();
+    let mut store = service.lock();
+    if let Some(profile) = store.cached(&key) {
+        return Ok(PreviewDenoise::Ready(
+            DenoiseProfile::clone(&profile),
+            config,
+        ));
+    }
+    if store.in_flight.contains(&key) || store.failed.contains(&key) {
+        return Ok(PreviewDenoise::Pending);
+    }
+    let job = ProfileJob {
+        key: key.clone(),
+        layout: *layout,
+        path: path.to_path_buf(),
+        channels,
+        cancel: store.background.clone(),
+    };
+    store.in_flight.push(key);
+    #[cfg(test)]
+    test_hooks::record_request(path);
+    let sent = match service.worker() {
+        Some(worker) => worker.send(job).map_err(|mpsc::SendError(job)| job.key),
+        None => Err(job.key),
+    };
+    if let Err(key) = sent {
+        store.in_flight.retain(|queued| *queued != key);
+        return Err(MediaError::Decode(
+            "denoise profile worker is not running".to_string(),
+        ));
+    }
+    Ok(PreviewDenoise::Pending)
+}
+
+/// Cancel queued and running background profile passes (the project is
+/// closing) and forget passes that failed, so the next project retries them.
+/// Cached profiles stay: they are keyed by source file version.
+pub(crate) fn cancel_background_profiles() {
+    let mut store = profiles().lock();
+    store.background.cancel();
+    store.background = MediaCancelToken::new();
+    store.failed.clear();
+}
+
+/// Whether a clip's noise profile still needs a pass (not cached).
+pub(crate) fn denoise_profile_pending(
+    config: Option<AudioDenoise>,
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+) -> bool {
+    if !matches!(active_denoise(config), Ok(Some(_))) {
+        return false;
+    }
+    let key = ProfileKey::new(layout, path, channels);
+    profiles().lock().cached(&key).is_none()
 }
 
 /// Cache key for a clip's noise profile: the source file (and its version),
@@ -355,60 +477,303 @@ struct ProfileKey {
     channels: usize,
 }
 
-static PROFILE_CACHE: Mutex<VecDeque<(ProfileKey, Arc<DenoiseProfile>)>> =
-    Mutex::new(VecDeque::new());
+impl ProfileKey {
+    fn new(layout: &ClipAudioLayout, path: &Path, channels: usize) -> Self {
+        let metadata = std::fs::metadata(path).ok();
+        ProfileKey {
+            path: path.to_path_buf(),
+            file_len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+            modified: metadata.and_then(|metadata| metadata.modified().ok()),
+            source_lo: layout.source_lo.to_bits(),
+            source_hi: layout.source_hi.to_bits(),
+            ratio: layout.ratio.to_bits(),
+            len: layout.len,
+            rate: layout.rate,
+            channels,
+        }
+    }
+}
+
+struct ProfileJob {
+    key: ProfileKey,
+    layout: ClipAudioLayout,
+    path: PathBuf,
+    channels: usize,
+    cancel: MediaCancelToken,
+}
+
+struct ProfileStore {
+    cache: VecDeque<(ProfileKey, Arc<DenoiseProfile>)>,
+    /// Passes running or queued, by any caller: a second caller for the same
+    /// key waits for (or, in preview, skips) the first instead of decoding
+    /// the clip again.
+    in_flight: Vec<ProfileKey>,
+    /// Background passes that failed; preview plays these clips undenoised
+    /// instead of retrying every window. Cleared when the project closes.
+    failed: Vec<ProfileKey>,
+    /// Cancels background passes; replaced when the project closes.
+    background: MediaCancelToken,
+}
+
+impl ProfileStore {
+    fn cached(&self, key: &ProfileKey) -> Option<Arc<DenoiseProfile>> {
+        self.cache
+            .iter()
+            .find(|(cached, _)| cached == key)
+            .map(|(_, profile)| Arc::clone(profile))
+    }
+
+    /// Record the end of a pass for `key`, caching its profile if it succeeded.
+    fn finish(&mut self, key: &ProfileKey, profile: Option<&Arc<DenoiseProfile>>) {
+        self.in_flight.retain(|queued| queued != key);
+        if let Some(profile) = profile {
+            self.failed.retain(|failed| failed != key);
+            self.cache.retain(|(cached, _)| cached != key);
+            while self.cache.len() >= PROFILE_CACHE_CAPACITY {
+                self.cache.pop_front();
+            }
+            self.cache.push_back((key.clone(), Arc::clone(profile)));
+        }
+    }
+}
+
+struct ProfileService {
+    store: Mutex<ProfileStore>,
+    /// Signalled whenever a pass ends.
+    finished: Condvar,
+    /// `None` when the worker thread could not be started.
+    worker: OnceLock<Option<Mutex<Sender<ProfileJob>>>>,
+}
+
+impl ProfileService {
+    fn lock(&self) -> MutexGuard<'_, ProfileStore> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The background worker's queue, starting the worker on first use. One
+    /// worker runs the passes one at a time, so preview never runs more than
+    /// one extra decode however many denoised clips it plays.
+    fn worker(&self) -> Option<Sender<ProfileJob>> {
+        let worker = self.worker.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            match std::thread::Builder::new()
+                .name("opentake-denoise-profile".to_string())
+                .spawn(move || run_profile_worker(receiver))
+            {
+                Ok(_) => Some(Mutex::new(sender)),
+                Err(error) => {
+                    eprintln!("[audio] could not start the denoise profile worker: {error}");
+                    None
+                }
+            }
+        });
+        worker.as_ref().map(|sender| {
+            sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+    }
+}
+
+fn profiles() -> &'static ProfileService {
+    static SERVICE: OnceLock<ProfileService> = OnceLock::new();
+    SERVICE.get_or_init(|| ProfileService {
+        store: Mutex::new(ProfileStore {
+            cache: VecDeque::new(),
+            in_flight: Vec::new(),
+            failed: Vec::new(),
+            background: MediaCancelToken::new(),
+        }),
+        finished: Condvar::new(),
+        worker: OnceLock::new(),
+    })
+}
+
+fn run_profile_worker(jobs: Receiver<ProfileJob>) {
+    for job in jobs {
+        #[cfg(test)]
+        test_hooks::wait_while_held(&job.path, &job.cancel);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute_profile(&job.layout, &job.path, job.channels, &job.cancel, None)
+        }))
+        .unwrap_or_else(|_| {
+            Err(MediaError::Decode(
+                "denoise profile pass panicked".to_string(),
+            ))
+        });
+        let service = profiles();
+        let mut store = service.lock();
+        store.finish(&job.key, result.as_ref().ok());
+        match &result {
+            Ok(_) | Err(MediaError::Cancelled) => {}
+            Err(error) => {
+                // Preview keeps playing the clip undenoised; export computes
+                // the profile itself and reports the error.
+                eprintln!(
+                    "[audio] denoise profile for {} failed: {error}",
+                    job.path.display()
+                );
+                store.failed.push(job.key.clone());
+            }
+        }
+        drop(store);
+        service.finished.notify_all();
+    }
+}
 
 /// The noise profile of a clip's whole rendered audio, estimated once from
 /// its entire source window (one extra decode) and cached by source version.
+/// Waits for a pass another caller already runs for the same clip; `progress`
+/// reports this caller's own pass in clip frames.
 pub(crate) fn clip_denoise_profile(
     layout: &ClipAudioLayout,
     path: &Path,
     channels: usize,
     cancel: &MediaCancelToken,
+    progress: Option<&dyn Fn(usize)>,
 ) -> Result<Arc<DenoiseProfile>, MediaError> {
-    let metadata = std::fs::metadata(path).ok();
-    let key = ProfileKey {
-        path: path.to_path_buf(),
-        file_len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
-        modified: metadata.and_then(|metadata| metadata.modified().ok()),
-        source_lo: layout.source_lo.to_bits(),
-        source_hi: layout.source_hi.to_bits(),
-        ratio: layout.ratio.to_bits(),
-        len: layout.len,
-        rate: layout.rate,
-        channels,
-    };
-    let cached = PROFILE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .find(|(cached, _)| *cached == key)
-        .map(|(_, profile)| Arc::clone(profile));
-    if let Some(profile) = cached {
-        return Ok(profile);
+    let key = ProfileKey::new(layout, path, channels);
+    let service = profiles();
+    let mut store = service.lock();
+    loop {
+        if let Some(profile) = store.cached(&key) {
+            return Ok(profile);
+        }
+        if !store.in_flight.contains(&key) {
+            store.in_flight.push(key.clone());
+            break;
+        }
+        if cancel.checkpoint() {
+            return Err(MediaError::Cancelled);
+        }
+        store = service
+            .finished
+            .wait_timeout(store, PROFILE_WAIT_POLL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
+    drop(store);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_profile(layout, path, channels, cancel, progress)
+    }));
+    let mut store = service.lock();
+    store.finish(
+        &key,
+        result.as_ref().ok().and_then(|result| result.as_ref().ok()),
+    );
+    drop(store);
+    service.finished.notify_all();
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn compute_profile(
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+    cancel: &MediaCancelToken,
+    progress: Option<&dyn Fn(usize)>,
+) -> Result<Arc<DenoiseProfile>, MediaError> {
+    #[cfg(test)]
+    test_hooks::record_pass(path);
     let mut reader = ClipAudioReader::open(*layout, path, channels, 0, None, cancel)?;
     let mut builder =
         DenoiseProfileBuilder::new(channels, layout.rate, layout.len).map_err(denoise_error)?;
     let mut chunk = Vec::new();
-    let mut remaining = layout.len;
-    while remaining > 0 {
-        let step = RENDER_CHUNK_FRAMES.min(remaining);
+    let mut done = 0;
+    while done < layout.len {
+        let step = RENDER_CHUNK_FRAMES.min(layout.len - done);
         chunk.clear();
         reader.read(step, &mut chunk)?;
         builder.push(&chunk, cancel).map_err(denoise_error)?;
-        remaining -= step;
+        done += step;
+        if let Some(progress) = progress {
+            progress(done);
+        }
     }
-    let profile = Arc::new(builder.finish(cancel).map_err(denoise_error)?);
-    let mut cache = PROFILE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.retain(|(cached, _)| *cached != key);
-    while cache.len() >= PROFILE_CACHE_CAPACITY {
-        cache.pop_front();
+    Ok(Arc::new(builder.finish(cancel).map_err(denoise_error)?))
+}
+
+/// Test seams for the background profile worker: count passes and requests
+/// per source path, and hold a path's background pass until released.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    use opentake_media::MediaCancelToken;
+
+    static PASSES: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+    static REQUESTS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+    static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static RELEASED: Condvar = Condvar::new();
+
+    fn bump(map: &Mutex<Option<HashMap<PathBuf, usize>>>, path: &Path) {
+        *map.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(path.to_path_buf())
+            .or_default() += 1;
     }
-    cache.push_back((key, Arc::clone(&profile)));
-    Ok(profile)
+
+    fn get(map: &Mutex<Option<HashMap<PathBuf, usize>>>, path: &Path) -> usize {
+        map.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|counts| counts.get(path).copied())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn record_pass(path: &Path) {
+        bump(&PASSES, path);
+    }
+
+    pub(super) fn record_request(path: &Path) {
+        bump(&REQUESTS, path);
+    }
+
+    /// Profile passes run for `path` (by any caller).
+    pub(crate) fn passes(path: &Path) -> usize {
+        get(&PASSES, path)
+    }
+
+    /// Background passes queued for `path`.
+    pub(crate) fn requests(path: &Path) -> usize {
+        get(&REQUESTS, path)
+    }
+
+    /// Hold background passes for `path` until the guard drops.
+    pub(crate) struct Hold(PathBuf);
+
+    pub(crate) fn hold(path: &Path) -> Hold {
+        HELD.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(path.to_path_buf());
+        Hold(path.to_path_buf())
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            HELD.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|held| *held != self.0);
+            RELEASED.notify_all();
+        }
+    }
+
+    pub(super) fn wait_while_held(path: &Path, cancel: &MediaCancelToken) {
+        let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while held.iter().any(|held| held == path) && !cancel.is_cancelled() {
+            held = RELEASED
+                .wait_timeout(held, Duration::from_millis(20))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
 }
 
 /// A mono 48 kHz test signal (a sine plus a little white noise) and a WAV
@@ -557,7 +922,7 @@ mod tests {
                 "a reader opened mid-clip continues the same samples"
             );
 
-            let profile = clip_denoise_profile(&layout, &path, 1, &cancel).unwrap();
+            let profile = clip_denoise_profile(&layout, &path, 1, &cancel, None).unwrap();
             let denoised = |from, steps: &[usize]| {
                 read_all(
                     layout,
