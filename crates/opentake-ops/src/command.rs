@@ -514,9 +514,32 @@ mod aligned_stem_track_tests {
         }
     }
 
+    fn stem_media(id: &str) -> MediaManifestEntry {
+        MediaManifestEntry {
+            id: id.into(),
+            name: id.into(),
+            kind: ClipType::Audio,
+            source: opentake_domain::MediaSource::External {
+                absolute_path: format!("/{id}.wav"),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }
+    }
+
     #[test]
     fn aligned_stems_use_separate_tracks_and_one_undo_entry() {
         let mut state = EditorState::default();
+        state.manifest.entries = vec![stem_media("vocals"), stem_media("accompaniment")];
         let ids = SeqIdGen::default();
         let result = apply(
             &mut state,
@@ -1375,12 +1398,15 @@ pub fn apply(
     // Commands inspect clip ends while deriving their transaction plan. Guard
     // the complete persisted graph before even that read. Undo/redo only
     // validate the history snapshot they would restore, and a removal only the
-    // clips it keeps, so a malformed clip can always be undone or removed.
-    if !matches!(
-        command,
-        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. }
-    ) {
-        validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // clips it keeps, so a malformed clip can always be undone or removed. A
+    // nested edit leaves its child timeline to the inner command's own guard,
+    // so a malformed clip can also be removed from inside a compound clip.
+    match &command {
+        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. } => {}
+        EditCommand::EditNestedSequence { sequence_id, .. } => {
+            validate_frame_arithmetic_outside_sequence(&state.timeline, "timeline", sequence_id)?;
+        }
+        _ => validate_timeline_frame_arithmetic(&state.timeline, "timeline")?,
     }
     match command {
         EditCommand::Undo => {
@@ -2952,6 +2978,34 @@ fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Resul
     Ok(())
 }
 
+/// [`validate_timeline_frame_arithmetic`] for everything except the child
+/// timeline of the nested sequence `sequence_id`.
+fn validate_frame_arithmetic_outside_sequence(
+    timeline: &Timeline,
+    label: &str,
+    sequence_id: &str,
+) -> Result<(), EditError> {
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            if clip.frame_arithmetic().is_err() {
+                validate_clip_frame_arithmetic(
+                    clip,
+                    &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
+                )?;
+            }
+        }
+    }
+    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        if sequence.id != sequence_id {
+            validate_timeline_frame_arithmetic(
+                &sequence.timeline,
+                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// [`validate_timeline_frame_arithmetic`] for every clip except the root clips
 /// whose ids are in `removed`.
 fn validate_kept_frame_arithmetic(
@@ -3252,7 +3306,7 @@ fn add_clips_auto_track(
     let entry_ends: Vec<i32> = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| validate_auto_track_entry(entry, index))
+        .map(|(index, entry)| validate_auto_track_entry(state, entry, index))
         .collect::<Result<_, _>>()?;
     // Route by the placed clip's own type, as validation and track
     // compatibility do: the audio part of a video asset (`media_type` audio,
@@ -3327,7 +3381,7 @@ fn add_clips_to_separate_auto_tracks(
         ));
     }
     for (index, entry) in entries.iter().enumerate() {
-        validate_auto_track_entry(entry, index)?;
+        validate_auto_track_entry(state, entry, index)?;
     }
     transact(
         state,
@@ -3673,6 +3727,7 @@ fn insert_clips(
     }
     let target_type = state.timeline.tracks[track_index].kind;
     for (i, e) in entries.iter().enumerate() {
+        validate_entry_media(state, e, i)?;
         if !e.media_type.is_compatible(target_type) {
             return Err(EditError::Invalid(format!(
                 "entries[{i}]: asset type is not compatible with the target track"
@@ -7696,7 +7751,26 @@ fn set_timeline_settings_cmd(
 
 // MARK: - Small local helpers
 
+/// A placed non-text clip must reference an asset in the project manifest;
+/// otherwise the timeline gains a clip that no preview or export can resolve.
+fn validate_entry_media(state: &EditorState, e: &ClipEntry, i: usize) -> Result<(), EditError> {
+    if e.media_type == ClipType::Text
+        || state
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.id == e.media_ref)
+    {
+        return Ok(());
+    }
+    Err(EditError::Invalid(format!(
+        "entries[{i}]: media asset not found: {}",
+        e.media_ref
+    )))
+}
+
 fn validate_entry(state: &EditorState, e: &ClipEntry, i: usize) -> Result<i32, EditError> {
+    validate_entry_media(state, e, i)?;
     if e.track_index >= state.timeline.tracks.len() {
         return Err(EditError::Invalid(format!(
             "entries[{i}]: track index {} out of range",
@@ -7723,7 +7797,12 @@ fn validate_entry(state: &EditorState, e: &ClipEntry, i: usize) -> Result<i32, E
     )
 }
 
-fn validate_auto_track_entry(e: &ClipEntry, i: usize) -> Result<i32, EditError> {
+fn validate_auto_track_entry(
+    state: &EditorState,
+    e: &ClipEntry,
+    i: usize,
+) -> Result<i32, EditError> {
+    validate_entry_media(state, e, i)?;
     let target = if e.media_type == ClipType::Audio {
         ClipType::Audio
     } else {

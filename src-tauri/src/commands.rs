@@ -4301,10 +4301,18 @@ mod edit_request_serde_tests {
         let err = validate_freeze_frame_request(&core, "nope", 10, 1).unwrap_err();
         assert!(err.contains("Clip not found"));
 
+        // Placement requires registered media.
+        let media = core
+            .import_media_file(
+                std::env::temp_dir().join("freeze-preflight.mp4"),
+                "Freeze preflight",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("register video");
         let added = core
             .apply(EditCommand::AddClips {
                 entries: vec![ClipEntry {
-                    media_ref: "asset-1".into(),
+                    media_ref: media.id,
                     media_type: ClipType::Video,
                     source_clip_type: ClipType::Video,
                     track_index: 0,
@@ -4332,10 +4340,17 @@ mod edit_request_serde_tests {
                 at: None,
             })
             .expect("audio track");
+        let audio_media = audio
+            .import_media_file(
+                std::env::temp_dir().join("freeze-preflight.wav"),
+                "Freeze preflight audio",
+                &opentake_core::ProbedMedia::default(),
+            )
+            .expect("register audio");
         let added = audio
             .apply(EditCommand::AddClips {
                 entries: vec![ClipEntry {
-                    media_ref: "asset-a1".into(),
+                    media_ref: audio_media.id,
                     media_type: ClipType::Audio,
                     source_clip_type: ClipType::Audio,
                     track_index: 0,

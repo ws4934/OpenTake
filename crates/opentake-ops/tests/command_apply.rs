@@ -46,7 +46,12 @@ fn audio_track(id: &str, sync: bool, clips: Vec<Clip>) -> Track {
 fn state(tracks: Vec<Track>) -> EditorState {
     let mut tl = Timeline::new();
     tl.tracks = tracks;
-    EditorState::new(tl, MediaManifest::new())
+    let mut manifest = MediaManifest::new();
+    // Placement commands require their media in the manifest.
+    manifest
+        .entries
+        .push(media_entry("m", ClipType::Video, 10.0));
+    EditorState::new(tl, manifest)
 }
 
 fn entry(track_index: usize, media_type: ClipType, start: i32, dur: i32) -> ClipEntry {
@@ -4870,4 +4875,209 @@ fn cross_cutting_command_acceptance() {
     ripple_delete_ranges_refuses_when_sync_follower_collides();
     undo_redo_restores_and_versions();
     unchanged_command_does_not_push_undo_or_bump_version();
+}
+
+#[test]
+fn placement_commands_reject_media_missing_from_the_manifest() {
+    let unknown = || ClipEntry {
+        media_ref: "does-not-exist".into(),
+        ..entry(0, ClipType::Video, 0, 30)
+    };
+    let commands = [
+        EditCommand::AddClips {
+            entries: vec![entry(0, ClipType::Video, 0, 30), unknown()],
+        },
+        EditCommand::AddClipsAutoTrack {
+            entries: vec![unknown()],
+        },
+        EditCommand::AddClipsToSeparateAutoTracks {
+            entries: vec![unknown()],
+        },
+        EditCommand::InsertClips {
+            track_index: 0,
+            at_frame: 0,
+            entries: vec![unknown()],
+        },
+    ];
+    for command in commands {
+        let mut st = state(vec![video_track("v", true, vec![clip("a", 0, 30)])]);
+        let before = st.timeline.clone();
+        let index = match &command {
+            EditCommand::AddClips { .. } => 1,
+            _ => 0,
+        };
+        let error = apply(&mut st, command.clone(), &SeqIdGen::default()).unwrap_err();
+        assert_eq!(
+            error,
+            EditError::Invalid(format!(
+                "entries[{index}]: media asset not found: does-not-exist"
+            )),
+            "{command:?}"
+        );
+        assert_eq!(st.timeline, before, "{command:?}");
+        assert_eq!(st.version(), 0, "{command:?}");
+        assert_eq!(st.undo_depth(), 0, "{command:?}");
+    }
+}
+
+#[test]
+fn nested_placement_rejects_media_missing_from_the_shared_manifest() {
+    let mut child = Timeline::new();
+    child.tracks = vec![video_track("child-track", true, vec![])];
+    let mut st = state(vec![video_track("root", true, vec![])]);
+    let ids = SeqIdGen::new("nested-");
+    let sequence_id = create_nested_child(&mut st, child, &ids);
+    let place = |media_ref: &str| EditCommand::EditNestedSequence {
+        sequence_id: sequence_id.clone(),
+        command: Box::new(EditCommand::AddClips {
+            entries: vec![ClipEntry {
+                media_ref: media_ref.into(),
+                ..entry(0, ClipType::Video, 0, 20)
+            }],
+        }),
+    };
+    let before = st.timeline.clone();
+    assert_eq!(
+        apply(&mut st, place("does-not-exist"), &ids).unwrap_err(),
+        EditError::Invalid("entries[0]: media asset not found: does-not-exist".into())
+    );
+    assert_eq!(st.timeline, before);
+    apply(&mut st, place("m"), &ids).unwrap();
+    assert_eq!(
+        st.timeline.nested_sequences[0].timeline.tracks[0].clips[0].media_ref,
+        "m"
+    );
+}
+
+fn create_nested_child(st: &mut EditorState, child: Timeline, ids: &SeqIdGen) -> String {
+    apply(
+        st,
+        EditCommand::CreateNestedSequence {
+            name: "Scene".into(),
+            timeline: child,
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 20,
+        },
+        ids,
+    )
+    .unwrap();
+    st.timeline.nested_sequences[0].id.clone()
+}
+
+#[test]
+fn a_malformed_clip_inside_a_compound_clip_can_be_removed_from_inside_it() {
+    let mut child = Timeline::new();
+    child.tracks = vec![video_track(
+        "child-track",
+        true,
+        vec![clip("child-ok", 0, 20)],
+    )];
+    let mut st = state(vec![video_track("root", true, vec![])]);
+    let ids = SeqIdGen::new("nested-");
+    let sequence_id = create_nested_child(&mut st, child, &ids);
+    // An older build saved a malformed clip inside the compound clip.
+    st.timeline.nested_sequences[0].timeline.tracks[0]
+        .clips
+        .push(clip("child-bad", 30, 0));
+    let nested = |command: EditCommand| EditCommand::EditNestedSequence {
+        sequence_id: sequence_id.clone(),
+        command: Box::new(command),
+    };
+    let move_ok = || EditCommand::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "child-ok".into(),
+            to_track: 0,
+            to_frame: 5,
+        }],
+    };
+
+    // Other edits inside the compound clip are still refused, naming the clip
+    // relative to the child timeline; root edits name its registry path.
+    assert_eq!(
+        apply(&mut st, nested(move_ok()), &ids).unwrap_err(),
+        EditError::Invalid(
+            "timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1".into()
+        )
+    );
+    let root_error = apply(
+        &mut st,
+        EditCommand::AddClips {
+            entries: vec![entry(0, ClipType::Video, 40, 10)],
+        },
+        &ids,
+    )
+    .unwrap_err();
+    assert_eq!(
+        root_error,
+        EditError::Invalid(
+            "timeline.nestedSequences[0].timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1"
+                .into()
+        )
+    );
+    // Removing a valid child clip still names the malformed one.
+    let before = st.timeline.clone();
+    assert!(apply(
+        &mut st,
+        nested(EditCommand::RemoveClips {
+            clip_ids: vec!["child-ok".into()],
+        }),
+        &ids,
+    )
+    .is_err());
+    assert_eq!(st.timeline, before);
+
+    let removed = apply(
+        &mut st,
+        nested(EditCommand::RemoveClips {
+            clip_ids: vec!["child-bad".into()],
+        }),
+        &ids,
+    )
+    .unwrap();
+    assert!(removed.changed);
+    let child_clips: Vec<&str> = st.timeline.nested_sequences[0].timeline.tracks[0]
+        .clips
+        .iter()
+        .map(|clip| clip.id.as_str())
+        .collect();
+    assert_eq!(child_clips, ["child-ok"]);
+    apply(&mut st, nested(move_ok()), &ids).unwrap();
+    assert_eq!(
+        st.timeline.nested_sequences[0].timeline.tracks[0].clips[0].start_frame,
+        5
+    );
+}
+
+#[test]
+fn a_nested_edit_still_refuses_a_malformed_clip_outside_its_sequence() {
+    let mut child = Timeline::new();
+    child.tracks = vec![video_track(
+        "child-track",
+        true,
+        vec![clip("child-ok", 0, 20)],
+    )];
+    let mut st = state(vec![video_track("root", true, vec![])]);
+    let ids = SeqIdGen::new("nested-");
+    let sequence_id = create_nested_child(&mut st, child, &ids);
+    st.timeline.tracks[0].clips.push(clip("root-bad", 40, 0));
+    let before = st.timeline.clone();
+    let error = apply(
+        &mut st,
+        EditCommand::EditNestedSequence {
+            sequence_id,
+            command: Box::new(EditCommand::RemoveClips {
+                clip_ids: vec!["child-ok".into()],
+            }),
+        },
+        &ids,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        EditError::Invalid(
+            "timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1".into()
+        )
+    );
+    assert_eq!(st.timeline, before);
 }

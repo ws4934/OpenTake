@@ -272,6 +272,10 @@ mod tests {
         let mut tl = Timeline::new();
         tl.tracks.push(Track::new("t1", ClipType::Video));
         project.timeline = tl;
+        project
+            .manifest
+            .entries
+            .push(crate::session::test_media_entry("a"));
         project.save().unwrap();
 
         let core = AppCore::new();
