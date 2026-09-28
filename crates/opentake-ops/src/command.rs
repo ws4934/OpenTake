@@ -1041,12 +1041,16 @@ pub enum EditCommand {
         entries: Vec<ClipEntry>,
     },
     /// Move clips (expanded to linked partners by the caller) to new tracks/frames.
+    /// A batch reaching before frame 0 is clamped as one group; moved clips
+    /// overwrite the clips they land on but must not overlap each other.
     MoveClips { moves: Vec<ClipMove> },
     /// Deep-copy clips (Option/Alt-drag duplicate) to new positions. Each clip
     /// is cloned with all its fields (keyframe tracks / grade / chroma / masks /
     /// effects / text / transform / crop / fades), gets a fresh id, is shifted
-    /// by `offset_frames`, lands on `target_track_indexes[i]`, and has its
+    /// by `offset_frames` (clamped for the whole batch so no copy starts before
+    /// frame 0), lands on `target_track_indexes[i]`, and has its
     /// `link_group_id` cleared (a copy is not linked to the original's group).
+    /// Copies overwrite the clips they land on but must not overlap each other.
     DuplicateClips {
         clip_ids: Vec<String>,
         offset_frames: i32,
@@ -1063,6 +1067,7 @@ pub enum EditCommand {
         mode: NewTrackClipMode,
     },
     /// Deep-paste complete clip snapshots with fresh clip/link/caption ids.
+    /// Entries overwrite the clips they land on but must not overlap each other.
     PasteClips { entries: Vec<PasteClipEntry> },
     /// Remove clips (expanded to linked partners), pruning emptied tracks.
     RemoveClips { clip_ids: Vec<String> },
@@ -1284,7 +1289,8 @@ pub enum EditCommand {
     /// Swap the positions — track + start frame — of two clips, so a cross-track
     /// drag exchanges them instead of overwriting (swallowing) the destination.
     /// Lossless: refused with no change if a clip would overlap a third clip at
-    /// its new slot. OpenTake-only extension.
+    /// its new slot, or, on one track, the other swapped clip. OpenTake-only
+    /// extension.
     SwapClips { a: String, b: String },
     /// Insert a new empty track of `kind` (clamped into its zone). Lets the drop
     /// flow create a track on demand when the timeline has no compatible one
@@ -2273,10 +2279,98 @@ fn transact(
 fn finish_edited_timeline(before: &Timeline, timeline: &mut Timeline) -> Result<(), EditError> {
     rebase_stabilization_after_edit(before, timeline);
     validate_timeline_frame_arithmetic(timeline, "timeline")?;
+    reject_new_overlaps(before, timeline)?;
     prune_invalid_transitions(timeline);
     timeline
         .validate_nested_sequences()
         .map_err(EditError::Invalid)
+}
+
+/// Refuse an edit that leaves two non-text clips overlapping on a track that
+/// had no such overlap before it. The render plan draws only the first of two
+/// overlapping clips, so every edit resolves its overlaps itself (overwrite,
+/// ripple or refusal); this is the backstop for all of them. A track that was
+/// already overlapping, e.g. saved by an older build, stays editable.
+fn reject_new_overlaps(before: &Timeline, after: &Timeline) -> Result<(), EditError> {
+    for track in &after.tracks {
+        let Some((earlier, later)) = first_clip_overlap(track) else {
+            continue;
+        };
+        let already_overlapping = before
+            .tracks
+            .iter()
+            .any(|old| old.id == track.id && first_clip_overlap(old).is_some());
+        if !already_overlapping {
+            return Err(EditError::Invalid(format!(
+                "edit would leave clips {} and {} overlapping on track {}",
+                earlier.id, later.id, track.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first two non-text clips of `track` that overlap. Text clips may
+/// overlap anything, as in the render plan.
+fn first_clip_overlap(track: &Track) -> Option<(&Clip, &Clip)> {
+    let mut clips: Vec<&Clip> = track
+        .clips
+        .iter()
+        .filter(|clip| clip.media_type != ClipType::Text)
+        .collect();
+    if clips
+        .windows(2)
+        .any(|pair| pair[0].start_frame > pair[1].start_frame)
+    {
+        clips.sort_by_key(|clip| clip.start_frame);
+    }
+    let end = |clip: &Clip| clip.start_frame.saturating_add(clip.duration_frames);
+    let mut furthest: Option<&Clip> = None;
+    for clip in clips {
+        match furthest {
+            Some(previous) if clip.start_frame < end(previous) => return Some((previous, clip)),
+            Some(previous) if end(clip) <= end(previous) => {}
+            _ => furthest = Some(clip),
+        }
+    }
+    None
+}
+
+/// One destination range of a batch edit, at `index` in the request.
+struct BatchSlot<'a> {
+    index: usize,
+    track_id: &'a str,
+    start: i32,
+    end: i32,
+    media_type: ClipType,
+}
+
+/// The first two non-text destination ranges of one batch that overlap on a
+/// track, as `(lower index, higher index, track id)`.
+fn first_batch_overlap<'a>(
+    slots: impl IntoIterator<Item = BatchSlot<'a>>,
+) -> Option<(usize, usize, &'a str)> {
+    let mut slots: Vec<BatchSlot<'a>> = slots
+        .into_iter()
+        .filter(|slot| slot.media_type != ClipType::Text)
+        .collect();
+    slots.sort_by(|a, b| (a.track_id, a.start, a.index).cmp(&(b.track_id, b.start, b.index)));
+    let mut furthest: Option<&BatchSlot<'a>> = None;
+    for slot in &slots {
+        match furthest {
+            Some(previous) if previous.track_id == slot.track_id && slot.start < previous.end => {
+                let (first, second) = if previous.index < slot.index {
+                    (previous.index, slot.index)
+                } else {
+                    (slot.index, previous.index)
+                };
+                return Some((first, second, slot.track_id));
+            }
+            Some(previous) if previous.track_id == slot.track_id && slot.end <= previous.end => {}
+            _ => furthest = Some(slot),
+        }
+    }
+    None
 }
 
 /// Keep every surviving clip's stabilization on the source frames it was
@@ -3403,6 +3497,15 @@ fn move_clips(
         return Err(EditError::Invalid("Missing or empty 'moves' array".into()));
     }
     validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // A batch that would start before frame 0 is clamped as one group, so the
+    // clips keep their spacing. (Upstream clamps each clip on its own, which
+    // stacks every clip moved past the start on frame 0.)
+    let lift = match moves.iter().map(|movement| movement.to_frame).min() {
+        Some(earliest) if earliest < 0 => earliest
+            .checked_neg()
+            .ok_or_else(|| EditError::Invalid("moves: destination start is out of range".into()))?,
+        _ => 0,
+    };
     let mut unique = HashSet::with_capacity(moves.len());
     let mut plans = Vec::with_capacity(moves.len());
     for (index, movement) in moves.iter().enumerate() {
@@ -3430,7 +3533,9 @@ fn move_clips(
                 "moves[{index}]: clip is incompatible with destination track"
             )));
         }
-        let to_frame = movement.to_frame.max(0);
+        let to_frame = movement.to_frame.checked_add(lift).ok_or_else(|| {
+            EditError::Invalid(format!("moves[{index}]: destination start overflows"))
+        })?;
         let to_end_frame = to_frame.checked_add(clip.duration_frames).ok_or_else(|| {
             EditError::Invalid(format!("moves[{index}]: destination end overflows"))
         })?;
@@ -3440,6 +3545,21 @@ fn move_clips(
             to_frame,
             to_end_frame,
         });
+    }
+    // Moved clips only overwrite clips that stay put, so two of them must not
+    // land on each other.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(plans.iter().enumerate().map(|(index, plan)| BatchSlot {
+            index,
+            track_id: &plan.to_track_id,
+            start: plan.to_frame,
+            end: plan.to_end_frame,
+            media_type: plan.clip.media_type,
+        }))
+    {
+        return Err(EditError::Invalid(format!(
+            "moves[{first}] and moves[{second}] would overlap on track {track_id}"
+        )));
     }
     let action_name = if moves.len() == 1 {
         "Move Clip"
@@ -3482,7 +3602,7 @@ fn duplicate_clips_cmd(
     }
     validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
     let mut unique = HashSet::with_capacity(clip_ids.len());
-    let mut plans = Vec::with_capacity(clip_ids.len());
+    let mut sources = Vec::with_capacity(clip_ids.len());
     for (index, (id, &target_track_index)) in clip_ids.iter().zip(&target_track_indexes).enumerate()
     {
         if !unique.insert(id.as_str()) {
@@ -3510,16 +3630,47 @@ fn duplicate_clips_cmd(
             .start_frame
             .checked_add(offset_frames)
             .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination start overflows")))?;
-        let to_frame = shifted.max(0);
+        sources.push((clip, target.id.clone(), shifted));
+    }
+    // The copies keep their spacing: an offset reaching past frame 0 is
+    // clamped for the whole batch. (Upstream clamps each copy on its own,
+    // which stacks every copy shifted past the start on frame 0.)
+    let lift = match sources.iter().map(|(_, _, shifted)| *shifted).min() {
+        Some(earliest) if earliest < 0 => earliest.checked_neg().ok_or_else(|| {
+            EditError::Invalid("offsetFrames: destination start is out of range".into())
+        })?,
+        _ => 0,
+    };
+    let mut plans = Vec::with_capacity(sources.len());
+    for (clip, to_track_id, shifted) in sources {
+        let id = &clip.id;
+        let to_frame = shifted
+            .checked_add(lift)
+            .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination start overflows")))?;
         let to_end_frame = to_frame
             .checked_add(clip.duration_frames)
             .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination end overflows")))?;
         plans.push(DuplicateClipPlan {
             clip,
-            to_track_id: target.id.clone(),
+            to_track_id,
             to_frame,
             to_end_frame,
         });
+    }
+    // Copies overwrite existing clips, not each other.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(plans.iter().enumerate().map(|(index, plan)| BatchSlot {
+            index,
+            track_id: &plan.to_track_id,
+            start: plan.to_frame,
+            end: plan.to_end_frame,
+            media_type: plan.clip.media_type,
+        }))
+    {
+        return Err(EditError::Invalid(format!(
+            "copies of clip {} and clip {} would overlap on track {track_id}",
+            plans[first].clip.id, plans[second].clip.id
+        )));
     }
     let action_name = if clip_ids.len() == 1 {
         "Duplicate Clip"
@@ -3863,6 +4014,23 @@ fn paste_clips(
             )));
         }
         validate_paste_media(state, &entry.clip)?;
+    }
+    // Every destination is cleared before any copy lands, so entries of one
+    // batch cannot overwrite each other and must not overlap.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(entries.iter().zip(&destination_ends).enumerate().map(
+            |(index, (entry, &end))| BatchSlot {
+                index,
+                track_id: &entry.target_track_id,
+                start: entry.start_frame,
+                end,
+                media_type: entry.clip.media_type,
+            },
+        ))
+    {
+        return Err(EditError::Invalid(format!(
+            "entries[{first}] and entries[{second}] would overlap on track {track_id}"
+        )));
     }
 
     transact(
