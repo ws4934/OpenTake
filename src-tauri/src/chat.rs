@@ -2445,17 +2445,25 @@ curl -sS -N -o /dev/null -H "$auth" -H "mcp-session-id: $session" \
         );
     }
 
+    /// Script tail for a fake CLI whose `get_transcript` call runs in the
+    /// background: wait until the test has seen the call reach the bridge
+    /// (it creates `go`), then print garbage so the turn fails internally.
+    #[cfg(unix)]
+    fn protocol_error_after_bridge_entry(root: &std::path::Path) -> (String, PathBuf) {
+        let go = root.join("go");
+        let tail = format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done\nprintf '%s\\n' 'not json'\nsleep 60",
+            go.display()
+        );
+        (tail, go)
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn codex_stop_during_an_internal_failure_drain_takes_effect() {
+    async fn codex_internal_failure_drain_is_bounded_and_keeps_the_error_reply() {
         let temp = tempfile::tempdir().unwrap();
-        // The tool call is still running when the CLI reports garbage, so
-        // the turn fails internally and drains its endpoint.
-        let script = fake_codex_calling_get_transcript(
-            temp.path(),
-            true,
-            "sleep 1\nprintf '%s\\n' 'not json'\nsleep 60",
-        );
+        let (tail, go) = protocol_error_after_bridge_entry(temp.path());
+        let script = fake_codex_calling_get_transcript(temp.path(), true, &tail);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let fixture = codex_turn_fixture(
@@ -2471,8 +2479,59 @@ curl -sS -N -o /dev/null -H "$auth" -H "mcp-session-id: $session" \
                 .await
         });
         wait_for_bridge_entry(entered_rx).await;
+        std::fs::write(&go, b"").unwrap();
+
+        // The transcription ignores its cancel token, yet the turn ends after
+        // the short cleanup grace instead of its 30-minute deadline.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the internal failure drain is bounded")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), crate::codex::CodexTurnError::Protocol);
+        assert!(fixture.cancel.media.is_cancelled());
+        assert!(!fixture.cancel.requested.load(Ordering::Acquire));
+        let mut session = ChatSession::new("chat-codex");
+        session
+            .messages
+            .push(ChatMessage::assistant("protocol error", vec![]));
+        assert!(matches!(
+            fixture.state.finalize_project_turn(
+                &fixture.project,
+                &fixture.key,
+                &fixture.cancel,
+                session
+            ),
+            Ok(TurnFinalization::Committed)
+        ));
+        let _ = release_tx.send(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_stop_during_an_internal_failure_drain_takes_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        // The tool call is still running when the CLI reports garbage, so
+        // the turn fails internally and drains its endpoint.
+        let (tail, go) = protocol_error_after_bridge_entry(temp.path());
+        let script = fake_codex_calling_get_transcript(temp.path(), true, &tail);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fixture = codex_turn_fixture(
+            temp.path(),
+            Arc::new(StubbornTranscriptBridge {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let context = fixture.context;
+        let turn = tokio::spawn(async move {
+            crate::codex::run_agent_turn_with_executable(&script, context, "caption it", |_| {})
+                .await
+        });
+        wait_for_bridge_entry(entered_rx).await;
+        std::fs::write(&go, b"").unwrap();
         // The protocol error has cancelled only the dispatch; the stubborn
-        // transcription keeps the drain waiting on the 30-minute deadline.
+        // transcription keeps the drain waiting for the cleanup grace.
         let drain_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !fixture.cancel.media.is_cancelled() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

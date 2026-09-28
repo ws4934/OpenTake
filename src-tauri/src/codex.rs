@@ -262,21 +262,46 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// The `(major, minor, patch)` of a `codex-cli X.Y.Z[-pre][+build]` banner.
-fn codex_version_triple(version: &str) -> Option<(u64, u64, u64)> {
-    let raw = version.strip_prefix("codex-cli ")?;
-    let core = raw.split(['-', '+']).next().unwrap_or(raw);
+/// A parsed Codex CLI version. It orders like semver precedence for the
+/// parts that matter here: a pre-release sorts before its release.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CodexVersion {
+    core: (u64, u64, u64),
+    release: bool,
+}
+
+/// The version in a `codex-cli X.Y[.Z][-pre][+build][ trailing text]` banner.
+fn codex_version(version: &str) -> Option<CodexVersion> {
+    let raw = version
+        .strip_prefix("codex-cli ")?
+        .split_whitespace()
+        .next()?;
+    let without_build = raw.split('+').next().unwrap_or(raw);
+    let (core, release) = match without_build.split_once('-') {
+        Some((core, _pre)) => (core, false),
+        None => (without_build, true),
+    };
     let mut parts = core.split('.');
-    let parsed = (
-        parts.next()?.parse::<u64>().ok()?,
-        parts.next()?.parse::<u64>().ok()?,
-        parts.next()?.parse::<u64>().ok()?,
-    );
-    parts.next().is_none().then_some(parsed)
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = match parts.next() {
+        Some(patch) => patch.parse::<u64>().ok()?,
+        None => 0,
+    };
+    parts.next().is_none().then_some(CodexVersion {
+        core: (major, minor, patch),
+        release,
+    })
 }
 
 fn supported_codex_version(version: &str) -> bool {
-    codex_version_triple(version).is_some_and(|triple| triple >= MINIMUM_CODEX_VERSION)
+    codex_version(version).is_some_and(|version| {
+        version
+            >= CodexVersion {
+                core: MINIMUM_CODEX_VERSION,
+                release: true,
+            }
+    })
 }
 
 fn parsed_codex_version(stdout: &[u8]) -> Option<String> {
@@ -1383,7 +1408,9 @@ async fn discover_codex_among(
     cancel: &AtomicBool,
     deadline: tokio::time::Instant,
 ) -> Result<CodexDiscovery, CodexTurnError> {
-    let mut newest_incompatible: Option<((u64, u64, u64), String)> = None;
+    // A `codex-cli` banner whose version cannot be parsed still means Codex
+    // is installed; it ranks below every parsed version.
+    let mut newest_incompatible: Option<(Option<CodexVersion>, String)> = None;
     for path in candidates {
         let Some(identity) = ExecutableIdentity::capture(&path) else {
             continue;
@@ -1407,13 +1434,12 @@ async fn discover_codex_among(
                 identity,
             }));
         }
-        if let Some(triple) = codex_version_triple(&version) {
-            if newest_incompatible
-                .as_ref()
-                .is_none_or(|(newest, _)| triple > *newest)
-            {
-                newest_incompatible = Some((triple, version));
-            }
+        let parsed = codex_version(&version);
+        if newest_incompatible
+            .as_ref()
+            .is_none_or(|(newest, _)| parsed > *newest)
+        {
+            newest_incompatible = Some((parsed, version));
         }
     }
     Ok(match newest_incompatible {
@@ -1471,19 +1497,21 @@ async fn write_prompt_with_lifecycle<W: AsyncWrite + Unpin>(
     }
 }
 
-/// When to stop waiting for the MCP endpoint's tool calls to drain. After a
-/// user cancel the dispatches observe their tokens and end promptly, so a
-/// straggler gets only a short grace. Internal failures keep the turn
-/// deadline, but a Stop pressed while they drain switches to the same short
-/// grace. Giving up detaches the endpoint (see
+/// When to stop waiting for the MCP endpoint's tool calls to drain. Once the
+/// dispatches were told to stop (a user cancel or an internal failure) they
+/// observe their tokens and end promptly, so a straggler that ignores its
+/// token gets only a short grace. A turn that ended normally keeps the turn
+/// deadline for its tool calls, but a Stop pressed while they drain switches
+/// to the same short grace. Giving up detaches the endpoint (see
 /// `EphemeralMcpEndpoint::close_or_detach`), which keeps the turn's saved
-/// error or timeout reply instead of cancelling the whole turn.
+/// error or timeout reply instead of cancelling the whole turn; the detached
+/// calls can only commit into the project they were admitted for.
 async fn endpoint_drain_give_up(
     deadline: tokio::time::Instant,
-    user_cancelled: bool,
+    dispatch_cancelled: bool,
     cancel: &AtomicBool,
 ) {
-    if user_cancelled {
+    if dispatch_cancelled {
         tokio::time::sleep_until(endpoint_close_deadline(
             deadline,
             tokio::time::Instant::now(),
@@ -1505,30 +1533,29 @@ async fn endpoint_drain_give_up(
     }
 }
 
-/// Deadline for draining the MCP endpoint: the short grace after a user
-/// cancel, the turn deadline otherwise.
+/// Deadline for draining the MCP endpoint: the short grace once the
+/// dispatches were cancelled, the turn deadline otherwise.
 fn endpoint_close_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
-    user_cancelled: bool,
+    dispatch_cancelled: bool,
 ) -> tokio::time::Instant {
-    if user_cancelled {
+    if dispatch_cancelled {
         deadline.min(now + CANCELLED_TURN_CLEANUP_GRACE)
     } else {
         deadline
     }
 }
 
-/// Close the endpoint after Codex could not be started, bounded like the
-/// normal drain.
+/// Close the endpoint after Codex could not be started. The caller has
+/// already cancelled the dispatches, so the drain gets the short grace.
 async fn close_endpoint_after_failure(
     endpoint: opentake_agent::mcp::server::EphemeralMcpEndpoint,
     cancel: &AtomicBool,
     deadline: tokio::time::Instant,
 ) {
-    let user_cancelled = cancel.load(Ordering::Acquire);
     let _ = endpoint
-        .close_or_detach(endpoint_drain_give_up(deadline, user_cancelled, cancel))
+        .close_or_detach(endpoint_drain_give_up(deadline, true, cancel))
         .await;
 }
 
@@ -1925,7 +1952,7 @@ where
     let endpoint_result = endpoint
         .close_or_detach(endpoint_drain_give_up(
             deadline,
-            outcome_was_cancelled || externally_cancelled,
+            requested_cleanup_cancel,
             context.cancel.as_ref(),
         ))
         .await;
@@ -2166,6 +2193,18 @@ mod tests {
         assert!(supported_codex_version("codex-cli 1.0.0"));
         assert!(!supported_codex_version("codex-cli unknown"));
         assert!(!supported_codex_version("other 0.146.0"));
+        // A pre-release of the minimum is older than the minimum.
+        assert!(!supported_codex_version("codex-cli 0.146.0-alpha.3"));
+        assert!(supported_codex_version("codex-cli 0.146.1-alpha.1"));
+        assert!(supported_codex_version("codex-cli 0.146.0+build.7"));
+        // Short and annotated banners still parse.
+        assert!(supported_codex_version("codex-cli 0.146"));
+        assert!(!supported_codex_version("codex-cli 0.145"));
+        assert!(supported_codex_version("codex-cli 0.146.0 (4f2a9c1)"));
+        assert_eq!(
+            codex_version("codex-cli 0.147 (dev)").map(|version| version.core),
+            Some((0, 147, 0))
+        );
     }
 
     #[test]
@@ -2531,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_user_cancel_shortens_the_endpoint_drain() {
+    fn a_dispatch_cancel_shortens_the_endpoint_drain() {
         let now = tokio::time::Instant::now();
         let deadline = now + Duration::from_secs(600);
         assert_eq!(
@@ -2544,7 +2583,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stop_during_an_internal_failure_drain_switches_to_the_short_grace() {
+    async fn a_stop_during_a_normal_drain_switches_to_the_short_grace() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
         let cancel = Arc::new(AtomicBool::new(false));
         let give_up = endpoint_drain_give_up(deadline, false, cancel.as_ref());
@@ -2553,7 +2592,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(600), &mut give_up)
                 .await
                 .is_err(),
-            "an internal failure keeps waiting for its tool calls"
+            "a turn that ended normally keeps waiting for its tool calls"
         );
         cancel.store(true, Ordering::Release);
         let stopped = tokio::time::Instant::now();
@@ -2565,8 +2604,8 @@ mod tests {
         .expect("a Stop bounds the drain by the short grace");
         assert!(tokio::time::Instant::now() - stopped >= CANCELLED_TURN_CLEANUP_GRACE);
 
-        // A user cancel uses the short grace from the start; the deadline
-        // still bounds both.
+        // A dispatch cancel (Stop or an internal failure) uses the short grace
+        // from the start; the deadline still bounds both.
         let started = tokio::time::Instant::now();
         endpoint_drain_give_up(deadline, true, &AtomicBool::new(false)).await;
         assert_eq!(
@@ -3190,6 +3229,26 @@ exit 2
                 .unwrap(),
             CodexDiscovery::NotFound
         ));
+
+        // An installed Codex whose banner cannot be parsed is not "missing",
+        // and a parsed old version is named in preference to it.
+        let odd = fake_codex_with_version(root.path(), "odd", "nightly");
+        let CodexDiscovery::Incompatible { version } =
+            discover_codex_among(vec![odd.clone()], &cancel, deadline)
+                .await
+                .unwrap()
+        else {
+            panic!("an unparsable Codex banner is reported as incompatible");
+        };
+        assert_eq!(version, "codex-cli nightly");
+        let CodexDiscovery::Incompatible { version } =
+            discover_codex_among(vec![odd, older.clone()], &cancel, deadline)
+                .await
+                .unwrap()
+        else {
+            panic!("an old CLI must be reported as incompatible");
+        };
+        assert_eq!(version, "codex-cli 0.100.0");
 
         let result = run_agent_turn_among(
             vec![old],
