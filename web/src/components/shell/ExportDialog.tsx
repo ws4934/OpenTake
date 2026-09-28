@@ -301,7 +301,9 @@ export function ExportDialog() {
 
       const exportPromise = api.exportVideo(
         {
-          outPath: withExt(chosen, ext),
+          // Only the exact dialog result is authorized; the backend appends
+          // the codec's container extension when the user typed none.
+          outPath: chosen,
           codec,
           quality,
         },

@@ -81,7 +81,7 @@ describe("TitleBar subtitle export menu", () => {
   it("subtitle export menu routes srt and vtt", () => {
     expect(titleBarSource).toContain('(["srt", "vtt"] as const).map');
     expect(titleBarSource).toContain("onExportSubtitles(fmt)");
-    expect(titleBarSource).toContain("api.exportSubtitles(withExt(chosen, format), format)");
+    expect(titleBarSource).toContain("api.exportSubtitles(chosen, format)");
     expect(titleBarSource).toContain('extensions: [format]');
   });
 });

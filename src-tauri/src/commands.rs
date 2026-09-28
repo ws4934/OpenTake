@@ -241,15 +241,8 @@ pub async fn project_new(
         .try_acquire()
         .map_err(crate::playback::session::PlaybackCommandError::busy)?;
     if let Some(path) = path {
-        let path = std::path::PathBuf::from(path);
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(
-            &app.asset_protocol_scope(),
-            &path,
-        ) {
-            return Err(crate::playback::session::PlaybackCommandError::engine(
-                "project path has not been approved by a native file dialog",
-            ));
-        }
+        let path = authorize_project_dialog_path(&app.asset_protocol_scope(), &path)
+            .map_err(crate::playback::session::PlaybackCommandError::engine)?;
         app.state::<crate::playback::PlaybackState>()
             .ensure_project_transition_available()?;
         let admission = coordinator
@@ -328,13 +321,7 @@ pub async fn project_new(
     let coordinator = app.state::<ProjectLifecycleCoordinator>();
     let lifecycle = coordinator.try_acquire()?;
     if let Some(path) = path {
-        let path = std::path::PathBuf::from(path);
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(
-            &app.asset_protocol_scope(),
-            &path,
-        ) {
-            return Err("project path has not been approved by a native file dialog".into());
-        }
+        let path = authorize_project_dialog_path(&app.asset_protocol_scope(), &path)?;
         let admission = coordinator.try_admit_prepare(&path)?;
         let prepared = prepare_saved_project_off_thread(
             path.clone(),
@@ -679,22 +666,50 @@ async fn await_project_cover_save_worker(
     }
 }
 
+/// Resolve the bundle path for a New Project / Save As dialog result `raw`.
+///
+/// GTK save dialogs never append the `.opentake` extension, and the dialog
+/// grants only the exact path it returned, so the extension is appended here in
+/// the same directory rather than by the WebView (#102). The resolved bundle is
+/// granted as well so `project_open` accepts it from the recent-projects list;
+/// the persisted-scope plugin keeps that grant across launches.
+pub(crate) fn authorize_project_dialog_path(
+    scope: &tauri::scope::fs::Scope,
+    raw: &str,
+) -> Result<std::path::PathBuf, String> {
+    let resolved = crate::dialog_output::authorize_dialog_output(
+        scope,
+        raw,
+        &[opentake_project::layout::BUNDLE_EXTENSION],
+    )
+    .map_err(|error| {
+        if error == crate::dialog_output::UNAPPROVED_OUTPUT {
+            "project path has not been approved by a native file dialog".to_string()
+        } else {
+            error
+        }
+    })?;
+    if !crate::safe_asset_protocol::scope_allows_lexical_path(scope, &resolved) {
+        scope
+            .allow_file(&resolved)
+            .map_err(|error| format!("authorize project bundle: {error}"))?;
+    }
+    Ok(resolved)
+}
+
 pub(crate) async fn save_project_with_composite_cover<R: tauri::Runtime>(
     app: AppHandle<R>,
     path: Option<String>,
     expected_project_epoch: u64,
     expected_project_path: Option<String>,
 ) -> Result<String, CmdError> {
-    if let Some(target) = path.as_deref().map(std::path::Path::new) {
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(
-            &app.asset_protocol_scope(),
-            target,
-        ) {
-            return Err(validation_error(
-                "project path has not been approved by a native file dialog".to_string(),
-            ));
-        }
-    }
+    let path = path
+        .map(|raw| {
+            authorize_project_dialog_path(&app.asset_protocol_scope(), &raw)
+                .map(|target| target.to_string_lossy().into_owned())
+                .map_err(validation_error)
+        })
+        .transpose()?;
     let cancel = opentake_media::MediaCancelToken::new();
     let worker_cancel = cancel.clone();
     let gate = std::sync::Arc::new(ProjectCoverCommitGate::default());
@@ -1026,14 +1041,77 @@ mod default_project_dir_tests {
 /// upstream (and OpenTake) emit XMEML; DaVinci/FCP still import FCP7 XML. Reads
 /// the timeline / media manifest / project dir from the core, builds the XML via
 /// the pure `export_xmeml`, and writes the file.
+///
+/// `path` must be the unmodified result of a native save dialog; the backend
+/// appends the extension when the user did not type it (see
+/// [`crate::dialog_output`]).
 #[tauri::command]
 pub fn export_xmeml(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
+    export_interchange(
+        &app.asset_protocol_scope(),
+        &core,
+        &path,
+        InterchangeFormat::Xmeml,
+    )
+    .map(|_| ())
+}
+
+/// Timeline interchange formats written by the `export_*` commands below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterchangeFormat {
+    Xmeml,
+    Edl,
+    Otio,
+    FcpxmlModern,
+}
+
+impl InterchangeFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Xmeml => "xml",
+            Self::Edl => "edl",
+            Self::Otio => "otio",
+            Self::FcpxmlModern => "fcpxml",
+        }
+    }
+}
+
+/// Authorize the dialog result `path` before reading anything (XMEML probes
+/// source timecodes), render the current timeline and replace the output
+/// atomically. Returns the path actually written.
+fn export_interchange(
+    scope: &tauri::scope::fs::Scope,
+    core: &AppCore,
+    path: &str,
+    format: InterchangeFormat,
+) -> Result<std::path::PathBuf, String> {
+    let out = crate::dialog_output::authorize_dialog_output(scope, path, &[format.extension()])?;
     let snapshot = core.runtime_snapshot();
+    let body = match format {
+        InterchangeFormat::Xmeml => render_xmeml(&snapshot),
+        InterchangeFormat::Edl => opentake_project::export_edl(&snapshot.timeline, &snapshot.media),
+        InterchangeFormat::Otio => opentake_project::export_otio(
+            &snapshot.timeline,
+            &snapshot.media,
+            snapshot.project_dir.as_deref(),
+        ),
+        InterchangeFormat::FcpxmlModern => opentake_project::export_fcpxml(
+            &snapshot.timeline,
+            &snapshot.media,
+            snapshot.project_dir.as_deref(),
+        ),
+    };
+    crate::dialog_output::write_file_atomically(&out, body.as_bytes())?;
+    Ok(out)
+}
+
+fn render_xmeml(snapshot: &opentake_core::ProjectRuntimeSnapshot) -> String {
     // Resolve each source file's start timecode via ffprobe (upstream reads the
     // QuickTime `tmcd` track; here `opentake_media::read_start_timecode` reads
     // `tags.timecode` and its drop-frame separator). Per-file failures are
@@ -1043,13 +1121,12 @@ pub fn export_xmeml(
         &snapshot.media,
         snapshot.project_dir.as_deref(),
     );
-    let xml = opentake_project::export_xmeml_with_timecodes(
+    opentake_project::export_xmeml_with_timecodes(
         &snapshot.timeline,
         &snapshot.media,
         snapshot.project_dir.as_deref(),
         &start_timecodes,
-    );
-    std::fs::write(&path, xml).map_err(|e| e.to_string())
+    )
 }
 
 /// Build the `media_ref -> start timecode` map for [`export_xmeml`]. Iterates the
@@ -1098,11 +1175,12 @@ fn resolve_start_timecodes(
 /// `export_fcpxml_modern`.
 #[tauri::command]
 pub fn export_fcpxml(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
 ) -> Result<(), String> {
-    export_xmeml(core, admission, path)
+    export_xmeml(app, core, admission, path)
 }
 
 /// `export_edl`: write the current timeline to `path` as a CMX3600 EDL (`.edl`).
@@ -1112,14 +1190,19 @@ pub fn export_fcpxml(
 /// dropped — see `opentake_project::edl` for the documented limitations.
 #[tauri::command]
 pub fn export_edl(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let snapshot = core.runtime_snapshot();
-    let edl = opentake_project::export_edl(&snapshot.timeline, &snapshot.media);
-    std::fs::write(&path, edl).map_err(|e| e.to_string())
+    export_interchange(
+        &app.asset_protocol_scope(),
+        &core,
+        &path,
+        InterchangeFormat::Edl,
+    )
+    .map(|_| ())
 }
 
 /// `export_otio`: write the current timeline to `path` as OpenTimelineIO JSON
@@ -1129,18 +1212,19 @@ pub fn export_edl(
 /// (effects, transforms, keyframes).
 #[tauri::command]
 pub fn export_otio(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let snapshot = core.runtime_snapshot();
-    let json = opentake_project::export_otio(
-        &snapshot.timeline,
-        &snapshot.media,
-        snapshot.project_dir.as_deref(),
-    );
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    export_interchange(
+        &app.asset_protocol_scope(),
+        &core,
+        &path,
+        InterchangeFormat::Otio,
+    )
+    .map(|_| ())
 }
 
 /// `export_fcpxml_modern`: write the current timeline to `path` as native Final
@@ -1150,18 +1234,19 @@ pub fn export_otio(
 /// `opentake_project::fcpxml_modern`.
 #[tauri::command]
 pub fn export_fcpxml_modern(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let snapshot = core.runtime_snapshot();
-    let xml = opentake_project::export_fcpxml(
-        &snapshot.timeline,
-        &snapshot.media,
-        snapshot.project_dir.as_deref(),
-    );
-    std::fs::write(&path, xml).map_err(|e| e.to_string())
+    export_interchange(
+        &app.asset_protocol_scope(),
+        &core,
+        &path,
+        InterchangeFormat::FcpxmlModern,
+    )
+    .map(|_| ())
 }
 
 /// Requested subtitle container, projected from the front end. Lower-cased serde
@@ -1196,14 +1281,36 @@ pub struct SubtitleExportSummary {
 /// written to disk. Returns the cue count so the UI can report an empty result.
 #[tauri::command]
 pub fn export_subtitles(
+    app: AppHandle,
     core: State<'_, AppCore>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     path: String,
     format: SubtitleFormat,
 ) -> Result<SubtitleExportSummary, String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
+    let scope = app.asset_protocol_scope();
+    let out = authorize_subtitle_output(&scope, &path, format)?;
     let timeline = core.get_timeline().timeline;
-    write_subtitles(&timeline, path, format)
+    write_subtitles(&timeline, out, format)
+}
+
+impl SubtitleFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Vtt => "vtt",
+        }
+    }
+}
+
+/// `path` is the unmodified native save dialog result; see
+/// [`crate::dialog_output::authorize_dialog_output`].
+fn authorize_subtitle_output(
+    scope: &tauri::scope::fs::Scope,
+    path: &str,
+    format: SubtitleFormat,
+) -> Result<std::path::PathBuf, String> {
+    crate::dialog_output::authorize_dialog_output(scope, path, &[format.extension()])
 }
 
 /// The subtitle export body, decoupled from Tauri/`AppCore` so it can be driven
@@ -1211,7 +1318,7 @@ pub fn export_subtitles(
 /// only snapshots the live session and delegates here.
 fn write_subtitles(
     timeline: &opentake_domain::Timeline,
-    path: String,
+    path: std::path::PathBuf,
     format: SubtitleFormat,
 ) -> Result<SubtitleExportSummary, String> {
     let cue_count = opentake_domain::collect_caption_cues(timeline).len();
@@ -1219,9 +1326,9 @@ fn write_subtitles(
         SubtitleFormat::Srt => opentake_domain::export_srt(timeline),
         SubtitleFormat::Vtt => opentake_domain::export_vtt(timeline),
     };
-    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    crate::dialog_output::write_file_atomically(&path, body.as_bytes())?;
     Ok(SubtitleExportSummary {
-        out_path: path,
+        out_path: path.to_string_lossy().into_owned(),
         cue_count,
     })
 }
@@ -4759,8 +4866,9 @@ mod generation_log_tests {
 
 #[cfg(test)]
 mod subtitle_export_tests {
-    use super::{write_subtitles, SubtitleFormat};
+    use super::{authorize_subtitle_output, write_subtitles, SubtitleFormat};
     use opentake_domain::{Clip, ClipType, Timeline, Track};
+    use tauri::Manager as _;
 
     /// Build a caption clip: text + caption_group_id set, media_type Text — the
     /// two fields `collect_caption_cues` requires to treat a clip as a caption.
@@ -4814,11 +4922,8 @@ mod subtitle_export_tests {
     /// numbered cue per caption, and reports the cue count.
     #[test]
     fn exports_non_empty_srt_with_cue_count() {
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!("opentake-subs-{}.srt", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("subs.srt");
         let tl = timeline_with(
             30,
             vec![
@@ -4830,10 +4935,9 @@ mod subtitle_export_tests {
         let summary =
             write_subtitles(&tl, path.clone(), SubtitleFormat::Srt).expect("srt export ok");
         assert_eq!(summary.cue_count, 2);
-        assert_eq!(summary.out_path, path);
+        assert_eq!(summary.out_path, path.to_string_lossy());
 
         let written = std::fs::read_to_string(&path).expect("read back srt");
-        let _ = std::fs::remove_file(&path);
         assert!(written.contains("Hello"));
         assert!(written.contains("World"));
         // SRT uses comma timestamps and 1-based indices.
@@ -4847,11 +4951,8 @@ mod subtitle_export_tests {
     /// VTT export always opens with the `WEBVTT` header and uses dot timestamps.
     #[test]
     fn exports_vtt_with_header() {
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!("opentake-subs-{}.vtt", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("subs.vtt");
         let tl = timeline_with(30, vec![caption("c1", "g1", 30, 30, "Hello")]);
 
         let summary =
@@ -4859,7 +4960,6 @@ mod subtitle_export_tests {
         assert_eq!(summary.cue_count, 1);
 
         let written = std::fs::read_to_string(&path).expect("read back vtt");
-        let _ = std::fs::remove_file(&path);
         assert!(written.starts_with("WEBVTT\n\n"), "got: {written:?}");
         assert!(
             written.contains("00:00:01.000 --> 00:00:02.000"),
@@ -4871,16 +4971,12 @@ mod subtitle_export_tests {
     /// reports `cue_count == 0`, the signal the UI uses for its friendly toast.
     #[test]
     fn empty_timeline_reports_zero_cues() {
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!("opentake-subs-empty-{}.srt", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.srt");
         let tl = Timeline::new();
 
         let summary =
             write_subtitles(&tl, path.clone(), SubtitleFormat::Srt).expect("empty export ok");
-        let _ = std::fs::remove_file(&path);
         assert_eq!(summary.cue_count, 0);
     }
 
@@ -4897,13 +4993,10 @@ mod subtitle_export_tests {
             ],
         );
         for (format, ext) in [(SubtitleFormat::Srt, "srt"), (SubtitleFormat::Vtt, "vtt")] {
-            let path = std::env::temp_dir()
-                .join(format!("opentake-subs-count-{}.{ext}", std::process::id()))
-                .to_string_lossy()
-                .into_owned();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(format!("count.{ext}"));
             let summary = write_subtitles(&tl, path.clone(), format).expect("subtitle export ok");
             let written = std::fs::read_to_string(&path).expect("read back subtitles");
-            let _ = std::fs::remove_file(&path);
 
             let body = written.strip_prefix("WEBVTT\n\n").unwrap_or(&written);
             let blocks: Vec<&str> = body.split("\n\n").filter(|b| !b.is_empty()).collect();
@@ -4915,6 +5008,182 @@ mod subtitle_export_tests {
                 "got: {written:?}"
             );
         }
+    }
+
+    #[test]
+    fn subtitle_output_requires_a_dialog_grant_and_gets_its_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.rc");
+        std::fs::write(&victim, b"keep").expect("seed victim");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+
+        for format in [SubtitleFormat::Srt, SubtitleFormat::Vtt] {
+            assert_eq!(
+                authorize_subtitle_output(&scope, &victim.to_string_lossy(), format),
+                Err(crate::dialog_output::UNAPPROVED_OUTPUT.to_string())
+            );
+        }
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"keep");
+
+        let raw = dir.path().join("captions");
+        scope.allow_file(&raw).expect("dialog grant");
+        let out = authorize_subtitle_output(&scope, &raw.to_string_lossy(), SubtitleFormat::Vtt)
+            .expect("approved dialog result");
+        assert_eq!(out, dir.path().join("captions.vtt"));
+        write_subtitles(&Timeline::new(), out.clone(), SubtitleFormat::Vtt).expect("write");
+        assert!(out.is_file());
+    }
+}
+
+#[cfg(test)]
+mod interchange_export_tests {
+    use super::{export_interchange, InterchangeFormat};
+    use opentake_core::AppCore;
+    use tauri::Manager as _;
+
+    const FORMATS: [InterchangeFormat; 4] = [
+        InterchangeFormat::Xmeml,
+        InterchangeFormat::Edl,
+        InterchangeFormat::Otio,
+        InterchangeFormat::FcpxmlModern,
+    ];
+
+    #[test]
+    fn unapproved_path_is_rejected_and_left_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = AppCore::new();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        for format in FORMATS {
+            let target = dir.path().join(format!("existing.{}", format.extension()));
+            std::fs::write(&target, b"keep").expect("seed target");
+
+            let error = export_interchange(&scope, &core, &target.to_string_lossy(), format)
+                .expect_err("unapproved path");
+
+            assert_eq!(error, crate::dialog_output::UNAPPROVED_OUTPUT, "{format:?}");
+            assert_eq!(std::fs::read(&target).expect("read"), b"keep", "{format:?}");
+        }
+    }
+
+    #[test]
+    fn approved_path_without_extension_exports_next_to_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = AppCore::new();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        for format in FORMATS {
+            let raw = dir.path().join(format!("cut-{}", format.extension()));
+            scope.allow_file(&raw).expect("dialog grant");
+
+            let out = export_interchange(&scope, &core, &raw.to_string_lossy(), format)
+                .expect("approved export");
+
+            let expected = dir.path().join(format!("cut-{0}.{0}", format.extension()));
+            assert_eq!(out, expected);
+            assert!(!std::fs::read(&expected).expect("read").is_empty());
+            assert!(!raw.exists());
+        }
+    }
+
+    #[test]
+    fn approved_existing_export_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("cut.edl");
+        std::fs::write(&raw, b"old").expect("seed export");
+        let core = AppCore::new();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_file(&raw).expect("dialog grant");
+
+        export_interchange(
+            &scope,
+            &core,
+            &raw.to_string_lossy(),
+            InterchangeFormat::Edl,
+        )
+        .expect("replace confirmed export");
+
+        assert_ne!(std::fs::read(&raw).expect("read"), b"old");
+    }
+}
+
+#[cfg(test)]
+mod project_dialog_path_tests {
+    use super::authorize_project_dialog_path;
+    use crate::safe_asset_protocol::scope_allows_lexical_path;
+    use opentake_core::AppCore;
+    use tauri::Manager as _;
+
+    #[test]
+    fn extensionless_dialog_result_becomes_a_reopenable_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("Vlog");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_file(&raw).expect("GTK dialog grant");
+
+        let bundle =
+            authorize_project_dialog_path(&scope, &raw.to_string_lossy()).expect("authorized");
+        assert_eq!(bundle, dir.path().join("Vlog.opentake"));
+        AppCore::new()
+            .save_project(Some(bundle.clone()))
+            .expect("create bundle");
+
+        // `project_open` from the recent-projects list checks this grant.
+        assert!(scope_allows_lexical_path(&scope, &bundle));
+        assert!(AppCore::new().open_project(&bundle).is_ok());
+    }
+
+    #[test]
+    fn dialog_result_with_extension_is_used_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("Vlog.opentake");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_file(&raw).expect("dialog grant");
+
+        assert_eq!(
+            authorize_project_dialog_path(&scope, &raw.to_string_lossy()),
+            Ok(raw)
+        );
+    }
+
+    #[test]
+    fn unapproved_or_frontend_extended_paths_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("Vlog");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        let unapproved = authorize_project_dialog_path(&scope, &raw.to_string_lossy())
+            .expect_err("no dialog grant");
+        assert!(unapproved.contains("native file dialog"), "{unapproved}");
+
+        scope.allow_file(&raw).expect("dialog grant");
+        let extended = dir.path().join("Vlog.opentake");
+        assert!(authorize_project_dialog_path(&scope, &extended.to_string_lossy()).is_err());
+        let escaped = dir.path().join("..").join("Vlog");
+        assert!(authorize_project_dialog_path(&scope, &escaped.to_string_lossy()).is_err());
+        assert!(!extended.exists());
+    }
+
+    #[test]
+    fn appended_bundle_that_already_exists_is_not_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("Vlog.opentake");
+        AppCore::new()
+            .save_project(Some(existing.clone()))
+            .expect("existing bundle");
+        let raw = dir.path().join("Vlog");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_file(&raw).expect("dialog grant");
+
+        let error = authorize_project_dialog_path(&scope, &raw.to_string_lossy())
+            .expect_err("unconfirmed replacement");
+        assert!(error.contains("already exists"), "{error}");
+        assert!(!scope_allows_lexical_path(&scope, &existing));
     }
 }
 

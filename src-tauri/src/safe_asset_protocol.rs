@@ -399,7 +399,7 @@ fn is_home_thumbnail_exception(scope: &Scope, path: &Path, bundle_path: &Path) -
         && scope_has_exact_file_grant(scope, path)
 }
 
-fn scope_has_exact_file_grant(scope: &Scope, path: &Path) -> bool {
+pub(crate) fn scope_has_exact_file_grant(scope: &Scope, path: &Path) -> bool {
     let escaped = glob::Pattern::escape(normalized_path(path).to_string_lossy().as_ref());
     scope.allowed_patterns().iter().any(|pattern| {
         #[cfg(target_os = "windows")]

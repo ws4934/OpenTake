@@ -1710,6 +1710,20 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
     Ok(Some(written_samples))
 }
 
+/// `req.out_path` must be the exact path a native save dialog returned (#95);
+/// the codec's container extension is appended when the user typed none.
+fn authorize_export_output(
+    scope: &tauri::scope::fs::Scope,
+    req: &ExportRequest,
+) -> Result<String, String> {
+    let extension = match req.codec {
+        ExportCodec::H264 | ExportCodec::H265 => "mp4",
+        ExportCodec::Prores | ExportCodec::Prores4444 => "mov",
+    };
+    crate::dialog_output::authorize_dialog_output(scope, &req.out_path, &[extension])
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// `export_video`: render the whole timeline to a video file on disk.
 ///
 /// Composites every frame at the full export resolution and encodes them to
@@ -1731,9 +1745,10 @@ pub async fn export_video(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,
-    req: ExportRequest,
+    mut req: ExportRequest,
     operation_id: String,
 ) -> Result<ExportSummary, String> {
+    req.out_path = authorize_export_output(&tauri::Manager::asset_protocol_scope(&app), &req)?;
     let guard = control.try_begin(&operation_id)?;
     let owned_control = control.inner().clone();
     // Snapshot the session up front; no session lock is held during GPU/encode.
@@ -4274,6 +4289,38 @@ mod tests {
         assert_eq!(
             ExportQuality::P4k.encode_resolution(),
             EncodeResolution::P2160
+        );
+    }
+
+    #[test]
+    fn export_output_requires_a_dialog_grant_and_codec_extension() {
+        use tauri::Manager as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        let existing = dir.path().join("film.mp4");
+        std::fs::write(&existing, b"keep").expect("seed movie");
+        let request = |out: &Path, codec| ExportRequest {
+            out_path: out.to_string_lossy().into_owned(),
+            codec,
+            quality: ExportQuality::P1080,
+        };
+
+        assert_eq!(
+            authorize_export_output(&scope, &request(&existing, ExportCodec::H264)),
+            Err(crate::dialog_output::UNAPPROVED_OUTPUT.to_string())
+        );
+        assert_eq!(std::fs::read(&existing).expect("read"), b"keep");
+
+        let raw = dir.path().join("master");
+        scope.allow_file(&raw).expect("dialog grant");
+        assert_eq!(
+            authorize_export_output(&scope, &request(&raw, ExportCodec::Prores)),
+            Ok(dir.path().join("master.mov").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            authorize_export_output(&scope, &request(&raw, ExportCodec::H265)),
+            Ok(dir.path().join("master.mp4").to_string_lossy().into_owned())
         );
     }
 

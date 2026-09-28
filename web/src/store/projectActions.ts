@@ -38,11 +38,6 @@ async function flushMotionStudioBeforeProjectBoundary(): Promise<void> {
   }
 }
 
-/** Ensure a chosen path carries the `.opentake` bundle extension. */
-function withExt(path: string): string {
-  return path.endsWith(`.${PROJECT_EXT}`) ? path : `${path}.${PROJECT_EXT}`;
-}
-
 function pathSeparator(path: string): "/" | "\\" {
   return path.lastIndexOf("\\") > path.lastIndexOf("/") ? "\\" : "/";
 }
@@ -104,7 +99,10 @@ export async function newProjectAndEnter(): Promise<void> {
     });
     if (typeof chosen !== "string") return; // cancelled
 
-    const requestedPath = withExt(chosen);
+    // Pass the dialog result unchanged: the native dialog authorizes exactly
+    // this path, and the backend appends `.opentake` beside it when the dialog
+    // did not (GTK never does).
+    const requestedPath = chosen;
     await flushMotionStudioBeforeProjectBoundary();
     await saveCurrentProjectBeforeBoundary();
     await stopNativePlaybackForProjectBoundary();
@@ -301,7 +299,7 @@ async function runSaveCurrentProjectAs(): Promise<void> {
     await flushMotionStudioBeforeProjectBoundary();
     if (!requestIsExactCurrent()) return;
     const committedPath = await api.projectSave(
-      withExt(selected),
+      selected,
       request.projectEpoch,
       request.projectPath,
     );

@@ -238,7 +238,7 @@ describe("ExportDialog control acceptance", () => {
     );
     expect(mocks.save.mock.calls[0]?.[0]).not.toHaveProperty("filters");
     expect(mocks.exportVideo).toHaveBeenCalledWith(
-      { outPath: "/tmp/render.mov", codec: "prores", quality: "1080p" },
+      { outPath: "/tmp/render", codec: "prores", quality: "1080p" },
       "video-operation-1",
     );
   });
@@ -253,7 +253,7 @@ describe("ExportDialog control acceptance", () => {
     });
 
     expect(mocks.exportVideo).toHaveBeenCalledWith(
-      { outPath: "/tmp/render.mp4", codec: "h264", quality: "4k" },
+      { outPath: "/tmp/render", codec: "h264", quality: "4k" },
       "video-operation-1",
     );
   });
@@ -358,7 +358,7 @@ describe("ExportDialog control acceptance", () => {
       expect.any(Function),
     );
     expect(mocks.exportVideo).toHaveBeenCalledWith(
-      { outPath: "/exports/final-cut.mp4", codec: "h264", quality: "1080p" },
+      { outPath: "/exports/final-cut", codec: "h264", quality: "1080p" },
       "video-operation-1",
     );
 
@@ -428,7 +428,7 @@ describe("ExportDialog control acceptance", () => {
     );
     expect(mocks.save.mock.calls.at(-1)?.[0]).not.toHaveProperty("filters");
     expect(mocks.exportVideo).toHaveBeenLastCalledWith(
-      { outPath: "/tmp/h265-render.mp4", codec: "h265", quality: "1080p" },
+      { outPath: "/tmp/h265-render", codec: "h265", quality: "1080p" },
       "video-operation-1",
     );
 
@@ -448,7 +448,7 @@ describe("ExportDialog control acceptance", () => {
     );
     expect(mocks.save.mock.calls.at(-1)?.[0]).not.toHaveProperty("filters");
     expect(mocks.exportVideo).toHaveBeenLastCalledWith(
-      { outPath: "/tmp/prores-render.mov", codec: "prores", quality: "1080p" },
+      { outPath: "/tmp/prores-render", codec: "prores", quality: "1080p" },
       "video-operation-1",
     );
 
@@ -464,7 +464,7 @@ describe("ExportDialog control acceptance", () => {
       expect.objectContaining({ defaultPath: "/tmp/My Film.mov" }),
     );
     expect(mocks.exportVideo).toHaveBeenLastCalledWith(
-      { outPath: "/tmp/prores-alpha-render.mov", codec: "prores4444", quality: "1080p" },
+      { outPath: "/tmp/prores-alpha-render", codec: "prores4444", quality: "1080p" },
       "video-operation-1",
     );
   });

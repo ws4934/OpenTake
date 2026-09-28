@@ -283,7 +283,7 @@ describe("TitleBar interchange export", () => {
     }));
     expect(mocks.save.mock.calls[0]?.[0]).not.toHaveProperty("filters");
     expect(run).toHaveBeenCalledTimes(1);
-    expect(run).toHaveBeenCalledWith(`/tmp/interchange.${ext}`);
+    expect(run).toHaveBeenCalledWith("/tmp/interchange");
     expect(useEditorUiStore.getState().toast?.message).toBe("title.exportInterchangeDone");
   });
 
@@ -376,7 +376,7 @@ describe("TitleBar subtitle export", () => {
       }),
     );
     expect(mocks.exportSubtitles).toHaveBeenCalledTimes(1);
-    expect(mocks.exportSubtitles).toHaveBeenCalledWith(path, format);
+    expect(mocks.exportSubtitles).toHaveBeenCalledWith("/tmp/captions", format);
     expect(useEditorUiStore.getState().toast?.message).toBe("title.exportSubtitlesDone");
   });
 

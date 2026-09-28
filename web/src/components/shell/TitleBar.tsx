@@ -40,11 +40,6 @@ function projectStem(projectPath: string | null): string {
   return base.replace(/\.opentake$/i, "") || "Timeline";
 }
 
-/** Ensure a chosen path carries the given extension (case-insensitive check). */
-function withExt(path: string, ext: string): string {
-  return path.toLowerCase().endsWith(`.${ext}`) ? path : `${path}.${ext}`;
-}
-
 /**
  * The four standard timeline-interchange formats. `key` drives the i18n labels
  * (`title.export<Cap>` / `…Dialog` / `…Filter`), `ext` is the file extension,
@@ -112,13 +107,13 @@ export function TitleBar() {
       title: t(`title.export${format.key}Dialog`),
       defaultPath,
       // rfd's deprecated macOS allowedFileTypes path disables Save for
-      // interchange extensions on macOS 26. withExt() enforces the type after
-      // confirmation while retaining the intended directory and filename.
+      // interchange extensions on macOS 26. The backend appends the format's
+      // extension next to the dialog-approved path, so pass it through as is.
     });
     if (typeof chosen !== "string") return; // cancelled
 
     try {
-      await format.run(withExt(chosen, format.ext));
+      await format.run(chosen);
       pushToast(t("title.exportInterchangeDone"));
     } catch {
       pushToast(t("title.exportInterchangeFailed"));
@@ -156,7 +151,8 @@ export function TitleBar() {
     if (typeof chosen !== "string") return; // cancelled
 
     try {
-      const summary = await api.exportSubtitles(withExt(chosen, format), format);
+      // The dialog grants exactly `chosen`; the backend appends the extension.
+      const summary = await api.exportSubtitles(chosen, format);
       pushToast(
         summary.cueCount > 0
           ? t("title.exportSubtitlesDone", { count: summary.cueCount })

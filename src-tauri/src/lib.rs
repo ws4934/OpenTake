@@ -13,6 +13,7 @@ mod chat;
 mod close_coordinator;
 mod codex;
 mod commands;
+mod dialog_output;
 // `pub` so the ffmpeg-gated integration test (`tests/export_integration.rs`) can
 // drive the export orchestrator (`export::run_export`) against the library
 // target. The Tauri command itself is registered below like the other modules.
