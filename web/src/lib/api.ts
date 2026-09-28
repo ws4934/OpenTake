@@ -1387,6 +1387,28 @@ export async function generateCaptions(
   throw new Error("caption generation requires the desktop app (whisper)");
 }
 
+/** Cancel one pending or running caption generation operation. */
+export async function cancelCaptionGeneration(operationId: string): Promise<boolean> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl<boolean>("cancel_caption_generation", { operationId });
+  return false;
+}
+
+/** Progress belongs to one operation; callers filter by their own operationId. */
+export async function onCaptionGenerationProgress(
+  handler: (progress: { operationId: string; completed: number; total: number; fraction: number }) => void,
+): Promise<() => void> {
+  await ensureTauri();
+  if (!listenImpl) return () => {};
+  return listenImpl("captions://progress", (e) => {
+    const p = e.payload as { operationId?: string; completed?: number; total?: number; fraction?: number } | undefined;
+    if (p && typeof p.operationId === "string" && typeof p.completed === "number"
+      && typeof p.total === "number" && typeof p.fraction === "number") {
+      handler({ operationId: p.operationId, completed: p.completed, total: p.total, fraction: p.fraction });
+    }
+  });
+}
+
 // MARK: - Semantic search (SigLIP2 visual model + index + query, search-wiring)
 
 /** Whether the SigLIP2 visual-search model is installed. Never downloads. The
@@ -1668,7 +1690,7 @@ export async function setTimelineSpriteInteractive(active: boolean): Promise<voi
 // MARK: - Timeline composite preview (#47)
 //
 // `composite_frame` renders the timeline at a frame on the GPU (wgpu compositor)
-// and returns a PNG data URL the Preview paints onto a <canvas>. `maxSize` caps
+// and returns a binary JPEG the Preview paints using a temporary object URL. `maxSize` caps
 // the longest side (px); omit for the backend default. Outside Tauri there is no
 // GPU/core, so this returns null and the Preview keeps its placeholder.
 //
@@ -1679,11 +1701,28 @@ export async function setTimelineSpriteInteractive(active: boolean): Promise<voi
 // which cannot decode-downscale, so the Quality cap only affects composite-based
 // paths (this command + capture) and the flagged streaming engine.
 
-/** One composited timeline frame: a PNG data URL plus its pixel size. */
+/** One composited timeline frame and its pixel size. Release the object URL when replaced. */
 export interface CompositeFrame {
   width: number;
   height: number;
   dataUrl: string;
+  release?: () => void;
+}
+
+/** Decode the native `OTF1` envelope: magic, LE width/height, JPEG body. */
+export function decodeCompositeFrameResponse(response: ArrayBuffer): CompositeFrame {
+  const bytes = new Uint8Array(response);
+  if (
+    bytes.length < 16 ||
+    bytes[0] !== 79 || bytes[1] !== 84 || bytes[2] !== 70 || bytes[3] !== 49 ||
+    bytes[12] !== 0xff || bytes[13] !== 0xd8
+  ) throw new Error("Invalid binary preview frame");
+  const view = new DataView(response);
+  const width = view.getUint32(4, true);
+  const height = view.getUint32(8, true);
+  if (width === 0 || height === 0) throw new Error("Invalid preview frame dimensions");
+  const dataUrl = URL.createObjectURL(new Blob([response.slice(12)], { type: "image/jpeg" }));
+  return { width, height, dataUrl, release: () => URL.revokeObjectURL(dataUrl) };
 }
 
 export interface CompositeStillRequest {
@@ -1713,14 +1752,16 @@ export async function compositeFrame(
   // The backend command takes an `i32`; the playhead accumulates as a float
   // during playback, so floor to the current frame before invoking (a
   // non-integer is rejected/coerced inconsistently by Tauri's deserializer).
-  if (invokeImpl)
-    return invokeImpl<CompositeFrame>("composite_frame", {
+  if (invokeImpl) {
+    const response = await invokeImpl<ArrayBuffer>("composite_frame", {
       request: {
         ...request,
         frame: Math.floor(request.frame),
       },
       maxSize,
     });
+    return decodeCompositeFrameResponse(response);
+  }
   return null;
 }
 

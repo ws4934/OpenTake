@@ -1720,6 +1720,11 @@ const DEFAULT_TEXT_STYLE: TextStyle = {
   },
 };
 
+/** Editing uses the nearest whole frame, including during fractional WebKit playback. */
+export function playheadEditFrame(activeFrame: number): number {
+  return Math.max(0, Math.round(activeFrame));
+}
+
 /** Add a text clip at the playhead on a fresh top track. Selects the new clip
  *  afterwards so the Inspector opens its Text tab. Used by the Toolbar "T"
  *  button.
@@ -1732,7 +1737,7 @@ const DEFAULT_TEXT_STYLE: TextStyle = {
  *  would clear to make room for the new text clip (#194). */
 export async function addTextClip() {
   const ui = useEditorUiStore.getState();
-  const startFrame = ui.activeFrame;
+  const startFrame = playheadEditFrame(ui.activeFrame);
   const timeline = currentTimeline();
 
   const durationFrames = durationSecondsToFrames(DEFAULT_TEXT_SECONDS, timeline.fps);
@@ -1839,7 +1844,7 @@ export async function pasteClipsAtPlayhead() {
   if (!cb.hasContent || cb.entries.length === 0) return;
   const ui = useEditorUiStore.getState();
   const tl = currentTimeline();
-  const offset = ui.activeFrame - cb.sourceFirstFrame;
+  const offset = playheadEditFrame(ui.activeFrame) - cb.sourceFirstFrame;
   const entries: PasteClipEntryReq[] = [];
   for (const e of cb.entries) {
     if (e.sourceTrackIndex >= tl.tracks.length) continue;

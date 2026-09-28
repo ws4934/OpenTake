@@ -1,6 +1,7 @@
 //! Real GPU acceptance for project-managed 3D `.cube` LUTs.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use opentake_domain::{Clip, ClipType, CubeLut, LutReference, Point, Timeline, Track, Transform};
 use opentake_render::gpu::texture::{upload_lut_3d, upload_rgba};
@@ -28,7 +29,7 @@ struct LutResolver<'d> {
     queue: &'d wgpu::Queue,
     source: Option<Rc<GpuTexture>>,
     lut: CubeLut,
-    uploaded_lut: Option<Rc<GpuLutTexture>>,
+    uploaded_lut: Option<Arc<GpuLutTexture>>,
 }
 
 impl TextureResolver for LutResolver<'_> {
@@ -49,9 +50,9 @@ impl TextureResolver for LutResolver<'_> {
     fn resolve_lut(
         &mut self,
         _reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, RenderError> {
         if self.uploaded_lut.is_none() {
-            self.uploaded_lut = Some(Rc::new(upload_lut_3d(
+            self.uploaded_lut = Some(Arc::new(upload_lut_3d(
                 self.device,
                 self.queue,
                 &self.lut,

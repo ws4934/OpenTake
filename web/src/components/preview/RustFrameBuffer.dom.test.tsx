@@ -13,6 +13,34 @@ afterEach(() => {
 });
 
 describe("paused native composite", () => {
+  it("releases a displayed binary still and a stale response", async () => {
+    const released = vi.fn();
+    let settleStale!: (image: { width: number; height: number; dataUrl: string; release: () => void }) => void;
+    const requestCompositeStill = vi.fn()
+      .mockResolvedValueOnce({ width: 640, height: 360, dataUrl: "blob:first", release: released })
+      .mockImplementationOnce(() => new Promise((resolve) => { settleStale = resolve; }))
+      .mockResolvedValueOnce(null);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const render = (stillFrame: number) => (
+      <RustFrameBuffer
+        event={null} endpoint={null} projectEpoch={3} timelineVersion={7}
+        engineDriving={false} stillFrame={stillFrame}
+        requestCompositeStill={requestCompositeStill} onTerminalFailure={vi.fn()}
+      />
+    );
+    await act(async () => { root.render(render(1)); await Promise.resolve(); });
+    expect(container.querySelector('[src="blob:first"]')).not.toBeNull();
+    await act(async () => root.render(render(2)));
+    await act(async () => root.render(render(3)));
+    await act(async () => settleStale({ width: 640, height: 360, dataUrl: "blob:stale", release: released }));
+    expect(released).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[src="blob:stale"]')).toBeNull();
+    await act(async () => root.unmount());
+    expect(released).toHaveBeenCalledTimes(2);
+  });
+
   it("cancels an in-flight settled composite when scrubbing starts", async () => {
     const requestCompositeStill = vi.fn(() => new Promise(() => undefined));
     const cancelCompositeStill = vi.fn().mockResolvedValue(undefined);

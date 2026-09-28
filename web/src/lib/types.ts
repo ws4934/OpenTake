@@ -985,6 +985,7 @@ export interface CaptionRequest {
   textCase?: CaptionCase;
   censorProfanity?: boolean;
   language?: string;
+  operationId?: string;
 }
 
 /** Outcome of `generate_captions` (mirror of Rust `GenerateCaptionsResult`). */

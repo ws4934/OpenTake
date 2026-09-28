@@ -391,13 +391,15 @@ pub struct HeadlessChromiumRenderer {
 impl HeadlessChromiumRenderer {
     /// Build the renderer with a cache and sandbox policy.
     pub fn new(cache: MotionCache, policy: SandboxPolicy) -> Self {
+        #[cfg(feature = "chromium")]
+        let browser_pool = chromium_backend::BrowserPool::registered();
         HeadlessChromiumRenderer {
             cache,
             policy,
             browser_path: None,
             cancellation: MotionCancellationToken::new(),
             #[cfg(feature = "chromium")]
-            browser_pool: Arc::new(chromium_backend::BrowserPool::new()),
+            browser_pool,
         }
     }
 
@@ -406,7 +408,7 @@ impl HeadlessChromiumRenderer {
     pub fn with_browser_path(mut self, path: impl Into<PathBuf>) -> Self {
         #[cfg(feature = "chromium")]
         {
-            self.browser_pool = Arc::new(chromium_backend::BrowserPool::new());
+            self.browser_pool = chromium_backend::BrowserPool::registered();
         }
         self.browser_path = Some(path.into());
         self
@@ -416,6 +418,20 @@ impl HeadlessChromiumRenderer {
     pub fn with_cancellation_token(mut self, token: MotionCancellationToken) -> Self {
         self.cancellation = token;
         self
+    }
+
+    /// Close an idle browser and prevent this renderer from launching or
+    /// retaining another. Active work is cooperatively cancelled by callers.
+    pub fn shutdown_pool(&self) {
+        #[cfg(feature = "chromium")]
+        self.browser_pool.shutdown();
+    }
+
+    /// Drain all renderer pools, including the Agent's independent renderer,
+    /// before Tauri's process exit bypasses managed-state destructors.
+    pub fn shutdown_all_pools() {
+        #[cfg(feature = "chromium")]
+        chromium_backend::shutdown_all_pools();
     }
 
     /// Locate Chrome, Chromium, or Edge without launching it. An explicit
@@ -568,7 +584,7 @@ mod chromium_backend {
     use std::net::TcpStream;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{mpsc, Mutex, MutexGuard, TryLockError};
+    use std::sync::{mpsc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -581,8 +597,8 @@ mod chromium_backend {
 
     use super::*;
 
-    static PROFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static AUTHOR_FENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static BROWSER_POOLS: OnceLock<Mutex<Vec<Weak<BrowserPool>>>> = OnceLock::new();
     const GPU_TRACE_FIELD_LIMIT: usize = 96;
     const GPU_TRACE_STATUS_LIMIT: usize = 48;
 
@@ -642,6 +658,7 @@ mod chromium_backend {
     pub(super) struct BrowserPool {
         slot: Mutex<Option<LiveBrowser>>,
         invalidation_pending: AtomicBool,
+        shutting_down: AtomicBool,
     }
 
     impl BrowserPool {
@@ -649,6 +666,28 @@ mod chromium_backend {
             Self {
                 slot: Mutex::new(None),
                 invalidation_pending: AtomicBool::new(false),
+                shutting_down: AtomicBool::new(false),
+            }
+        }
+
+        pub(super) fn registered() -> Arc<Self> {
+            let pool = Arc::new(Self::new());
+            let mut registry = BROWSER_POOLS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|weak| weak.strong_count() != 0);
+            registry.push(Arc::downgrade(&pool));
+            pool
+        }
+
+        pub(super) fn shutdown(&self) {
+            self.shutting_down.store(true, Ordering::Release);
+            self.invalidate_idle();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.invalidation_pending.load(Ordering::Acquire) && Instant::now() < deadline {
+                self.drain_pending_invalidation();
+                thread::sleep(Duration::from_millis(20));
             }
         }
 
@@ -659,6 +698,9 @@ mod chromium_backend {
             timeout: Duration,
             cancellation: &MotionCancellationToken,
         ) -> MotionResult<BrowserLease<'a>> {
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(MotionError::Cancelled);
+            }
             let mut slot = loop {
                 match self.slot.try_lock() {
                     Ok(slot) => break slot,
@@ -675,6 +717,10 @@ mod chromium_backend {
                     }
                 }
             };
+
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(MotionError::Cancelled);
+            }
 
             let observed_invalidation = self.invalidation_pending.swap(false, Ordering::AcqRel);
             let invalidated_browser = if observed_invalidation {
@@ -777,7 +823,8 @@ mod chromium_backend {
         }
 
         fn commit_reuse(&mut self) {
-            if self.observed_invalidation
+            if self.pool.shutting_down.load(Ordering::Acquire)
+                || self.observed_invalidation
                 || self.pool.invalidation_pending.swap(false, Ordering::AcqRel)
             {
                 let browser = self.slot.as_mut().and_then(|slot| slot.take());
@@ -785,6 +832,21 @@ mod chromium_backend {
                 return;
             }
             self.reusable = true;
+        }
+    }
+
+    pub(super) fn shutdown_all_pools() {
+        let Some(registry) = BROWSER_POOLS.get() else {
+            return;
+        };
+        let pools: Vec<_> = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for pool in pools {
+            pool.shutdown();
         }
     }
 
@@ -1671,8 +1733,9 @@ mod chromium_backend {
             timeout: Duration,
             cancellation: &MotionCancellationToken,
         ) -> MotionResult<(Self, String)> {
-            let profile = unique_profile_dir();
-            std::fs::create_dir_all(&profile)?;
+            // tempfile creates an exclusive user-private directory (0700 on
+            // Unix), even when the shared OS temp directory is world readable.
+            let profile = create_private_profile()?;
             let mut command = Command::new(executable);
             command
                 .args(browser_launch_args())
@@ -1681,7 +1744,9 @@ mod chromium_backend {
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
             configure_command(&mut command);
-            let mut child = command.spawn().map_err(|error| {
+            #[cfg(target_os = "linux")]
+            kill_with_parent_process(&mut command);
+            let mut child = spawn_browser(command).map_err(|error| {
                 let _ = std::fs::remove_dir_all(&profile);
                 if error.kind() == std::io::ErrorKind::NotFound {
                     MotionError::renderer_unavailable(format!(
@@ -1820,16 +1885,77 @@ mod chromium_backend {
         }
     }
 
-    fn unique_profile_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let counter = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "opentake-chromium-{}-{nanos}-{counter}",
-            std::process::id()
-        ))
+    /// Kill the browser when the app process dies. Tauri exits with
+    /// `process::exit`, so destructors cannot be the only containment boundary
+    /// for a retained Chromium process.
+    #[cfg(target_os = "linux")]
+    fn kill_with_parent_process(command: &mut Command) {
+        use std::os::unix::process::CommandExt;
+
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: the pre-exec hook only calls async-signal-safe kernel
+        // functions, and reports failure before the child executes.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Launch a browser process. Linux delivers the parent-death signal when
+    /// the *thread* that forked the child exits, and renders run on pooled
+    /// blocking threads that retire when idle, which would kill a retained
+    /// browser mid-reuse. A spawner thread that lives as long as the process
+    /// therefore forks every browser.
+    #[cfg(target_os = "linux")]
+    fn spawn_browser(command: Command) -> std::io::Result<Child> {
+        type Request = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+        static SPAWNER: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
+        let spawner = SPAWNER.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<Request>();
+            // Never joined: the thread must outlive every browser it launches.
+            // If it cannot start, the dropped receiver fails each launch below.
+            let _ = thread::Builder::new()
+                .name("opentake-chromium-spawner".to_string())
+                .spawn(move || {
+                    for (mut command, reply) in receiver {
+                        let _ = reply.send(command.spawn());
+                    }
+                });
+            Mutex::new(sender)
+        });
+        let stopped = || std::io::Error::other("Chromium spawner thread is not running");
+        let (reply, response) = mpsc::sync_channel(1);
+        spawner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send((command, reply))
+            .map_err(|_| stopped())?;
+        response.recv().map_err(|_| stopped())?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_browser(mut command: Command) -> std::io::Result<Child> {
+        command.spawn()
+    }
+
+    fn create_private_profile() -> std::io::Result<PathBuf> {
+        // Keep the owning pid in the name so leftovers can be traced to a process.
+        let prefix = format!("opentake-chromium-{}-", std::process::id());
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(builder.tempdir()?.keep())
     }
 
     type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -3138,6 +3264,99 @@ mod chromium_backend {
         use tungstenite::protocol::Role;
 
         use super::*;
+
+        #[cfg(unix)]
+        #[test]
+        fn chromium_profile_directory_is_private() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let profile = create_private_profile().unwrap();
+            let permissions = std::fs::metadata(&profile).unwrap().permissions().mode();
+            assert_eq!(permissions & 0o777, 0o700);
+            std::fs::remove_dir_all(profile).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn browser_launched_from_a_retired_thread_keeps_running() {
+            // Renders run on blocking-pool threads that exit when idle; the
+            // parent-death signal must follow the process, not that thread.
+            let mut child = thread::spawn(|| {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                kill_with_parent_process(&mut command);
+                spawn_browser(command).unwrap()
+            })
+            .join()
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let status = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                status.is_none(),
+                "browser died with its launching thread: {status:?}"
+            );
+        }
+
+        #[test]
+        fn shutdown_blocks_future_browser_acquisition() {
+            let pool = BrowserPool::registered();
+            pool.shutdown();
+            assert!(pool.shutting_down.load(Ordering::Acquire));
+            let error = pool
+                .acquire(
+                    Path::new("browser-is-never-launched"),
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    &MotionCancellationToken::new(),
+                )
+                .err()
+                .expect("shutdown must reject before spawning a browser");
+            assert!(matches!(error, MotionError::Cancelled));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn shutdown_pool_terminates_browser_and_removes_profile() {
+            let browser = HeadlessChromiumRenderer::find_browser()
+                .expect("Windows native qualification requires Chrome or Edge");
+            let tmp = tempfile::tempdir().unwrap();
+            let renderer = HeadlessChromiumRenderer::new(
+                MotionCache::new(tmp.path()),
+                SandboxPolicy::offline_with_timeout(Duration::from_secs(45)),
+            )
+            .with_browser_path(browser);
+            let request = MotionRenderRequest::new(
+                MotionSource::code("<div style='background:#326599'>frame</div>"),
+                30,
+                1,
+                48,
+                32,
+            );
+            renderer
+                .render(&request)
+                .expect("render a live browser frame");
+            let profile = renderer
+                .browser_pool
+                .slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("successful render retains the browser")
+                .process
+                .profile
+                .clone();
+            assert!(profile.is_dir());
+
+            renderer.shutdown_pool();
+
+            assert!(renderer.browser_pool.slot.lock().unwrap().is_none());
+            assert!(
+                !profile.exists(),
+                "profile must be removed after process exit"
+            );
+        }
 
         fn fake_cdp_pair() -> (Cdp, WebSocket<TcpStream>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
