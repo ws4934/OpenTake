@@ -394,13 +394,24 @@ struct MediaInfo<'a> {
 
 /// Retained, pre-authorized media inputs for strict project-cover capture.
 /// Missing entries fail closed; the renderer never reopens their manifest paths.
+/// LUTs are carried as bytes read through the session's retained project root,
+/// keyed by content hash and hash-checked again when they are resolved.
 pub(crate) struct CompositeSourceAuthority {
     files: HashMap<String, File>,
+    luts: HashMap<String, Vec<u8>>,
 }
 
 impl CompositeSourceAuthority {
     pub(crate) fn new(files: HashMap<String, File>) -> Self {
-        Self { files }
+        Self {
+            files,
+            luts: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn with_luts(mut self, luts: HashMap<String, Vec<u8>>) -> Self {
+        self.luts = luts;
+        self
     }
 }
 
@@ -906,6 +917,9 @@ struct MediaResolver<'d> {
     lent_images: Vec<(ImageTextureKey, Rc<GpuTexture>)>,
     materialization_error: Option<String>,
     strict_materialization: bool,
+    /// LUT bytes pre-read for strict materialization, which has no project
+    /// root to read from.
+    authorized_luts: Option<&'d HashMap<String, Vec<u8>>>,
 }
 
 impl MediaResolver<'_> {
@@ -1193,13 +1207,22 @@ impl TextureResolver for MediaResolver<'_> {
         if let Some(cached) = self.lut_cache.get(&reference.id) {
             return Ok(Some(cached.clone()));
         }
-        let resolved = crate::lut::resolve_project_lut(
-            self.project_root,
-            reference,
-            self.device,
-            self.queue,
-            "preview-lut",
-        )?;
+        let resolved = match self.authorized_luts {
+            Some(authorized) => Some(crate::lut::resolve_authorized_lut(
+                authorized,
+                reference,
+                self.device,
+                self.queue,
+                "cover-lut",
+            )?),
+            None => crate::lut::resolve_project_lut(
+                self.project_root,
+                reference,
+                self.device,
+                self.queue,
+                "preview-lut",
+            )?,
+        };
         if let Some(texture) = &resolved {
             if self.lut_cache.len() >= LUT_CACHE_CAP {
                 self.lut_cache.clear();
@@ -1770,6 +1793,9 @@ fn composite_timeline_frame_with_authority(
             lent_images: Vec::new(),
             materialization_error: None,
             strict_materialization,
+            authorized_luts: authority
+                .filter(|_| strict_materialization)
+                .map(|authority| &authority.luts),
         };
         let interpolation = timeline_interpolation_config(plan.fps)?;
         let composite = ctx.compositor.render_to_rgba_with_interpolation(
@@ -2941,6 +2967,7 @@ mod tests {
             lent_images: Vec::new(),
             materialization_error: None,
             strict_materialization: false,
+            authorized_luts: None,
         };
         let text_source = |clip_id: &str| TextureSource::Text {
             clip_id: clip_id.to_string(),

@@ -894,6 +894,13 @@ impl EditorSession {
         Ok(root.open_asset_file(relative)?)
     }
 
+    /// Read a managed LUT (`media/luts/<name>`) through the retained bundle
+    /// handle. `None` when it does not exist.
+    pub fn read_lut(&self, name: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
+        Ok(root.read_lut(name, max_bytes)?)
+    }
+
     /// Compare a caller's retained no-follow bundle handle with the handle
     /// retained when this exact session opened or saved the project.
     pub(crate) fn matches_project_root_identity(&self, current: &Handle) -> Result<bool> {

@@ -909,6 +909,7 @@ fn authorize_composite_sources<R: tauri::Runtime>(
         };
         files.insert(entry.id.clone(), retained);
     }
+    let luts = authorize_composite_luts(core, snapshot);
     if project_authority
         .as_ref()
         .is_some_and(|authority| !core.project_asset_authority_matches(authority))
@@ -916,7 +917,44 @@ fn authorize_composite_sources<R: tauri::Runtime>(
     {
         return Err("project source authority changed during cover capture".to_string());
     }
-    Ok(crate::render::CompositeSourceAuthority::new(files))
+    Ok(crate::render::CompositeSourceAuthority::new(files).with_luts(luts))
+}
+
+/// Read every LUT the snapshot's clips reference through the session's
+/// retained project root. A LUT that cannot be read is left out, so the strict
+/// compositor fails on it as missing; a LUT whose bytes do not match its
+/// content hash fails when it is resolved.
+fn authorize_composite_luts(
+    core: &AppCore,
+    snapshot: &opentake_core::ProjectRuntimeSnapshot,
+) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut luts = std::collections::HashMap::new();
+    if snapshot.project_dir.is_none() {
+        return luts;
+    }
+    let references = std::iter::once(&snapshot.timeline)
+        .chain(
+            snapshot
+                .timeline
+                .nested_sequences
+                .iter()
+                .map(|sequence| &sequence.timeline),
+        )
+        .flat_map(|timeline| &timeline.tracks)
+        .flat_map(|track| &track.clips)
+        .filter_map(|clip| clip.lut.as_ref());
+    for reference in references {
+        if luts.contains_key(&reference.id) || reference.validate().is_err() {
+            continue;
+        }
+        if let Ok(Some(bytes)) = core.read_project_lut(
+            &crate::lut::managed_lut_filename(reference),
+            opentake_domain::CubeLut::MAX_BYTES,
+        ) {
+            luts.insert(reference.id.clone(), bytes);
+        }
+    }
+    luts
 }
 
 #[cfg(test)]
@@ -2540,11 +2578,12 @@ impl KeyframeValueDto {
 #[cfg(test)]
 mod project_open_async_tests {
     use super::{
-        await_project_cover_save_worker, capture_composite_project_thumbnail, internal_error,
-        prepare_saved_project_off_thread, project_save_for_project,
-        project_save_for_project_with_checkpoint, project_save_for_project_with_commit_gate,
-        run_blocking_with_timeout, save_current_project_before_exit, ProjectCoverCapture,
-        ProjectCoverCommitGate, ProjectLifecycleCoordinator,
+        authorize_composite_sources, await_project_cover_save_worker,
+        capture_composite_project_thumbnail, internal_error, prepare_saved_project_off_thread,
+        project_save_for_project, project_save_for_project_with_checkpoint,
+        project_save_for_project_with_commit_gate, run_blocking_with_timeout,
+        save_current_project_before_exit, ProjectCoverCapture, ProjectCoverCommitGate,
+        ProjectLifecycleCoordinator,
     };
     use opentake_core::core::PreparedProjectOpen;
     use opentake_core::AppCore;
@@ -3467,6 +3506,148 @@ mod project_open_async_tests {
         assert!(
             text_background[0] > 120 && text_background[2] > 120,
             "{text_background:?}"
+        );
+    }
+
+    #[test]
+    fn thumbnail_authoritative_composite_applies_a_managed_lut() {
+        use opentake_domain::{
+            Clip, ClipType, LutReference, MediaManifestEntry, MediaSource, Track,
+        };
+        use sha2::Digest as _;
+
+        if opentake_render::RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "OPENTAKE_REQUIRE_GPU is set but no GPU adapter was found"
+            );
+            eprintln!("skip: authoritative LUT cover fixture needs a GPU adapter");
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let image_path = fixture.path().join("blue.png");
+        image::RgbaImage::from_pixel(320, 180, image::Rgba([20, 40, 220, 255]))
+            .save(&image_path)
+            .expect("save image");
+        // A LUT that maps every color to red.
+        let mut lut = b"LUT_3D_SIZE 17\n".to_vec();
+        for _ in 0..17_usize.pow(3) {
+            lut.extend_from_slice(b"1 0 0\n");
+        }
+        let lut_id: String = sha2::Sha256::digest(&lut)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let mut clip = Clip::new("graded", "blue", 0, 30);
+        clip.media_type = ClipType::Image;
+        clip.lut = Some(LutReference::new(lut_id.clone(), "Red", 1.0).expect("LUT reference"));
+        let mut track = Track::new("image", ClipType::Image);
+        track.clips.push(clip);
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.width = 320;
+        timeline.height = 180;
+        timeline.tracks = vec![track];
+        let mut project = opentake_project::Project::new(fixture.path().join("Graded.opentake"));
+        project.timeline = timeline;
+        project.manifest.entries = vec![MediaManifestEntry {
+            id: "blue".into(),
+            name: "blue".into(),
+            kind: ClipType::Image,
+            source: MediaSource::External {
+                absolute_path: image_path.to_string_lossy().into_owned(),
+            },
+            duration: 1.0,
+            generation_input: None,
+            source_width: Some(320),
+            source_height: Some(180),
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }];
+        project.save().expect("save graded fixture");
+        let lut_name = format!("{lut_id}.cube");
+        opentake_project::ProjectRoot::open(&project.bundle_path)
+            .expect("open bundle")
+            .write_lut_atomic(&lut_name, &lut)
+            .expect("store managed LUT");
+        let core = AppCore::new();
+        core.open_project(&project.bundle_path)
+            .expect("open graded fixture");
+        let app = tauri::test::mock_app();
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&image_path)
+            .expect("authorize image");
+        let render = crate::render::RenderState::new();
+        let cancel = opentake_media::MediaCancelToken::new();
+
+        let capture = capture_composite_project_thumbnail(
+            app.handle(),
+            &core,
+            &core.runtime_snapshot(),
+            &render,
+            &cancel,
+        );
+        let ProjectCoverCapture::Captured(bytes) = capture else {
+            panic!("capture a cover through a managed LUT: {capture:?}");
+        };
+        let cover = image::load_from_memory(&bytes)
+            .expect("decode cover")
+            .to_rgb8();
+        let center = cover.get_pixel(cover.width() / 2, cover.height() / 2).0;
+        assert!(
+            center[0] > 200 && center[1] < 40 && center[2] < 40,
+            "the LUT maps the blue image to red: {center:?}"
+        );
+
+        // The agent's timeline result goes through the same strict compositor.
+        let snapshot = core.runtime_snapshot();
+        let authority =
+            authorize_composite_sources(app.handle(), &core, &snapshot).expect("authorize");
+        let rendered = crate::render::render_timeline_result_png(
+            &snapshot.timeline,
+            &snapshot.media,
+            &snapshot.project_dir,
+            &render,
+            crate::render::EmptyTimelineCanvasInput {
+                project_width: 320,
+                project_height: 180,
+                fps: snapshot.timeline.fps,
+                playhead_frame: 0,
+            },
+            &cancel,
+            &authority,
+        )
+        .expect("render the timeline result through a managed LUT");
+        assert!(!rendered.empty_canvas);
+
+        // A managed LUT whose bytes no longer match its content hash fails
+        // instead of rendering ungraded. A fresh render context: the current
+        // one caches the LUT texture by its content hash, which only ever
+        // holds bytes that passed the hash check.
+        let tampered = project
+            .bundle_path
+            .join("media")
+            .join("luts")
+            .join(&lut_name);
+        let mut altered = lut.clone();
+        altered.extend_from_slice(b"# tampered\n");
+        std::fs::write(&tampered, altered).expect("tamper with the managed LUT");
+        let capture = capture_composite_project_thumbnail(
+            app.handle(),
+            &core,
+            &core.runtime_snapshot(),
+            &crate::render::RenderState::new(),
+            &cancel,
+        );
+        assert!(
+            matches!(capture, ProjectCoverCapture::CaptureFailed),
+            "a tampered LUT must fail the capture"
         );
     }
 
