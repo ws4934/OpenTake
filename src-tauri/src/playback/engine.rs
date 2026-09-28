@@ -140,9 +140,13 @@ pub trait PlaybackClock: Send + Sync {
         None
     }
     /// The render loop paused itself after a fatal failure: silence the
-    /// clock's audio output until the next resume commits. A no-op for clocks
-    /// without sound.
+    /// clock's audio output until the render thread resumes and that resume
+    /// commits. A no-op for clocks without sound.
     fn halt(&self) {}
+    /// The render thread processed a resume: a [`Self::halt`] from before it
+    /// no longer keeps the output muted, one after it still does. Called on
+    /// the render thread, so the order against its own failures is exact.
+    fn resumed(&self) {}
 }
 
 /// Receives each composited frame. Production: [`super::transport::MjpegSink`],
@@ -911,7 +915,7 @@ impl PlaybackEngine {
 
     #[cfg(test)]
     pub(crate) fn test_resume_observer(
-        audio_paused: Arc<std::sync::atomic::AtomicBool>,
+        audio_output: Arc<super::audio::OutputState>,
     ) -> (Self, mpsc::Receiver<bool>, mpsc::Receiver<()>) {
         let (control_tx, control_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -927,7 +931,7 @@ impl PlaybackEngine {
                         let _ = reply.send(());
                     }
                     PlaybackCmd::Resume(_, reply) => {
-                        let paused = audio_paused.load(std::sync::atomic::Ordering::Acquire);
+                        let paused = audio_output.is_muted();
                         let _ = resume_tx.send(paused);
                         let _ = reply.send(());
                     }
@@ -1102,6 +1106,7 @@ fn run_render_loop<R: FrameRenderer>(
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     clock.seek(frame);
+                    clock.resumed();
                     if std::mem::take(&mut retry_on_resume) {
                         renderer.seek();
                     } else {
@@ -1145,6 +1150,7 @@ fn run_render_loop<R: FrameRenderer>(
                         sink.invalidate();
                     }
                     clock.seek(frame);
+                    clock.resumed();
                     resume_decode_streams(Some(current_frame), frame, || renderer.seek());
                     pause_requested.store(false, Ordering::Release);
                     let _ = reply.send(());
@@ -1168,6 +1174,10 @@ fn run_render_loop<R: FrameRenderer>(
             continue;
         }
 
+        // The seek generation is read before the clock: a seek submitted
+        // after this read makes the frame stale however the clock read raced
+        // it, so a frame picked from a pre-seek clock never publishes.
+        let render_generation = seek_mailbox.generation();
         let (clamped, done) = loop_step(clock.frame(fps), total);
         if let Some(message) = clock.take_error() {
             errors.report(PlaybackFailure {
@@ -1177,8 +1187,8 @@ fn run_render_loop<R: FrameRenderer>(
                 fatal: false,
             });
         }
-        let render_generation = seek_mailbox.generation();
         let rendered = renderer.render(clamped);
+
         if startup.is_none() && cancel.is_cancelled() {
             // Teardown cancelled the session's decodes (an edit, a project
             // switch or a stop); a `Stop` follows. Whatever the render
@@ -1750,6 +1760,83 @@ mod tests {
             })
         );
         assert_eq!(mailbox.take(), None);
+    }
+
+    /// A clock whose read at `trigger` races a seek to `target`: the seek is
+    /// submitted while the read is under way and the pre-seek frame returned.
+    struct SeekRacingClock {
+        next: AtomicI32,
+        trigger: i32,
+        target: i32,
+        control: std::sync::OnceLock<EngineControl>,
+    }
+
+    impl PlaybackClock for SeekRacingClock {
+        fn frame(&self, _fps: i32) -> i32 {
+            let frame = self.next.fetch_add(1, Ordering::AcqRel);
+            if frame == self.trigger {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while self.control.get().is_none() && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+                self.control
+                    .get()
+                    .expect("engine control installed")
+                    .seek(self.target);
+            }
+            frame
+        }
+
+        fn seek(&self, frame: i32) {
+            self.next.store(frame, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn a_frame_picked_from_a_pre_seek_clock_never_publishes() {
+        let clock = Arc::new(SeekRacingClock {
+            next: AtomicI32::new(0),
+            trigger: 3,
+            target: 500,
+            control: std::sync::OnceLock::new(),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let renders = Arc::new(Mutex::new(Vec::new()));
+        let renderer = StubRenderer {
+            total: 1_000,
+            fail_at: None,
+            renders: Arc::clone(&renders),
+            seeks: Arc::new(AtomicI32::new(0)),
+            block_at: None,
+        };
+        let engine = PlaybackEngine::spawn_with(
+            move || Ok(renderer),
+            RenderOutputs {
+                clock: clock.clone(),
+                sink: sink.clone(),
+                errors: Arc::new(RecordingErrors::default()),
+            },
+            None,
+            None,
+            MediaCancelToken::new(),
+        )
+        .expect("spawn stub render loop");
+        let _ = clock.control.set(engine.control());
+
+        wait_until("post-seek frames", || {
+            sink.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| *frame >= 510)
+        });
+        engine.stop();
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(
+            !frames.contains(&3),
+            "the frame read while the seek landed is stale: {frames:?}"
+        );
+        assert!(frames.iter().all(|frame| *frame < 3 || *frame >= 500));
     }
 
     #[test]

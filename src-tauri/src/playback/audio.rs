@@ -8,20 +8,32 @@
 //! the render loop reads to pick its target video frame. A silent timeline falls
 //! back to the wall-clock [`InstantClock`] PR1 ships.
 //!
-//! The cpal callback never blocks or allocates. A single producer decodes and
-//! mixes fixed windows into a bounded channel; the callback uses only atomics
-//! and non-blocking `try_recv`, emitting silence on underrun. Seek advances a
-//! generation, cancels the old decode, and makes both producer and consumer
-//! discard stale windows before audible output resumes.
+//! The cpal callback never blocks, allocates, frees or prints. A single
+//! producer decodes and mixes fixed windows into a bounded channel; the
+//! callback uses only atomics, an uncontended `try_lock` and non-blocking
+//! `try_recv`/`try_send`, emitting silence on underrun. Windows it has played
+//! or found stale go back to the producer through a bounded recycle channel
+//! (the producer frees them), and failures are recorded for the render loop,
+//! never logged from the callback. Seek advances a generation, cancels the old
+//! decode, and makes both producer and consumer discard stale windows before
+//! audible output resumes.
+//!
+//! The clock reports what is audible, not what was handed to the device: each
+//! callback publishes the frames it wrote plus the output latency derived from
+//! its `OutputCallbackInfo` timestamps, and [`AudioClock`] subtracts that
+//! delay from the device position (#69).
 //!
 //! Stereo is mixed once and mapped to the device's channel count in the callback
-//! (mono downmix / >2 zero-fill). The mixing math mirrors the proven export
-//! mixdown (`export.rs`), parameterised by the device rate and done per channel.
+//! (mono downmix / >2 zero-fill). The mix itself is the export's: the render
+//! plan's flattened audio clips (nested sequences included) read through the
+//! shared clip readers with the same gain, true-peak ceiling and denoise
+//! semantics ([`AudioPlanLike`]), parameterised by the device rate and done per
+//! channel.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -31,14 +43,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use crossbeam_channel::{bounded, Receiver as ChunkReceiver, Sender as ChunkSender};
 
-use opentake_domain::{AudioDenoise, Clip, ClipType, Timeline};
-use opentake_media::{
-    decode_pcm_interleaved_cancellable, encode::mix::apply_true_peak_ceiling, MediaCancelToken,
-    MediaError, PcmFormat, PcmSpec,
-};
+use opentake_domain::Timeline;
+use opentake_media::{encode::mix::apply_true_peak_ceiling, MediaCancelToken, MediaError};
+use opentake_render::{try_collect_audio_clips, AudioClipPlan};
 
 use crate::clip_audio::{
-    clip_source_window_secs, keep_clip_reader, ClipAudioLayout, ClipAudioReader, PreviewDenoise,
+    keep_clip_reader, AudioPlanLike, ClipAudioLayout, ClipAudioReader, PreviewDenoise,
 };
 
 pub(crate) use crate::clip_audio::ProfileScope;
@@ -52,9 +62,16 @@ const FALLBACK_SAMPLE_RATE: u32 = 48_000;
 /// The mix is always interleaved stereo; the callback maps it to the device's
 /// channel count.
 const MIX_CHANNELS: usize = 2;
-const MIX_CANCEL_CHUNK_FRAMES: usize = 4 * 1024;
 const STREAM_WINDOW_SECONDS: usize = 2;
 const STREAM_WINDOW_CAPACITY: usize = 4;
+/// Window buffers the callback can hand back before the producer drains them:
+/// every queued window plus the one playing and the one being sent, so a
+/// `try_send` into the recycle channel never finds it full.
+const RECYCLE_CAPACITY: usize = STREAM_WINDOW_CAPACITY + 2;
+/// Longest wait for one query on the `opentake-audio-device` thread. A
+/// driver that hangs there must not hang a resume: the query then answers
+/// "unknown", which callers read as "the device did not change".
+const DEVICE_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_SEND_POLL: Duration = Duration::from_millis(5);
 const CALLBACK_START_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -230,10 +247,6 @@ fn audio_buffer_too_large(detail: impl std::fmt::Display) -> MediaError {
     MediaError::Decode(format!("audio_buffer_too_large: {detail}"))
 }
 
-fn audio_allocation_failed(detail: impl std::fmt::Display) -> MediaError {
-    MediaError::Decode(format!("audio_allocation_failed: {detail}"))
-}
-
 struct AudioStreamControl {
     generation: AtomicU64,
     requested_start: AtomicU64,
@@ -251,10 +264,21 @@ struct AudioStreamControl {
     /// `(generation, end)`: the producer has queued every window of that
     /// generation up to output frame `end`.
     buffered: Mutex<(u64, u64)>,
+    /// Whether the output is muted: a paused session's producer closes its
+    /// clip readers once its queue is full instead of holding them open.
+    output: Arc<OutputState>,
+    /// Window buffers the callback had to free itself because the recycle
+    /// channel was gone or full. Stays zero in a healthy session.
+    callback_frees: AtomicU64,
 }
 
 impl AudioStreamControl {
+    #[cfg(test)]
     fn new(start_frame: u64) -> Self {
+        Self::with_output(start_frame, Arc::new(OutputState::new(false)))
+    }
+
+    fn with_output(start_frame: u64, output: Arc<OutputState>) -> Self {
         Self {
             generation: AtomicU64::new(0),
             requested_start: AtomicU64::new(start_frame),
@@ -265,21 +289,30 @@ impl AudioStreamControl {
             seek_epoch: AtomicU64::new(0),
             reported_epoch: AtomicU64::new(u64::MAX),
             buffered: Mutex::new((0, start_frame)),
+            output,
+            callback_frees: AtomicU64::new(0),
         }
     }
 
-    /// Record a window failure. Only the first failure after each explicit
-    /// seek is kept, so a broken clip is reported once rather than every
-    /// window or every clock re-alignment.
-    fn record_error(&self, message: String) {
+    /// Record the failure of a window of `generation`. Only the first failure
+    /// after each explicit seek is kept, so a broken clip is reported once
+    /// rather than every window or every clock re-alignment. A window of a
+    /// superseded generation reports nothing: the generation is checked under
+    /// the lock [`Self::request_seek`] takes after advancing it, so a failure
+    /// from before a seek can never be recorded under the seek's epoch.
+    fn record_error(&self, generation: u64, message: String) {
+        let mut pending = self
+            .pending_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
         let epoch = self.seek_epoch.load(Ordering::Acquire);
         if self.reported_epoch.swap(epoch, Ordering::AcqRel) == epoch {
             return;
         }
-        *self
-            .pending_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+        *pending = Some(message);
     }
 
     fn take_error(&self) -> Option<String> {
@@ -290,14 +323,19 @@ impl AudioStreamControl {
     }
 
     /// A transport seek: restart the producer at `start_frame` and forget a
-    /// failure reported for the previous position.
+    /// failure reported for the previous position. The generation advances
+    /// before the seek epoch, both under the error lock, so a window of the
+    /// old position that fails meanwhile is dropped by [`Self::record_error`]
+    /// instead of counting for the new one, and the first failure at the new
+    /// position is never mistaken for an old one.
     fn request_seek(&self, start_frame: u64) {
-        self.seek_epoch.fetch_add(1, Ordering::AcqRel);
-        self.pending_error
+        let mut pending = self
+            .pending_error
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.restart_at(start_frame);
+        self.seek_epoch.fetch_add(1, Ordering::AcqRel);
+        pending.take();
     }
 
     /// Whether output frame `frame` of the current generation is already
@@ -359,15 +397,58 @@ struct AudioStreamChunk {
     samples: Vec<f32>,
 }
 
+/// The callback's end of the window stream. It never frees a window: one it
+/// has played or found stale goes back to the producer through `recycle`.
 struct AudioStreamConsumer {
-    receiver: ChunkReceiver<Result<AudioStreamChunk, MediaError>>,
+    receiver: ChunkReceiver<AudioStreamChunk>,
+    recycle: ChunkSender<Vec<f32>>,
+    /// Buffers `recycle` had no room for, held until it has. Its capacity is
+    /// reserved up front, so parking a buffer here does not allocate.
+    parked: Vec<Vec<f32>>,
     control: Arc<AudioStreamControl>,
     current: Option<AudioStreamChunk>,
-    /// The producer reported an error or exited, so no later window arrives.
+    /// The producer exited, so no later window arrives.
     terminated: bool,
 }
 
 impl AudioStreamConsumer {
+    fn new(
+        receiver: ChunkReceiver<AudioStreamChunk>,
+        recycle: ChunkSender<Vec<f32>>,
+        control: Arc<AudioStreamControl>,
+    ) -> Self {
+        Self {
+            receiver,
+            recycle,
+            parked: Vec::with_capacity(RECYCLE_CAPACITY),
+            control,
+            current: None,
+            terminated: false,
+        }
+    }
+
+    /// Hand a window's buffer back to the producer without freeing it here.
+    fn retire(&mut self, chunk: AudioStreamChunk) {
+        while let Some(parked) = self.parked.pop() {
+            if let Err(error) = self.recycle.try_send(parked) {
+                self.parked.push(error.into_inner());
+                break;
+            }
+        }
+        let samples = match self.recycle.try_send(chunk.samples) {
+            Ok(()) => return,
+            Err(error) => error.into_inner(),
+        };
+        if self.parked.len() < self.parked.capacity() {
+            self.parked.push(samples);
+        } else {
+            // Unreachable while the producer runs (the recycle channel holds
+            // every buffer that can exist); counted so tests can prove it.
+            self.control.callback_frees.fetch_add(1, Ordering::Relaxed);
+            drop(samples);
+        }
+    }
+
     fn discard_stale(&mut self) {
         let generation = self.control.generation.load(Ordering::Acquire);
         if self
@@ -375,23 +456,20 @@ impl AudioStreamConsumer {
             .as_ref()
             .is_some_and(|chunk| chunk.generation != generation)
         {
-            self.current = None;
+            if let Some(stale) = self.current.take() {
+                self.retire(stale);
+            }
         }
         if self.current.is_some() {
             return;
         }
         loop {
             match self.receiver.try_recv() {
-                Ok(Ok(chunk)) if chunk.generation == generation => {
+                Ok(chunk) if chunk.generation == generation => {
                     self.current = Some(chunk);
                     break;
                 }
-                Ok(Ok(_)) => {}
-                // Producer failures are reported through `AudioStreamControl`;
-                // the real-time callback must not log or block.
-                Ok(Err(_)) => {
-                    self.terminated = true;
-                }
+                Ok(stale) => self.retire(stale),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.terminated = true;
@@ -416,7 +494,9 @@ impl AudioStreamConsumer {
             if self.current.as_ref().is_some_and(covers) {
                 return true;
             }
-            self.current = None;
+            if let Some(played) = self.current.take() {
+                self.retire(played);
+            }
             self.discard_stale();
             match self.current.as_ref() {
                 Some(chunk) if !covers(chunk) && frame < chunk.start_frame => return false,
@@ -437,21 +517,22 @@ impl AudioStreamConsumer {
     }
 }
 
-enum PlaybackSamples {
-    Buffered(Arc<Vec<f32>>),
-    Streaming(AudioStreamConsumer),
-}
-
 /// Time source of [`AudioClock`]; injectable so stall/recovery tests run on
 /// virtual time.
 type ClockNow = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Audio master clock: the playhead derives from the device frame position
-/// (`pos`, in output audio frames), which the cpal callback advances in lock-step
-/// with the sound the user hears — so video genuinely follows audio.
+/// (`pos`, in output audio frames), which the cpal callback advances as it
+/// hands samples to the device, minus the output delay the callback measures
+/// (`delay`) — so video follows the sound the user actually hears.
 pub struct AudioClock {
-    /// Output audio frames played so far (shared with the cpal callback).
+    /// Output audio frames handed to the device so far (shared with the cpal
+    /// callback).
     pos: Arc<AtomicU64>,
+    /// Output frames between `pos` and the frame audible now, as the last
+    /// callback measured them: the frames it wrote plus the device latency
+    /// its `OutputCallbackInfo` timestamps report (#69).
+    delay: Arc<AtomicU64>,
     /// Output device sample rate (Hz = frames/sec).
     rate: u32,
     /// Project fps (for `seek`, which has no fps argument).
@@ -496,6 +577,7 @@ impl AudioClock {
         let observed_at = now();
         Self {
             pos,
+            delay: Arc::new(AtomicU64::new(0)),
             rate,
             fps,
             stream,
@@ -516,6 +598,18 @@ impl AudioClock {
         self.mute = Some(mute);
         self
     }
+
+    /// Read the output delay the output's callback measures.
+    fn delayed_by(mut self, delay: Arc<AtomicU64>) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// The output frame audible now: the device position minus the output
+    /// delay, never below zero.
+    fn audible_pos(&self, pos: u64) -> u64 {
+        pos.saturating_sub(self.delay.load(Ordering::Acquire))
+    }
 }
 
 fn audio_position_frame(pos: u64, rate: u32, fps: i32) -> i32 {
@@ -535,7 +629,10 @@ impl PlaybackClock for AudioClock {
     fn frame(&self, fps: i32) -> i32 {
         let fps = if fps > 0 { fps } else { self.fps.max(1) };
         let pos = self.pos.load(Ordering::Acquire);
-        let audio_frame = audio_position_frame(pos, self.rate, fps);
+        // What is audible, not what was handed to the device: video must
+        // not run ahead of the sound by the output latency. The playhead
+        // still never moves back when the delay grows (`last_frame`).
+        let audio_frame = audio_position_frame(self.audible_pos(pos), self.rate, fps);
         let now = (self.now)();
         let mut progress = self
             .progress
@@ -568,7 +665,10 @@ impl PlaybackClock for AudioClock {
                     progress.last_frame = progress.last_frame.max(audio_frame);
                     return progress.last_frame;
                 }
-                let target_pos = frame_audio_position(target_frame, self.rate, fps);
+                // Hand the device the samples that become audible at the
+                // target once the output delay has elapsed.
+                let target_pos = frame_audio_position(target_frame, self.rate, fps)
+                    .saturating_add(self.delay.load(Ordering::Acquire));
                 self.pos.store(target_pos, Ordering::Release);
                 if let Some(stream) = &self.stream {
                     // Windows already queued up to the target are skipped by
@@ -643,27 +743,67 @@ impl PlaybackClock for AudioClock {
 
     fn halt(&self) {
         if let Some(mute) = &self.mute {
-            mute.halt();
+            mute.0.halt();
         }
+    }
+
+    fn resumed(&self) {
+        if let Some(mute) = &self.mute {
+            mute.0.clear_halt();
+        }
+    }
+}
+
+const OUTPUT_MUTED: u8 = 1;
+const OUTPUT_HALTED: u8 = 2;
+
+/// The logical state of one output: muted (the callback plays silence) and
+/// halted (the render loop paused itself on a fatal failure). One atomic
+/// holds both, so a committing resume checks "not halted" and unmutes in one
+/// step: a failure can never slip between the check and the unmute.
+#[derive(Debug)]
+pub(crate) struct OutputState(AtomicU8);
+
+impl OutputState {
+    fn new(muted: bool) -> Self {
+        Self(AtomicU8::new(if muted { OUTPUT_MUTED } else { 0 }))
+    }
+
+    /// Whether the output plays silence.
+    pub(crate) fn is_muted(&self) -> bool {
+        self.0.load(Ordering::Acquire) & OUTPUT_MUTED != 0
+    }
+
+    fn mute(&self) {
+        self.0.fetch_or(OUTPUT_MUTED, Ordering::AcqRel);
+    }
+
+    /// Mute and hold the output muted across a concurrently committing
+    /// resume, until the render thread resumes again.
+    fn halt(&self) {
+        self.0
+            .fetch_or(OUTPUT_MUTED | OUTPUT_HALTED, Ordering::AcqRel);
+    }
+
+    /// The render thread resumed: a failure it reported before no longer
+    /// holds the output muted.
+    fn clear_halt(&self) {
+        self.0.fetch_and(!OUTPUT_HALTED, Ordering::AcqRel);
+    }
+
+    /// Unmute unless halted, atomically.
+    fn unmute_unless_halted(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & OUTPUT_HALTED == 0).then_some(state & !OUTPUT_MUTED)
+            });
     }
 }
 
 /// The logical mute of one output, as the render loop's clock sees it.
 #[derive(Clone)]
-struct OutputMute {
-    paused: Arc<AtomicBool>,
-    /// Set when the render loop paused itself on a fatal failure; keeps a
-    /// resume that is committing concurrently from unmuting. Cleared by the
-    /// next `prepare_resume`, which precedes the render thread's resume.
-    halted: Arc<AtomicBool>,
-}
-
-impl OutputMute {
-    fn halt(&self) {
-        self.halted.store(true, Ordering::Release);
-        self.paused.store(true, Ordering::Release);
-    }
-}
+struct OutputMute(Arc<OutputState>);
 
 /// A cloneable transport endpoint of one audio output thread. `pause` and
 /// `mute` never wait; only `prepare_resume` blocks (for callback liveness or a
@@ -671,24 +811,19 @@ impl OutputMute {
 #[derive(Clone)]
 pub struct AudioControl {
     control_tx: Sender<AudioCmd>,
-    paused: Arc<AtomicBool>,
-    halted: Arc<AtomicBool>,
+    output: Arc<OutputState>,
 }
 
 impl AudioControl {
-    fn new(control_tx: Sender<AudioCmd>, paused: Arc<AtomicBool>) -> Self {
-        Self {
-            control_tx,
-            paused,
-            halted: Arc::new(AtomicBool::new(false)),
-        }
+    fn new(control_tx: Sender<AudioCmd>, output: Arc<OutputState>) -> Self {
+        Self { control_tx, output }
     }
 
     /// Mute output immediately. The hardware stream keeps running silently so
     /// a later resume can prove callback liveness without trusting an
     /// asynchronous backend play/pause acknowledgement.
     pub fn pause(&self) -> Result<(), String> {
-        self.paused.store(true, Ordering::Release);
+        self.output.mute();
         let (reply, _acknowledgement) = mpsc::channel();
         self.control_tx
             .send(AudioCmd::Pause(reply))
@@ -699,9 +834,13 @@ impl AudioControl {
     /// rebuilding the stream first when the default output device changed or
     /// the stream reported an error. The caller can then seek/resume the video
     /// clock before committing audible output.
+    ///
+    /// A halt from an earlier failure is not cleared here but by the render
+    /// thread when it processes this resume ([`PlaybackClock::resumed`]), so
+    /// a failure the previous run reports while this handshake blocks still
+    /// counts as old, and one the resumed run reports keeps the output muted.
     pub fn prepare_resume(&self) -> Result<(), String> {
-        self.paused.store(true, Ordering::Release);
-        self.halted.store(false, Ordering::Release);
+        self.output.mute();
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control_tx
             .send(AudioCmd::Resume(reply_tx))
@@ -713,23 +852,18 @@ impl AudioControl {
 
     /// Commit a successfully prepared resume after the render clock has been
     /// positioned. The already-running callback begins consuming at `pos` on
-    /// its next block. Stays muted when the render thread failed (and halted
-    /// the output) after `prepare_resume`.
+    /// its next block. Stays muted when the resumed render thread failed (and
+    /// halted the output); the check and the unmute are one atomic step.
     pub fn commit_resume(&self) {
-        if !self.halted.load(Ordering::Acquire) {
-            self.paused.store(false, Ordering::Release);
-        }
+        self.output.unmute_unless_halted();
     }
 
     fn output_mute(&self) -> OutputMute {
-        OutputMute {
-            paused: Arc::clone(&self.paused),
-            halted: Arc::clone(&self.halted),
-        }
+        OutputMute(Arc::clone(&self.output))
     }
 
     pub fn mute(&self) {
-        self.paused.store(true, Ordering::Release);
+        self.output.mute();
     }
 }
 
@@ -751,14 +885,16 @@ enum AudioCmd {
 
 /// Samples shared by successive output streams of one session: a stream
 /// rebuilt for a new default device continues from the same consumer state.
-type SharedSamples = Arc<Mutex<PlaybackSamples>>;
+type SharedSamples = Arc<Mutex<AudioStreamConsumer>>;
 
 /// What one output stream needs from the session.
 #[derive(Clone)]
 struct OutputShared {
     samples: SharedSamples,
     pos: Arc<AtomicU64>,
-    paused: Arc<AtomicBool>,
+    /// The output delay each callback publishes for [`AudioClock`].
+    delay: Arc<AtomicU64>,
+    output: Arc<OutputState>,
     callback_epoch: Arc<AtomicU64>,
     /// Set by the backend's error callback (device removed / invalidated).
     stream_error: Arc<AtomicBool>,
@@ -793,48 +929,25 @@ impl OutputBackend for CpalBackend {
 }
 
 impl AudioPlayback {
-    /// Start playing `buffer` (interleaved stereo, at the device rate) from `pos`.
-    /// Returns `Err` if the device/stream can't be set up (caller falls back to
-    /// the wall clock). Blocks until the stream is built so failures surface
-    /// synchronously.
-    fn start(
-        buffer: Arc<Vec<f32>>,
-        rate: u32,
-        pos: Arc<AtomicU64>,
-        paused: Arc<AtomicBool>,
-    ) -> Result<Self, String> {
-        let (control_tx, handle) = spawn_output(
-            || CpalBackend,
-            PlaybackSamples::Buffered(buffer),
-            rate,
-            pos,
-            &paused,
-        )?;
-        Ok(AudioPlayback {
-            control: AudioControl::new(control_tx, paused),
-            handle: Some(handle),
-            stream_control: None,
-            stream_producer: None,
-        })
-    }
-
+    /// Play the prepared window stream through the default output device.
+    /// Returns `Err` if the device/stream can't be set up (the caller falls
+    /// back to the wall clock). Blocks until the stream is live so failures
+    /// surface synchronously.
     fn start_stream(
-        consumer: AudioStreamConsumer,
-        stream_control: Arc<AudioStreamControl>,
-        stream_producer: JoinHandle<()>,
+        prepared: PreparedTimelineAudio,
         rate: u32,
         pos: Arc<AtomicU64>,
-        paused: Arc<AtomicBool>,
+        delay: Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        match spawn_output(
-            || CpalBackend,
-            PlaybackSamples::Streaming(consumer),
-            rate,
-            pos,
-            &paused,
-        ) {
+        let PreparedTimelineAudio {
+            consumer,
+            control: stream_control,
+            producer: stream_producer,
+        } = prepared;
+        let output = Arc::clone(&stream_control.output);
+        match spawn_output(|| CpalBackend, consumer, rate, pos, delay, &output) {
             Ok((control_tx, handle)) => Ok(Self {
-                control: AudioControl::new(control_tx, paused),
+                control: AudioControl::new(control_tx, output),
                 handle: Some(handle),
                 stream_control: Some(stream_control),
                 stream_producer: Some(stream_producer),
@@ -915,11 +1028,11 @@ impl AudioPlayback {
     #[cfg(test)]
     fn from_test_thread(
         control_tx: Sender<AudioCmd>,
-        paused: &Arc<AtomicBool>,
+        output: &Arc<OutputState>,
         handle: JoinHandle<()>,
     ) -> Self {
         Self {
-            control: AudioControl::new(control_tx, Arc::clone(paused)),
+            control: AudioControl::new(control_tx, Arc::clone(output)),
             handle: Some(handle),
             stream_control: None,
             stream_producer: None,
@@ -927,10 +1040,10 @@ impl AudioPlayback {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_stub() -> (Self, Arc<AtomicBool>, Receiver<()>) {
+    pub(crate) fn test_stub() -> (Self, Arc<OutputState>, Receiver<()>) {
         let (control_tx, control_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(OutputState::new(false));
         let handle = thread::spawn(move || {
             while let Ok(command) = control_rx.recv() {
                 match command {
@@ -952,9 +1065,9 @@ impl AudioPlayback {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_failing_resume() -> (Self, Arc<AtomicBool>) {
+    pub(crate) fn test_failing_resume() -> (Self, Arc<OutputState>) {
         let (control_tx, control_rx) = mpsc::channel();
-        let paused = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(OutputState::new(true));
         let handle = thread::spawn(move || {
             while let Ok(command) = control_rx.recv() {
                 match command {
@@ -974,11 +1087,11 @@ impl AudioPlayback {
     /// An output thread whose resume liveness check blocks until released (a
     /// Bluetooth device that stopped calling back).
     #[cfg(test)]
-    pub(crate) fn test_blocking_resume() -> (Self, Arc<AtomicBool>, Receiver<()>, Sender<()>) {
+    pub(crate) fn test_blocking_resume() -> (Self, Arc<OutputState>, Receiver<()>, Sender<()>) {
         let (control_tx, control_rx) = mpsc::channel();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let paused = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(OutputState::new(true));
         let handle = thread::spawn(move || {
             while let Ok(command) = control_rx.recv() {
                 match command {
@@ -1003,11 +1116,11 @@ impl AudioPlayback {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_blocking_stop() -> (Self, Arc<AtomicBool>, Receiver<()>, Sender<()>) {
+    pub(crate) fn test_blocking_stop() -> (Self, Arc<OutputState>, Receiver<()>, Sender<()>) {
         let (control_tx, control_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(OutputState::new(false));
         let handle = thread::spawn(move || {
             while let Ok(command) = control_rx.recv() {
                 match command {
@@ -1050,10 +1163,11 @@ impl Drop for AudioPlayback {
 /// live. `backend` is constructed on that thread (cpal handles may be `!Send`).
 fn spawn_output<B, F>(
     backend: F,
-    samples: PlaybackSamples,
+    samples: AudioStreamConsumer,
     rate: u32,
     pos: Arc<AtomicU64>,
-    paused: &Arc<AtomicBool>,
+    delay: Arc<AtomicU64>,
+    output: &Arc<OutputState>,
 ) -> Result<(Sender<AudioCmd>, JoinHandle<()>), String>
 where
     B: OutputBackend,
@@ -1064,7 +1178,8 @@ where
     let shared = OutputShared {
         samples: Arc::new(Mutex::new(samples)),
         pos,
-        paused: Arc::clone(paused),
+        delay,
+        output: Arc::clone(output),
         callback_epoch: Arc::new(AtomicU64::new(0)),
         stream_error: Arc::new(AtomicBool::new(false)),
         rate,
@@ -1107,7 +1222,7 @@ fn audio_thread<B: OutputBackend>(
     while let Ok(command) = control_rx.recv() {
         match command {
             AudioCmd::Pause(reply) => {
-                // Logical pause is established by `paused=true` before this
+                // Logical pause is established by muting the output before this
                 // message. Keep the hardware stream running muted so a later
                 // resume can prove current callback liveness without trusting
                 // an asynchronous backend play ack.
@@ -1253,7 +1368,7 @@ fn write_frame<T: cpal::Sample + FromSample<f32>>(frame: &mut [T], left: f32, ri
 
 /// Build an output stream whose callback maps the interleaved stereo mix to the
 /// device channels and advances `pos` by the frames written — the lock-free
-/// master-clock tick.
+/// master-clock tick — and publishes the output delay to subtract from it.
 fn out_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1263,10 +1378,12 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let channels = (config.channels as usize).max(1);
+    let device_rate = config.sample_rate.0;
     let OutputShared {
         samples,
         pos,
-        paused,
+        delay,
+        output,
         callback_epoch,
         stream_error,
         rate: _,
@@ -1280,67 +1397,25 @@ where
     device
         .build_output_stream(
             config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
                 callback_epoch.fetch_add(1, Ordering::Release);
+                let latency = output_latency_frames(info.timestamp(), device_rate);
                 // Only one stream of a session is ever alive (a rebuild drops
                 // the old one first), so this lock is uncontended; never wait.
                 let mut samples = match samples.try_lock() {
                     Ok(samples) => samples,
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
-                        for sample in data.iter_mut() {
-                            *sample = T::from_sample(0.0f32);
-                        }
+                        silence(data);
+                        delay.store(latency, Ordering::Release);
                         return;
                     }
                 };
-                let samples = &mut *samples;
-                let out_frames = data.len() / channels;
-                // Atomically claim this block's start frame and advance the master
-                // clock. A concurrent `seek` (store) is honored on the next
-                // callback; within a block we play from the claimed start.
-                if paused.load(Ordering::Acquire) {
-                    if let PlaybackSamples::Streaming(consumer) = samples {
-                        consumer.discard_stale();
-                    }
-                    for sample in data.iter_mut() {
-                        *sample = T::from_sample(0.0f32);
-                    }
-                    return;
-                }
-                let mut written = 0;
-                while written < out_frames {
-                    let Some((start, count)) =
-                        claim_ready_audio_block(samples, &pos, out_frames - written)
-                    else {
-                        for sample in &mut data[written * channels..] {
-                            *sample = T::from_sample(0.0f32);
-                        }
-                        return;
-                    };
-                    for (i, frame) in data[written * channels..(written + count) * channels]
-                        .chunks_mut(channels)
-                        .enumerate()
-                    {
-                        let audio_frame = start.saturating_add(i as u64);
-                        let (left, right) = match &mut *samples {
-                            PlaybackSamples::Buffered(buffer) => {
-                                let base = usize::try_from(audio_frame)
-                                    .ok()
-                                    .and_then(|frame| frame.checked_mul(MIX_CHANNELS));
-                                match base.filter(|base| base + 1 < buffer.len()) {
-                                    Some(base) => (buffer[base], buffer[base + 1]),
-                                    None => (0.0, 0.0),
-                                }
-                            }
-                            PlaybackSamples::Streaming(consumer) => {
-                                consumer.sample_frame(audio_frame)
-                            }
-                        };
-                        write_frame(frame, left, right);
-                    }
-                    written += count;
-                }
+                let written = fill_output_block(&mut samples, &pos, &output, data, channels);
+                // At this instant the first frame just written becomes audible
+                // after `latency`, so the audible frame is `pos` minus what was
+                // written and the latency.
+                delay.store((written as u64).saturating_add(latency), Ordering::Release);
             },
             err_fn,
             None,
@@ -1348,32 +1423,88 @@ where
         .map_err(|e| format!("build output stream: {e}"))
 }
 
+/// Output frames between the start of a callback's block and its playback,
+/// from the callback's timestamps; zero when the backend reports none.
+fn output_latency_frames(timestamp: cpal::OutputStreamTimestamp, rate: u32) -> u64 {
+    latency_frames(timestamp.playback.duration_since(&timestamp.callback), rate)
+}
+
+fn latency_frames(latency: Option<Duration>, rate: u32) -> u64 {
+    latency.map_or(0, |latency| {
+        (latency.as_secs_f64() * f64::from(rate)) as u64
+    })
+}
+
+fn silence<T: SizedSample + FromSample<f32>>(data: &mut [T]) {
+    for sample in data.iter_mut() {
+        *sample = T::from_sample(0.0f32);
+    }
+}
+
+/// One callback's work, independent of the device sample type: play the
+/// consumer's windows from `pos` into `data` (silence while muted or on
+/// underrun) and return the output frames the clock advanced by.
+fn fill_output_block<T: SizedSample + FromSample<f32>>(
+    consumer: &mut AudioStreamConsumer,
+    pos: &AtomicU64,
+    output: &OutputState,
+    data: &mut [T],
+    channels: usize,
+) -> usize {
+    let out_frames = data.len() / channels;
+    if output.is_muted() {
+        consumer.discard_stale();
+        silence(data);
+        return 0;
+    }
+    // Atomically claim this block's start frame and advance the master clock.
+    // A concurrent `seek` (store) is honored on the next callback; within a
+    // block we play from the claimed start.
+    let mut written = 0;
+    while written < out_frames {
+        let Some((start, count)) = claim_ready_audio_block(consumer, pos, out_frames - written)
+        else {
+            silence(&mut data[written * channels..]);
+            return written;
+        };
+        for (i, frame) in data[written * channels..(written + count) * channels]
+            .chunks_mut(channels)
+            .enumerate()
+        {
+            let (left, right) = consumer.sample_frame(start.saturating_add(i as u64));
+            write_frame(frame, left, right);
+        }
+        written += count;
+    }
+    written
+}
+
 /// Keep the audio master clock at the first undecoded sample. Once the next
 /// window arrives, playback resumes at that exact sample rather than dropping
 /// the start of a clip while the callback is emitting silence.
 fn claim_ready_audio_block(
-    samples: &mut PlaybackSamples,
+    consumer: &mut AudioStreamConsumer,
     pos: &AtomicU64,
     out_frames: usize,
 ) -> Option<(u64, usize)> {
-    let mut count = out_frames;
-    if let PlaybackSamples::Streaming(consumer) = samples {
-        let start = pos.load(Ordering::Acquire);
-        if !consumer.ready_at(start) {
-            if !consumer.terminated {
-                consumer.control.underruns.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            // A failed or finished producer can never fill the gap. Keep the
-            // clock moving over silence instead of freezing playback.
-            return Some((pos.fetch_add(count as u64, Ordering::AcqRel), count));
+    let start = pos.load(Ordering::Acquire);
+    if !consumer.ready_at(start) {
+        if !consumer.terminated {
+            consumer.control.underruns.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
-        let chunk = consumer.current.as_ref().expect("ready chunk");
-        let end = chunk
-            .start_frame
-            .saturating_add((chunk.samples.len() / MIX_CHANNELS) as u64);
-        count = count.min((end - start) as usize);
+        // A failed or finished producer can never fill the gap. Keep the
+        // clock moving over silence instead of freezing playback.
+        return Some((
+            pos.fetch_add(out_frames as u64, Ordering::AcqRel),
+            out_frames,
+        ));
     }
+    let chunk = consumer.current.as_ref().expect("ready chunk");
+    let end = chunk
+        .start_frame
+        .saturating_add((chunk.samples.len() / MIX_CHANNELS) as u64);
+    let count = out_frames.min((end - start) as usize);
     Some((pos.fetch_add(count as u64, Ordering::AcqRel), count))
 }
 
@@ -1397,21 +1528,39 @@ fn on_audio_device_thread<T: Send + 'static>(
                 .map(|_| job_tx)
         })
         .as_ref()?;
-    submit_device_query(worker, query)
+    submit_device_query(worker, DEVICE_QUERY_TIMEOUT, query)
 }
 
+/// Run `query` on the device thread behind `worker`, waiting at most
+/// `timeout` for the thread to take it and answer. A timeout answers `None`
+/// ("unknown"): a resume then keeps its stream (the device did not change)
+/// and a rate probe uses the fallback rate. A late answer is discarded.
 fn submit_device_query<T: Send + 'static>(
     worker: &SyncSender<DeviceJob>,
+    timeout: Duration,
     query: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> Option<T> {
+    let deadline = Instant::now() + timeout;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    worker
-        .send(Box::new(move || {
-            let result = catch_unwind(AssertUnwindSafe(query)).unwrap_or(None);
-            let _ = reply_tx.send(result);
-        }))
-        .ok()?;
-    reply_rx.recv().ok().flatten()
+    let mut job: DeviceJob = Box::new(move || {
+        let result = catch_unwind(AssertUnwindSafe(query)).unwrap_or(None);
+        let _ = reply_tx.try_send(result);
+    });
+    // The queue holds one job; a hung query keeps it full.
+    loop {
+        match worker.try_send(job) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                job = returned;
+                thread::sleep(CALLBACK_POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+    reply_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .flatten()
 }
 
 fn run_device_jobs(job_rx: Receiver<DeviceJob>) {
@@ -1433,203 +1582,6 @@ fn query_default_output_rate() -> Option<u32> {
     let device = host.default_output_device()?;
     let config = device.default_output_config().ok()?;
     Some(config.sample_rate().0)
-}
-
-/// One clip's decoded audio, placed on the output timeline as interleaved stereo
-/// at the device rate, with its per-output-frame `volume_at` gain envelope.
-struct StereoClip {
-    /// Output audio-frame offset on the timeline (sample index = ×2).
-    start_frame: usize,
-    /// Interleaved stereo samples (length = 2 × frames).
-    interleaved: Vec<f32>,
-    /// Per-output-frame gain (length = frames; empty = unity throughout).
-    gains: Vec<f32>,
-    /// User true-peak ceiling. The mixer keeps the same codec reconstruction
-    /// safety margin as export so native preview does not audition hotter peaks.
-    true_peak_ceiling_dbtp: Option<f64>,
-}
-
-/// Decode one clip's visible audio window into a placed [`StereoClip`] at `rate`
-/// (interleaved stereo). `None` when the clip contributes no audio.
-fn project_clip_audio_stereo(
-    clip: &Clip,
-    media: &HashMap<String, MediaInfo>,
-    timeline_fps: i32,
-    rate: u32,
-    cancel: &MediaCancelToken,
-) -> Result<Option<StereoClip>, MediaError> {
-    if clip.duration_frames <= 0 || timeline_fps <= 0 || rate == 0 {
-        return Ok(None);
-    }
-    let Some(info) = media.get(&clip.media_ref) else {
-        return Ok(None);
-    };
-    let Some((lo, hi)) = clip_source_window_secs(clip, timeline_fps) else {
-        return Ok(None);
-    };
-
-    let spec = PcmSpec {
-        sample_rate: rate,
-        channels: MIX_CHANNELS as u16,
-        format: PcmFormat::F32,
-    };
-    let interleaved =
-        decode_pcm_interleaved_cancellable(&info.path, &spec, Some((lo, hi)), cancel)?;
-    let interleaved =
-        apply_preview_denoise(&interleaved, MIX_CHANNELS, rate, clip.audio_denoise, cancel)?;
-    let frames = interleaved.len() / MIX_CHANNELS;
-    if frames == 0 {
-        return Ok(None);
-    }
-
-    let start_frame =
-        ((clip.start_frame.max(0) as f64) / timeline_fps as f64 * rate as f64).round() as usize;
-    let frames_per_tl_frame = rate as f64 / timeline_fps as f64;
-    let mut gains = Vec::new();
-    gains
-        .try_reserve_exact(frames)
-        .map_err(|error| audio_allocation_failed(format!("gain reserve {frames}: {error}")))?;
-    let mut all_unity = true;
-    for k in 0..frames {
-        let tl_frame = clip.start_frame + (k as f64 / frames_per_tl_frame).floor() as i32;
-        let g = clip.volume_at(tl_frame) as f32;
-        if (g - 1.0).abs() > f32::EPSILON {
-            all_unity = false;
-        }
-        gains.push(g);
-    }
-
-    Ok(Some(StereoClip {
-        start_frame,
-        interleaved,
-        gains: if all_unity { Vec::new() } else { gains },
-        true_peak_ceiling_dbtp: clip
-            .loudness_normalization
-            .map(|normalization| normalization.true_peak_ceiling_dbtp),
-    }))
-}
-
-fn apply_preview_denoise(
-    samples: &[f32],
-    channels: usize,
-    sample_rate: u32,
-    config: Option<AudioDenoise>,
-    cancel: &MediaCancelToken,
-) -> Result<Vec<f32>, MediaError> {
-    let Some(config) = config.filter(|config| config.preview_enabled) else {
-        return Ok(samples.to_vec());
-    };
-    opentake_media::analysis::denoise_interleaved(
-        samples,
-        channels,
-        sample_rate,
-        config,
-        cancel,
-        None,
-    )
-    .map_err(|error| match error {
-        opentake_media::analysis::DenoiseError::Cancelled => MediaError::Cancelled,
-        other => MediaError::Decode(other.to_string()),
-    })
-}
-
-/// Visit a placed stereo mix in bounded windows. Only one `window_frames`
-/// scratch buffer is live at a time regardless of the total timeline extent.
-fn mix_stereo_windows(
-    clips: &[StereoClip],
-    window_frames: usize,
-    cancel: &MediaCancelToken,
-    mut emit: impl FnMut(usize, &[f32]) -> Result<(), MediaError>,
-) -> Result<(), MediaError> {
-    if window_frames == 0 {
-        return Err(MediaError::Decode(
-            "audio mix window must contain at least one frame".to_string(),
-        ));
-    }
-    let true_peak_ceiling_dbtp = clips
-        .iter()
-        .filter_map(|clip| clip.true_peak_ceiling_dbtp)
-        .min_by(f64::total_cmp);
-    let total_frames = clips
-        .iter()
-        .map(|c| {
-            c.start_frame
-                .checked_add(c.interleaved.len() / MIX_CHANNELS)
-                .ok_or_else(|| audio_buffer_too_large("mix frame extent overflow"))
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-    for window_start in (0..total_frames).step_by(window_frames) {
-        if cancel.checkpoint() {
-            return Err(MediaError::Cancelled);
-        }
-        let window_end = window_start.saturating_add(window_frames).min(total_frames);
-        let window_samples = window_end
-            .saturating_sub(window_start)
-            .checked_mul(MIX_CHANNELS)
-            .ok_or_else(|| audio_buffer_too_large("mix window sample count overflow"))?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(window_samples).map_err(|error| {
-            audio_allocation_failed(format!("mix window reserve {window_samples}: {error}"))
-        })?;
-        out.resize(window_samples, 0.0);
-        for clip in clips {
-            let clip_frames = clip.interleaved.len() / MIX_CHANNELS;
-            let clip_end = clip.start_frame.saturating_add(clip_frames);
-            let overlap_start = window_start.max(clip.start_frame);
-            let overlap_end = window_end.min(clip_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            for chunk_start in (overlap_start..overlap_end).step_by(MIX_CANCEL_CHUNK_FRAMES) {
-                if cancel.checkpoint() {
-                    return Err(MediaError::Cancelled);
-                }
-                let chunk_end = chunk_start
-                    .saturating_add(MIX_CANCEL_CHUNK_FRAMES)
-                    .min(overlap_end);
-                for timeline_frame in chunk_start..chunk_end {
-                    let clip_frame = timeline_frame - clip.start_frame;
-                    let gain = if clip.gains.is_empty() {
-                        1.0
-                    } else {
-                        clip.gains[clip_frame]
-                    };
-                    let output = (timeline_frame - window_start) * MIX_CHANNELS;
-                    let input = clip_frame * MIX_CHANNELS;
-                    out[output] += clip.interleaved[input] * gain;
-                    out[output + 1] += clip.interleaved[input + 1] * gain;
-                }
-            }
-        }
-        for value in &mut out {
-            *value = value.clamp(-1.0, 1.0);
-        }
-        apply_true_peak_ceiling(&mut out, true_peak_ceiling_dbtp);
-        emit(window_start, &out)?;
-    }
-    Ok(())
-}
-
-/// Sum placed stereo clips into one interleaved buffer, applying per-frame gains
-/// and hard-limiting to [-1, 1] (mirrors the export mixdown, per channel).
-fn mix_stereo(clips: &[StereoClip], cancel: &MediaCancelToken) -> Result<Vec<f32>, MediaError> {
-    let mut out = Vec::new();
-    mix_stereo_windows(
-        clips,
-        MIX_CANCEL_CHUNK_FRAMES,
-        cancel,
-        |_start_frame, samples| {
-            out.try_reserve(samples.len()).map_err(|error| {
-                audio_allocation_failed(format!("mix output reserve {}: {error}", samples.len()))
-            })?;
-            out.extend_from_slice(samples);
-            Ok(())
-        },
-    )?;
-    Ok(out)
 }
 
 fn timeline_audio_frames(timeline: &Timeline, rate: u32) -> Result<u64, MediaError> {
@@ -1658,9 +1610,12 @@ struct PreviewAudioSources {
     profiles: ProfileScope,
 }
 
-/// An open clip reader, and the clip and source it reads.
+/// An open clip reader, and the flattened clip and source it reads.
 struct PreviewReader {
-    clip_id: String,
+    /// Index of the clip in the session's flattened audio clips. Leaves of a
+    /// nested sequence used by two compound clips share a clip id, so the
+    /// index, not the id, names the reader's clip.
+    clip: usize,
     path: PathBuf,
     layout: ClipAudioLayout,
     reader: ClipAudioReader,
@@ -1683,12 +1638,12 @@ impl PreviewAudioSources {
         Ok(audible)
     }
 
-    /// Take the open reader that continues `clip` at clip frame `from` with
-    /// the requested denoise, if there is one. Any other reader of the clip
-    /// (an old layout, or a denoise that changed) is closed.
+    /// Take the open reader that continues clip `clip` at clip frame `from`
+    /// with the requested denoise, if there is one. Any other reader of the
+    /// clip (an old layout, or a denoise that changed) is closed.
     fn take_reader(
         &mut self,
-        clip_id: &str,
+        clip: usize,
         path: &Path,
         layout: &ClipAudioLayout,
         from: usize,
@@ -1698,7 +1653,7 @@ impl PreviewAudioSources {
         let mut index = 0;
         while index < self.readers.len() {
             let open = &self.readers[index];
-            if open.clip_id != clip_id {
+            if open.clip != clip {
                 index += 1;
                 continue;
             }
@@ -1727,7 +1682,8 @@ impl PreviewAudioSources {
         });
     }
 
-    /// Close every open reader (after a seek or a failed window).
+    /// Close every open reader (after a seek, a failed window, or while the
+    /// session is paused).
     fn close_readers(&mut self) {
         self.readers.clear();
     }
@@ -1744,19 +1700,24 @@ enum ProfileWait {
     Block,
 }
 
-fn mix_timeline_window(
-    timeline: &Timeline,
-    media: &HashMap<String, MediaInfo>,
+/// What one playback session mixes: the render plan's audio clips (nested
+/// sequences flattened, muted tracks dropped) at the timeline's fps.
+struct PreviewMix<'a> {
+    clips: &'a [AudioClipPlan],
+    media: &'a HashMap<String, MediaInfo>,
+    fps: i32,
     rate: u32,
+}
+
+fn mix_timeline_window(
+    mix: &PreviewMix<'_>,
     window_start: u64,
     window_frames: usize,
     sources: &mut PreviewAudioSources,
     cancel: &MediaCancelToken,
 ) -> Result<Vec<f32>, MediaError> {
     mix_timeline_window_channels(
-        timeline,
-        media,
-        rate,
+        mix,
         MIX_CHANNELS,
         window_start,
         window_frames,
@@ -1772,12 +1733,9 @@ fn mix_timeline_window(
 /// window's samples do not depend on where playback started (#16). A clip
 /// that continues from the previous window keeps its reader, so consecutive
 /// windows read one continuous decode, as export does. `channels` is the
-/// preview's stereo except in the export-parity test.
-#[allow(clippy::too_many_arguments)]
+/// preview's stereo except in the export-parity tests.
 fn mix_timeline_window_channels(
-    timeline: &Timeline,
-    media: &HashMap<String, MediaInfo>,
-    rate: u32,
+    mix: &PreviewMix<'_>,
     channels: usize,
     window_start: u64,
     window_frames: usize,
@@ -1786,9 +1744,7 @@ fn mix_timeline_window_channels(
     cancel: &MediaCancelToken,
 ) -> Result<Vec<f32>, MediaError> {
     let result = mix_window_with_readers(
-        timeline,
-        media,
-        rate,
+        mix,
         channels,
         window_start,
         window_frames,
@@ -1803,11 +1759,8 @@ fn mix_timeline_window_channels(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn mix_window_with_readers(
-    timeline: &Timeline,
-    media: &HashMap<String, MediaInfo>,
-    rate: u32,
+    mix: &PreviewMix<'_>,
     channels: usize,
     window_start: u64,
     window_frames: usize,
@@ -1815,29 +1768,23 @@ fn mix_window_with_readers(
     profiles: ProfileWait,
     cancel: &MediaCancelToken,
 ) -> Result<Vec<f32>, MediaError> {
+    let PreviewMix {
+        clips,
+        media,
+        fps,
+        rate,
+    } = *mix;
     let sample_count = window_frames
         .checked_mul(channels)
         .ok_or_else(|| audio_buffer_too_large("streaming window sample count overflow"))?;
     let mut mixed = vec![0.0_f32; sample_count];
     let window_end = window_start.saturating_add(window_frames as u64);
-    let audible_clips = || {
-        timeline
-            .tracks
-            .iter()
-            .filter(|track| !track.muted)
-            .flat_map(|track| &track.clips)
-            .filter(|clip| {
-                matches!(clip.media_type, ClipType::Audio | ClipType::Video)
-                    && clip.duration_frames > 0
-            })
-    };
-    // Like export, the strictest ceiling of any clip applies to the whole
-    // timeline, so it cannot change with the window alignment.
-    let true_peak_ceiling_dbtp = audible_clips()
-        .filter_map(|clip| {
-            clip.loudness_normalization
-                .map(|normalization| normalization.true_peak_ceiling_dbtp)
-        })
+    // Like export, the strictest ceiling of any clip (or of a compound clip
+    // around it) applies to the whole timeline, so it cannot change with the
+    // window alignment.
+    let true_peak_ceiling_dbtp = clips
+        .iter()
+        .filter_map(AudioPlanLike::true_peak_ceiling_dbtp)
         .min_by(f64::total_cmp);
     let mut samples = Vec::new();
     // Readers this window leaves mid-clip; they replace `sources.readers` at
@@ -1847,14 +1794,18 @@ fn mix_window_with_readers(
     // reader of a clip beyond the cap, closed right after it is read.
     let mut continuing = Vec::new();
     sources.close_readers_outside(window_start, window_end);
-    for clip in audible_clips() {
+    for (index, plan) in clips.iter().enumerate() {
         if cancel.checkpoint() {
             return Err(MediaError::Cancelled);
+        }
+        let clip = plan.clip();
+        if clip.duration_frames <= 0 {
+            continue;
         }
         let Some(info) = media.get(&clip.media_ref) else {
             continue;
         };
-        let Some(layout) = ClipAudioLayout::new(clip, timeline.fps, rate) else {
+        let Some(layout) = ClipAudioLayout::new(clip, fps, rate) else {
             continue;
         };
         let (clip_start, clip_end) = layout.span();
@@ -1863,7 +1814,7 @@ fn mix_window_with_readers(
         if overlap_start >= overlap_end || !sources.has_audio(&info.path, cancel)? {
             continue;
         }
-        let config = clip.audio_denoise.filter(|config| config.preview_enabled);
+        let config = plan.audio_denoise().filter(|config| config.preview_enabled);
         let denoise = match profiles {
             ProfileWait::Background => {
                 match crate::clip_audio::preview_clip_denoise(
@@ -1885,7 +1836,7 @@ fn mix_window_with_readers(
         };
         let from = layout.offset_of(overlap_start);
         let (mut reader, keep) =
-            match sources.take_reader(&clip.id, &info.path, &layout, from, denoise.is_some()) {
+            match sources.take_reader(index, &info.path, &layout, from, denoise.is_some()) {
                 Some(reader) => (reader, true),
                 None => {
                     let keep = keep_clip_reader(sources.readers.len() + continuing.len());
@@ -1899,7 +1850,7 @@ fn mix_window_with_readers(
         reader.read(frames, &mut samples)?;
         if overlap_end < clip_end && keep {
             continuing.push(PreviewReader {
-                clip_id: clip.id.clone(),
+                clip: index,
                 path: info.path.clone(),
                 layout,
                 reader,
@@ -1909,12 +1860,10 @@ fn mix_window_with_readers(
         }
         let output_start = (overlap_start - window_start) as usize;
         for frame in 0..frames {
-            let timeline_frame = crate::clip_audio::timeline_frame_at(
-                overlap_start + frame as u64,
-                timeline.fps,
-                rate,
-            );
-            let gain = clip.volume_at(timeline_frame) as f32;
+            let timeline_frame =
+                crate::clip_audio::timeline_frame_at(overlap_start + frame as u64, fps, rate);
+            // Compound clips multiply their volume into their leaves' gain.
+            let gain = plan.volume_at(timeline_frame) as f32;
             let output = (output_start + frame) * channels;
             for channel in 0..channels {
                 mixed[output + channel] += samples[frame * channels + channel] * gain;
@@ -1936,13 +1885,43 @@ struct PreparedTimelineAudio {
     producer: JoinHandle<()>,
 }
 
+/// The producer's view of a session's mix.
+trait WindowMixer {
+    /// Mix output frames `[start, start + len)`.
+    fn mix(
+        &mut self,
+        start: u64,
+        len: usize,
+        cancel: &MediaCancelToken,
+    ) -> Result<Vec<f32>, MediaError>;
+
+    /// Close every open clip reader; the next window reopens what it needs.
+    fn close_readers(&mut self);
+}
+
+/// Free the window buffers the callback handed back.
+fn drain_recycled(recycle: &ChunkReceiver<Vec<f32>>) {
+    while let Ok(buffer) = recycle.try_recv() {
+        drop(buffer);
+    }
+}
+
+/// Queue `chunk`, waiting while the queue is full. Returns `false` when the
+/// producer stopped or a newer generation made the chunk stale. While it
+/// waits the producer frees recycled buffers, and a muted (paused) session
+/// closes its clip readers: nothing is consumed until the session resumes,
+/// so up to [`MAX_OPEN_CLIP_READERS`](crate::clip_audio::MAX_OPEN_CLIP_READERS)
+/// FFmpeg processes would otherwise stay open for as long as it is paused.
 fn send_stream_chunk(
-    sender: &ChunkSender<Result<AudioStreamChunk, MediaError>>,
-    mut chunk: Result<AudioStreamChunk, MediaError>,
+    sender: &ChunkSender<AudioStreamChunk>,
+    recycle: &ChunkReceiver<Vec<f32>>,
+    mut chunk: AudioStreamChunk,
     control: &AudioStreamControl,
-    generation: u64,
+    mixer: &mut impl WindowMixer,
 ) -> bool {
+    let generation = chunk.generation;
     loop {
+        drain_recycled(recycle);
         if control.stopped.load(Ordering::Acquire)
             || control.generation.load(Ordering::Acquire) != generation
         {
@@ -1952,6 +1931,9 @@ fn send_stream_chunk(
             Ok(()) => return true,
             Err(crossbeam_channel::TrySendError::Full(returned)) => {
                 chunk = returned;
+                if control.output.is_muted() {
+                    mixer.close_readers();
+                }
                 thread::sleep(STREAM_SEND_POLL);
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
@@ -1973,11 +1955,17 @@ struct ProducerWindows {
 /// A window that fails to decode is reported once per generation and played
 /// as silence, so one broken clip neither stops the producer (silencing the
 /// rest of the session) nor freezes the audio master clock.
+///
+/// `first_window` is the token the prefilled first window was read with: the
+/// readers it left open continue into the next windows, so it is this
+/// generation's token and a seek or stop cancels it like any other.
 fn run_audio_producer(
     control: &AudioStreamControl,
-    sender: &ChunkSender<Result<AudioStreamChunk, MediaError>>,
+    sender: &ChunkSender<AudioStreamChunk>,
+    recycle: &ChunkReceiver<Vec<f32>>,
     windows: ProducerWindows,
-    mut mix_window: impl FnMut(u64, usize, &MediaCancelToken) -> Result<Vec<f32>, MediaError>,
+    mut mixer: impl WindowMixer,
+    first_window: MediaCancelToken,
 ) {
     let ProducerWindows {
         rate,
@@ -1986,8 +1974,9 @@ fn run_audio_producer(
         window_frames,
     } = windows;
     let mut generation = 0_u64;
-    let mut window_cancel = MediaCancelToken::new();
+    let mut window_cancel = first_window;
     loop {
+        drain_recycled(recycle);
         if control.stopped.load(Ordering::Acquire) {
             break;
         }
@@ -1997,6 +1986,9 @@ fn run_audio_producer(
             next_frame = control.requested_start.load(Ordering::Acquire);
         }
         if next_frame >= total_frames {
+            if control.output.is_muted() {
+                mixer.close_readers();
+            }
             thread::sleep(STREAM_SEND_POLL);
             continue;
         }
@@ -2019,7 +2011,7 @@ fn run_audio_producer(
                 .take();
             continue;
         }
-        let result = mix_window(next_frame, len, &window_cancel);
+        let result = mixer.mix(next_frame, len, &window_cancel);
         control
             .active_decode
             .lock()
@@ -2032,54 +2024,94 @@ fn run_audio_producer(
             Ok(samples) => samples,
             Err(MediaError::Cancelled) => continue,
             Err(error) => {
-                control.record_error(format!(
-                    "audio at {:.1} s could not be decoded and plays as silence: {error}",
-                    next_frame as f64 / rate.max(1) as f64
-                ));
+                control.record_error(
+                    generation,
+                    format!(
+                        "audio at {:.1} s could not be decoded and plays as silence: {error}",
+                        next_frame as f64 / rate.max(1) as f64
+                    ),
+                );
                 vec![0.0; len * MIX_CHANNELS]
             }
         };
-        if send_stream_chunk(
-            sender,
-            Ok(AudioStreamChunk {
-                generation,
-                start_frame: next_frame,
-                samples,
-            }),
-            control,
+        let chunk = AudioStreamChunk {
             generation,
-        ) {
+            start_frame: next_frame,
+            samples,
+        };
+        if send_stream_chunk(sender, recycle, chunk, control, &mut mixer) {
             next_frame = next_frame.saturating_add(len as u64);
             control.mark_buffered(generation, next_frame);
         }
     }
 }
 
+/// The production [`WindowMixer`]: the session's flattened clips, read
+/// through its preview sources.
+struct TimelineMixer {
+    clips: Vec<AudioClipPlan>,
+    media: HashMap<String, MediaInfo>,
+    fps: i32,
+    rate: u32,
+    sources: PreviewAudioSources,
+}
+
+impl WindowMixer for TimelineMixer {
+    fn mix(
+        &mut self,
+        start: u64,
+        len: usize,
+        cancel: &MediaCancelToken,
+    ) -> Result<Vec<f32>, MediaError> {
+        let mix = PreviewMix {
+            clips: &self.clips,
+            media: &self.media,
+            fps: self.fps,
+            rate: self.rate,
+        };
+        mix_timeline_window(&mix, start, len, &mut self.sources, cancel).map_err(
+            |error| match error {
+                MediaError::Cancelled => MediaError::Cancelled,
+                error => MediaError::Decode(super::project::redact_media_paths(
+                    &self.media,
+                    &error.to_string(),
+                )),
+            },
+        )
+    }
+
+    fn close_readers(&mut self) {
+        self.sources.close_readers();
+    }
+}
+
 /// Prepare bounded timeline-audio scheduling at `rate`. The initial window is
 /// mixed synchronously so decode failures surface before playback ownership is
 /// published; all subsequent windows are produced on one bounded worker.
+///
+/// The mix covers the render plan's flattened audio clips, so sound inside a
+/// compound clip plays as it exports (#33). The first window is read with
+/// `first_window`, which the producer adopts for the readers that window
+/// leaves open: pass a token the session's prepare cancellation reaches (a
+/// child of it); a seek or stop then cancels it too. `output` is the
+/// session's output state, which starts muted for a prepared session.
 fn mix_timeline_stereo(
     timeline: &Timeline,
     media: &HashMap<String, MediaInfo>,
     rate: u32,
     start_frame: u64,
     profiles: &ProfileScope,
-    cancel: &MediaCancelToken,
+    output: Arc<OutputState>,
+    first_window: &MediaCancelToken,
 ) -> Result<Option<PreparedTimelineAudio>, MediaError> {
     if timeline.fps <= 0 || rate == 0 {
         return Ok(None);
     }
-    let has_candidates = timeline
-        .tracks
-        .iter()
-        .filter(|track| !track.muted)
-        .any(|track| {
-            track.clips.iter().any(|clip| {
-                matches!(clip.media_type, ClipType::Audio | ClipType::Video)
-                    && clip.duration_frames > 0
-                    && media.contains_key(&clip.media_ref)
-            })
-        });
+    let clips = try_collect_audio_clips(timeline).map_err(MediaError::Decode)?;
+    let has_candidates = clips.iter().any(|plan| {
+        let clip = plan.clip();
+        clip.duration_frames > 0 && media.contains_key(&clip.media_ref)
+    });
     if !has_candidates {
         return Ok(None);
     }
@@ -2092,68 +2124,60 @@ fn mix_timeline_stereo(
         .ok_or_else(|| audio_buffer_too_large("streaming window frame overflow"))?;
     let first_len = (total_frames - start_frame).min(window_frames as u64) as usize;
     let mut sources = PreviewAudioSources::new(profiles.clone());
-    let first_samples = mix_timeline_window(
-        timeline,
+    let mix = PreviewMix {
+        clips: &clips,
         media,
+        fps: timeline.fps,
         rate,
-        start_frame,
-        first_len,
-        &mut sources,
-        cancel,
-    )?;
+    };
+    let first_samples =
+        mix_timeline_window(&mix, start_frame, first_len, &mut sources, first_window)?;
     let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+    let (recycle_sender, recycle) = bounded(RECYCLE_CAPACITY);
     sender
-        .send(Ok(AudioStreamChunk {
+        .send(AudioStreamChunk {
             generation: 0,
             start_frame,
             samples: first_samples,
-        }))
+        })
         .map_err(|_| MediaError::Decode("audio stream queue closed during prefill".to_string()))?;
-    let control = Arc::new(AudioStreamControl::new(start_frame));
+    let control = Arc::new(AudioStreamControl::with_output(start_frame, output));
     control.mark_buffered(0, start_frame.saturating_add(first_len as u64));
+    // Until the producer registers its own window token, a seek or stop
+    // cancels the first window's readers through this one.
+    *control
+        .active_decode
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(first_window.clone());
     let producer_control = Arc::clone(&control);
-    let producer_timeline = timeline.clone();
-    let producer_media = media.clone();
+    let mixer = TimelineMixer {
+        clips,
+        media: media.clone(),
+        fps: timeline.fps,
+        rate,
+        sources,
+    };
+    let first_window = first_window.clone();
     let producer = thread::Builder::new()
         .name("opentake-audio-fill".to_string())
         .spawn(move || {
             run_audio_producer(
                 &producer_control,
                 &sender,
+                &recycle,
                 ProducerWindows {
                     rate,
                     next_frame: start_frame.saturating_add(first_len as u64),
                     total_frames,
                     window_frames,
                 },
-                |start, len, cancel| {
-                    mix_timeline_window(
-                        &producer_timeline,
-                        &producer_media,
-                        rate,
-                        start,
-                        len,
-                        &mut sources,
-                        cancel,
-                    )
-                    .map_err(|error| match error {
-                        MediaError::Cancelled => MediaError::Cancelled,
-                        error => MediaError::Decode(super::project::redact_media_paths(
-                            &producer_media,
-                            &error.to_string(),
-                        )),
-                    })
-                },
+                mixer,
+                first_window,
             )
         })
         .map_err(|error| MediaError::Decode(format!("spawn audio fill worker: {error}")))?;
     Ok(Some(PreparedTimelineAudio {
-        consumer: AudioStreamConsumer {
-            receiver,
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        },
+        consumer: AudioStreamConsumer::new(receiver, recycle_sender, Arc::clone(&control)),
         control,
         producer,
     }))
@@ -2220,62 +2244,53 @@ fn build_clock_with_state(
     let rate = default_output_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     let start_audio_frame =
         ((start_frame.max(0) as f64 / fps.max(1) as f64) * rate as f64).round() as u64;
-    let Some(prepared) =
-        mix_timeline_stereo(timeline, media, rate, start_audio_frame, profiles, cancel)?
+    let output = Arc::new(OutputState::new(start_paused));
+    // The prepare token reaches the first window's readers through this child,
+    // which the session's seeks and stop cancel afterwards.
+    let first_window = cancel.child();
+    let Some(prepared) = mix_timeline_stereo(
+        timeline,
+        media,
+        rate,
+        start_audio_frame,
+        profiles,
+        output,
+        &first_window,
+    )?
     else {
         return Ok((Arc::new(InstantClock::new(start_frame)), None));
     };
     let pos = Arc::new(AtomicU64::new(start_audio_frame));
-    let paused = Arc::new(AtomicBool::new(start_paused));
+    let delay = Arc::new(AtomicU64::new(0));
     let clock = AudioClock::new(
         Arc::clone(&pos),
         rate,
         fps,
         Some(Arc::clone(&prepared.control)),
-    );
-    match AudioPlayback::start_stream(
-        prepared.consumer,
-        prepared.control,
-        prepared.producer,
-        rate,
-        pos,
-        paused,
-    ) {
-        Ok(audio) => {
-            let clock = clock.muting(audio.control.output_mute());
-            Ok((Arc::new(clock), Some(audio)))
-        }
-        Err(error) => {
-            eprintln!("[audio] {error}; falling back to wall clock");
-            Ok((Arc::new(InstantClock::new(start_frame)), None))
-        }
-    }
+    )
+    .delayed_by(Arc::clone(&delay));
+    Ok(install_audio_clock(
+        clock,
+        AudioPlayback::start_stream(prepared, rate, pos, delay),
+        start_frame,
+    ))
 }
 
-fn clock_from_mixed<F>(
-    mixed: Vec<f32>,
-    rate: u32,
-    fps: i32,
+/// The session's clock: the device clock when its output started, else the
+/// wall clock from `start_frame` (a device that fails to start never
+/// freezes playback).
+fn install_audio_clock(
+    clock: AudioClock,
+    started: Result<AudioPlayback, String>,
     start_frame: i32,
-    start_paused: bool,
-    start: F,
-) -> (Arc<dyn PlaybackClock>, Option<AudioPlayback>)
-where
-    F: FnOnce(Arc<Vec<f32>>, Arc<AtomicU64>, Arc<AtomicBool>) -> Result<AudioPlayback, String>,
-{
-    let buffer = Arc::new(mixed);
-    let pos = Arc::new(AtomicU64::new(0));
-    let paused = Arc::new(AtomicBool::new(start_paused));
-    let clock = AudioClock::new(pos.clone(), rate, fps, None);
-    clock.seek(start_frame); // begin playback at the current playhead
-
-    match start(buffer, pos, paused) {
+) -> (Arc<dyn PlaybackClock>, Option<AudioPlayback>) {
+    match started {
         Ok(audio) => {
             let clock = clock.muting(audio.control.output_mute());
             (Arc::new(clock), Some(audio))
         }
-        Err(e) => {
-            eprintln!("[audio] {e}; falling back to wall clock");
+        Err(error) => {
+            eprintln!("[audio] {error}; falling back to wall clock");
             (Arc::new(InstantClock::new(start_frame)), None)
         }
     }
@@ -2288,7 +2303,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use opentake_domain::{Clip, Track};
+    use opentake_domain::{AudioDenoise, Clip, ClipType, Track};
     use opentake_media::{MediaCancelToken, MediaError};
 
     fn audio_timeline(clips: Vec<Clip>) -> Timeline {
@@ -2298,6 +2313,15 @@ mod tests {
         track.clips = clips;
         timeline.tracks.push(track);
         timeline
+    }
+
+    /// A consumer of `receiver` whose recycled buffers nobody drains.
+    fn test_consumer(
+        receiver: ChunkReceiver<AudioStreamChunk>,
+        control: Arc<AudioStreamControl>,
+    ) -> AudioStreamConsumer {
+        let (recycle, _drained) = bounded(RECYCLE_CAPACITY);
+        AudioStreamConsumer::new(receiver, recycle, control)
     }
 
     fn audio_clip(id: &str, media_ref: &str, start_frame: i32, duration_frames: i32) -> Clip {
@@ -2331,8 +2355,10 @@ mod tests {
             ("m1".to_string(), MediaInfo { path: first }),
             ("m2".to_string(), MediaInfo { path: second }),
         ]);
+        // The prepare token reaches the first window through a child token.
         let cancel = MediaCancelToken::new();
-        let worker_cancel = cancel.clone();
+        let first_window = cancel.child();
+        let worker_window = first_window.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             done_tx
@@ -2342,16 +2368,17 @@ mod tests {
                     48_000,
                     0,
                     &ProfileScope::new(),
-                    &worker_cancel,
+                    Arc::new(OutputState::new(true)),
+                    &worker_window,
                 ))
                 .expect("publish audio prepare result");
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while cancel.spawned_child_count() == 0 && Instant::now() < deadline {
+        while first_window.spawned_child_count() == 0 && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert_eq!(cancel.spawned_child_count(), 1);
+        assert_eq!(first_window.spawned_child_count(), 1);
         cancel.cancel();
         let error = match done_rx
             .recv_timeout(Duration::from_secs(5))
@@ -2363,89 +2390,9 @@ mod tests {
         assert!(matches!(error, MediaError::Cancelled));
         worker.join().expect("join audio prepare worker");
         assert_eq!(
-            cancel.spawned_child_count(),
+            first_window.spawned_child_count(),
             1,
             "second clip must not spawn"
-        );
-    }
-
-    #[test]
-    fn large_mix_observes_cancellation_between_chunks() {
-        let cancel = MediaCancelToken::new();
-        let worker_cancel = cancel.clone();
-        let clip = StereoClip {
-            start_frame: 0,
-            interleaved: vec![0.25; 12_000_000],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: None,
-        };
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            done_tx
-                .send(mix_stereo(&[clip], &worker_cancel))
-                .expect("publish mix result");
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cancel.checkpoint_count() == 0 && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            cancel.checkpoint_count() > 0,
-            "mix must enter a production chunk"
-        );
-        cancel.cancel();
-        let result = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("chunked mix must observe cancellation");
-        assert!(matches!(result, Err(MediaError::Cancelled)));
-        worker.join().expect("join mix worker");
-    }
-
-    #[test]
-    fn long_timeline_mix_has_constant_peak_allocation_and_matches_short_reference() {
-        let near = StereoClip {
-            start_frame: 0,
-            interleaved: vec![0.6, -0.6, 0.5, 0.5],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: None,
-        };
-        let far = StereoClip {
-            start_frame: 48_000 * 60 * 60,
-            interleaved: vec![0.25, -0.25],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: None,
-        };
-        let reference = mix_stereo(
-            &[StereoClip {
-                start_frame: near.start_frame,
-                interleaved: near.interleaved.clone(),
-                gains: near.gains.clone(),
-                true_peak_ceiling_dbtp: near.true_peak_ceiling_dbtp,
-            }],
-            &MediaCancelToken::new(),
-        )
-        .unwrap();
-        let mut first_window = Vec::new();
-        let mut peak_samples = 0;
-
-        mix_stereo_windows(
-            &[near, far],
-            1024,
-            &MediaCancelToken::new(),
-            |start_frame, samples| {
-                peak_samples = peak_samples.max(samples.len());
-                if start_frame == 0 {
-                    first_window.extend_from_slice(samples);
-                }
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(&first_window[..reference.len()], reference);
-        assert!(
-            peak_samples <= 1024 * MIX_CHANNELS,
-            "one-hour timeline must retain only one bounded mix window"
         );
     }
 
@@ -2454,34 +2401,29 @@ mod tests {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(4);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: 0,
                 samples: vec![0.25, -0.25],
-            }))
+            })
             .unwrap();
-        let mut consumer = AudioStreamConsumer {
-            receiver,
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        };
+        let mut consumer = test_consumer(receiver, Arc::clone(&control));
         assert_eq!(consumer.sample_frame(0), (0.25, -0.25));
 
         control.request_seek(10);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: 1,
                 samples: vec![0.5, 0.5],
-            }))
+            })
             .unwrap();
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 1,
                 start_frame: 10,
                 samples: vec![0.75, -0.75],
-            }))
+            })
             .unwrap();
         assert_eq!(consumer.sample_frame(10), (0.75, -0.75));
         assert_eq!(consumer.sample_frame(99), (0.0, 0.0));
@@ -2494,20 +2436,15 @@ mod tests {
         let control = Arc::new(AudioStreamControl::new(first_sample));
         let (sender, receiver) = bounded(4);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: first_sample,
                 samples: vec![0.75, -0.75, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125],
-            }))
+            })
             .unwrap();
         let pos = Arc::new(AtomicU64::new(first_sample));
         let clock = AudioClock::new(Arc::clone(&pos), 48_000, 30, Some(Arc::clone(&control)));
-        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
-            receiver,
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        });
+        let mut samples = test_consumer(receiver, Arc::clone(&control));
 
         clock.seek(30); // render thread initialization
         clock.seek(30); // first Resume
@@ -2519,9 +2456,7 @@ mod tests {
             let (start, count) =
                 claim_ready_audio_block(&mut samples, &pos, 2).expect("prefilled block");
             assert_eq!(count, 2);
-            let PlaybackSamples::Streaming(consumer) = &mut samples else {
-                unreachable!()
-            };
+            let consumer = &mut samples;
             assert_eq!(consumer.sample_frame(start), expected[0]);
             assert_eq!(consumer.sample_frame(start + 1), expected[1]);
         }
@@ -2541,26 +2476,19 @@ mod tests {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(4);
         let pos = AtomicU64::new(0);
-        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
-            receiver,
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        });
+        let mut samples = test_consumer(receiver, Arc::clone(&control));
 
         assert_eq!(claim_ready_audio_block(&mut samples, &pos, 128), None);
         assert_eq!(pos.load(Ordering::Acquire), 0);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: 0,
                 samples: vec![0.8, -0.8, 0.6, -0.6],
-            }))
+            })
             .unwrap();
         assert_eq!(claim_ready_audio_block(&mut samples, &pos, 2), Some((0, 2)));
-        let PlaybackSamples::Streaming(consumer) = &mut samples else {
-            unreachable!()
-        };
+        let consumer = &mut samples;
         assert_eq!(consumer.sample_frame(0), (0.8, -0.8));
         assert_eq!(consumer.sample_frame(1), (0.6, -0.6));
     }
@@ -2569,26 +2497,17 @@ mod tests {
     fn failed_audio_stream_keeps_the_clock_moving_with_silence() {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(4);
-        sender
-            .send(Err(MediaError::Decode("broken clip".into())))
-            .unwrap();
+        // The producer exited: no later window arrives.
         drop(sender);
         let pos = AtomicU64::new(0);
-        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
-            receiver,
-            control,
-            current: None,
-            terminated: false,
-        });
+        let mut samples = test_consumer(receiver, control);
 
         assert_eq!(
             claim_ready_audio_block(&mut samples, &pos, 128),
             Some((0, 128))
         );
         assert_eq!(pos.load(Ordering::Acquire), 128);
-        let PlaybackSamples::Streaming(consumer) = &mut samples else {
-            unreachable!()
-        };
+        let consumer = &mut samples;
         assert_eq!(consumer.sample_frame(0), (0.0, 0.0));
     }
 
@@ -2597,19 +2516,14 @@ mod tests {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(4);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: 0,
                 samples: vec![0.5, 0.5, 0.5, 0.5],
-            }))
+            })
             .unwrap();
         let pos = AtomicU64::new(0);
-        let mut samples = PlaybackSamples::Streaming(AudioStreamConsumer {
-            receiver,
-            control,
-            current: None,
-            terminated: false,
-        });
+        let mut samples = test_consumer(receiver, control);
 
         assert_eq!(
             claim_ready_audio_block(&mut samples, &pos, 128),
@@ -2618,19 +2532,17 @@ mod tests {
         assert_eq!(claim_ready_audio_block(&mut samples, &pos, 126), None);
         assert_eq!(pos.load(Ordering::Acquire), 2);
         sender
-            .send(Ok(AudioStreamChunk {
+            .send(AudioStreamChunk {
                 generation: 0,
                 start_frame: 2,
                 samples: vec![0.75, -0.75, 0.75, -0.75],
-            }))
+            })
             .unwrap();
         assert_eq!(
             claim_ready_audio_block(&mut samples, &pos, 126),
             Some((2, 2))
         );
-        let PlaybackSamples::Streaming(consumer) = &mut samples else {
-            unreachable!()
-        };
+        let consumer = &mut samples;
         assert_eq!(consumer.sample_frame(2), (0.75, -0.75));
     }
 
@@ -2640,19 +2552,14 @@ mod tests {
         let (sender, receiver) = bounded(4);
         for (start_frame, sample) in [(0, 0.25), (1, 0.75)] {
             sender
-                .send(Ok(AudioStreamChunk {
+                .send(AudioStreamChunk {
                     generation: 0,
                     start_frame,
                     samples: vec![sample, -sample],
-                }))
+                })
                 .unwrap();
         }
-        let mut consumer = AudioStreamConsumer {
-            receiver,
-            control,
-            current: None,
-            terminated: false,
-        };
+        let mut consumer = test_consumer(receiver, control);
 
         consumer.discard_stale();
         consumer.discard_stale();
@@ -2677,6 +2584,7 @@ mod tests {
             48_000,
             0,
             &ProfileScope::new(),
+            Arc::new(OutputState::new(true)),
             &MediaCancelToken::new(),
         ) {
             Err(error) => error,
@@ -2720,14 +2628,19 @@ mod tests {
         let worker = std::thread::spawn(move || run_device_jobs(job_rx));
 
         assert_eq!(
-            submit_device_query(&job_tx, || -> Option<u32> {
+            submit_device_query(&job_tx, DEVICE_QUERY_TIMEOUT, || -> Option<u32> {
                 panic!("simulated CPAL query panic")
             }),
             None
         );
-        assert_eq!(submit_device_query(&job_tx, || Some(44_100)), Some(44_100));
         assert_eq!(
-            submit_device_query(&job_tx, || Some("speakers".to_string())),
+            submit_device_query(&job_tx, DEVICE_QUERY_TIMEOUT, || Some(44_100)),
+            Some(44_100)
+        );
+        assert_eq!(
+            submit_device_query(&job_tx, DEVICE_QUERY_TIMEOUT, || Some(
+                "speakers".to_string()
+            )),
             Some("speakers".to_string())
         );
 
@@ -3008,18 +2921,34 @@ mod tests {
             .muting(audio.control().output_mute());
 
         audio.prepare_resume().expect("prepare");
-        // The render thread, already resumed, fails before the commit.
+        // The render thread resumes, then fails before the commit.
+        clock.resumed();
         clock.halt();
         audio.commit_resume();
-        assert!(
-            paused.load(Ordering::Acquire),
-            "a failed render keeps sound off"
-        );
+        assert!(paused.is_muted(), "a failed render keeps sound off");
 
         // The next resume is a retry and unmutes normally.
         audio.prepare_resume().expect("prepare again");
+        clock.resumed();
         audio.commit_resume();
-        assert!(!paused.load(Ordering::Acquire));
+        assert!(!paused.is_muted());
+    }
+
+    #[test]
+    fn a_failure_of_the_previous_run_does_not_mute_a_retried_resume() {
+        let (audio, output, _stopped) = AudioPlayback::test_stub();
+        let clock = AudioClock::new(Arc::new(AtomicU64::new(0)), 48_000, 30, None)
+            .muting(audio.control().output_mute());
+
+        // Play, pause, play again: the retried resume's handshake is under way
+        // when the first run's render failure lands.
+        audio.prepare_resume().expect("prepare the retry");
+        clock.halt();
+        // The render thread then processes the retried resume, which renders
+        // (and would show video) again: its commit must unmute.
+        clock.resumed();
+        audio.commit_resume();
+        assert!(!output.is_muted(), "video and sound resume together");
     }
 
     #[test]
@@ -3093,19 +3022,14 @@ mod tests {
         let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
         for window in 0..3_u64 {
             sender
-                .send(Ok(AudioStreamChunk {
+                .send(AudioStreamChunk {
                     generation: 0,
                     start_frame: window * 100,
                     samples: vec![window as f32; 100 * MIX_CHANNELS],
-                }))
+                })
                 .unwrap();
         }
-        let mut consumer = AudioStreamConsumer {
-            receiver,
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        };
+        let mut consumer = test_consumer(receiver, Arc::clone(&control));
         assert_eq!(consumer.sample_frame(10), (0.0, 0.0));
         assert_eq!(consumer.sample_frame(250), (2.0, 2.0));
         assert_eq!(control.underruns.load(Ordering::Acquire), 0);
@@ -3114,7 +3038,7 @@ mod tests {
     #[test]
     fn a_seek_forgets_an_unreported_failure_but_realignment_does_not_repeat_it() {
         let control = AudioStreamControl::new(0);
-        control.record_error("clip-2 failed at 1.0 s".to_string());
+        control.record_error(0, "clip-2 failed at 1.0 s".to_string());
         control.request_seek(500);
         assert_eq!(
             control.take_error(),
@@ -3122,11 +3046,13 @@ mod tests {
             "the error belonged to the old position"
         );
 
-        control.record_error("clip-2 failed at 6.0 s".to_string());
+        let generation = control.generation.load(Ordering::Acquire);
+        control.record_error(generation, "clip-2 failed at 6.0 s".to_string());
         assert!(control.take_error().is_some());
         // A clock re-alignment restarts the producer, which hits the same clip.
         control.restart_at(700);
-        control.record_error("clip-2 failed at 7.0 s".to_string());
+        let generation = control.generation.load(Ordering::Acquire);
+        control.record_error(generation, "clip-2 failed at 7.0 s".to_string());
         assert_eq!(
             control.take_error(),
             None,
@@ -3135,9 +3061,63 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_fails_across_a_seek_is_not_reported_for_the_new_position() {
+        let control = AudioStreamControl::new(0);
+        // The producer is mixing a window of generation 0 when the seek lands;
+        // its failure arrives after the seek completed.
+        let window_generation = control.generation.load(Ordering::Acquire);
+        control.request_seek(500);
+        control.record_error(window_generation, "clip-2 failed at 0.0 s".to_string());
+        assert_eq!(control.take_error(), None, "a stale window reports nothing");
+
+        // The first failure at the new position is still reported, once.
+        let generation = control.generation.load(Ordering::Acquire);
+        control.record_error(generation, "clip-3 failed at 5.0 s".to_string());
+        assert_eq!(
+            control.take_error().as_deref(),
+            Some("clip-3 failed at 5.0 s")
+        );
+    }
+
+    /// A [`WindowMixer`] around a closure, counting reader closes.
+    struct FnMixer<F> {
+        mix: F,
+        closes: Arc<AtomicU64>,
+    }
+
+    impl<F> WindowMixer for FnMixer<F>
+    where
+        F: FnMut(u64, usize, &MediaCancelToken) -> Result<Vec<f32>, MediaError>,
+    {
+        fn mix(
+            &mut self,
+            start: u64,
+            len: usize,
+            cancel: &MediaCancelToken,
+        ) -> Result<Vec<f32>, MediaError> {
+            (self.mix)(start, len, cancel)
+        }
+
+        fn close_readers(&mut self) {
+            self.closes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn fn_mixer<F>(mix: F) -> FnMixer<F>
+    where
+        F: FnMut(u64, usize, &MediaCancelToken) -> Result<Vec<f32>, MediaError>,
+    {
+        FnMixer {
+            mix,
+            closes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
     fn producer_reports_a_failed_window_once_and_recovers_after_seek() {
         let control = Arc::new(AudioStreamControl::new(0));
         let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        let (recycle_sender, recycle) = bounded(RECYCLE_CAPACITY);
         let failing = Arc::new(AtomicBool::new(true));
         let producer_control = Arc::clone(&control);
         let producer_failing = Arc::clone(&failing);
@@ -3145,19 +3125,21 @@ mod tests {
             run_audio_producer(
                 &producer_control,
                 &sender,
+                &recycle,
                 ProducerWindows {
                     rate: 100,
                     next_frame: 0,
                     total_frames: 10_000,
                     window_frames: 100,
                 },
-                |start, len, _cancel| {
+                fn_mixer(|start, len, _cancel: &MediaCancelToken| {
                     // Every window from 100 on hits a broken clip.
                     if start >= 100 && producer_failing.load(Ordering::Acquire) {
                         return Err(MediaError::Decode("clip-2 decode failed".to_string()));
                     }
                     Ok(vec![0.5; len * MIX_CHANNELS])
-                },
+                }),
+                MediaCancelToken::new(),
             )
         });
 
@@ -3165,7 +3147,6 @@ mod tests {
             receiver
                 .recv_timeout(Duration::from_secs(2))
                 .expect("producer keeps producing")
-                .expect("failures are silence, not stream errors")
         };
         let mut chunks = Vec::new();
         for _ in 0..3 {
@@ -3189,12 +3170,8 @@ mod tests {
         // the consumer plays real samples without underruns.
         failing.store(false, Ordering::Release);
         control.request_seek(500);
-        let mut consumer = AudioStreamConsumer {
-            receiver: receiver.clone(),
-            control: Arc::clone(&control),
-            current: None,
-            terminated: false,
-        };
+        let mut consumer =
+            AudioStreamConsumer::new(receiver.clone(), recycle_sender, Arc::clone(&control));
         let deadline = Instant::now() + Duration::from_secs(2);
         while !consumer.ready_at(500) {
             assert!(Instant::now() < deadline, "post-seek window arrives");
@@ -3267,11 +3244,13 @@ mod tests {
             opened: Arc::clone(&opened),
             stream_error: Arc::clone(&stream_error),
         };
-        let paused = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(OutputState::new(true));
+        let (_chunks, receiver) = bounded(STREAM_WINDOW_CAPACITY);
         let (control_tx, handle) = spawn_output(
             move || backend,
-            PlaybackSamples::Buffered(Arc::new(vec![0.0; 96_000])),
+            test_consumer(receiver, Arc::new(AudioStreamControl::new(0))),
             48_000,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             &paused,
         )
@@ -3353,14 +3332,9 @@ mod tests {
 
     #[test]
     fn failed_audio_start_installs_advancing_wall_clock() {
-        let (clock, audio) = clock_from_mixed(
-            vec![0.0, 0.0],
-            48_000,
-            100,
-            0,
-            false,
-            |_buffer, _pos, _paused| Err("callback readiness timeout".to_string()),
-        );
+        let device = AudioClock::new(Arc::new(AtomicU64::new(0)), 48_000, 100, None);
+        let (clock, audio) =
+            install_audio_clock(device, Err("callback readiness timeout".to_string()), 0);
 
         assert!(audio.is_none());
         std::thread::sleep(Duration::from_millis(25));
@@ -3372,17 +3346,10 @@ mod tests {
 
     #[test]
     fn successful_audio_start_retains_device_clock() {
-        let (clock, audio) = clock_from_mixed(
-            vec![0.0, 0.0],
-            48_000,
-            30,
-            0,
-            false,
-            |_buffer, pos, _paused| {
-                pos.store(48_000, Ordering::Release);
-                Ok(AudioPlayback::test_stub().0)
-            },
-        );
+        let pos = Arc::new(AtomicU64::new(0));
+        let device = AudioClock::new(Arc::clone(&pos), 48_000, 30, None);
+        let (clock, audio) = install_audio_clock(device, Ok(AudioPlayback::test_stub().0), 0);
+        pos.store(48_000, Ordering::Release);
 
         assert!(audio.is_some());
         assert_eq!(clock.frame(30), 30);
@@ -3427,20 +3394,9 @@ mod tests {
         let mut clip = Clip::new("c1", "asset-1", 0, 60);
         clip.trim_start_frame = 15;
         clip.speed = 1.0;
-        let (lo, hi) = clip_source_window_secs(&clip, 30).expect("window");
+        let (lo, hi) = crate::clip_audio::clip_source_window_secs(&clip, 30).expect("window");
         assert!((lo - 0.5).abs() < 1e-6);
         assert!((hi - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn project_clip_audio_stereo_skips_clip_without_media_entry() {
-        let clip = Clip::new("c1", "missing", 0, 30);
-        let media: HashMap<String, MediaInfo> = HashMap::new();
-        assert!(
-            project_clip_audio_stereo(&clip, &media, 30, 48_000, &MediaCancelToken::new())
-                .expect("missing media is silent")
-                .is_none()
-        );
     }
 
     #[test]
@@ -3453,79 +3409,11 @@ mod tests {
             48_000,
             0,
             &ProfileScope::new(),
+            Arc::new(OutputState::new(true)),
             &MediaCancelToken::new()
         )
         .expect("empty timeline")
         .is_none());
-    }
-
-    #[test]
-    fn mix_stereo_sums_placed_clips_and_clamps() {
-        // Clip A at frame 0: 2 stereo frames [(0.6,-0.6),(0.5,0.5)].
-        // Clip B at frame 1: 1 stereo frame (0.6,0.6) → overlaps A's frame 1.
-        let a = StereoClip {
-            start_frame: 0,
-            interleaved: vec![0.6, -0.6, 0.5, 0.5],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: None,
-        };
-        let b = StereoClip {
-            start_frame: 1,
-            interleaved: vec![0.6, 0.6],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: None,
-        };
-        let out = mix_stereo(&[a, b], &MediaCancelToken::new()).expect("mix");
-        assert_eq!(out.len(), 4); // 2 frames × 2 channels
-                                  // frame 0 = A only.
-        assert!((out[0] - 0.6).abs() < 1e-6);
-        assert!((out[1] + 0.6).abs() < 1e-6);
-        // frame 1 = A(0.5,0.5) + B(0.6,0.6) = (1.1,1.1) → clamped to (1.0,1.0).
-        assert!((out[2] - 1.0).abs() < 1e-6);
-        assert!((out[3] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mix_stereo_applies_per_frame_gain() {
-        let c = StereoClip {
-            start_frame: 0,
-            interleaved: vec![1.0, 1.0, 1.0, 1.0],
-            gains: vec![0.5, 0.25],
-            true_peak_ceiling_dbtp: None,
-        };
-        let out = mix_stereo(&[c], &MediaCancelToken::new()).expect("mix");
-        assert_eq!(out, vec![0.5, 0.5, 0.25, 0.25]);
-    }
-
-    #[test]
-    fn mix_stereo_enforces_normalized_true_peak_with_codec_margin() {
-        let clip = StereoClip {
-            start_frame: 0,
-            interleaved: vec![1.0, -1.0],
-            gains: Vec::new(),
-            true_peak_ceiling_dbtp: Some(-1.0),
-        };
-        let out = mix_stereo(&[clip], &MediaCancelToken::new()).expect("mix");
-        let expected = 10.0_f32.powf(-3.0 / 20.0);
-        assert!((out[0] - expected).abs() < 1e-6);
-        assert!((out[1] + expected).abs() < 1e-6);
-    }
-
-    #[test]
-    fn denoise_preview_uses_shared_processing_owner() {
-        let config = opentake_domain::AudioDenoise {
-            mode: opentake_domain::DenoiseMode::Adaptive,
-            strength: 0.75,
-            preview_enabled: true,
-        };
-        let input = vec![0.2, -0.1, 0.15, -0.05, 0.1, 0.0, 0.05, 0.05];
-        let cancel = MediaCancelToken::new();
-        let preview = apply_preview_denoise(&input, 2, 48_000, Some(config), &cancel)
-            .expect("preview denoise");
-        let shared =
-            opentake_media::analysis::denoise_interleaved(&input, 2, 48_000, config, &cancel, None)
-                .expect("shared denoise");
-        assert_eq!(preview, shared);
     }
 
     /// Two noisy tones, the second denoised and faded in, over eight seconds.
@@ -3568,6 +3456,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (timeline, paths) = denoised_timeline(dir.path());
         let media = media_for(&paths);
+        let clips = try_collect_audio_clips(&timeline).unwrap();
         // Seeks inside the plain clip (0.7 s), inside the denoised clip
         // (2.08 s), and in the middle of an STFT hop (3.96 s), at the usual
         // device rate and at a Bluetooth hands-free rate, where the denoiser's
@@ -3591,9 +3480,12 @@ mod tests {
                     let len = (total - position).min(window as u64) as usize;
                     out.extend(
                         mix_timeline_window_channels(
-                            &timeline,
-                            &media,
-                            rate,
+                            &PreviewMix {
+                                clips: &clips,
+                                media: &media,
+                                fps: timeline.fps,
+                                rate,
+                            },
                             MIX_CHANNELS,
                             position,
                             len,
@@ -3654,6 +3546,7 @@ mod tests {
         let timeline = audio_timeline(clips);
         let paths = HashMap::from([("tone".to_string(), source)]);
         let media = media_for(&paths);
+        let clips = try_collect_audio_clips(&timeline).unwrap();
         let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
             .unwrap()
             .expect("audible timeline");
@@ -3669,9 +3562,12 @@ mod tests {
             let len = (total - position).min(window);
             previewed.extend(
                 mix_timeline_window_channels(
-                    &timeline,
-                    &media,
-                    rate,
+                    &PreviewMix {
+                        clips: &clips,
+                        media: &media,
+                        fps: timeline.fps,
+                        rate,
+                    },
                     1,
                     position as u64,
                     len,
@@ -3724,6 +3620,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (timeline, paths) = denoised_timeline(dir.path());
         let media = media_for(&paths);
+        let clips = try_collect_audio_clips(&timeline).unwrap();
         let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
             .unwrap()
             .expect("audible timeline");
@@ -3740,9 +3637,12 @@ mod tests {
             let len = (total - position).min(70_001);
             previewed.extend(
                 mix_timeline_window_channels(
-                    &timeline,
-                    &media,
-                    rate,
+                    &PreviewMix {
+                        clips: &clips,
+                        media: &media,
+                        fps: timeline.fps,
+                        rate,
+                    },
                     1,
                     position as u64,
                     len,
@@ -3790,6 +3690,7 @@ mod tests {
                 48_000,
                 start,
                 &profiles,
+                Arc::new(OutputState::new(false)),
                 &MediaCancelToken::new(),
             );
             let _ = sender.send(prepared);
@@ -3829,11 +3730,15 @@ mod tests {
         }
         let rate = 48_000_u32;
         let window = rate as usize * STREAM_WINDOW_SECONDS;
+        let undenoised_clips = try_collect_audio_clips(&undenoised).unwrap();
         let mix_undenoised = |start: u64| {
             mix_timeline_window_channels(
-                &undenoised,
-                &media,
-                rate,
+                &PreviewMix {
+                    clips: &undenoised_clips,
+                    media: &media,
+                    fps: undenoised.fps,
+                    rate,
+                },
                 MIX_CHANNELS,
                 start,
                 window,
@@ -3856,8 +3761,7 @@ mod tests {
             .consumer
             .receiver
             .recv_timeout(Duration::from_secs(10))
-            .expect("first window")
-            .expect("first window mixed");
+            .expect("first window");
         assert_eq!(chunk.start_frame, start);
         assert!(
             chunk.samples == mix_undenoised(start),
@@ -3872,8 +3776,7 @@ mod tests {
                 .consumer
                 .receiver
                 .recv_timeout(Duration::from_secs(10))
-                .expect("window after the seek")
-                .expect("window mixed after the seek");
+                .expect("window after the seek");
             if chunk.generation == 1 {
                 break chunk;
             }
@@ -3909,8 +3812,7 @@ mod tests {
             .consumer
             .receiver
             .recv_timeout(Duration::from_secs(10))
-            .expect("first window")
-            .expect("first window mixed");
+            .expect("first window");
         assert!(
             chunk.samples != mix_undenoised(start),
             "denoised once ready"
@@ -3954,6 +3856,7 @@ mod tests {
         let timeline = audio_timeline(vec![clip]);
         let paths = HashMap::from([("tone".to_string(), source)]);
         let media = media_for(&paths);
+        let clips = try_collect_audio_clips(&timeline).unwrap();
         let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
             .unwrap()
             .expect("audible timeline");
@@ -3968,9 +3871,12 @@ mod tests {
             let len = (total - position).min(window);
             previewed.extend(
                 mix_timeline_window_channels(
-                    &timeline,
-                    &media,
-                    rate,
+                    &PreviewMix {
+                        clips: &clips,
+                        media: &media,
+                        fps: timeline.fps,
+                        rate,
+                    },
                     1,
                     position as u64,
                     len,
@@ -4015,5 +3921,675 @@ mod tests {
         let mut surround = [9.0f32; 4];
         write_frame(&mut surround, 0.3, -0.4);
         assert_eq!(surround, [0.3, -0.4, 0.0, 0.0]);
+    }
+
+    // --- The production mix: flattened clips, gains, ceilings (#33, #69) ---
+
+    const MIX_TEST_RATE: u32 = 48_000;
+    /// Output frames per timeline frame at 30 fps and 48 kHz.
+    const FRAME: usize = 1_600;
+
+    /// A mono WAV holding `value` for `seconds`.
+    fn dc_wav(dir: &std::path::Path, name: &str, value: f32, seconds: f32) -> PathBuf {
+        let path = dir.join(format!("{name}.wav"));
+        crate::clip_audio::fixtures::write_wav(
+            &path,
+            &vec![value; (seconds * MIX_TEST_RATE as f32) as usize],
+        );
+        path
+    }
+
+    /// Mix the whole timeline as preview does, in mono at 48 kHz (the export's
+    /// channel layout), in windows of `window` frames.
+    fn preview_mono(
+        timeline: &Timeline,
+        paths: &HashMap<String, PathBuf>,
+        window: usize,
+    ) -> Vec<f32> {
+        let clips = try_collect_audio_clips(timeline).expect("flatten audio");
+        let media = media_for(paths);
+        let mix = PreviewMix {
+            clips: &clips,
+            media: &media,
+            fps: timeline.fps,
+            rate: MIX_TEST_RATE,
+        };
+        let total = timeline_audio_frames(timeline, MIX_TEST_RATE).unwrap() as usize;
+        let mut sources = PreviewAudioSources::default();
+        let mut out = Vec::with_capacity(total);
+        let mut position = 0;
+        while position < total {
+            let len = (total - position).min(window);
+            out.extend(
+                mix_timeline_window_channels(
+                    &mix,
+                    1,
+                    position as u64,
+                    len,
+                    &mut sources,
+                    ProfileWait::Block,
+                    &MediaCancelToken::new(),
+                )
+                .expect("mix window"),
+            );
+            position += len;
+        }
+        out
+    }
+
+    fn assert_span(samples: &[f32], range: std::ops::Range<usize>, expected: f32, what: &str) {
+        let worst = samples[range.clone()]
+            .iter()
+            .map(|sample| (sample - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst < 1.0e-3,
+            "{what}: samples {range:?} differ from {expected} by up to {worst}"
+        );
+    }
+
+    /// A root timeline whose only clip is compound clip `compound` over a
+    /// nested sequence holding `inner` on one audio track.
+    fn compound_timeline(inner: Vec<Clip>, compound: Clip, nested_muted: bool) -> Timeline {
+        let mut child = audio_timeline(inner);
+        child.tracks[0].muted = nested_muted;
+        let mut root = Timeline::new();
+        root.fps = 30;
+        root.nested_sequences
+            .push(opentake_domain::NestedSequence::new(
+                "sequence", "Sequence", child,
+            ));
+        let mut track = Track::new("v1", ClipType::Video);
+        track.clips.push(compound);
+        root.tracks.push(track);
+        root
+    }
+
+    #[test]
+    fn preview_mix_adds_clips_by_gain_clamps_and_skips_muted_tracks() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([
+            ("half".to_string(), dc_wav(dir.path(), "half", 0.5, 2.0)),
+            (
+                "quarter".to_string(),
+                dc_wav(dir.path(), "quarter", 0.25, 2.0),
+            ),
+            ("loud".to_string(), dc_wav(dir.path(), "loud", 0.9, 2.0)),
+        ]);
+        let mut timeline = audio_timeline(vec![audio_clip("a", "half", 0, 30)]);
+        let mut quiet = audio_clip("b", "quarter", 15, 30);
+        quiet.volume = 0.5;
+        for (id, clips, muted) in [
+            ("a2", vec![quiet], false),
+            ("a3", vec![audio_clip("c", "loud", 0, 15)], false),
+            ("muted", vec![audio_clip("m", "loud", 0, 45)], true),
+        ] {
+            let mut track = Track::new(id, ClipType::Audio);
+            track.clips = clips;
+            track.muted = muted;
+            timeline.tracks.push(track);
+        }
+
+        let mixed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        assert_eq!(mixed.len(), 45 * FRAME);
+        // 0.5 + 0.9 clamps to 1; the muted track adds nothing anywhere.
+        assert_span(&mixed, 0..15 * FRAME, 1.0, "clamped sum");
+        assert_span(
+            &mixed,
+            15 * FRAME..30 * FRAME,
+            0.5 + 0.25 * 0.5,
+            "gained sum",
+        );
+        assert_span(&mixed, 30 * FRAME..45 * FRAME, 0.25 * 0.5, "gained clip");
+    }
+
+    #[test]
+    fn preview_mix_applies_volume_envelopes_per_frame_across_window_boundaries() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([("half".to_string(), dc_wav(dir.path(), "half", 0.5, 2.0))]);
+        let mut clip = audio_clip("fade", "half", 3, 40);
+        clip.fade_in_frames = 12;
+        clip.fade_out_frames = 9;
+        let timeline = audio_timeline(vec![clip.clone()]);
+
+        let whole = preview_mono(&timeline, &paths, 64 * FRAME);
+        for frame in 0..timeline.total_frames() {
+            let gain = if (3..43).contains(&frame) {
+                clip.volume_at(frame) as f32
+            } else {
+                0.0
+            };
+            let start = frame as usize * FRAME;
+            assert_span(
+                &whole,
+                start..start + FRAME,
+                0.5 * gain,
+                &format!("frame {frame}"),
+            );
+        }
+        // Windows that start mid-frame land every sample in the same place.
+        for window in [1_234, 70_001] {
+            assert_eq!(preview_mono(&timeline, &paths, window), whole, "{window}");
+        }
+    }
+
+    #[test]
+    fn preview_mix_enforces_the_strictest_true_peak_ceiling() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([("loud".to_string(), dc_wav(dir.path(), "loud", 0.9, 1.0))]);
+        let mut limited = audio_clip("limited", "loud", 0, 15);
+        limited.loudness_normalization = Some(opentake_domain::LoudnessNormalization {
+            target_lufs: -14.0,
+            true_peak_ceiling_dbtp: -1.0,
+            input_integrated_lufs: -14.0,
+            input_true_peak_dbtp: -1.0,
+            gain_db: 0.0,
+            output_integrated_lufs: -14.0,
+            output_true_peak_dbtp: -1.0,
+        });
+        // The ceiling of one clip applies to the whole timeline, as in export.
+        let timeline = audio_timeline(vec![limited, audio_clip("free", "loud", 15, 15)]);
+
+        let mixed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        // -1 dBTP less the export's 2 dB codec margin.
+        let ceiling = 10.0_f32.powf(-3.0 / 20.0);
+        assert_span(&mixed, 0..30 * FRAME, ceiling, "limited to the ceiling");
+    }
+
+    #[test]
+    fn preview_mix_skips_a_clip_without_a_media_entry() {
+        let timeline = audio_timeline(vec![audio_clip("c1", "missing", 0, 30)]);
+        let mixed = preview_mono(&timeline, &HashMap::new(), 2 * MIX_TEST_RATE as usize);
+        assert_eq!(mixed.len(), 30 * FRAME);
+        assert!(mixed.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn sound_inside_a_compound_clip_plays_in_preview_as_it_exports() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        use crate::clip_audio::fixtures::{noisy_tone, write_wav};
+        let dir = tempfile::tempdir().unwrap();
+        let tone = dir.path().join("tone.wav");
+        write_wav(&tone, &noisy_tone(4.0, 440.0, 7));
+        let paths = HashMap::from([("tone".to_string(), tone)]);
+        let mut inner = audio_clip("inner", "tone", 6, 90);
+        inner.trim_start_frame = 4;
+        inner.fade_in_frames = 8;
+        let mut compound = Clip::new_nested("compound", "sequence", 10, 70);
+        compound.trim_start_frame = 12;
+        compound.volume = 0.7;
+        let timeline = compound_timeline(vec![inner], compound, false);
+
+        let previewed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        let exported = crate::export::mix_timeline_audio_for_paths(&timeline, &paths)
+            .unwrap()
+            .expect("export hears the compound clip");
+        assert_eq!(previewed.len(), exported.len());
+        let span = 10 * FRAME..80 * FRAME;
+        let rms = (previewed[span.clone()]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum::<f32>()
+            / span.len() as f32)
+            .sqrt();
+        assert!(rms > 0.05, "the compound clip is audible in preview: {rms}");
+        let max_difference = previewed
+            .iter()
+            .zip(&exported)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_difference < 1.0e-5,
+            "preview differs from export by {max_difference}"
+        );
+    }
+
+    #[test]
+    fn a_compound_clip_multiplies_its_volume_and_ceiling_into_its_leaves() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([("dc".to_string(), dc_wav(dir.path(), "dc", 0.8, 2.0))]);
+        let mut inner = audio_clip("inner", "dc", 0, 60);
+        inner.volume = 0.5;
+        let mut compound = Clip::new_nested("compound", "sequence", 0, 60);
+        compound.volume = 0.5;
+        let timeline = compound_timeline(vec![inner.clone()], compound.clone(), false);
+        let mixed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        assert_span(&mixed, 0..60 * FRAME, 0.8 * 0.25, "0.5 x 0.5 = 0.25");
+
+        // A ceiling on the compound clip limits the sound inside it.
+        inner.volume = 1.0;
+        compound.volume = 1.0;
+        compound.loudness_normalization = Some(opentake_domain::LoudnessNormalization {
+            target_lufs: -14.0,
+            true_peak_ceiling_dbtp: -6.0,
+            input_integrated_lufs: -14.0,
+            input_true_peak_dbtp: -1.0,
+            gain_db: 0.0,
+            output_integrated_lufs: -14.0,
+            output_true_peak_dbtp: -6.0,
+        });
+        let timeline = compound_timeline(vec![inner], compound, false);
+        let mixed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        assert_span(
+            &mixed,
+            0..60 * FRAME,
+            10.0_f32.powf(-8.0 / 20.0),
+            "compound ceiling",
+        );
+    }
+
+    #[test]
+    fn a_left_trimmed_compound_clip_reads_the_matching_source_position() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // One value per source second: 0.1, 0.2, 0.3, 0.4.
+        let steps = dir.path().join("steps.wav");
+        crate::clip_audio::fixtures::write_wav(
+            &steps,
+            &(0..4 * MIX_TEST_RATE as usize)
+                .map(|index| 0.1 * (index / MIX_TEST_RATE as usize + 1) as f32)
+                .collect::<Vec<_>>(),
+        );
+        let paths = HashMap::from([("steps".to_string(), steps)]);
+        let mut compound = Clip::new_nested("compound", "sequence", 0, 60);
+        compound.trim_start_frame = 30;
+        let timeline =
+            compound_timeline(vec![audio_clip("inner", "steps", 0, 120)], compound, false);
+
+        let mixed = preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize);
+        // The compound's first second shows the sequence's second second.
+        assert_span(&mixed, 100..30 * FRAME - 100, 0.2, "first root second");
+        assert_span(
+            &mixed,
+            30 * FRAME + 100..60 * FRAME - 100,
+            0.3,
+            "second root second",
+        );
+    }
+
+    #[test]
+    fn a_muted_nested_track_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([("dc".to_string(), dc_wav(dir.path(), "dc", 0.8, 2.0))]);
+        let timeline = compound_timeline(
+            vec![audio_clip("inner", "dc", 0, 60)],
+            Clip::new_nested("compound", "sequence", 0, 60),
+            true,
+        );
+        assert!(try_collect_audio_clips(&timeline).unwrap().is_empty());
+        assert!(preview_mono(&timeline, &paths, 2 * MIX_TEST_RATE as usize)
+            .iter()
+            .all(|sample| *sample == 0.0));
+        let prepared = mix_timeline_stereo(
+            &timeline,
+            &media_for(&paths),
+            MIX_TEST_RATE,
+            0,
+            &ProfileScope::new(),
+            Arc::new(OutputState::new(true)),
+            &MediaCancelToken::new(),
+        )
+        .expect("prepare");
+        assert!(prepared.is_none(), "nothing audible, no audio stream");
+    }
+
+    #[test]
+    fn a_timeline_whose_only_sound_is_inside_a_compound_clip_creates_an_audio_stream() {
+        if !crate::clip_audio::fixtures::ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = HashMap::from([("dc".to_string(), dc_wav(dir.path(), "dc", 0.8, 2.0))]);
+        let timeline = compound_timeline(
+            vec![audio_clip("inner", "dc", 0, 60)],
+            Clip::new_nested("compound", "sequence", 0, 60),
+            false,
+        );
+        let prepared = prepare_playback(&timeline, &media_for(&paths), 0, &ProfileScope::new());
+        let first = prepared
+            .consumer
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first window");
+        assert!(first.samples.iter().any(|sample| sample.abs() > 0.5));
+        stop_playback(prepared);
+    }
+
+    // --- The realtime callback frees nothing (#69-2) ---
+
+    #[test]
+    fn the_callback_hands_every_played_or_stale_window_back_to_the_producer() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        let (recycle_sender, recycle) = bounded(RECYCLE_CAPACITY);
+        let mut consumer = AudioStreamConsumer::new(receiver, recycle_sender, Arc::clone(&control));
+        let mut sent = Vec::new();
+        let mut send = |generation: u64, start_frame: u64, value: f32| {
+            let samples = vec![value; 4 * MIX_CHANNELS];
+            sent.push(samples.as_ptr() as usize);
+            sender
+                .send(AudioStreamChunk {
+                    generation,
+                    start_frame,
+                    samples,
+                })
+                .unwrap();
+        };
+        let pos = AtomicU64::new(0);
+        let output = OutputState::new(false);
+        let mut block = vec![0.0_f32; 6 * MIX_CHANNELS];
+
+        // Play across a window boundary: the first window is retired.
+        send(0, 0, 0.25);
+        send(0, 4, 0.5);
+        assert_eq!(
+            fill_output_block(&mut consumer, &pos, &output, &mut block, MIX_CHANNELS),
+            6
+        );
+        // A seek makes the playing window and a queued one stale.
+        send(0, 8, 0.75);
+        control.request_seek(100);
+        send(1, 100, 1.0);
+        output.mute();
+        consumer.discard_stale();
+        output.unmute_unless_halted();
+        pos.store(100, Ordering::Release);
+        assert_eq!(
+            fill_output_block(
+                &mut consumer,
+                &pos,
+                &output,
+                &mut block[..4 * MIX_CHANNELS],
+                MIX_CHANNELS
+            ),
+            4
+        );
+
+        let returned = std::iter::from_fn(|| recycle.try_recv().ok())
+            .map(|buffer| buffer.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        // Everything but the post-seek window it is still playing.
+        assert_eq!(returned, sent[..3]);
+        assert_eq!(control.callback_frees.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_full_recycle_channel_parks_windows_instead_of_freeing_them() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(16);
+        let (recycle_sender, recycle) = bounded(1);
+        let mut consumer = AudioStreamConsumer::new(receiver, recycle_sender, Arc::clone(&control));
+        for window in 0..4_u64 {
+            sender
+                .send(AudioStreamChunk {
+                    generation: 0,
+                    start_frame: window,
+                    samples: vec![0.5; MIX_CHANNELS],
+                })
+                .unwrap();
+        }
+        // Skipping to the fourth window retires three: one fits the channel,
+        // two wait parked until the producer drains it.
+        assert!(consumer.ready_at(3));
+        assert_eq!(consumer.parked.len(), 2);
+        drain_recycled(&recycle);
+        consumer.control.request_seek(10);
+        consumer.discard_stale();
+        assert_eq!(consumer.parked.len(), 2, "one parked window moved on");
+        assert_eq!(control.callback_frees.load(Ordering::Acquire), 0);
+    }
+
+    // --- The clock follows what is audible (#69-3) ---
+
+    #[test]
+    fn the_clock_subtracts_the_output_delay_and_never_moves_back() {
+        let pos = Arc::new(AtomicU64::new(0));
+        let delay = Arc::new(AtomicU64::new(0));
+        let clock =
+            AudioClock::new(Arc::clone(&pos), 48_000, 30, None).delayed_by(Arc::clone(&delay));
+        // One second handed to the device, 150 ms of it not audible yet
+        // (for example a Bluetooth headset).
+        pos.store(48_000, Ordering::Release);
+        delay.store(7_200, Ordering::Release);
+        assert_eq!(clock.frame(30), 25);
+        // The device reports more latency: the playhead holds, never rewinds.
+        delay.store(12_000, Ordering::Release);
+        assert_eq!(clock.frame(30), 25);
+        pos.store(48_000 + 1_600, Ordering::Release);
+        assert_eq!(clock.frame(30), 25);
+        // It advances again once the audible position passes it.
+        pos.store(48_000 + 12_000, Ordering::Release);
+        assert_eq!(clock.frame(30), 30);
+        // A delay larger than the position saturates at the start.
+        let early = AudioClock::new(Arc::new(AtomicU64::new(1_000)), 48_000, 30, None)
+            .delayed_by(Arc::new(AtomicU64::new(9_000)));
+        assert_eq!(early.frame(30), 0);
+    }
+
+    #[test]
+    fn output_latency_converts_the_callback_timestamps_to_frames() {
+        assert_eq!(latency_frames(None, 48_000), 0);
+        assert_eq!(latency_frames(Some(Duration::from_millis(20)), 48_000), 960);
+        assert_eq!(
+            latency_frames(Some(Duration::from_millis(200)), 44_100),
+            8_820
+        );
+    }
+
+    #[test]
+    fn a_muted_block_is_silent_and_does_not_advance_the_clock() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        sender
+            .send(AudioStreamChunk {
+                generation: 0,
+                start_frame: 0,
+                samples: vec![0.5; 8 * MIX_CHANNELS],
+            })
+            .unwrap();
+        let mut consumer = test_consumer(receiver, control);
+        let pos = AtomicU64::new(0);
+        let mut block = vec![1.0_f32; 4 * MIX_CHANNELS];
+        let output = OutputState::new(true);
+        assert_eq!(
+            fill_output_block(&mut consumer, &pos, &output, &mut block, MIX_CHANNELS),
+            0
+        );
+        assert!(block.iter().all(|sample| *sample == 0.0));
+        assert_eq!(pos.load(Ordering::Acquire), 0);
+        output.unmute_unless_halted();
+        assert_eq!(
+            fill_output_block(&mut consumer, &pos, &output, &mut block, MIX_CHANNELS),
+            4
+        );
+        assert!(block.iter().all(|sample| *sample == 0.5));
+    }
+
+    // --- Device-thread waits are bounded (#214) ---
+
+    #[test]
+    fn a_hung_device_query_answers_unknown_after_the_timeout() {
+        let (job_tx, job_rx) = mpsc::sync_channel::<DeviceJob>(1);
+        let worker = std::thread::spawn(move || run_device_jobs(job_rx));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // A driver call that never returns while the resume waits on it.
+        let hung = submit_device_query(&job_tx, Duration::from_millis(50), move || {
+            let _ = release_rx.recv();
+            Some("speakers".to_string())
+        });
+        assert_eq!(hung, None, "a timeout reads as \"device unchanged\"");
+        // The queue behind it is full too; that also times out.
+        assert_eq!(
+            submit_device_query(&job_tx, Duration::from_millis(50), || Some(1_u32)),
+            None
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            submit_device_query(&job_tx, DEVICE_QUERY_TIMEOUT, || Some(44_100)),
+            Some(44_100)
+        );
+        drop(job_tx);
+        worker.join().expect("join audio device thread");
+    }
+
+    // --- Clip readers of a paused session (#209) ---
+
+    #[test]
+    fn a_paused_session_closes_its_clip_readers_once_its_queue_is_full() {
+        let output = Arc::new(OutputState::new(true));
+        let control = Arc::new(AudioStreamControl::with_output(0, Arc::clone(&output)));
+        let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        let (recycle_sender, recycle) = bounded(RECYCLE_CAPACITY);
+        let mixed = Arc::new(AtomicU64::new(0));
+        let mixer = fn_mixer({
+            let mixed = Arc::clone(&mixed);
+            move |_start: u64, len: usize, _cancel: &MediaCancelToken| {
+                mixed.fetch_add(1, Ordering::AcqRel);
+                Ok(vec![0.5; len * MIX_CHANNELS])
+            }
+        });
+        let closes = Arc::clone(&mixer.closes);
+        let producer_control = Arc::clone(&control);
+        let producer = thread::spawn(move || {
+            run_audio_producer(
+                &producer_control,
+                &sender,
+                &recycle,
+                ProducerWindows {
+                    rate: 100,
+                    next_frame: 0,
+                    total_frames: 100_000,
+                    window_frames: 100,
+                },
+                mixer,
+                MediaCancelToken::new(),
+            )
+        });
+
+        // Paused: the producer fills the queue, then releases its decoders.
+        wait_for(Duration::from_secs(5), "readers closed", || {
+            closes.load(Ordering::Acquire) > 0
+        });
+        let mixed_while_paused = mixed.load(Ordering::Acquire);
+        assert_eq!(
+            mixed_while_paused as usize,
+            STREAM_WINDOW_CAPACITY + 1,
+            "the queue plus the window waiting to be sent"
+        );
+
+        // Resumed: the session consumes and the producer reopens and mixes on.
+        output.unmute_unless_halted();
+        let mut consumer = AudioStreamConsumer::new(receiver, recycle_sender, Arc::clone(&control));
+        let mut frame = 0;
+        wait_for(Duration::from_secs(5), "mixing resumes", || {
+            while consumer.ready_at(frame) {
+                frame += 1;
+            }
+            mixed.load(Ordering::Acquire) > mixed_while_paused
+        });
+        let closes_while_playing = closes.load(Ordering::Acquire);
+        for _ in 0..3 {
+            while consumer.ready_at(frame) {
+                frame += 1;
+            }
+            thread::sleep(STREAM_SEND_POLL * 4);
+        }
+        assert_eq!(
+            closes.load(Ordering::Acquire),
+            closes_while_playing,
+            "a playing session keeps its readers"
+        );
+
+        control.stop();
+        drop(consumer);
+        producer.join().expect("producer exits on stop");
+    }
+
+    #[test]
+    fn a_seek_or_stop_interrupts_the_readers_the_first_window_left_open() {
+        for stop in [false, true] {
+            // The prepare token reaches the prefilled window through a child;
+            // the readers that window left open read the next window with it.
+            let prepare = MediaCancelToken::new();
+            let first_window = prepare.child();
+            let control = Arc::new(AudioStreamControl::new(0));
+            let (sender, _receiver) = bounded(STREAM_WINDOW_CAPACITY);
+            let (_recycle_sender, recycle) = bounded(RECYCLE_CAPACITY);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let expected = first_window.clone();
+            let mixer = fn_mixer(move |start: u64, _len: usize, cancel: &MediaCancelToken| {
+                if start == 100 {
+                    // The second window: continue the first window's reader.
+                    let _ = outcome_tx.send(cancel.same_instance(&expected));
+                    let _ = entered_tx.send(());
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !cancel.is_cancelled() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    return Err(MediaError::Cancelled);
+                }
+                Ok(vec![0.0; 100 * MIX_CHANNELS])
+            });
+            let producer_control = Arc::clone(&control);
+            let producer_window = first_window.clone();
+            let producer = thread::spawn(move || {
+                run_audio_producer(
+                    &producer_control,
+                    &sender,
+                    &recycle,
+                    ProducerWindows {
+                        rate: 100,
+                        next_frame: 100,
+                        total_frames: 400,
+                        window_frames: 100,
+                    },
+                    mixer,
+                    producer_window,
+                )
+            });
+            assert!(
+                outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "the second window reads with the first window's token"
+            );
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if stop {
+                control.stop();
+            } else {
+                control.request_seek(300);
+            }
+            assert!(
+                first_window.is_cancelled(),
+                "stop={stop}: the read is interrupted"
+            );
+            assert!(!prepare.is_cancelled(), "the session itself goes on");
+            control.stop();
+            producer.join().expect("producer exits");
+        }
     }
 }
