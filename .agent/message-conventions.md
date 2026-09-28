@@ -164,7 +164,7 @@ Evidence: state at the top how the problem was verified (code reading, reproduct
 
 Start from `.github/pull_request_template.md` and write in English. Every section that remains must carry real information: delete sections that do not apply, never leave one empty or write `None`, `N/A`, `TBD` or `-` in it, and do not append tool attribution or session links (§1).
 
-- `## Linked issues` (whenever the PR relates to an issue; required when the title references one): `Closes #N` for a complete fix, `Refs #N` for a partial or related change, one per line. Every issue in the title appears here; a `(partial #N)` title links it with `Refs #N`, never with a closing keyword. Delete the section when there is no issue.
+- `## Linked issues` (whenever the PR relates to an issue; required when the title references one): `Closes #N` for a complete fix, `Refs #N` for a partial or related change, one per line. Every issue in the title appears here; a `(partial #N)` title links it with `Refs #N`, never with a closing keyword. Delete the section when there is no issue. GitHub closes the issue after a closing keyword (`close`, `fix` or `resolve` in any form, followed by `#N`) wherever it appears in the description, so use closing keywords only in this section; elsewhere write "issue #N".
 - `## Summary` (required): user-visible changes and the main code changes.
 - `## Root cause` (required for `fix` and `perf`; delete it for other types): why the problem happened.
 - `## Implementation notes` (optional): key design decisions and trade-offs; justify any departure from upstream palmier-pro semantics.
@@ -243,6 +243,7 @@ git config core.hooksPath .githooks
   - `## Summary` and `## Testing` exist; so does `## Root cause` for a `fix` or `perf` title, `## Linked issues` when the title references an issue, and `## Follow-ups` for a `(partial #N)` title.
   - No section is empty or holds only a placeholder such as `None`, `N/A`, `TBD` or `-`.
   - `## Linked issues` contains `Closes`/`Fixes`/`Resolves #N` or `Refs #N`, references every issue in the title, and uses only `Refs` for the issues of a partial fix.
+  - Closing keywords appear only in `## Linked issues`, outside inline code and code blocks.
   - `## Testing` has no unchecked items and contains a checked item or a written description.
   - No tool attribution lines, agent session links or leftover template placeholders such as `<crate>`; no non-English text outside inline code and code blocks.
 - Commit messages (local hook): the same header rules, a blank line after the subject, an English body and no agent session links.
