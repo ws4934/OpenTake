@@ -1,6 +1,7 @@
 //! One save flight shared by window close and user Quit, and the choice that
 //! follows a failed save.
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 
@@ -13,7 +14,7 @@ pub(crate) enum CloseIntent {
 
 impl CloseIntent {
     fn from_bits(bits: u8) -> Option<Self> {
-        match bits & INTENT_BITS {
+        match bits {
             1 => Some(Self::Hide),
             2 => Some(Self::Exit),
             _ => None,
@@ -38,27 +39,46 @@ pub(crate) enum FailedCloseChoice {
     Discard,
     /// Keep the project open.
     Cancel,
+    /// The WebView could not show its prompt: hand it to the native one.
+    Native,
 }
 
-const INTENT_BITS: u8 = 0b11;
-/// Set once the WebView or the native fallback has taken over the prompt.
-const PROMPT_CLAIMED: u8 = 0b100;
+/// One close or quit whose save failed and that waits for the user's choice.
+/// The id distinguishes it from any later failure, so a stale prompt, timer
+/// or answer never acts on a newer one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FailedClose {
+    pub(crate) id: u64,
+    pub(crate) intent: CloseIntent,
+    pub(crate) message: String,
+}
+
+#[derive(Default)]
+struct FailedState {
+    next_id: u64,
+    /// The waiting failure and whether a prompt (WebView or native) shows it.
+    pending: Option<(FailedClose, bool)>,
+}
 
 #[derive(Default)]
 pub(crate) struct CloseCoordinator {
     pending: AtomicU8,
-    /// The intent of a close whose save failed and awaits the user's choice,
-    /// plus [`PROMPT_CLAIMED`] once one prompt shows it.
-    failed: AtomicU8,
+    failed: Mutex<FailedState>,
 }
 
 impl CloseCoordinator {
+    fn failed(&self) -> std::sync::MutexGuard<'_, FailedState> {
+        // The state is updated in single assignments, so it stays consistent
+        // even if a holder panicked.
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Start one save, or promote an in-flight window close to Quit. A new
     /// request supersedes a failed close still waiting for its choice.
     pub(crate) fn request(&self, intent: CloseIntent) -> bool {
         let admitted = self.pending.fetch_max(intent as u8, Ordering::AcqRel) == 0;
         if admitted {
-            self.failed.store(0, Ordering::Release);
+            self.failed().pending = None;
         }
         admitted
     }
@@ -72,33 +92,52 @@ impl CloseCoordinator {
     }
 
     /// Remember a close whose save failed until the user chooses what to do.
-    pub(crate) fn record_failure(&self, intent: CloseIntent) {
-        self.failed.store(intent as u8, Ordering::Release);
+    pub(crate) fn record_failure(&self, intent: CloseIntent, message: String) -> FailedClose {
+        let mut state = self.failed();
+        state.next_id += 1;
+        let failure = FailedClose {
+            id: state.next_id,
+            intent,
+            message,
+        };
+        state.pending = Some((failure.clone(), false));
+        failure
     }
 
     /// Let exactly one prompt (the WebView's, or the native fallback when the
-    /// WebView never answers) show the pending choice.
-    pub(crate) fn claim_prompt(&self) -> Option<CloseIntent> {
-        let current = self.failed.load(Ordering::Acquire);
-        let intent = CloseIntent::from_bits(current)?;
-        if current & PROMPT_CLAIMED != 0 {
-            return None;
+    /// WebView never answers) show failure `id`, if it is still waiting.
+    pub(crate) fn claim_prompt(&self, id: u64) -> Option<FailedClose> {
+        match &mut self.failed().pending {
+            Some((failure, claimed)) if failure.id == id && !*claimed => {
+                *claimed = true;
+                Some(failure.clone())
+            }
+            _ => None,
         }
-        self.failed
-            .compare_exchange(
-                current,
-                current | PROMPT_CLAIMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()
-            .map(|_| intent)
     }
 
-    /// Consume the pending failed close; `None` when nothing is waiting (for
-    /// example after a newer close request superseded it).
-    pub(crate) fn take_failure(&self) -> Option<CloseIntent> {
-        CloseIntent::from_bits(self.failed.swap(0, Ordering::AcqRel))
+    /// Return a claimed failure to the unclaimed state, so the native prompt
+    /// can show it after the WebView failed to.
+    pub(crate) fn release_prompt(&self, id: u64) -> Option<FailedClose> {
+        match &mut self.failed().pending {
+            Some((failure, claimed)) if failure.id == id && *claimed => {
+                *claimed = false;
+                Some(failure.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Consume failure `id`; `None` when it is no longer waiting (a newer
+    /// close request superseded it, or it was already answered).
+    pub(crate) fn take_failure(&self, id: u64) -> Option<FailedClose> {
+        let mut state = self.failed();
+        match &state.pending {
+            Some((failure, _)) if failure.id == id => {
+                state.pending.take().map(|(failure, _)| failure)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -132,25 +171,64 @@ mod tests {
     #[test]
     fn failed_close_is_prompted_once_and_resolved_once() {
         let coordinator = CloseCoordinator::default();
-        assert_eq!(coordinator.claim_prompt(), None);
-        assert_eq!(coordinator.take_failure(), None);
+        assert_eq!(coordinator.claim_prompt(1), None);
+        assert_eq!(coordinator.take_failure(1), None);
 
-        coordinator.record_failure(CloseIntent::Exit);
-        assert_eq!(coordinator.claim_prompt(), Some(CloseIntent::Exit));
-        assert_eq!(coordinator.claim_prompt(), None, "one prompt at a time");
-        assert_eq!(coordinator.take_failure(), Some(CloseIntent::Exit));
-        assert_eq!(coordinator.take_failure(), None, "a choice applies once");
-        assert_eq!(coordinator.claim_prompt(), None);
+        let failure = coordinator.record_failure(CloseIntent::Exit, "disk full".into());
+        assert_eq!(failure.message, "disk full");
+        assert_eq!(coordinator.claim_prompt(failure.id), Some(failure.clone()));
+        assert_eq!(
+            coordinator.claim_prompt(failure.id),
+            None,
+            "one prompt at a time"
+        );
+        assert_eq!(coordinator.take_failure(failure.id), Some(failure.clone()));
+        assert_eq!(
+            coordinator.take_failure(failure.id),
+            None,
+            "a choice applies once"
+        );
+        assert_eq!(coordinator.claim_prompt(failure.id), None);
+    }
+
+    #[test]
+    fn a_released_prompt_can_be_claimed_again() {
+        let coordinator = CloseCoordinator::default();
+        let failure = coordinator.record_failure(CloseIntent::Hide, "unplugged".into());
+        assert_eq!(
+            coordinator.release_prompt(failure.id),
+            None,
+            "not claimed yet"
+        );
+        assert!(coordinator.claim_prompt(failure.id).is_some());
+        assert_eq!(
+            coordinator.release_prompt(failure.id),
+            Some(failure.clone())
+        );
+        assert_eq!(coordinator.claim_prompt(failure.id), Some(failure));
+    }
+
+    #[test]
+    fn stale_prompts_timers_and_answers_never_act_on_a_newer_failure() {
+        let coordinator = CloseCoordinator::default();
+        let old = coordinator.record_failure(CloseIntent::Hide, "old error".into());
+        let new = coordinator.record_failure(CloseIntent::Exit, "new error".into());
+        assert_ne!(old.id, new.id);
+        assert_eq!(coordinator.claim_prompt(old.id), None);
+        assert_eq!(coordinator.release_prompt(old.id), None);
+        assert_eq!(coordinator.take_failure(old.id), None);
+        assert_eq!(coordinator.claim_prompt(new.id), Some(new.clone()));
+        assert_eq!(coordinator.take_failure(new.id), Some(new));
     }
 
     #[test]
     fn a_new_close_request_supersedes_a_waiting_failure() {
         let coordinator = CloseCoordinator::default();
         assert!(coordinator.request(CloseIntent::Hide));
-        let (intent, _) = coordinator.finish(Err("volume unplugged")).unwrap_err();
-        coordinator.record_failure(intent);
+        let (intent, message) = coordinator.finish(Err("volume unplugged")).unwrap_err();
+        let failure = coordinator.record_failure(intent, message.into());
         assert!(coordinator.request(CloseIntent::Exit));
-        assert_eq!(coordinator.take_failure(), None);
+        assert_eq!(coordinator.take_failure(failure.id), None);
         assert_eq!(coordinator.finish::<()>(Ok(())), Ok(CloseIntent::Exit));
     }
 
@@ -162,6 +240,7 @@ mod tests {
             ("\"retry\"", FailedCloseChoice::Retry),
             ("\"discard\"", FailedCloseChoice::Discard),
             ("\"cancel\"", FailedCloseChoice::Cancel),
+            ("\"native\"", FailedCloseChoice::Native),
         ] {
             assert_eq!(
                 serde_json::from_str::<FailedCloseChoice>(raw).unwrap(),

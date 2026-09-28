@@ -71,7 +71,7 @@ const srv = vi.hoisted(() => {
     message: vi.fn(async (..._args: unknown[]): Promise<string> => "Cancel"),
     messageDialog: vi.fn(async () => srv.message),
     lifecycleClaimFailedClose: vi.fn(async () => true),
-    lifecycleResolveFailedClose: vi.fn(async (_choice: string) => {}),
+    lifecycleResolveFailedClose: vi.fn(async (_id: number, _choice: string) => {}),
     getDefaultProjectDir: vi.fn(async () => ""),
     checkPathExists: vi.fn(async (_path: string) => false),
     // A refresh snapshot to return instead of the default one.
@@ -1319,10 +1319,11 @@ describe("resolveFailedClose", () => {
   ])("answers %s with %s", async (button, choice) => {
     srv.message.mockResolvedValueOnce(button);
 
-    await resolveFailedClose({ intent: "exit", message: "No space left on device" });
+    await resolveFailedClose({ id: 7, intent: "exit", message: "No space left on device" });
 
+    expect(srv.lifecycleClaimFailedClose).toHaveBeenCalledWith(7);
     expect(srv.message.mock.calls[0]?.[0]).toContain("No space left on device");
-    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(choice);
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(7, choice);
     expect(srv.projectSave).not.toHaveBeenCalled();
   });
 
@@ -1330,16 +1331,24 @@ describe("resolveFailedClose", () => {
     srv.message.mockResolvedValueOnce("Save As…");
     srv.save.mockResolvedValueOnce("/tmp/elsewhere.opentake");
 
-    await resolveFailedClose({ intent: "hide", message: "bundle was deleted" });
+    await resolveFailedClose({ id: 3, intent: "hide", message: "bundle was deleted" });
 
     expect(srv.projectSave).toHaveBeenCalledWith("/tmp/elsewhere.opentake", 1, "/tmp/current.opentake");
-    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith("retry");
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(3, "retry");
+  });
+
+  it("hands the choice to the native prompt when the dialog cannot be shown", async () => {
+    srv.message.mockRejectedValueOnce(new Error("dialog.message not allowed"));
+
+    await resolveFailedClose({ id: 9, intent: "exit", message: "disk full" });
+
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(9, "native");
   });
 
   it("does not prompt when the native fallback already owns the choice", async () => {
     srv.lifecycleClaimFailedClose.mockResolvedValueOnce(false);
 
-    await resolveFailedClose({ intent: "exit", message: "disk full" });
+    await resolveFailedClose({ id: 2, intent: "exit", message: "disk full" });
 
     expect(srv.message).not.toHaveBeenCalled();
     expect(srv.lifecycleResolveFailedClose).not.toHaveBeenCalled();

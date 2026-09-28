@@ -131,6 +131,9 @@ fn main_window_capability_exposes_no_shell_or_filesystem_commands() {
     // issues the single-use write grants; the plugin's own save command (and
     // `dialog:default`, which includes it) would only widen the read scope.
     assert!(permissions.contains(&"dialog:allow-open"));
+    // The failed-save prompt (Save As / Don't Save / Cancel) is a message
+    // dialog; allowing it grants no filesystem scope.
+    assert!(permissions.contains(&"dialog:allow-message"));
     assert!(permissions
         .iter()
         .all(|permission| !matches!(*permission, "dialog:default" | "dialog:allow-save")));

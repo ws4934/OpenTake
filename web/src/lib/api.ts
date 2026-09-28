@@ -2594,24 +2594,32 @@ export async function onCloseSaveFailed(
   if (!listenImpl) return () => {};
   return listenImpl("close_save_failed", (e) => {
     const p = e.payload as Partial<CloseSaveFailedEvent> | undefined;
-    if (p && (p.intent === "hide" || p.intent === "exit") && typeof p.message === "string") {
-      handler({ intent: p.intent, message: p.message });
+    if (
+      p &&
+      typeof p.id === "number" &&
+      (p.intent === "hide" || p.intent === "exit") &&
+      typeof p.message === "string"
+    ) {
+      handler({ id: p.id, intent: p.intent, message: p.message });
     }
   });
 }
 
-/** Claim the pending failed-close prompt. `false` when the native fallback
- *  already showed it or nothing is waiting. */
-export async function lifecycleClaimFailedClose(): Promise<boolean> {
+/** Claim failed-close prompt `id`. `false` when the native fallback already
+ *  showed it or it is no longer waiting. */
+export async function lifecycleClaimFailedClose(id: number): Promise<boolean> {
   await ensureTauri();
   if (!invokeImpl) return false;
-  return (await invokeImpl<string | null>("lifecycle_claim_failed_close")) !== null;
+  return invokeImpl<boolean>("lifecycle_claim_failed_close", { id });
 }
 
-/** Answer a failed close or quit save. */
-export async function lifecycleResolveFailedClose(choice: FailedCloseChoice): Promise<void> {
+/** Answer failed close or quit save `id`. */
+export async function lifecycleResolveFailedClose(
+  id: number,
+  choice: FailedCloseChoice,
+): Promise<void> {
   await ensureTauri();
-  if (invokeImpl) await invokeImpl<void>("lifecycle_resolve_failed_close", { choice });
+  if (invokeImpl) await invokeImpl<void>("lifecycle_resolve_failed_close", { id, choice });
 }
 
 /** Subscribe to `go_home` after macOS window close saves and hides the window.

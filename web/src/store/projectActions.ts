@@ -14,7 +14,7 @@ import { useProjectStore } from "./projectStore";
 import { useRecentStore } from "./recentStore";
 import { refreshMedia, resetProjectMediaState, useMediaStore } from "./mediaStore";
 import { messageDialog, openDialog, saveDialog } from "../lib/dialog";
-import type { CloseSaveFailedEvent } from "../lib/types";
+import type { CloseSaveFailedEvent, FailedCloseChoice } from "../lib/types";
 import { t } from "../i18n";
 import { projectErrorMessage } from "../lib/projectMessages";
 import { stopNativePlaybackForProjectBoundary } from "../components/preview/nativePlaybackSession";
@@ -248,18 +248,22 @@ async function runFailedSaveChoice(detail?: string): Promise<FailedSaveChoice> {
 }
 
 /** The save before a window close or quit failed (see `lifecycle.rs`). Claim
- *  the prompt (the native fallback may already own it), ask, and answer. */
+ *  the prompt (the native fallback may already own it), ask, and answer. If
+ *  the dialog itself fails, the native prompt takes over instead of the close
+ *  being silently cancelled. */
 export async function resolveFailedClose(event: CloseSaveFailedEvent): Promise<void> {
-  if (!(await api.lifecycleClaimFailedClose())) return;
-  let choice: FailedSaveChoice = "cancel";
+  if (!(await api.lifecycleClaimFailedClose(event.id))) return;
+  let answer: FailedCloseChoice;
   try {
-    choice = await chooseAfterFailedSave(event.message);
-  } finally {
-    const answer = choice === "saved" ? "retry" : choice;
-    await api.lifecycleResolveFailedClose(answer).catch((error: unknown) => {
-      useEditorUiStore.getState().pushToast(projectLifecycleErrorMessage(error));
-    });
+    const choice = await chooseAfterFailedSave(event.message);
+    answer = choice === "saved" ? "retry" : choice;
+  } catch (error) {
+    console.error("Failed-save prompt could not be shown:", error);
+    answer = "native";
   }
+  await api.lifecycleResolveFailedClose(event.id, answer).catch((error: unknown) => {
+    useEditorUiStore.getState().pushToast(projectLifecycleErrorMessage(error));
+  });
 }
 
 async function runSaveCoordinator(): Promise<void> {
