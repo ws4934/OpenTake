@@ -121,7 +121,10 @@ impl OrphanedGenerationStore {
                 .map_err(|error| format!("hold generation result: {error}"))?;
             let _ = fs::remove_file(staged);
         }
-        let held = fs::File::open(&destination)
+        // Flushing needs write access on Windows (`FlushFileBuffers`).
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
             .and_then(|file| {
                 file.sync_all()?;
                 file.metadata()

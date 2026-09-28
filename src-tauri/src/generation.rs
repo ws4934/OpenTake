@@ -3894,7 +3894,9 @@ mod tests {
         core: &AppCore,
         model: &str,
     ) -> opentake_domain::MediaManifestEntry {
-        for _ in 0..150 {
+        // Generous for loaded CI runners (probing and fsyncs are slow there).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(entry) = core.media().entries.into_iter().find(|entry| {
                 entry.generation_input.as_ref().is_some_and(|input| {
                     input.model == model && input.status == Some(GenerationJobStatus::Ready)
@@ -4656,7 +4658,7 @@ mod tests {
         job_id: &str,
         expected: GenerationJobStatus,
     ) -> opentake_domain::GenerationInput {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(input) = core
                 .media()
