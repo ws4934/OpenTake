@@ -754,8 +754,9 @@ pub fn decode_frame_at_with_color_cancellable(
             if cancel.is_cancelled() {
                 return Err(MediaError::Cancelled);
             }
-            return result
-                .ok_or_else(|| MediaError::Decode(format!("no frame at {:.3}s", req.time_secs)));
+            return result.ok_or_else(|| MediaError::NoFrameAt {
+                time_secs: req.time_secs,
+            });
         }
         match child.as_inner_mut().try_wait() {
             Ok(Some(_)) => {
@@ -765,8 +766,8 @@ pub fn decode_frame_at_with_color_cancellable(
                 if cancel.is_cancelled() {
                     return Err(MediaError::Cancelled);
                 }
-                return result.ok_or_else(|| {
-                    MediaError::Decode(format!("no frame at {:.3}s", req.time_secs))
+                return result.ok_or_else(|| MediaError::NoFrameAt {
+                    time_secs: req.time_secs,
                 });
             }
             Ok(None) => thread::sleep(FRAME_CHILD_POLL_INTERVAL),
@@ -916,7 +917,7 @@ pub fn decode_frames_at_with_color_cancellable(
                 }
                 // A duplicate of an already-emitted frame, or an undecodable
                 // point: skip it.
-                Ok(_) | Err(MediaError::Decode(_)) => {}
+                Ok(_) | Err(MediaError::Decode(_) | MediaError::NoFrameAt { .. }) => {}
                 Err(MediaError::Cancelled) => {
                     out.push(Err(MediaError::Cancelled));
                     return out;
@@ -1191,10 +1192,9 @@ fn decode_grid_run(
         return Err(MediaError::Cancelled);
     }
     if frames.is_empty() {
-        return Err(MediaError::Decode(format!(
-            "no frame at {:.3}s",
-            run.origin_us as f64 / MICROS_PER_SEC as f64
-        )));
+        return Err(MediaError::NoFrameAt {
+            time_secs: run.origin_us as f64 / MICROS_PER_SEC as f64,
+        });
     }
     pts.sort_unstable();
     Ok(frames

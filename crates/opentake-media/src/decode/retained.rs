@@ -142,7 +142,9 @@ pub(super) fn decode_retained_frame(
     let selection = selection?;
     frame?
         .map(|frame| (selection.secs(), frame))
-        .ok_or_else(|| MediaError::Decode(format!("no frame at {:.3}s", req.time_secs)))
+        .ok_or_else(|| MediaError::NoFrameAt {
+            time_secs: req.time_secs,
+        })
 }
 
 fn terminate(tree: &mut ProcessTree, child: &mut Child) {
