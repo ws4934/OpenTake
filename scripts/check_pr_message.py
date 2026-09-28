@@ -48,6 +48,10 @@ UNCHECKED = re.compile(r"^\s*[-*+]\s*\[ \]")
 ISSUE_REFERENCE = re.compile(
     r"\b(?P<keyword>close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\s+#(?P<number>\d+)", re.IGNORECASE
 )
+# GitHub closes the issue after a closing keyword anywhere in a description.
+CLOSING_REFERENCE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:[\w.-]+/[\w.-]+)?#\d+", re.IGNORECASE
+)
 # Tool attribution footers and agent session or task links.
 ATTRIBUTION = re.compile(
     r"generated (?:with|by) \[?(?:claude|codex|chatgpt|openai|copilot|cursor|gemini)"
@@ -127,6 +131,25 @@ def attribution_errors(text: str, what: str) -> list[str]:
     return []
 
 
+def stray_closing_errors(body: str) -> list[str]:
+    """Closing keywords outside '## Linked issues' still close their issues on merge."""
+    errors = []
+    in_linked = False
+    for number, line in prose_lines(body):
+        heading = HEADING.match(line)
+        if heading:
+            in_linked = heading["name"].strip().lower() == "linked issues"
+            continue
+        if in_linked:
+            continue
+        for match in CLOSING_REFERENCE.finditer(line):
+            errors.append(
+                f"{match.group(0)!r} outside '## Linked issues' closes that issue when the PR "
+                f"merges (line {number}); link issues only in '## Linked issues' or reword it"
+            )
+    return errors
+
+
 def sections(body: str) -> dict[str, list[str]]:
     """Map '## ' headings, as written, to their content lines (code included, comments removed)."""
     found: dict[str, list[str]] = {}
@@ -155,6 +178,7 @@ def filled(lines: list[str]) -> list[str]:
 def check_body(body: str, title: str = "") -> list[str]:
     """Check a PR description; the title decides which conditional sections are required."""
     errors = non_english_errors(body, "PR description") + attribution_errors(body, "PR description")
+    errors += stray_closing_errors(body)
     header = HEADER.match(title)
     suffix = ISSUE_SUFFIX.search(title)
     partial = bool(suffix and suffix["partial"])

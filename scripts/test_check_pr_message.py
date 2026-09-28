@@ -156,6 +156,22 @@ class BodyTests(unittest.TestCase):
         errors = check.check_body(GOOD_BODY, "fix(tauri): unblock saves during proxy creation (#28, #97)")
         self.assertTrue(has_error(errors, "must reference #97"))
 
+    def test_rejects_closing_keywords_outside_linked_issues(self) -> None:
+        stray = GOOD_BODY.replace(
+            "- Windows uses `ReplaceFileW`; Unix uses `renameat`.",
+            "- The removed workflow failed PRs that did not close #8 or #64.",
+        )
+        errors = check.check_body(stray, GOOD_TITLE)
+        self.assertTrue(has_error(errors, "'close #8' outside '## Linked issues'"))
+        self.assertFalse(has_error(errors, "#64"))
+        preamble = "Fixes: #12\n\n" + GOOD_BODY
+        self.assertTrue(has_error(check.check_body(preamble, GOOD_TITLE), "'Fixes: #12' outside"))
+        quoted = GOOD_BODY.replace(
+            "- Windows uses `ReplaceFileW`; Unix uses `renameat`.",
+            "- Squash commits end with `Closes #28`.\n\n```text\nfix: keep it\n\nCloses #28\n```",
+        )
+        self.assertEqual(check.check_body(quoted, GOOD_TITLE), [])
+
     def test_partial_fix_uses_refs_and_follow_ups(self) -> None:
         partial = GOOD_BODY.replace("Closes #28", "Refs #28") + FOLLOW_UPS
         self.assertEqual(check.check_body(partial, PARTIAL_TITLE), [])
