@@ -744,39 +744,69 @@ fn persist_entries(path: &Path, entries: &[ProjectEntry]) -> Result<(), String> 
     result
 }
 
+/// Explorer parses `/select,"<path>"` itself and needs only the path quoted.
+/// Rust's argument quoting would wrap the whole switch in quotes whenever the
+/// path contains a space (`"/select,C:\My Projects\a.opentake"`), which
+/// Explorer does not select, so Windows passes this as a raw argument.
+/// Explorer does not understand the `\\?\` prefix, and Windows file names
+/// cannot contain `"`.
+#[cfg(any(target_os = "windows", test))]
+fn explorer_select_argument(path: &Path) -> Result<OsString, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "project path is not valid Unicode".to_string())?;
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+    if text.contains('"') {
+        return Err("project path contains a quote character".into());
+    }
+    Ok(OsString::from(format!("/select,\"{text}\"")))
+}
+
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = Command::new("explorer.exe");
         if path.exists() {
-            (
-                "open",
-                vec!["-R".into(), path.to_string_lossy().into_owned()],
-            )
+            command.raw_arg(explorer_select_argument(path)?);
         } else {
-            let parent = path.parent().unwrap_or(path);
-            ("open", vec![parent.to_string_lossy().into_owned()])
+            command.arg(path.parent().unwrap_or(path));
         }
-    } else if cfg!(target_os = "windows") {
-        if path.exists() {
-            (
-                "explorer.exe",
-                vec![format!("/select,{}", path.to_string_lossy())],
-            )
+        // Explorer hands the request to the running shell and commonly exits
+        // with status 1 after the window is shown (or keeps running as the
+        // shell), so starting it is the only reliable success signal.
+        command
+            .spawn()
+            .map(drop)
+            .map_err(|error| format!("start file manager: {error}"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+            if path.exists() {
+                (
+                    "open",
+                    vec!["-R".into(), path.to_string_lossy().into_owned()],
+                )
+            } else {
+                let parent = path.parent().unwrap_or(path);
+                ("open", vec![parent.to_string_lossy().into_owned()])
+            }
         } else {
-            let parent = path.parent().unwrap_or(path);
-            ("explorer.exe", vec![parent.to_string_lossy().into_owned()])
+            let target = path.parent().unwrap_or(path);
+            ("xdg-open", vec![target.to_string_lossy().into_owned()])
+        };
+        let status = Command::new(program)
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("start file manager: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("file manager exited with status {status}"))
         }
-    } else {
-        let target = path.parent().unwrap_or(path);
-        ("xdg-open", vec![target.to_string_lossy().into_owned()])
-    };
-    let status = Command::new(program)
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("start file manager: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("file manager exited with status {status}"))
     }
 }
 
@@ -1662,6 +1692,23 @@ mod tests {
             .is_err());
         assert!(registry.registered_entry(&project).is_ok());
         assert!(project.exists());
+    }
+
+    #[test]
+    fn explorer_select_argument_quotes_only_the_path() {
+        assert_eq!(
+            explorer_select_argument(Path::new(r"C:\My Projects\a.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\My Projects\a.opentake""#)
+        );
+        assert_eq!(
+            explorer_select_argument(Path::new(r"C:\Projects\b.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\Projects\b.opentake""#)
+        );
+        assert_eq!(
+            explorer_select_argument(Path::new(r"\\?\C:\Long Projects\c.opentake")).unwrap(),
+            OsString::from(r#"/select,"C:\Long Projects\c.opentake""#)
+        );
+        assert!(explorer_select_argument(Path::new(r#"C:\bad"name.opentake"#)).is_err());
     }
 
     #[cfg(target_os = "windows")]
