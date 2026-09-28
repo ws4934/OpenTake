@@ -13,6 +13,8 @@ pub mod locale;
 pub mod model;
 pub mod search;
 pub mod timeline;
+#[cfg(any(test, feature = "whisper-backend"))]
+mod tokens;
 
 #[cfg(feature = "whisper-backend")]
 pub mod whisper;
