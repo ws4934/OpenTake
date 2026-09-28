@@ -168,7 +168,7 @@ Start from `.github/pull_request_template.md` and write in English. Every sectio
 - `## Summary` (required): user-visible changes and the main code changes.
 - `## Root cause` (required for `fix` and `perf`; delete it for other types): why the problem happened.
 - `## Implementation notes` (optional): key design decisions and trade-offs; justify any departure from upstream palmier-pro semantics.
-- `## Testing` (required): only what was actually run, with results. Check each item you ran and delete the others; manual checks name the platform and steps. Changes to crates that PR CI does not build (see [workflow.md](workflow.md) §3) must include the local full-workspace results, or explain why they could not be run.
+- `## Testing` (required): only what was actually run, with results. Check each item you ran and delete the others; manual checks name the platform and steps. Name what CI cannot cover (GPU, audio device, real browser, installer; see [workflow.md](workflow.md) §3) and how it was verified, or write "needs verification on <platform>".
 - `## Risk and rollback` (optional): what could break (data, compatibility, platforms) and how to roll back.
 - `## Follow-ups` (required for a partial fix; optional otherwise): the remaining work, item by item.
 

@@ -20,7 +20,7 @@ In short:
 
 ## Validation
 
-PR CI builds only the lightweight crates and the web frontend. Run the checks that match your change from the repository root and record the commands you actually ran in the PR:
+PR CI selects its checks from your change: `pr.yml` covers the core crates and the web frontend on Linux, and `pr-native.yml` tests every affected Rust crate on Linux, Windows and macOS. For fast feedback, and for anything CI runners cannot exercise, run the matching checks from the repository root and record the commands you actually ran in the PR:
 
 ```bash
 cargo fmt --all --check

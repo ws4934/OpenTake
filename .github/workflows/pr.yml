@@ -1,8 +1,9 @@
 name: PR checks
 
 # Pull requests check the lightweight Rust crates, workflow/provisioning scripts,
-# and web build/tests. Full workspace and desktop integration checks live in
-# ci.yml and release.yml for release tags or manual dispatch.
+# and web build/tests. pr-native.yml builds and tests the affected crates on
+# Linux, Windows and macOS when Rust code changes; release-time and hardware
+# checks live in ci.yml and release.yml for release tags or manual dispatch.
 on:
   pull_request:
 

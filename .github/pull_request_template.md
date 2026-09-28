@@ -27,9 +27,9 @@ Closes #
 
 ## Testing
 <!--
-Check what you actually ran and add the results; delete the rest. Changes to
-src-tauri, opentake-media, opentake-render, opentake-motion, opentake-agent or
-opentake-gen need local full-workspace results because PR CI does not build them.
+Check what you actually ran and add the results; delete the rest. CI tests the
+affected crates on Linux, Windows and macOS; name what it cannot cover (GPU,
+audio device, real browser, installer) and how you verified it.
 -->
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
