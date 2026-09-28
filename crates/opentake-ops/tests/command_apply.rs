@@ -2395,6 +2395,73 @@ fn create_folder_and_move_asset_into_it() {
     assert_eq!(st.manifest.folders.len(), 1);
 }
 
+#[test]
+fn single_folder_commands_reject_missing_references_like_their_batches() {
+    // An asset in, or a folder under, a folder that does not exist is shown
+    // in no folder of the default folder view.
+    let mut st = EditorState::new(Timeline::new(), MediaManifest::new());
+    st.manifest
+        .entries
+        .push(media_entry("asset", ClipType::Video, 1.0));
+    let g = SeqIdGen::new("f-");
+    let folder = apply(
+        &mut st,
+        EditCommand::CreateFolder {
+            name: "Existing".into(),
+            parent_folder_id: None,
+        },
+        &g,
+    )
+    .unwrap()
+    .affected_clip_ids[0]
+        .clone();
+    let before = st.manifest.clone();
+    let (version, depth, minted) = (st.version(), st.undo_depth(), g.count());
+
+    for (command, message) in [
+        (
+            EditCommand::CreateFolder {
+                name: "Orphan".into(),
+                parent_folder_id: Some("missing".into()),
+            },
+            "parentFolderId not found: missing",
+        ),
+        (
+            EditCommand::MoveToFolder {
+                asset_ids: vec!["asset".into()],
+                folder_id: Some("missing".into()),
+            },
+            "folderId not found: missing",
+        ),
+        (
+            EditCommand::MoveToFolder {
+                asset_ids: vec!["missing".into()],
+                folder_id: Some(folder.clone()),
+            },
+            "media asset not found: missing",
+        ),
+    ] {
+        let error = apply(&mut st, command, &g).unwrap_err();
+        assert_eq!(error, EditError::Invalid(message.into()));
+        assert_eq!(st.manifest, before);
+        assert_eq!(
+            (st.version(), st.undo_depth(), g.count()),
+            (version, depth, minted)
+        );
+    }
+
+    apply(
+        &mut st,
+        EditCommand::MoveToFolder {
+            asset_ids: vec!["asset".into()],
+            folder_id: Some(folder.clone()),
+        },
+        &g,
+    )
+    .unwrap();
+    assert_eq!(st.manifest.entries[0].folder_id, Some(folder));
+}
+
 // ---- remove tracks --------------------------------------------------------
 
 #[test]

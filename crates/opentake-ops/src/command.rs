@@ -7060,6 +7060,7 @@ fn create_folder(
     if name.is_empty() {
         return Err(EditError::Invalid("folder name is required".into()));
     }
+    validate_folder_parent(state, parent_folder_id.as_deref())?;
     transact(
         state,
         "New Folder",
@@ -7094,18 +7095,7 @@ fn create_folders(
         return Err(EditError::Invalid("folder name is required".into()));
     }
     for entry in &entries {
-        if let Some(parent) = entry.parent_folder_id.as_deref() {
-            if !state
-                .manifest
-                .folders
-                .iter()
-                .any(|folder| folder.id == parent)
-            {
-                return Err(EditError::Invalid(format!(
-                    "parentFolderId not found: {parent}"
-                )));
-            }
-        }
+        validate_folder_parent(state, entry.parent_folder_id.as_deref())?;
     }
     let count = entries.len();
     transact(
@@ -7136,6 +7126,7 @@ fn move_to_folder(
     if asset_ids.is_empty() {
         return Err(EditError::Invalid("assetIds is required".into()));
     }
+    validate_folder_move(state, &asset_ids, folder_id.as_deref())?;
     let n = asset_ids.len();
     transact(
         state,
@@ -7167,30 +7158,7 @@ fn move_to_folders(
         ));
     }
     for entry in &entries {
-        for asset_id in &entry.asset_ids {
-            if !state
-                .manifest
-                .entries
-                .iter()
-                .any(|asset| asset.id == *asset_id)
-            {
-                return Err(EditError::Invalid(format!(
-                    "media asset not found: {asset_id}"
-                )));
-            }
-        }
-        if let Some(folder_id) = entry.folder_id.as_deref() {
-            if !state
-                .manifest
-                .folders
-                .iter()
-                .any(|folder| folder.id == folder_id)
-            {
-                return Err(EditError::Invalid(format!(
-                    "folderId not found: {folder_id}"
-                )));
-            }
-        }
+        validate_folder_move(state, &entry.asset_ids, entry.folder_id.as_deref())?;
     }
     let asset_count = entries
         .iter()
@@ -7214,6 +7182,57 @@ fn move_to_folders(
             Ok(Vec::new())
         },
     )
+}
+
+/// A new folder's parent must exist, or the folder view shows it nowhere.
+fn validate_folder_parent(state: &EditorState, parent: Option<&str>) -> Result<(), EditError> {
+    if let Some(parent) = parent {
+        if !state
+            .manifest
+            .folders
+            .iter()
+            .any(|folder| folder.id == parent)
+        {
+            return Err(EditError::Invalid(format!(
+                "parentFolderId not found: {parent}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Moved assets and their destination folder must exist, or the folder view
+/// shows the assets nowhere.
+fn validate_folder_move(
+    state: &EditorState,
+    asset_ids: &[String],
+    folder_id: Option<&str>,
+) -> Result<(), EditError> {
+    for asset_id in asset_ids {
+        if !state
+            .manifest
+            .entries
+            .iter()
+            .any(|asset| asset.id == *asset_id)
+        {
+            return Err(EditError::Invalid(format!(
+                "media asset not found: {asset_id}"
+            )));
+        }
+    }
+    if let Some(folder_id) = folder_id {
+        if !state
+            .manifest
+            .folders
+            .iter()
+            .any(|folder| folder.id == folder_id)
+        {
+            return Err(EditError::Invalid(format!(
+                "folderId not found: {folder_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn rename_media(
