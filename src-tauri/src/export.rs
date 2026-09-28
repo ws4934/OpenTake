@@ -3578,9 +3578,15 @@ mod tests {
     fn sequential_export_decodes_300_frames_with_one_stream_per_clip() {
         use std::process::Command;
 
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!("SKIP: ffmpeg sidecars are required for the 300-frame export stream test");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("long-gop.mp4");
-        let status = Command::new("ffmpeg")
+        let status = Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
             .args([
                 "-v",
                 "error",
@@ -3602,7 +3608,7 @@ mod tests {
             ])
             .arg(&source)
             .status()
-            .expect("native export qualification requires pinned ffmpeg");
+            .expect("generate the long-GOP fixture with FFmpeg");
         assert!(status.success(), "long GOP fixture must encode");
 
         let mut timeline = opentake_domain::Timeline::new();
