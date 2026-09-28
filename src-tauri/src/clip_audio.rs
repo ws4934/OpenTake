@@ -1,20 +1,37 @@
-//! Clip audio rendering for export (#3).
+//! Clip audio rendering shared by preview playback and export (#3, #16).
 //!
-//! A clip's audio is a function of its clip-relative position at the mix
+//! A clip's audio is a pure function of its clip-relative position at the mix
 //! rate: frame `k` of the clip reads its decoded source window at `k * ratio`
 //! source frames (linear interpolation, `ratio` = consumed / timeline
-//! frames). [`ClipAudioReader`] serves consecutive clip frames from one
-//! forward [`PcmStream`], so export keeps one decoder per audible clip for as
-//! long as the clip is in range instead of starting one per mix window.
+//! frames), and a denoised clip is filtered with one noise profile estimated
+//! from its whole source window. Nothing depends on where a mix window or a
+//! playback session starts, so preview and export produce the same samples for
+//! the same timeline position.
+//!
+//! [`ClipAudioReader`] serves consecutive clip frames from one forward
+//! [`PcmStream`]. Export keeps one reader per audible clip for as long as the
+//! clip is in range (one decoder per clip, not per window). Preview mixes
+//! independent windows and opens a reader per window that starts a denoise
+//! warm-up before the window, which converges on the uninterrupted result.
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
-use opentake_domain::Clip;
+use opentake_domain::{AudioDenoise, Clip};
+use opentake_media::analysis::{
+    denoise_stream_start, DenoiseError, DenoiseProfile, DenoiseProfileBuilder, DenoiseStream,
+};
 use opentake_media::{MediaCancelToken, MediaError, PcmFormat, PcmSpec, PcmStream};
 
 /// Source frames pulled from the decoder per read.
 const SOURCE_READ_FRAMES: usize = 8 * 1024;
+/// Clip frames resampled (and fed to the denoiser) per step.
+const RENDER_CHUNK_FRAMES: usize = 4 * 1024;
+/// Distinct clip noise profiles remembered across preview windows, playback
+/// sessions and exports.
+const PROFILE_CACHE_CAPACITY: usize = 32;
 
 /// Timeline mix frame at the start of timeline frame `frame` (rounded, as the
 /// audio clock seeks). Negative before the timeline starts.
@@ -94,6 +111,13 @@ impl ClipAudioLayout {
     }
 }
 
+fn denoise_error(error: DenoiseError) -> MediaError {
+    match error {
+        DenoiseError::Cancelled => MediaError::Cancelled,
+        other => MediaError::Decode(format!("audio denoise failed: {other}")),
+    }
+}
+
 /// Whether `path` has an audio track. Only regular files are probed; a pipe or
 /// other special file goes straight to the decoder, which reports failures.
 pub(crate) fn source_has_audio(path: &Path, cancel: &MediaCancelToken) -> Result<bool, MediaError> {
@@ -104,7 +128,7 @@ pub(crate) fn source_has_audio(path: &Path, cancel: &MediaCancelToken) -> Result
 }
 
 /// Consecutive frames of one clip's audio, resampled onto the clip's frame
-/// grid and decoded by one forward [`PcmStream`].
+/// grid and optionally denoised, decoded by one forward [`PcmStream`].
 pub(crate) struct ClipAudioReader {
     layout: ClipAudioLayout,
     channels: usize,
@@ -115,16 +139,25 @@ pub(crate) struct ClipAudioReader {
     /// No more source frames will arrive; later frames read as silence.
     source_done: bool,
     /// Next clip frame to resample.
+    raw_position: usize,
+    denoise: Option<DenoiseStream>,
+    /// Denoised frames already emitted by the denoiser, not yet read.
+    denoised: VecDeque<f32>,
+    /// Next clip frame [`ClipAudioReader::read`] returns.
     position: usize,
+    cancel: MediaCancelToken,
 }
 
 impl ClipAudioReader {
-    /// Serve clip frames from `from` on.
+    /// Serve clip frames from `from` on. A denoised reader starts decoding a
+    /// warm-up before `from`, so its output matches a reader that started at
+    /// the clip's first frame.
     pub(crate) fn open(
         layout: ClipAudioLayout,
         path: &Path,
         channels: usize,
         from: usize,
+        denoise: Option<(DenoiseProfile, AudioDenoise)>,
         cancel: &MediaCancelToken,
     ) -> Result<Self, MediaError> {
         if from > layout.len || channels == 0 || channels > usize::from(u16::MAX) {
@@ -133,7 +166,12 @@ impl ClipAudioReader {
                 layout.len
             )));
         }
-        let source_start = (from as f64 * layout.ratio).floor() as usize;
+        let start = if denoise.is_some() {
+            denoise_stream_start(layout.rate, from)
+        } else {
+            from
+        };
+        let source_start = (start as f64 * layout.ratio).floor() as usize;
         let source_from = layout.source_lo + source_start as f64 / f64::from(layout.rate);
         let spec = PcmSpec {
             sample_rate: layout.rate,
@@ -150,15 +188,31 @@ impl ClipAudioReader {
         } else {
             None
         };
-        Ok(ClipAudioReader {
+        let denoise = match denoise {
+            Some((profile, config)) => {
+                Some(DenoiseStream::new(profile, config, start).map_err(denoise_error)?)
+            }
+            None => None,
+        };
+        let mut reader = ClipAudioReader {
             layout,
             channels,
             source_done: source.is_none(),
             source,
             source_buffer: VecDeque::new(),
             source_start,
-            position: from,
-        })
+            raw_position: start,
+            denoise,
+            denoised: VecDeque::new(),
+            position: start,
+            cancel: cancel.clone(),
+        };
+        if start < from {
+            // Warm-up: frames before `from` only settle the denoiser.
+            let mut discard = Vec::new();
+            reader.read(from - start, &mut discard)?;
+        }
+        Ok(reader)
     }
 
     /// Append the next `frames` clip frames (interleaved) to `out`.
@@ -169,10 +223,42 @@ impl ClipAudioReader {
                 self.layout.len
             )));
         }
-        out.try_reserve(frames * self.channels)
+        let wanted = frames * self.channels;
+        out.try_reserve(wanted)
             .map_err(|error| MediaError::Decode(format!("clip audio buffer: {error}")))?;
+        if self.denoise.is_none() {
+            self.resample(frames, out)?;
+            self.position += frames;
+            return Ok(());
+        }
+        let mut raw = Vec::new();
+        let mut emitted = Vec::new();
+        while self.denoised.len() < wanted && self.raw_position < self.layout.len {
+            let step = RENDER_CHUNK_FRAMES.min(self.layout.len - self.raw_position);
+            raw.clear();
+            self.resample(step, &mut raw)?;
+            emitted.clear();
+            if let Some(stream) = self.denoise.as_mut() {
+                stream
+                    .push(&raw, &mut emitted, &self.cancel)
+                    .map_err(denoise_error)?;
+            }
+            self.denoised.extend(emitted.iter().copied());
+        }
+        if self.denoised.len() < wanted {
+            return Err(MediaError::Decode(
+                "clip audio denoiser ended before the clip".to_string(),
+            ));
+        }
+        out.extend(self.denoised.drain(..wanted));
+        self.position += frames;
+        Ok(())
+    }
+
+    /// Resample the next `frames` clip frames from the source.
+    fn resample(&mut self, frames: usize, out: &mut Vec<f32>) -> Result<(), MediaError> {
         for _ in 0..frames {
-            let source = self.position as f64 * self.layout.ratio;
+            let source = self.raw_position as f64 * self.layout.ratio;
             let index = source.floor() as usize;
             let fraction = (source - index as f64) as f32;
             self.fill_source(index + 1)?;
@@ -186,10 +272,10 @@ impl ClipAudioReader {
                 };
                 out.push(value);
             }
-            self.position += 1;
+            self.raw_position += 1;
         }
         // Keep only the frames the next clip frame can still reach.
-        let next = (self.position as f64 * self.layout.ratio).floor() as usize;
+        let next = (self.raw_position as f64 * self.layout.ratio).floor() as usize;
         let stale = next.saturating_sub(self.source_start);
         let buffered = self.source_buffer.len() / self.channels;
         if stale > SOURCE_READ_FRAMES && stale <= buffered {
@@ -234,8 +320,99 @@ impl ClipAudioReader {
     }
 }
 
+/// The denoiser input for a clip reader: `None` when the clip is not denoised
+/// (zero strength is a bit-exact bypass), else the validated settings and the
+/// clip's noise profile.
+pub(crate) fn clip_denoise(
+    config: Option<AudioDenoise>,
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+    cancel: &MediaCancelToken,
+) -> Result<Option<(DenoiseProfile, AudioDenoise)>, MediaError> {
+    let Some(config) = config.filter(|config| config.strength != 0.0) else {
+        return Ok(None);
+    };
+    config
+        .validate()
+        .map_err(|error| denoise_error(DenoiseError::InvalidConfig(error.to_string())))?;
+    let profile = clip_denoise_profile(layout, path, channels, cancel)?;
+    Ok(Some((DenoiseProfile::clone(&profile), config)))
+}
+
+/// Cache key for a clip's noise profile: the source file (and its version),
+/// the source window, and the frame grid it is rendered on.
+#[derive(Clone, Debug, PartialEq)]
+struct ProfileKey {
+    path: PathBuf,
+    file_len: u64,
+    modified: Option<SystemTime>,
+    source_lo: u64,
+    source_hi: u64,
+    ratio: u64,
+    len: usize,
+    rate: u32,
+    channels: usize,
+}
+
+static PROFILE_CACHE: Mutex<VecDeque<(ProfileKey, Arc<DenoiseProfile>)>> =
+    Mutex::new(VecDeque::new());
+
+/// The noise profile of a clip's whole rendered audio, estimated once from
+/// its entire source window (one extra decode) and cached by source version.
+pub(crate) fn clip_denoise_profile(
+    layout: &ClipAudioLayout,
+    path: &Path,
+    channels: usize,
+    cancel: &MediaCancelToken,
+) -> Result<Arc<DenoiseProfile>, MediaError> {
+    let metadata = std::fs::metadata(path).ok();
+    let key = ProfileKey {
+        path: path.to_path_buf(),
+        file_len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+        modified: metadata.and_then(|metadata| metadata.modified().ok()),
+        source_lo: layout.source_lo.to_bits(),
+        source_hi: layout.source_hi.to_bits(),
+        ratio: layout.ratio.to_bits(),
+        len: layout.len,
+        rate: layout.rate,
+        channels,
+    };
+    let cached = PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(cached, _)| *cached == key)
+        .map(|(_, profile)| Arc::clone(profile));
+    if let Some(profile) = cached {
+        return Ok(profile);
+    }
+    let mut reader = ClipAudioReader::open(*layout, path, channels, 0, None, cancel)?;
+    let mut builder =
+        DenoiseProfileBuilder::new(channels, layout.rate, layout.len).map_err(denoise_error)?;
+    let mut chunk = Vec::new();
+    let mut remaining = layout.len;
+    while remaining > 0 {
+        let step = RENDER_CHUNK_FRAMES.min(remaining);
+        chunk.clear();
+        reader.read(step, &mut chunk)?;
+        builder.push(&chunk, cancel).map_err(denoise_error)?;
+        remaining -= step;
+    }
+    let profile = Arc::new(builder.finish(cancel).map_err(denoise_error)?);
+    let mut cache = PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|(cached, _)| *cached != key);
+    while cache.len() >= PROFILE_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    cache.push_back((key, Arc::clone(&profile)));
+    Ok(profile)
+}
+
 /// A mono 48 kHz test signal (a sine plus a little white noise) and a WAV
-/// writer for it, shared by the audio tests.
+/// writer for it, shared by the preview and export audio tests.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::path::Path;
@@ -289,6 +466,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::{ffmpeg_ready, noisy_tone, write_wav, RATE};
     use super::*;
+    use opentake_domain::DenoiseMode;
 
     fn clip(start_frame: i32, duration_frames: i32) -> Clip {
         Clip::new("clip", "media", start_frame, duration_frames)
@@ -327,9 +505,15 @@ mod tests {
         assert_eq!(timeline_frame_at(44_100, 24, 44_100), 24);
     }
 
-    fn read_all(layout: ClipAudioLayout, path: &Path, from: usize, steps: &[usize]) -> Vec<f32> {
+    fn read_all(
+        layout: ClipAudioLayout,
+        path: &Path,
+        from: usize,
+        steps: &[usize],
+        denoise: Option<(DenoiseProfile, AudioDenoise)>,
+    ) -> Vec<f32> {
         let cancel = MediaCancelToken::new();
-        let mut reader = ClipAudioReader::open(layout, path, 1, from, &cancel).unwrap();
+        let mut reader = ClipAudioReader::open(layout, path, 1, from, denoise, &cancel).unwrap();
         let mut out = Vec::new();
         let mut position = from;
         for step in steps.iter().copied().cycle() {
@@ -355,17 +539,47 @@ mod tests {
         let mut retimed = clip(0, 90);
         retimed.trim_start_frame = 12;
         retimed.speed = 1.5;
+        let config = AudioDenoise {
+            mode: DenoiseMode::Voice,
+            strength: 0.7,
+            preview_enabled: true,
+        };
         for source in [clip(0, 150), retimed] {
             let layout = ClipAudioLayout::new(&source, 30, RATE).unwrap();
-            let whole = read_all(layout, &path, 0, &[layout.len]);
+            let cancel = MediaCancelToken::new();
+            let whole = read_all(layout, &path, 0, &[layout.len], None);
             assert_eq!(whole.len(), layout.len);
-            assert_eq!(read_all(layout, &path, 0, &[1, 4_095, 17_000]), whole);
+            assert_eq!(read_all(layout, &path, 0, &[1, 4_095, 17_000], None), whole);
             let from = 37_123;
             assert_eq!(
-                read_all(layout, &path, from, &[9_999]),
+                read_all(layout, &path, from, &[9_999], None),
                 whole[from..],
                 "a reader opened mid-clip continues the same samples"
             );
+
+            let profile = clip_denoise_profile(&layout, &path, 1, &cancel).unwrap();
+            let denoised = |from, steps: &[usize]| {
+                read_all(
+                    layout,
+                    &path,
+                    from,
+                    steps,
+                    Some((DenoiseProfile::clone(&profile), config)),
+                )
+            };
+            let reference = denoised(0, &[layout.len]);
+            assert_eq!(denoised(0, &[96_000, 5, 20_000]), reference);
+            let restarted = denoised(from, &[96_000]);
+            let max_difference = restarted
+                .iter()
+                .zip(&reference[from..])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_difference < 1.0e-6,
+                "restart differs by {max_difference}"
+            );
+            assert_ne!(reference, whole, "denoise changed the signal");
         }
     }
 }

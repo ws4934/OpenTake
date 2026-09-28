@@ -1408,6 +1408,7 @@ fn apply_export_denoise(
     apply_export_denoise_with_external(samples, channels, config, control, None)
 }
 
+#[cfg(test)]
 fn apply_export_denoise_with_external(
     samples: &[f32],
     channels: usize,
@@ -1481,6 +1482,28 @@ fn mix_timeline_audio(
         spec: AUDIO_DECODE_SPEC,
         samples_f32,
     }))
+}
+
+/// Export's mono 48 kHz mix of a whole timeline from media paths, for the
+/// preview parity tests in `playback::audio`.
+#[cfg(test)]
+pub(crate) fn mix_timeline_audio_for_paths(
+    timeline: &opentake_domain::Timeline,
+    paths: &HashMap<String, PathBuf>,
+) -> Result<Option<Vec<f32>>, String> {
+    let media = paths
+        .iter()
+        .map(|(id, path)| {
+            (
+                id.clone(),
+                MediaInfo {
+                    path: path.clone(),
+                    source_fps: None,
+                },
+            )
+        })
+        .collect();
+    Ok(mix_timeline_audio(timeline, &media, None, None)?.map(|pcm| pcm.samples_f32))
 }
 
 struct AudioStreamOptions<'a> {
@@ -1589,11 +1612,16 @@ fn stream_flattened_audio<T: AudioPlanLike>(
             let reader = match readers.entry(index) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
+                    let path = &media[media_ref].path;
+                    let denoise =
+                        clip_audio::clip_denoise(plan.audio_denoise(), &layout, path, 1, &cancel)
+                            .map_err(|error| decode_failure(media_ref, error))?;
                     let reader = ClipAudioReader::open(
                         layout,
-                        &media[media_ref].path,
+                        path,
                         1,
                         layout.offset_of(overlap_start),
+                        denoise,
                         &cancel,
                     )
                     .map_err(|error| decode_failure(media_ref, error))?;
@@ -1607,15 +1635,8 @@ fn stream_flattened_audio<T: AudioPlanLike>(
             if overlap_end == clip_end {
                 readers.remove(&index);
             }
-            let processed = apply_export_denoise_with_external(
-                &samples,
-                1,
-                plan.audio_denoise(),
-                control,
-                external_cancel,
-            )?;
             let output_start = (overlap_start - window_start) as usize;
-            for (offset, sample) in processed.iter().enumerate() {
+            for (offset, sample) in samples.iter().enumerate() {
                 if offset.is_multiple_of(AUDIO_CANCEL_CHUNK_SAMPLES) {
                     check_audio_cancel_with_external(control, external_cancel)?;
                 }
@@ -5287,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn export_audio_decodes_each_clip_once_and_matches_whole_clip_decodes() {
+    fn export_audio_decodes_each_clip_once_and_matches_whole_clip_processing() {
         use crate::clip_audio::fixtures::{ffmpeg_ready, noisy_tone, write_wav};
 
         if !ffmpeg_ready() {
@@ -5300,8 +5321,8 @@ mod tests {
         write_wav(&first, &noisy_tone(40.0, 440.0, 1));
         write_wav(&second, &noisy_tone(40.0, 660.0, 2));
 
-        // 60 s timeline: A covers 0-30 s, B covers 25-60 s from its 2 s trim
-        // at half volume, so the two overlap for five seconds.
+        // 60 s timeline: A covers 0-30 s, B covers 25-60 s from its 2 s trim,
+        // at half volume and denoised, so the two overlap for five seconds.
         let mut timeline = opentake_domain::Timeline::new();
         timeline.fps = 30;
         let mut a = Clip::new("a", "first", 0, 900);
@@ -5310,6 +5331,11 @@ mod tests {
         b.media_type = ClipType::Audio;
         b.trim_start_frame = 60;
         b.volume = 0.5;
+        b.audio_denoise = Some(AudioDenoise {
+            mode: opentake_domain::DenoiseMode::Voice,
+            strength: 0.6,
+            preview_enabled: false,
+        });
         for (id, clip) in [("a1", a), ("a2", b)] {
             let mut track = opentake_domain::Track::new(id, ClipType::Audio);
             track.clips.push(clip);
@@ -5363,13 +5389,13 @@ mod tests {
 
         assert!(has_audio);
         assert_eq!(streamed.len(), 60 * MIX_SAMPLE_RATE as usize);
-        // Thirty two-second windows, yet one probe per source file and one
-        // decoder per clip.
-        assert_eq!(spawned, 4, "helper processes for 2 clips over 30 windows");
-        assert_eq!(cancel.spawned_child_count(), 4);
+        // Thirty two-second windows, yet one probe per source file, one
+        // decoder per clip and one noise-profile pass for the denoised clip.
+        assert_eq!(spawned, 5, "helper processes for 2 clips over 30 windows");
+        assert_eq!(cancel.spawned_child_count(), 5);
 
-        // The whole-clip projection decoded each clip in one piece; the
-        // streamed windows reproduce it sample for sample.
+        // The pre-streaming projection decoded and denoised each clip whole;
+        // the streamed windows reproduce it sample for sample.
         let whole_clips = clips
             .iter()
             .map(|clip| {

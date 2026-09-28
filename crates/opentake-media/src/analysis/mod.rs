@@ -14,7 +14,10 @@ pub use autocrop::{
     PixelFormat,
 };
 pub use beat::{detect_beats, BeatDetectionConfig, BeatOnset};
-pub use denoise::{denoise_interleaved, DenoiseError, DenoiseProgressCallback};
+pub use denoise::{
+    denoise_interleaved, denoise_stream_start, denoise_warmup_frames, DenoiseError, DenoiseProfile,
+    DenoiseProfileBuilder, DenoiseProgressCallback, DenoiseStream,
+};
 pub use loudness::{
     analyze_loudness, analyze_loudness_with_progress, apply_loudness_gain, LoudnessAnalysis,
     LoudnessError, LoudnessNormalizationConfig, LoudnessProgressCallback,
