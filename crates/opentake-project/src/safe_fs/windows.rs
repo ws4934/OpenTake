@@ -1745,13 +1745,18 @@ fn verify_owner_only(handle: HANDLE, expected: &OwnerOnlySecurity) -> Result<()>
     verify_single_owner_ace(descriptor_bytes, dacl, acl_bytes_in_use, ace, expected)
 }
 
+// The failure-injection hooks below are per thread, like
+// OWNER_DESCRIPTOR_FIXTURE: every hooked call runs synchronously on the test's
+// own thread, so tests running in parallel (CI uses two test threads) never
+// consume or overwrite each other's injected failure.
 #[cfg(test)]
-static FORCE_DACL_VERIFY_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FORCE_DACL_VERIFY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn force_next_owner_verification_failure() {
-    FORCE_DACL_VERIFY_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+    FORCE_DACL_VERIFY_FAILURE.set(true);
 }
 
 #[cfg(test)]
@@ -1809,7 +1814,7 @@ fn verify_created_owner_only(handle: HANDLE, expected: &OwnerOnlySecurity) -> Re
         SafeFsOperation::VerifySecurityDescriptor,
     )?;
     #[cfg(test)]
-    if FORCE_DACL_VERIFY_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if FORCE_DACL_VERIFY_FAILURE.replace(false) {
         return Err(malformed_security());
     }
     verify_owner_only(handle, expected)
@@ -1859,7 +1864,7 @@ fn duplicate_directory(source: &DirectoryAuthority) -> Result<DirectoryAuthority
 
 fn mark_delete_handle(handle: HANDLE, operation: SafeFsOperation) -> Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_CREATED_DISPOSITION.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if FAIL_NEXT_CREATED_DISPOSITION.replace(false) {
         return Err(SafeFsError::io(
             operation,
             io::Error::other("injected created disposition failure"),
@@ -2062,8 +2067,10 @@ struct RevalidationProof {
 type RevalidationHook = Arc<dyn Fn(&DirectoryAuthority) -> Result<RevalidationProof> + Send + Sync>;
 
 #[cfg(test)]
-static REVALIDATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RevalidationHook>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static REVALIDATION_HOOK: std::cell::RefCell<Option<RevalidationHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 #[allow(dead_code)] // Task 6B parent seam; Task 7B test-only removes this.
@@ -2073,36 +2080,24 @@ struct RevalidationHookGuard;
 #[allow(dead_code)]
 impl Drop for RevalidationHookGuard {
     fn drop(&mut self) {
-        *REVALIDATION_HOOK
-            .get_or_init(Default::default)
-            .lock()
-            .expect("revalidation hook mutex poisoned") = None;
+        REVALIDATION_HOOK.set(None);
     }
 }
 
 #[cfg(test)]
 #[allow(dead_code)] // First call site is in Task 7B test-only bodies.
 fn install_revalidation_hook(hook: RevalidationHook) -> RevalidationHookGuard {
-    let mut slot = REVALIDATION_HOOK
-        .get_or_init(Default::default)
-        .lock()
-        .expect("revalidation hook mutex poisoned");
     assert!(
-        slot.is_none(),
-        "revalidation tests require --test-threads=1"
+        REVALIDATION_HOOK.replace(Some(hook)).is_none(),
+        "one revalidation hook per test"
     );
-    *slot = Some(hook);
     RevalidationHookGuard
 }
 
 fn collect_revalidation_proof(directory: &DirectoryAuthority) -> Result<RevalidationProof> {
     #[cfg(test)]
     {
-        let hook = REVALIDATION_HOOK
-            .get_or_init(Default::default)
-            .lock()
-            .expect("revalidation hook mutex poisoned")
-            .clone();
+        let hook = REVALIDATION_HOOK.with_borrow(Clone::clone);
         if let Some(hook) = hook {
             return hook(directory);
         }
@@ -2743,9 +2738,10 @@ type BeforeRetainedDeleteHook =
     Arc<dyn Fn(HANDLE, &DirectoryAuthority, &ComponentName) -> Result<()> + Send + Sync>;
 
 #[cfg(test)]
-static BEFORE_RETAINED_DELETE_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<Option<BeforeRetainedDeleteHook>>,
-> = std::sync::OnceLock::new();
+thread_local! {
+    static BEFORE_RETAINED_DELETE_HOOK: std::cell::RefCell<Option<BeforeRetainedDeleteHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 struct BeforeRetainedDeleteHookGuard;
@@ -2753,10 +2749,7 @@ struct BeforeRetainedDeleteHookGuard;
 #[cfg(test)]
 impl Drop for BeforeRetainedDeleteHookGuard {
     fn drop(&mut self) {
-        *BEFORE_RETAINED_DELETE_HOOK
-            .get_or_init(Default::default)
-            .lock()
-            .expect("retained-delete hook mutex poisoned") = None;
+        BEFORE_RETAINED_DELETE_HOOK.set(None);
     }
 }
 
@@ -2764,15 +2757,10 @@ impl Drop for BeforeRetainedDeleteHookGuard {
 fn install_before_retained_delete_hook(
     hook: BeforeRetainedDeleteHook,
 ) -> BeforeRetainedDeleteHookGuard {
-    let mut slot = BEFORE_RETAINED_DELETE_HOOK
-        .get_or_init(Default::default)
-        .lock()
-        .expect("retained-delete hook mutex poisoned");
     assert!(
-        slot.is_none(),
-        "retained-delete tests require --test-threads=1"
+        BEFORE_RETAINED_DELETE_HOOK.replace(Some(hook)).is_none(),
+        "one retained-delete hook per test"
     );
-    *slot = Some(hook);
     BeforeRetainedDeleteHookGuard
 }
 
@@ -2783,11 +2771,7 @@ fn run_before_retained_delete_hook(
 ) -> Result<()> {
     #[cfg(test)]
     {
-        let hook = BEFORE_RETAINED_DELETE_HOOK
-            .get_or_init(Default::default)
-            .lock()
-            .expect("retained-delete hook mutex poisoned")
-            .clone();
+        let hook = BEFORE_RETAINED_DELETE_HOOK.with_borrow(Clone::clone);
         if let Some(hook) = hook {
             return hook(handle, parent, name);
         }
@@ -2906,9 +2890,10 @@ enum WindowsCreateFailurePoint {
 }
 
 #[cfg(test)]
-static WINDOWS_CREATE_FAILURE: std::sync::OnceLock<
-    std::sync::Mutex<Option<WindowsCreateFailurePoint>>,
-> = std::sync::OnceLock::new();
+thread_local! {
+    static WINDOWS_CREATE_FAILURE: std::cell::Cell<Option<WindowsCreateFailurePoint>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 struct WindowsCreateFailureGuard;
@@ -2916,24 +2901,16 @@ struct WindowsCreateFailureGuard;
 #[cfg(test)]
 impl Drop for WindowsCreateFailureGuard {
     fn drop(&mut self) {
-        *WINDOWS_CREATE_FAILURE
-            .get_or_init(Default::default)
-            .lock()
-            .expect("Windows create-failure mutex poisoned") = None;
+        WINDOWS_CREATE_FAILURE.set(None);
     }
 }
 
 #[cfg(test)]
 fn install_windows_create_failure(point: WindowsCreateFailurePoint) -> WindowsCreateFailureGuard {
-    let mut slot = WINDOWS_CREATE_FAILURE
-        .get_or_init(Default::default)
-        .lock()
-        .expect("Windows create-failure mutex poisoned");
     assert!(
-        slot.is_none(),
-        "Windows create-failure tests require --test-threads=1"
+        WINDOWS_CREATE_FAILURE.replace(Some(point)).is_none(),
+        "one Windows create failure per test"
     );
-    *slot = Some(point);
     WindowsCreateFailureGuard
 }
 
@@ -2942,26 +2919,21 @@ fn inject_windows_create_failure(
     operation: SafeFsOperation,
 ) -> Result<()> {
     #[cfg(test)]
-    {
-        let mut slot = WINDOWS_CREATE_FAILURE
-            .get_or_init(Default::default)
-            .lock()
-            .expect("Windows create-failure mutex poisoned");
-        if *slot == Some(point) {
-            *slot = None;
-            return Err(SafeFsError::io(
-                operation,
-                io::Error::other(format!("injected Windows {point:?} failure")),
-            ));
-        }
+    if WINDOWS_CREATE_FAILURE.get() == Some(point) {
+        WINDOWS_CREATE_FAILURE.set(None);
+        return Err(SafeFsError::io(
+            operation,
+            io::Error::other(format!("injected Windows {point:?} failure")),
+        ));
     }
     let _ = (point, operation);
     Ok(())
 }
 
 #[cfg(test)]
-static FAIL_NEXT_CREATED_DISPOSITION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_NEXT_CREATED_DISPOSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 struct CreatedDispositionFailureGuard;
@@ -2969,15 +2941,15 @@ struct CreatedDispositionFailureGuard;
 #[cfg(test)]
 impl Drop for CreatedDispositionFailureGuard {
     fn drop(&mut self) {
-        FAIL_NEXT_CREATED_DISPOSITION.store(false, std::sync::atomic::Ordering::SeqCst);
+        FAIL_NEXT_CREATED_DISPOSITION.set(false);
     }
 }
 
 #[cfg(test)]
 fn install_created_disposition_failure() -> CreatedDispositionFailureGuard {
     assert!(
-        !FAIL_NEXT_CREATED_DISPOSITION.swap(true, std::sync::atomic::Ordering::SeqCst),
-        "created disposition tests require --test-threads=1"
+        !FAIL_NEXT_CREATED_DISPOSITION.replace(true),
+        "one created disposition failure per test"
     );
     CreatedDispositionFailureGuard
 }
