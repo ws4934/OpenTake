@@ -40,6 +40,7 @@
 //!     line may occupy before it must wrap; used by the caller's `fits`/transform.
 
 use opentake_domain::Clip;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{TranscriptionResult, TranscriptionSegment, TranscriptionWord};
 
@@ -153,26 +154,45 @@ fn split<F: Fn(&str) -> bool>(text: &str, fits: &F) -> Vec<String> {
     parts.iter().flat_map(|p| split(p, fits)).collect()
 }
 
-/// Break once at the best boundary present: sentence (`.!?`), then clause
-/// (`,;:`), then the midpoint word. Port of `breakOnce(_:)`
-/// (`CaptionBuilder.swift:31-33`).
+/// Break once at the best boundary present: sentence (`.!?`, full-width
+/// `。！？`), then clause (`,;:`, full-width `，；：、`), then the midpoint word.
+/// Port of `breakOnce(_:)` (`CaptionBuilder.swift:31-33`), extended for
+/// languages written without spaces: upstream only knows ASCII punctuation
+/// followed by a space, which never occurs in Chinese or Japanese transcripts.
 fn break_once(text: &str) -> Vec<String> {
-    break_on(text, ".!?")
-        .or_else(|| break_on(text, ",;:"))
+    break_on(text, ".!?。！？")
+        .or_else(|| break_on(text, ",;:，；：、"))
         .unwrap_or_else(|| break_at_mid_word(text))
 }
 
-/// Split after any delimiter that is followed by a space (or end of string), so
-/// `"U.S."` and `"3.14"` stay intact. Returns `None` when it produced only one
-/// piece. Verbatim port of `breakOn(_:delimiters:)` (`CaptionBuilder.swift:36-53`).
+/// Split after any ASCII delimiter that is followed by a space (or end of
+/// string), so `"U.S."` and `"3.14"` stay intact, and after any full-width
+/// delimiter whether or not a space follows (CJK text has none). Closing
+/// brackets and quotes right after a full-width delimiter stay with the piece
+/// they close. Returns `None` when it produced only one piece. Port of
+/// `breakOn(_:delimiters:)` (`CaptionBuilder.swift:36-53`).
 fn break_on(text: &str, delimiters: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = text.chars().collect();
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
-    for (i, c) in chars.iter().enumerate() {
-        current.push(*c);
-        let next_is_break = i + 1 >= chars.len() || chars[i + 1] == ' ';
-        if delimiters.contains(*c) && next_is_break {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        current.push(c);
+        i += 1;
+        if !delimiters.contains(c) {
+            continue;
+        }
+        let is_break = if c.is_ascii() {
+            i >= chars.len() || chars[i] == ' '
+        } else {
+            while i < chars.len() && is_closing_punctuation(chars[i]) {
+                current.push(chars[i]);
+                i += 1;
+            }
+            true
+        };
+        if is_break {
             let piece = current.trim();
             if !piece.is_empty() {
                 pieces.push(piece.to_string());
@@ -191,15 +211,58 @@ fn break_on(text: &str, delimiters: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Closing quotes and brackets that belong to the sentence or clause before
+/// them (`「好。」` must not start the next caption with `」`).
+fn is_closing_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '」' | '』' | '）' | '】' | '〕' | '〉' | '》' | '”' | '’' | '"' | '\'' | ')'
+    )
+}
+
 /// Break at the midpoint word boundary. A single word (no spaces) is returned
-/// unchanged. Port of `breakAtMidWord(_:)` (`CaptionBuilder.swift:55-60`).
+/// unchanged, unless it is written in a script without spaces between words
+/// (Chinese, Japanese, Thai, ...): that text is split at its middle grapheme
+/// cluster instead, so a long unpunctuated CJK line still ends up fitting.
+/// Port of `breakAtMidWord(_:)` (`CaptionBuilder.swift:55-60`).
 fn break_at_mid_word(text: &str) -> Vec<String> {
     let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
     if words.len() <= 1 {
-        return vec![text.to_string()];
+        return break_at_mid_grapheme(text);
     }
     let mid = words.len() / 2;
     vec![words[..mid].join(" "), words[mid..].join(" ")]
+}
+
+/// Split unspaced-script text at its middle grapheme cluster. Text in a
+/// spaced script (an over-long English word) is kept whole, as upstream does.
+fn break_at_mid_grapheme(text: &str) -> Vec<String> {
+    if !text.chars().any(is_unspaced_script) {
+        return vec![text.to_string()];
+    }
+    let boundaries: Vec<usize> = text.grapheme_indices(true).map(|(at, _)| at).collect();
+    if boundaries.len() <= 1 {
+        return vec![text.to_string()];
+    }
+    let at = boundaries[boundaries.len() / 2];
+    vec![text[..at].to_string(), text[at..].to_string()]
+}
+
+/// Characters of scripts written without spaces between words.
+fn is_unspaced_script(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x0E00..=0x0EFF // Thai, Lao
+            | 0x1000..=0x109F // Myanmar
+            | 0x1780..=0x17FF // Khmer
+            | 0x3000..=0x30FF // CJK symbols and punctuation, Hiragana, Katakana
+            | 0x31F0..=0x31FF // Katakana phonetic extensions
+            | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFF00..=0xFFEF // Half-width and full-width forms
+            | 0x20000..=0x3FFFF // CJK Unified Ideographs Extensions B and later
+    )
 }
 
 /// Share `[start, end]` across `texts` by character count, back-to-back. Port of
@@ -729,6 +792,61 @@ mod tests {
         let out = phrases(&s, &fits_chars(5), MIN_DISPLAY_DURATION_SECS);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "supercalifragilisticexpialidocious");
+    }
+
+    #[test]
+    fn cjk_sentence_splits_on_full_width_punctuation_without_spaces() {
+        let s = seg("今天天气很好。我们去公园吧，然后一起吃饭。", 0.0, 6.0);
+        let fits = fits_chars(8);
+        let out = phrases(&s, &fits, MIN_DISPLAY_DURATION_SECS);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["今天天气很好。", "我们去公园吧，", "然后一起吃饭。"]
+        );
+        assert!(out.iter().all(|p| fits(&p.text)));
+    }
+
+    #[test]
+    fn cjk_clause_marks_split_and_closing_quotes_stay_attached() {
+        let s = seg("他说：「好。」然后我们一起走了、很开心", 0.0, 6.0);
+        let fits = fits_chars(7);
+        let out = phrases(&s, &fits, MIN_DISPLAY_DURATION_SECS);
+        assert!(out.len() > 1);
+        assert!(out.iter().all(|p| fits(&p.text)), "{out:?}");
+        assert!(out.iter().any(|p| p.text.ends_with("。」")), "{out:?}");
+        assert!(out.iter().all(|p| !p.text.starts_with('」')), "{out:?}");
+        let joined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, "他说：「好。」然后我们一起走了、很开心");
+    }
+
+    #[test]
+    fn unpunctuated_cjk_line_splits_at_grapheme_midpoints() {
+        let text = "我们今天下午三点在学校门口见面然后一起去图书馆看书";
+        let s = seg(text, 0.0, 6.0);
+        let fits = fits_chars(6);
+        let out = phrases(&s, &fits, MIN_DISPLAY_DURATION_SECS);
+        assert!(out.len() >= 4, "{out:?}");
+        assert!(out.iter().all(|p| fits(&p.text)), "{out:?}");
+        let joined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn grapheme_midpoint_never_splits_a_cluster() {
+        // Each "が" is written as か + a combining voiced sound mark.
+        let text = "か\u{3099}".repeat(6);
+        let parts = break_at_mid_word(&text);
+        assert_eq!(parts, ["か\u{3099}".repeat(3), "か\u{3099}".repeat(3)]);
+    }
+
+    #[test]
+    fn japanese_sentence_marks_split() {
+        let s = seg("きょうは晴れです！公園に行きましょう？", 0.0, 4.0);
+        let fits = fits_chars(10);
+        let out = phrases(&s, &fits, MIN_DISPLAY_DURATION_SECS);
+        let texts: Vec<&str> = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, ["きょうは晴れです！", "公園に行きましょう？"]);
     }
 
     #[test]
