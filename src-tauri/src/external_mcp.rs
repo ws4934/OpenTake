@@ -1530,12 +1530,12 @@ impl ExternalMcpCatalog {
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomically(staging: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomically(staging: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(staging, destination)
 }
 
 #[cfg(windows)]
-fn replace_file_atomically(staging: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomically(staging: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -1568,12 +1568,12 @@ fn replace_file_atomically(staging: &Path, destination: &Path) -> std::io::Resul
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
     fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
     // Windows does not support opening a directory as a synchronizable File.
     // `rename` remains atomic; the OS owns the corresponding directory flush.
     Ok(())

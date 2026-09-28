@@ -1013,6 +1013,12 @@ const zh: Dict = {
   "settings.byokSaved": "密钥已安全存储在系统钥匙串中。",
   "settings.byokDelete": "删除密钥",
   "settings.byokSaveFailed": "保存失败：{error}",
+  "settings.voiceRemovalTitle": "待移除的声音克隆",
+  "settings.voiceRemovalDesc":
+    "这些声音克隆的录入已取消或未能保存到工程，但从服务商账户移除时失败。请重试移除，或在服务商的声音库中手动删除。",
+  "settings.voiceRemovalRetry": "重试移除",
+  "settings.voiceRemovalRetrying": "正在移除…",
+  "settings.voiceRemovalFailed": "移除失败：{error}",
   "settings.codexDesc":
     "使用官方 Codex CLI 的 ChatGPT 登录直接驱动 OpenTake Agent。OpenTake 不读取、不复制也不保存你的 ChatGPT 凭据。",
   "settings.codexChecking": "正在检查官方 Codex 登录状态…",
@@ -2238,6 +2244,12 @@ const en: Dict = {
   "settings.byokSaved": "Key stored securely in your system keychain.",
   "settings.byokDelete": "Remove key",
   "settings.byokSaveFailed": "Save failed: {error}",
+  "settings.voiceRemovalTitle": "Voice clones pending removal",
+  "settings.voiceRemovalDesc":
+    "The enrollment of these voice clones was cancelled or could not be saved to a project, but removing them from your provider account failed. Retry the removal, or delete them in the provider's voice library.",
+  "settings.voiceRemovalRetry": "Retry removal",
+  "settings.voiceRemovalRetrying": "Removing…",
+  "settings.voiceRemovalFailed": "Removal failed: {error}",
   "settings.codexDesc":
     "Use the official Codex CLI's ChatGPT sign-in to power the OpenTake Agent. OpenTake never reads, copies, or stores your ChatGPT credentials.",
   "settings.codexChecking": "Checking the official Codex login…",

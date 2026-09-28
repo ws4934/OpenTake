@@ -48,6 +48,7 @@ mod storage;
 pub mod telemetry;
 mod transcribe;
 mod updater;
+mod voice_revocations;
 
 // Streaming playback engine (#53). Feature-gated (`playback-engine`, now a DEFAULT
 // feature) and `pub` so the gated GPU+ffmpeg integration test can drive the render
@@ -217,10 +218,19 @@ pub fn run() {
                 cache_root.clone(),
             ));
             motion::spawn_startup_cache_maintenance(&cache_root);
+            // Abandoned voice clones whose provider removal failed. They have
+            // no project record, so the queue lives in application data.
+            let voice_revocations = Arc::new(voice_revocations::VoiceRevocationStore::new(
+                app.path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir())
+                    .join("voice-revocations.json"),
+            ));
             let advanced_bridge = Arc::new(advanced::TauriAdvancedWorkflowBridge::new(
                 core.clone(),
                 cache_root.clone(),
                 models_dir.clone(),
+                voice_revocations,
             ));
             let motion_document_app = app.handle().clone();
             let motion_document_notify: mcp::MotionDocumentNotifier = Arc::new(move |change| {
@@ -459,6 +469,8 @@ pub fn run() {
             advanced::advanced_generate_avatar,
             advanced::advanced_clone_voice,
             advanced::cancel_advanced_workflow,
+            advanced::voice_revocations_pending,
+            advanced::voice_revocation_retry,
             secret::secret_save,
             secret::secret_load,
             secret::secret_delete,

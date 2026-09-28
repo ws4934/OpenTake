@@ -1225,6 +1225,19 @@ export interface SecretStatus {
   masked: string;
 }
 
+/** A voice clone the user abandoned (the enrollment was cancelled or could not
+ *  be saved to a project) whose removal from the provider failed. Mirror of
+ *  the Rust `PendingVoiceRevocation`; it lives in application data because no
+ *  project record is left to revoke it from. */
+export interface PendingVoiceRevocation {
+  provider: string;
+  providerVoiceId: string;
+  voiceName: string;
+  /** Unix seconds when the removal was first queued. */
+  recordedAt: number;
+  lastError: string;
+}
+
 // MARK: - Optional account backend (mirror of src-tauri account.rs)
 
 /** Identity returned by a configured backend's `/api/auth/verify` endpoint. */

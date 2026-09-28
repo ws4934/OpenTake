@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::media::MediaState;
+use crate::voice_revocations::{unix_now_seconds, PendingVoiceRevocation, VoiceRevocationStore};
 
 pub struct TauriAdvancedWorkflowBridge {
     core: AppCore,
@@ -51,6 +52,7 @@ pub struct TauriAdvancedWorkflowBridge {
     caption_translator: Arc<dyn CaptionTranslationProvider>,
     avatar_provider: Arc<dyn AvatarProvider>,
     voice_provider: Arc<dyn VoiceCloneProvider>,
+    voice_revocations: Arc<VoiceRevocationStore>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -814,28 +816,20 @@ impl VoiceCloneProvider for NetworkElevenLabsVoiceProvider {
             .map_err(|_| advanced_execution("voice provider client initialization failed"))?;
         let response = client
             .post("https://api.elevenlabs.io/v1/voices/add")
-            .header("xi-api-key", key.clone())
+            .header("xi-api-key", key)
             .multipart(form)
             .send()
             .map_err(|_| advanced_execution("voice enrollment request failed"))?;
         let response = bounded_json_response(response, "voice")?;
-        let provider_voice_id = response
+        // A cancellation that arrived while the provider was enrolling is
+        // handled by the caller, which revokes the new voice and keeps its id
+        // for a retry when that removal fails.
+        response
             .get("voice_id")
             .and_then(serde_json::Value::as_str)
             .filter(|value| valid_provider_resource_id(value))
             .map(str::to_string)
-            .ok_or_else(|| advanced_execution("voice provider returned no valid voice id"))?;
-        if cancel.checkpoint() {
-            let _ = client
-                .delete(format!(
-                    "https://api.elevenlabs.io/v1/voices/{provider_voice_id}"
-                ))
-                .header("xi-api-key", key)
-                .timeout(std::time::Duration::from_secs(10))
-                .send();
-            return Err(cancelled_workflow("voice enrollment cancelled"));
-        }
-        Ok(provider_voice_id)
+            .ok_or_else(|| advanced_execution("voice provider returned no valid voice id"))
     }
 
     fn generate(
@@ -1632,8 +1626,46 @@ pub fn cancel_advanced_workflow(state: State<'_, AdvancedWorkflowCommandState>) 
     state.cancel_active()
 }
 
+/// Voice clones whose enrollment was abandoned but whose provider removal
+/// failed, for Settings to list.
+#[tauri::command]
+pub async fn voice_revocations_pending(
+    state: State<'_, AdvancedWorkflowCommandState>,
+) -> Result<Vec<PendingVoiceRevocation>, String> {
+    let bridge = Arc::clone(&state.bridge);
+    tauri::async_runtime::spawn_blocking(move || bridge.pending_voice_revocations())
+        .await
+        .map_err(|error| format!("voice removal worker failed: {error}"))?
+}
+
+/// Retry removing one queued provider voice; returns the remaining queue.
+#[tauri::command]
+pub async fn voice_revocation_retry(
+    state: State<'_, AdvancedWorkflowCommandState>,
+    provider_voice_id: String,
+) -> Result<Vec<PendingVoiceRevocation>, String> {
+    let token = state.begin()?;
+    let bridge = Arc::clone(&state.bridge);
+    let worker_token = token.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        bridge.retry_voice_revocation(&provider_voice_id, &worker_token)
+    })
+    .await
+    .map_err(|error| format!("voice removal worker failed: {error}"))
+    .and_then(|result| result.map_err(|error| error.message));
+    state.finish(&token);
+    result
+}
+
 impl TauriAdvancedWorkflowBridge {
-    pub fn new(core: AppCore, cache_root: PathBuf, models_dir: PathBuf) -> Self {
+    /// `voice_revocations` must live in application data: it names provider
+    /// voices that have no project record left to revoke them from.
+    pub fn new(
+        core: AppCore,
+        cache_root: PathBuf,
+        models_dir: PathBuf,
+        voice_revocations: Arc<VoiceRevocationStore>,
+    ) -> Self {
         Self {
             core,
             avatar_provider: Arc::new(NetworkFalAvatarProvider {
@@ -1643,7 +1675,16 @@ impl TauriAdvancedWorkflowBridge {
             models_dir,
             caption_translator: Arc::new(NetworkCaptionTranslationProvider),
             voice_provider: Arc::new(NetworkElevenLabsVoiceProvider),
+            voice_revocations,
         }
+    }
+
+    #[cfg(test)]
+    fn for_test(core: AppCore, cache_root: PathBuf, models_dir: PathBuf) -> Self {
+        let voice_revocations = Arc::new(VoiceRevocationStore::new(
+            cache_root.join("voice-revocations.json"),
+        ));
+        Self::new(core, cache_root, models_dir, voice_revocations)
     }
 
     #[cfg(test)]
@@ -1658,6 +1699,9 @@ impl TauriAdvancedWorkflowBridge {
             avatar_provider: Arc::new(NetworkFalAvatarProvider {
                 cache_root: cache_root.clone(),
             }),
+            voice_revocations: Arc::new(VoiceRevocationStore::new(
+                cache_root.join("voice-revocations.json"),
+            )),
             cache_root,
             models_dir,
             caption_translator,
@@ -1675,11 +1719,110 @@ impl TauriAdvancedWorkflowBridge {
     ) -> Self {
         Self {
             core,
+            voice_revocations: Arc::new(VoiceRevocationStore::new(
+                cache_root.join("voice-revocations.json"),
+            )),
             cache_root,
             models_dir,
             caption_translator: Arc::new(NetworkCaptionTranslationProvider),
             avatar_provider,
             voice_provider,
+        }
+    }
+
+    /// Provider voices whose removal is still owed to the user.
+    pub(crate) fn pending_voice_revocations(&self) -> Result<Vec<PendingVoiceRevocation>, String> {
+        self.voice_revocations.list()
+    }
+
+    /// Retry removing one queued provider voice. Only voices OpenTake queued
+    /// itself can be removed this way.
+    fn retry_voice_revocation(
+        &self,
+        provider_voice_id: &str,
+        cancel: &MediaCancelToken,
+    ) -> Result<Vec<PendingVoiceRevocation>, AdvancedWorkflowError> {
+        const PROVIDER: &str = "elevenlabs";
+        let queued = self
+            .voice_revocations
+            .list()
+            .map_err(advanced_execution)?
+            .into_iter()
+            .find(|entry| {
+                entry.provider == PROVIDER && entry.provider_voice_id == provider_voice_id
+            })
+            .ok_or_else(|| advanced_resource("this voice is not waiting for removal"))?;
+        if let Err(error) = self.voice_provider.revoke(provider_voice_id, cancel) {
+            self.voice_revocations
+                .record(PendingVoiceRevocation {
+                    last_error: error.message.clone(),
+                    ..queued
+                })
+                .map_err(|store_error| {
+                    advanced_execution(format!(
+                        "{}; the retry failure could not be recorded: {store_error}",
+                        error.message
+                    ))
+                })?;
+            return Err(error);
+        }
+        self.voice_revocations
+            .remove(PROVIDER, provider_voice_id)
+            .map_err(|error| {
+                advanced_execution(format!(
+                    "provider voice {provider_voice_id} was removed, but the pending list \
+                     could not be updated: {error}"
+                ))
+            })?;
+        self.voice_revocations.list().map_err(advanced_execution)
+    }
+
+    /// Remove a voice the provider enrolled but the user will not keep: the
+    /// enrollment was cancelled or its project record was not committed.
+    /// When the removal fails, the voice id is queued in application data so
+    /// Settings can retry it. The returned error always names the voice.
+    fn abandon_enrolled_voice(
+        &self,
+        provider_voice_id: &str,
+        voice_name: &str,
+        failure: AdvancedWorkflowError,
+    ) -> AdvancedWorkflowError {
+        // The user's cancellation must not also cancel the cleanup.
+        match self
+            .voice_provider
+            .revoke(provider_voice_id, &MediaCancelToken::new())
+        {
+            Ok(()) => AdvancedWorkflowError::new(
+                failure.kind,
+                format!(
+                    "{}; the new provider voice {provider_voice_id} was removed",
+                    failure.message
+                ),
+            ),
+            Err(revoke_error) => {
+                let queued = self.voice_revocations.record(PendingVoiceRevocation {
+                    provider: "elevenlabs".to_string(),
+                    provider_voice_id: provider_voice_id.to_string(),
+                    voice_name: voice_name.to_string(),
+                    recorded_at: unix_now_seconds(),
+                    last_error: revoke_error.message.clone(),
+                });
+                let follow_up = match queued {
+                    Ok(()) => "retry the removal from Settings → AI".to_string(),
+                    Err(store_error) => format!(
+                        "it could not be queued for a retry ({store_error}); delete it from \
+                         your ElevenLabs voice library"
+                    ),
+                };
+                AdvancedWorkflowError::new(
+                    failure.kind,
+                    format!(
+                        "{}; removing the new provider voice {provider_voice_id} failed ({}); \
+                         {follow_up}",
+                        failure.message, revoke_error.message
+                    ),
+                )
+            }
         }
     }
 
@@ -3399,9 +3542,16 @@ impl TauriAdvancedWorkflowBridge {
                     },
                     cancel,
                 )?;
-                // A completed remote enrollment has already been paid for.
-                // Persist it even if cancellation arrived while the provider
-                // was returning, so the user can revoke it deliberately later.
+                // A clone is consent-bound biometric data: one the user
+                // cancelled while the provider was enrolling it must not stay
+                // in their provider account.
+                if cancel.checkpoint() {
+                    return Err(self.abandon_enrolled_voice(
+                        &provider_voice_id,
+                        voice_name,
+                        cancelled_workflow("voice enrollment cancelled"),
+                    ));
+                }
                 let record = VoiceModelRecord {
                     id: voice_model_id.clone(),
                     provider: PROVIDER.into(),
@@ -3424,9 +3574,15 @@ impl TauriAdvancedWorkflowBridge {
                         },
                     )
                     .map_err(|error| {
-                        advanced_execution(format!(
-                            "{error}; provider voice {provider_voice_id} retained for recovery"
-                        ))
+                        // Without a project record the voice could never be
+                        // revoked from OpenTake, so it is removed now.
+                        self.abandon_enrolled_voice(
+                            &provider_voice_id,
+                            voice_name,
+                            advanced_execution(format!(
+                                "voice enrollment could not be saved to the project: {error}"
+                            )),
+                        )
                     })?;
                 Ok(AdvancedWorkflowCommit {
                     result: json!({
@@ -4326,7 +4482,7 @@ mod tests {
     fn advanced_work_cannot_begin_after_update_install_claims_admission() {
         let temp = tempfile::tempdir().unwrap();
         let admission = crate::updater::InstallAdmissionGate::default();
-        let bridge = Arc::new(TauriAdvancedWorkflowBridge::new(
+        let bridge = Arc::new(TauriAdvancedWorkflowBridge::for_test(
             AppCore::new(),
             temp.path().join("cache"),
             temp.path().join("models"),
@@ -4387,6 +4543,30 @@ mod tests {
         fail_generation: bool,
         revoked: Arc<Mutex<HashSet<String>>>,
         calls: Arc<Mutex<Vec<String>>>,
+        /// The user cancels while the provider is enrolling the voice.
+        cancel_during_enroll: bool,
+        /// Runs while the provider is enrolling (for example to change the
+        /// project so the enrollment cannot be committed).
+        during_enroll: Option<Box<dyn Fn() + Send + Sync>>,
+        fail_revoke: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FixtureVoiceProvider {
+        fn new(
+            fixture: PathBuf,
+            revoked: Arc<Mutex<HashSet<String>>>,
+            calls: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                fixture,
+                fail_generation: false,
+                revoked,
+                calls,
+                cancel_during_enroll: false,
+                during_enroll: None,
+                fail_revoke: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
     }
 
     impl VoiceCloneProvider for FixtureVoiceProvider {
@@ -4398,6 +4578,12 @@ mod tests {
             self.calls.lock().unwrap().push("enroll".into());
             if cancel.checkpoint() {
                 return Err(cancelled_workflow("fixture voice enrollment cancelled"));
+            }
+            if let Some(during_enroll) = &self.during_enroll {
+                during_enroll();
+            }
+            if self.cancel_during_enroll {
+                cancel.cancel();
             }
             Ok("provider-voice-fixture".into())
         }
@@ -4438,6 +4624,9 @@ mod tests {
             self.calls.lock().unwrap().push("revoke".into());
             if cancel.checkpoint() {
                 return Err(cancelled_workflow("fixture voice revocation cancelled"));
+            }
+            if self.fail_revoke.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(advanced_execution("fixture voice removal failed"));
             }
             self.revoked
                 .lock()
@@ -4619,7 +4808,7 @@ mod tests {
             })
             .unwrap();
         let clip_id = placed.affected_clip_ids[0].clone();
-        let bridge = TauriAdvancedWorkflowBridge::new(
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
             core.clone(),
             root.path().join("cache"),
             root.path().join("models"),
@@ -4804,8 +4993,11 @@ mod tests {
             })
             .unwrap();
         let clip_id = placed.affected_clip_ids[0].clone();
-        let bridge =
-            TauriAdvancedWorkflowBridge::new(core.clone(), root.path().join("cache"), models_dir);
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
+            core.clone(),
+            root.path().join("cache"),
+            models_dir,
+        );
         assert!(bridge.supported_tools().contains(&ToolName::GenerateMatte));
         let request = GenerateMatteArgs {
             clip_id: clip_id.clone(),
@@ -5001,7 +5193,7 @@ mod tests {
         .unwrap();
         core.save_project(None).unwrap();
 
-        let bridge = TauriAdvancedWorkflowBridge::new(
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
             core.clone(),
             root.path().join("cache"),
             root.path().join("models"),
@@ -5220,7 +5412,7 @@ mod tests {
             .unwrap();
         let clip_id = placed.affected_clip_ids[0].clone();
         core.save_project(None).unwrap();
-        let bridge = TauriAdvancedWorkflowBridge::new(
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
             core.clone(),
             root.path().join("cache"),
             root.path().join("models"),
@@ -5368,7 +5560,7 @@ mod tests {
             )
             .unwrap();
         let source_id = imported[0].entry.id.clone();
-        let bridge = TauriAdvancedWorkflowBridge::new(
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
             core.clone(),
             root.path().join("cache"),
             root.path().join("models"),
@@ -6247,7 +6439,7 @@ mod tests {
                 .collect(),
             apply: Some(false),
         };
-        let bridge = TauriAdvancedWorkflowBridge::new(
+        let bridge = TauriAdvancedWorkflowBridge::for_test(
             core.clone(),
             root.path().join("cache"),
             root.path().join("models"),
@@ -6477,12 +6669,11 @@ mod tests {
             fail: false,
             calls: calls.clone(),
         });
-        let voice = Arc::new(FixtureVoiceProvider {
-            fixture: fixture.generated_voice.clone(),
-            fail_generation: false,
-            revoked: Arc::new(Mutex::new(HashSet::new())),
-            calls: Arc::new(Mutex::new(Vec::new())),
-        });
+        let voice = Arc::new(FixtureVoiceProvider::new(
+            fixture.generated_voice.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
         let bridge = TauriAdvancedWorkflowBridge::with_identity_providers(
             fixture.core.clone(),
             fixture.root.path().join("cache"),
@@ -6580,12 +6771,11 @@ mod tests {
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let revoked = Arc::new(Mutex::new(HashSet::new()));
-        let voice = Arc::new(FixtureVoiceProvider {
-            fixture: fixture.generated_voice.clone(),
-            fail_generation: false,
-            revoked: revoked.clone(),
-            calls: calls.clone(),
-        });
+        let voice = Arc::new(FixtureVoiceProvider::new(
+            fixture.generated_voice.clone(),
+            revoked.clone(),
+            calls.clone(),
+        ));
         let avatar = Arc::new(FixtureAvatarProvider {
             fixture: fixture.avatar_video.clone(),
             fail: false,
@@ -6663,10 +6853,12 @@ mod tests {
                 calls: Arc::new(Mutex::new(0)),
             }),
             Arc::new(FixtureVoiceProvider {
-                fixture: fixture.generated_voice.clone(),
                 fail_generation: true,
-                revoked: revoked.clone(),
-                calls: failed_calls,
+                ..FixtureVoiceProvider::new(
+                    fixture.generated_voice.clone(),
+                    revoked.clone(),
+                    failed_calls,
+                )
             }),
         );
         let before_failure = fixture.core.runtime_snapshot();
@@ -6750,5 +6942,168 @@ mod tests {
         let reopened = AppCore::new();
         reopened.open_project(&fixture.bundle).unwrap();
         assert!(reopened.runtime_snapshot().timeline.voice_models[0].revoked);
+    }
+
+    fn enroll_voice(
+        bridge: &TauriAdvancedWorkflowBridge,
+        fixture: &IdentityFixture,
+    ) -> Result<AdvancedWorkflowCommit, AdvancedWorkflowError> {
+        bridge.clone_voice(
+            CloneVoiceArgs {
+                action: "enroll".into(),
+                reference_audio_media_ref: Some(fixture.audio_id.clone()),
+                consent_id: "consent-voice-fixture".into(),
+                voice_name: Some("Narrator".into()),
+                provider: Some("elevenlabs".into()),
+                model: Some("eleven_multilingual_v2".into()),
+                cost_authorized: Some(true),
+                ..CloneVoiceArgs::default()
+            },
+            &MediaCancelToken::new(),
+        )
+    }
+
+    #[test]
+    fn voice_enrollment_cancelled_in_flight_revokes_the_clone_and_saves_no_record() {
+        let Some(fixture) = identity_fixture() else {
+            return;
+        };
+        for fail_revoke in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let revoked = Arc::new(Mutex::new(HashSet::new()));
+            let voice = FixtureVoiceProvider {
+                cancel_during_enroll: true,
+                ..FixtureVoiceProvider::new(
+                    fixture.generated_voice.clone(),
+                    revoked.clone(),
+                    calls.clone(),
+                )
+            };
+            voice
+                .fail_revoke
+                .store(fail_revoke, std::sync::atomic::Ordering::SeqCst);
+            let cache = fixture
+                .root
+                .path()
+                .join(format!("cancel-cache-{fail_revoke}"));
+            let bridge = TauriAdvancedWorkflowBridge::with_identity_providers(
+                fixture.core.clone(),
+                cache,
+                fixture.root.path().join("models"),
+                Arc::new(FixtureAvatarProvider {
+                    fixture: fixture.avatar_video.clone(),
+                    fail: false,
+                    calls: Arc::new(Mutex::new(0)),
+                }),
+                Arc::new(voice),
+            );
+
+            let error = enroll_voice(&bridge, &fixture).unwrap_err();
+            assert_eq!(error.kind, AdvancedWorkflowErrorKind::Cancelled);
+            assert!(
+                error.message.contains("provider-voice-fixture"),
+                "{}",
+                error.message
+            );
+            assert_eq!(calls.lock().unwrap().as_slice(), ["enroll", "revoke"]);
+            assert!(fixture
+                .core
+                .runtime_snapshot()
+                .timeline
+                .voice_models
+                .is_empty());
+            let reopened = AppCore::new();
+            reopened.open_project(&fixture.bundle).unwrap();
+            assert!(reopened.runtime_snapshot().timeline.voice_models.is_empty());
+            let pending = bridge.pending_voice_revocations().unwrap();
+            if fail_revoke {
+                assert!(revoked.lock().unwrap().is_empty());
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].provider_voice_id, "provider-voice-fixture");
+                assert_eq!(pending[0].voice_name, "Narrator");
+                assert_eq!(pending[0].last_error, "fixture voice removal failed");
+                assert!(error.message.contains("Settings"), "{}", error.message);
+            } else {
+                assert!(revoked.lock().unwrap().contains("provider-voice-fixture"));
+                assert!(pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn voice_enrollment_commit_failure_revokes_and_keeps_a_failed_removal_for_retry() {
+        let Some(fixture) = identity_fixture() else {
+            return;
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(HashSet::new()));
+        // Replacing the project while the provider enrolls makes the
+        // identity-bound commit fail after the clone already exists.
+        let replaced = fixture.core.clone();
+        let voice = Arc::new(FixtureVoiceProvider {
+            during_enroll: Some(Box::new(move || {
+                replaced.new_project();
+            })),
+            ..FixtureVoiceProvider::new(
+                fixture.generated_voice.clone(),
+                revoked.clone(),
+                calls.clone(),
+            )
+        });
+        voice
+            .fail_revoke
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cache = fixture.root.path().join("commit-cache");
+        let bridge = TauriAdvancedWorkflowBridge::with_identity_providers(
+            fixture.core.clone(),
+            cache.clone(),
+            fixture.root.path().join("models"),
+            Arc::new(FixtureAvatarProvider {
+                fixture: fixture.avatar_video.clone(),
+                fail: false,
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            voice.clone(),
+        );
+
+        let error = enroll_voice(&bridge, &fixture).unwrap_err();
+        assert_eq!(error.kind, AdvancedWorkflowErrorKind::ExecutionFailed);
+        assert!(
+            error.message.contains("could not be saved")
+                && error.message.contains("provider-voice-fixture"),
+            "{}",
+            error.message
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["enroll", "revoke"]);
+        let reopened = AppCore::new();
+        reopened.open_project(&fixture.bundle).unwrap();
+        assert!(reopened.runtime_snapshot().timeline.voice_models.is_empty());
+        // The failed removal is kept in application data, not the project.
+        let queued = VoiceRevocationStore::new(cache.join("voice-revocations.json"))
+            .list()
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].provider_voice_id, "provider-voice-fixture");
+
+        // Only queued voices can be retried.
+        let unknown = bridge
+            .retry_voice_revocation("someone-else", &MediaCancelToken::new())
+            .unwrap_err();
+        assert_eq!(unknown.kind, AdvancedWorkflowErrorKind::ResourceNotFound);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        // A failed retry keeps the voice queued with the latest error.
+        assert!(bridge
+            .retry_voice_revocation("provider-voice-fixture", &MediaCancelToken::new())
+            .is_err());
+        assert_eq!(bridge.pending_voice_revocations().unwrap().len(), 1);
+        voice
+            .fail_revoke
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(bridge
+            .retry_voice_revocation("provider-voice-fixture", &MediaCancelToken::new())
+            .unwrap()
+            .is_empty());
+        assert!(revoked.lock().unwrap().contains("provider-voice-fixture"));
+        assert!(bridge.pending_voice_revocations().unwrap().is_empty());
     }
 }
