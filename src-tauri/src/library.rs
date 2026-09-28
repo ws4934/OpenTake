@@ -1271,6 +1271,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_keeps_the_library_available_with_foreign_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let files = root.join(opentake_media::library::FILES_SUBDIR);
+        std::fs::create_dir_all(files.join(".staging/unexpected-dir")).unwrap();
+        std::fs::write(files.join(".DS_Store"), b"finder metadata").unwrap();
+        std::fs::write(files.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::create_dir(files.join("Some Folder")).unwrap();
+
+        let library = LibraryState::new(LibraryStore::new(root));
+
+        let store = library.store().expect("library stays available");
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"favorite bytes").unwrap();
+        let entry = store
+            .favorite(&FavoriteRequest {
+                source: &source,
+                kind: "video",
+                category: None,
+                favorited_at: 1.0,
+                thumb: None,
+            })
+            .unwrap();
+        assert!(store.remove(&entry.id).unwrap());
+    }
+
+    #[test]
     fn library_import_marks_and_persists_the_new_project_asset() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("clip.png");
