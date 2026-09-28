@@ -85,15 +85,15 @@ pub fn project_text(timeline: &Timeline) -> HashMap<String, TextInfo> {
                 if clip.media_type != ClipType::Text {
                     continue;
                 }
-                let (Some(content), Some(style)) = (&clip.text_content, &clip.text_style) else {
+                let Some((content, style)) = opentake_render::text_clip_raster_input(clip) else {
                     continue;
                 };
                 let tl = clip.transform.top_left();
                 text.insert(
                     clip.id.clone(),
                     TextInfo {
-                        content: content.clone(),
-                        style: style.clone(),
+                        content: content.to_string(),
+                        style: style.into_owned(),
                         box_norm: (tl.x, tl.y, clip.transform.width, clip.transform.height),
                     },
                 );
@@ -467,17 +467,26 @@ mod tests {
         text_clip.text_style = Some(TextStyle::default());
         track.clips.push(text_clip);
 
-        // A text-typed clip missing content is skipped (no panic, no entry).
+        // A text-typed clip missing content is blank text: it projects with
+        // empty content (no style needed), so resolvers draw nothing instead
+        // of failing on a missing raster input (#180).
         let mut empty = Clip::new("text-2", "asset-y", 30, 30);
         empty.media_type = ClipType::Text;
         track.clips.push(empty);
 
+        // Visible text without a style has no raster input.
+        let mut unstyled = Clip::new("text-3", "asset-z", 60, 30);
+        unstyled.media_type = ClipType::Text;
+        unstyled.text_content = Some("unstyled".into());
+        track.clips.push(unstyled);
+
         tl.tracks.push(track);
 
         let text = project_text(&tl);
-        assert_eq!(text.len(), 1);
+        assert_eq!(text.len(), 2);
         assert_eq!(text.get("text-1").unwrap().content, "hello");
-        assert!(!text.contains_key("text-2"));
+        assert_eq!(text.get("text-2").unwrap().content, "");
+        assert!(!text.contains_key("text-3"));
     }
 
     #[test]

@@ -16,7 +16,10 @@ pub use color::{linear_to_srgb, srgb_to_linear};
 pub use compositor::{Compositor, TextureResolver};
 pub use device::RenderDevice;
 pub use text_engine::CosmicTextRasterizer;
-pub use text_raster::{NullTextRasterizer, TextRasterRequest, TextRasterizer};
+pub use text_raster::{
+    is_blank_text, rasterize_text_layer, text_clip_raster_input, NullTextRasterizer,
+    TextLayerError, TextRasterRequest, TextRasterizer,
+};
 pub use texture::{upload_lut_3d, upload_rgba, GpuLutTexture, GpuTexture, TextureCache};
 
 /// Errors from GPU device acquisition and frame compositing.

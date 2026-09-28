@@ -741,6 +741,80 @@ fn export_with_text_clip_respects_font_availability() {
     }
 }
 
+/// Every decoded frame of `path` as packed RGB24, in presentation order.
+fn decoded_rgb_frames(path: &Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        .output()
+        .expect("decode exported frames");
+    assert!(output.status.success(), "decode {}", path.display());
+    output.stdout
+}
+
+/// A blank text clip (empty or whitespace-only content) draws nothing: the
+/// export succeeds and every frame matches the same timeline exported without
+/// the clip (#180). Blank text needs no fonts, so this runs on fontless hosts.
+#[test]
+fn export_with_blank_text_clip_matches_export_without_it() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src_blank_text.mp4");
+    let (sw, sh, sfps, frames) = (320, 240, 10, 6);
+    if !make_video(&src, sw, sh, sfps, frames) {
+        eprintln!("skip: could not generate fixture media");
+        return;
+    }
+    let base = build_timeline(frames as i32, sw as i32, sh as i32, sfps as f64);
+    let manifest = build_manifest(&src, sw as i32, sh as i32, sfps as f64);
+    let export = |timeline: &Timeline, name: &str| {
+        let out = dir.path().join(name);
+        let req = ExportRequest {
+            out_path: out.to_string_lossy().into_owned(),
+            codec: Default::default(), // H.264
+            quality: ExportQuality::P720,
+        };
+        match run_export(timeline, &manifest, &None, &req) {
+            Ok(summary) => {
+                assert_eq!(summary.frame_count, frames as i32);
+                assert_summary_matches_real_probe(&summary, &out);
+                Some(out)
+            }
+            Err(error) if error.contains("no GPU device") => None,
+            Err(error) => panic!("export {name} failed: {error}"),
+        }
+    };
+    let Some(reference) = export(&base, "without_text.mp4") else {
+        eprintln!("skip: no GPU adapter available");
+        return;
+    };
+    let reference_frames = decoded_rgb_frames(&reference);
+
+    for (label, content) in [("empty", ""), ("whitespace", "  \n\t ")] {
+        let mut timeline = base.clone();
+        let mut text_track = Track::new("t-text", ClipType::Video);
+        let mut text = Clip::new("clip-blank-text", "", 0, frames as i32);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = Some(content.to_string());
+        text.text_style = Some(TextStyle::default());
+        text_track.clips.push(text);
+        timeline.tracks.push(text_track);
+
+        let out = export(&timeline, &format!("{label}_text.mp4"))
+            .expect("the GPU was available for the reference export");
+        assert!(
+            decoded_rgb_frames(&out) == reference_frames,
+            "{label} text clip must not change any exported pixel"
+        );
+    }
+}
+
 /// Transparent delivery must preserve the alpha plane through the full GPU →
 /// raw-RGBA → ProRes 4444 path. The text glyph gives the frame a non-zero alpha
 /// island while the transparent clear color leaves the surrounding canvas at 0.

@@ -42,8 +42,8 @@ use opentake_project::ProjectRoot;
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::wgpu;
 use opentake_render::{
-    CosmicTextRasterizer, DecodedFrame, FramePlan, GpuLutTexture, GpuTexture, TextRasterRequest,
-    TextRasterizer, TextureCache, TextureResolver, TextureSource,
+    rasterize_text_layer, CosmicTextRasterizer, DecodedFrame, FramePlan, GpuLutTexture, GpuTexture,
+    TextRasterRequest, TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
 
 use crate::render::LottieMaterializer;
@@ -404,7 +404,7 @@ pub struct PlaybackResolverState {
     lottie: LottieMaterializer,
     /// Image content hashes, revalidated by file identity on every lookup.
     content_hashes: ContentHashCache,
-    text_rasterizer: CosmicTextRasterizer,
+    text_rasterizer: Box<dyn TextRasterizer>,
     media: HashMap<String, MediaInfo>,
     text: HashMap<String, TextInfo>,
     timeline_fps: i32,
@@ -443,7 +443,7 @@ impl PlaybackResolverState {
             static_cache: TextureCache::new(STATIC_CACHE_CAP),
             lottie: LottieMaterializer::new(),
             content_hashes: ContentHashCache::new(),
-            text_rasterizer: CosmicTextRasterizer::new(),
+            text_rasterizer: Box::new(CosmicTextRasterizer::new()),
             media,
             text,
             timeline_fps,
@@ -487,6 +487,12 @@ impl PlaybackResolverState {
     /// served by reverse windows instead of a forward stream.
     pub fn set_reversed_clips(&mut self, clip_ids: HashSet<String>) {
         self.reversed_clips = clip_ids;
+    }
+
+    /// Swap the text backend (tests use a rasterizer that returns `None`).
+    #[cfg(test)]
+    fn set_text_rasterizer(&mut self, rasterizer: Box<dyn TextRasterizer>) {
+        self.text_rasterizer = rasterizer;
     }
 
     /// Take the first materialization failure recorded during the current
@@ -743,10 +749,16 @@ impl<'d, 's> StreamingResolver<'d, 's> {
             box_norm: info.box_norm,
             canvas: self.state.render_box,
         };
-        let Some(frame) = self.state.text_rasterizer.rasterize(&req) else {
-            return self
-                .state
-                .fail_materialization(format!("text clip {clip_id} rasterization failed"));
+        // A blank text clip draws nothing; only a non-blank one that yields no
+        // pixels fails playback (#180).
+        let frame = match rasterize_text_layer(self.state.text_rasterizer.as_ref(), &req) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return None,
+            Err(error) => {
+                return self
+                    .state
+                    .fail_materialization(format!("text clip {clip_id} {error}"));
+            }
         };
         let tex = upload_rgba(
             self.device,
@@ -1239,6 +1251,52 @@ mod tests {
             .take_materialization_error()
             .expect("missing text must retain an explicit materialization failure");
         assert!(error.contains("text clip missing-text"), "{error}");
+    }
+
+    #[test]
+    fn blank_text_draws_nothing_while_a_missing_raster_still_fails_playback() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            return;
+        };
+        let text_info = |content: &str, box_norm| TextInfo {
+            content: content.to_string(),
+            style: opentake_domain::TextStyle::default(),
+            box_norm,
+        };
+        let full = (0.0, 0.0, 1.0, 1.0);
+        let text = HashMap::from([
+            ("empty".to_string(), text_info("", full)),
+            ("spaces".to_string(), text_info(" \t ", full)),
+            (
+                "sliver".to_string(),
+                text_info("hidden", (0.0, 0.0, 0.001, 1.0)),
+            ),
+            ("visible".to_string(), text_info("visible", full)),
+        ]);
+        let mut state =
+            PlaybackResolverState::new(HashMap::new(), text, 30, (64, 64), MediaCancelToken::new());
+        // Returns `None` for every request, like a broken text backend.
+        state.set_text_rasterizer(Box::new(opentake_render::NullTextRasterizer));
+        let source = |clip_id: &str| TextureSource::Text {
+            clip_id: clip_id.to_string(),
+        };
+        let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
+        for blank in ["empty", "spaces", "sliver"] {
+            assert!(resolver.resolve(&source(blank), 0).is_none());
+        }
+        drop(resolver);
+        assert_eq!(state.take_materialization_error(), None);
+
+        let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
+        assert!(resolver.resolve(&source("visible"), 0).is_none());
+        drop(resolver);
+        let error = state
+            .take_materialization_error()
+            .expect("a missing raster for visible text must fail playback");
+        assert!(
+            error.contains("text clip visible rasterization failed"),
+            "{error}"
+        );
     }
 
     #[test]

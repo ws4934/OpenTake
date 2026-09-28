@@ -30,16 +30,12 @@ use cosmic_text::{
 };
 use opentake_domain::{Rgba, TextAlignment};
 
-use crate::gpu::text_raster::{TextRasterRequest, TextRasterizer};
+use crate::gpu::text_raster::{is_blank_text, text_box_pixels, TextRasterRequest, TextRasterizer};
 use crate::source::DecodedFrame;
 
 /// Upstream font-size basis: sizes are authored against a 1080p-tall canvas and
 /// scaled by the actual canvas height (`TextLayerController` / `TextLayout`).
 const CANVAS_BASIS_HEIGHT: f64 = 1080.0;
-
-/// Largest text box we will rasterize (px per side). Bounds the CPU/RAM cost of a
-/// degenerate transform; real text boxes are well under this.
-const MAX_BOX_SIDE: u32 = 8192;
 
 /// cosmic-text rasterizer. Owns a `FontSystem` (system fonts discovered once) and
 /// a `SwashCache`, both mutated during layout/raster, so they sit behind a
@@ -106,22 +102,6 @@ impl TextRasterizer for CosmicTextRasterizer {
     }
 }
 
-/// Box pixel size from the normalized box + canvas, clamped to sane bounds.
-/// The box comes from `clip.transform` (top-left + width/height) — i.e. upstream
-/// `layer.frame = (tl.x*W, tl.y*H, transform.width*W, transform.height*H)` at
-/// `TextLayerController.applyStyle` L157-163 — **not** `TextLayout.naturalSize`
-/// (that measures glyph bounds for clip placement only; the shadow padding
-/// `12*2` and `+4` slack live there, not in this rasterizer's box).
-fn box_pixels(box_norm: (f64, f64, f64, f64), canvas: (u32, u32)) -> Option<(u32, u32)> {
-    let (_, _, bw, bh) = box_norm;
-    let w = (bw * canvas.0 as f64).round();
-    let h = (bh * canvas.1 as f64).round();
-    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
-        return None;
-    }
-    Some(((w as u32).min(MAX_BOX_SIDE), (h as u32).min(MAX_BOX_SIDE)))
-}
-
 /// Map the domain text alignment to cosmic-text's.
 fn to_align(a: TextAlignment) -> Align {
     match a {
@@ -183,13 +163,13 @@ fn ch8(v: f64) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Rasterize one text clip's box to premultiplied RGBA, or `None` for empty
-/// content / a degenerate box.
+/// Rasterize one text clip's box to premultiplied RGBA, or `None` for a blank
+/// request (empty content or a sub-pixel box, see [`is_blank_text`]).
 fn rasterize_box(inner: &mut Inner, req: &TextRasterRequest<'_>) -> Option<DecodedFrame> {
-    if req.content.trim().is_empty() {
+    if is_blank_text(req) {
         return None;
     }
-    let (bw, bh) = box_pixels(req.box_norm, req.canvas)?;
+    let (bw, bh) = text_box_pixels(req.box_norm, req.canvas)?;
     let style = req.style;
 
     let fs = &mut inner.font_system;

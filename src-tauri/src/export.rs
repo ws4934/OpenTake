@@ -78,6 +78,7 @@ use opentake_render::{
     GpuLutTexture, GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest,
     TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
+use opentake_render::{is_blank_text, rasterize_text_layer, text_clip_raster_input};
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
 /// hit rate is low; a small cache still helps text/image layers re-used across
@@ -533,7 +534,7 @@ struct MediaResolver<'d> {
     content_hashes: &'d mut ContentHashCache,
     media: &'d HashMap<String, MediaInfo>,
     text: &'d HashMap<String, TextInfo>,
-    text_rasterizer: &'d CosmicTextRasterizer,
+    text_rasterizer: &'d dyn TextRasterizer,
     /// Decode/raster box for source frames (matches the export render size).
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
@@ -729,17 +730,13 @@ impl MediaResolver<'_> {
             box_norm: info.box_norm,
             canvas: self.render_box,
         };
-        let frame = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.text_rasterizer.rasterize(&req)
-        })) {
+        // A blank text clip draws nothing; only a non-blank one that yields no
+        // pixels fails the export (#180).
+        let frame = match rasterize_text_layer(self.text_rasterizer, &req) {
             Ok(Some(frame)) => frame,
-            Ok(None) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization failed"));
-            }
-            Err(_) => {
-                return self
-                    .fail_materialization(format!("text clip {clip_id} rasterization panicked"));
+            Ok(None) => return None,
+            Err(error) => {
+                return self.fail_materialization(format!("text clip {clip_id} {error}"));
             }
         };
         let tex = upload_rgba(self.device, self.queue, &frame, false, Some("export-text"));
@@ -977,15 +974,15 @@ fn project_text(timeline: &opentake_domain::Timeline) -> HashMap<String, TextInf
                 if clip.media_type != ClipType::Text {
                     continue;
                 }
-                let (Some(content), Some(style)) = (&clip.text_content, &clip.text_style) else {
+                let Some((content, style)) = text_clip_raster_input(clip) else {
                     continue;
                 };
                 let tl = clip.transform.top_left();
                 text.insert(
                     clip.id.clone(),
                     TextInfo {
-                        content: content.clone(),
-                        style: style.clone(),
+                        content: content.to_string(),
+                        style: style.into_owned(),
                         box_norm: (tl.x, tl.y, clip.transform.width, clip.transform.height),
                     },
                 );
@@ -2121,7 +2118,10 @@ pub(crate) fn run_export_with_control(
     // Fail closed: a text-bearing export with no font faces would complete
     // "successfully" with invisible text. Reject it before the encoder starts;
     // the preview path (render.rs) deliberately stays lenient.
-    ensure_text_export_fonts(!plan.text_plans.is_empty(), &text_rasterizer)?;
+    ensure_text_export_fonts(
+        plan_draws_text(&plan, &text, (render_size.width, render_size.height)),
+        &text_rasterizer,
+    )?;
 
     // Declare this before the encoder so Rust drops the encoder first (which
     // reaps ffmpeg) and only then removes an error/cancelled partial output.
@@ -2473,6 +2473,28 @@ fn validate_export_probe(
         ));
     }
     Ok(())
+}
+
+/// Whether any text clip in `plan` has glyphs to draw at `render_box`. Blank
+/// text draws nothing (#180), so it never needs fonts; a text clip without a
+/// raster input counts as drawing so the font guard stays fail-closed (the
+/// resolver reports that clip later).
+fn plan_draws_text(
+    plan: &RenderPlan,
+    text: &HashMap<String, TextInfo>,
+    render_box: (u32, u32),
+) -> bool {
+    plan.text_plans.iter().any(|clip_plan| {
+        text.get(&clip_plan.clip_id).is_none_or(|info| {
+            !is_blank_text(&TextRasterRequest {
+                clip_id: &clip_plan.clip_id,
+                content: &info.content,
+                style: &info.style,
+                box_norm: info.box_norm,
+                canvas: render_box,
+            })
+        })
+    })
 }
 
 /// Fail-closed guard for text-bearing exports: an export whose plan contains
@@ -5528,6 +5550,97 @@ mod tests {
     fn text_export_allows_fontless_run_without_text_clips() {
         let headless = CosmicTextRasterizer::without_system_fonts();
         assert!(ensure_text_export_fonts(false, &headless).is_ok());
+    }
+
+    fn text_timeline(content: Option<&str>) -> opentake_domain::Timeline {
+        let mut timeline = opentake_domain::Timeline::new();
+        let mut text = Clip::new("text", "", 0, 10);
+        text.media_type = ClipType::Text;
+        text.source_clip_type = ClipType::Text;
+        text.text_content = content.map(str::to_string);
+        text.text_style = Some(TextStyle::default());
+        let mut track = opentake_domain::Track::new("text", ClipType::Text);
+        track.clips.push(text);
+        timeline.tracks.push(track);
+        timeline
+    }
+
+    #[test]
+    fn blank_text_clips_do_not_require_fonts() {
+        let render_size = opentake_render::RenderSize::new(64, 64);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::new(),
+        };
+        let draws_text = |content: Option<&str>| {
+            let timeline = text_timeline(content);
+            let plan = try_build_render_plan(&timeline, render_size, &metrics).unwrap();
+            assert_eq!(plan.text_plans.len(), 1);
+            plan_draws_text(&plan, &project_text(&timeline), (64, 64))
+        };
+        assert!(!draws_text(None));
+        assert!(!draws_text(Some("")));
+        assert!(!draws_text(Some("  \n ")));
+        assert!(draws_text(Some("visible")));
+
+        let headless = CosmicTextRasterizer::without_system_fonts();
+        assert!(ensure_text_export_fonts(draws_text(Some(" ")), &headless).is_ok());
+    }
+
+    #[test]
+    fn export_resolver_skips_blank_text_but_fails_a_missing_raster() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            return;
+        };
+        let info = |content: &str, box_norm| TextInfo {
+            content: content.to_string(),
+            style: TextStyle::default(),
+            box_norm,
+        };
+        let full = (0.0, 0.0, 1.0, 1.0);
+        let text = HashMap::from([
+            ("empty".to_string(), info("", full)),
+            ("spaces".to_string(), info("   ", full)),
+            ("sliver".to_string(), info("hidden", (0.0, 0.0, 0.001, 1.0))),
+            ("visible".to_string(), info("visible", full)),
+        ]);
+        let media = HashMap::new();
+        let video_frames = HashMap::new();
+        let mut cache = TextureCache::new(4);
+        let mut lottie = LottieMaterializer::new();
+        let mut content_hashes = ContentHashCache::new();
+        let mut lut_cache = HashMap::new();
+        let mut resolver = MediaResolver {
+            device: &dev.device,
+            queue: &dev.queue,
+            cache: &mut cache,
+            lottie: &mut lottie,
+            content_hashes: &mut content_hashes,
+            media: &media,
+            text: &text,
+            // Returns `None` for every request, like a broken text backend.
+            text_rasterizer: &opentake_render::NullTextRasterizer,
+            render_box: (64, 64),
+            project_root: None,
+            lut_cache: &mut lut_cache,
+            video_frames: &video_frames,
+            materialization_error: None,
+        };
+        let source = |clip_id: &str| TextureSource::Text {
+            clip_id: clip_id.to_string(),
+        };
+        for blank in ["empty", "spaces", "sliver"] {
+            assert!(resolver.resolve(&source(blank), 0).is_none());
+        }
+        assert_eq!(resolver.materialization_error, None);
+        assert!(resolver.resolve(&source("visible"), 0).is_none());
+        let error = resolver
+            .materialization_error
+            .take()
+            .expect("a missing raster for visible text must fail the export");
+        assert!(
+            error.contains("text clip visible rasterization failed"),
+            "{error}"
+        );
     }
 
     #[test]
