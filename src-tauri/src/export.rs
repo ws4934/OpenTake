@@ -1487,7 +1487,7 @@ fn mix_timeline_audio(
 
 /// Export's mono 48 kHz mix of a whole timeline from media paths, for the
 /// preview parity tests in `playback::audio`.
-#[cfg(test)]
+#[cfg(all(test, feature = "playback-engine"))]
 pub(crate) fn mix_timeline_audio_for_paths(
     timeline: &opentake_domain::Timeline,
     paths: &HashMap<String, PathBuf>,
