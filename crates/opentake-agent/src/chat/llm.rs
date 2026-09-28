@@ -61,19 +61,20 @@ impl LlmProvider {
     }
 }
 
-/// Model ids the providers have retired. Sessions persisted with one of these
-/// resolve to the provider default instead of failing every turn.
+/// Model ids the providers have retired. A session whose chosen model is one of
+/// these resolves to the provider default instead of failing every turn.
 const RETIRED_MODELS: &[&str] = &["claude-3-5-haiku-latest", "claude-3-5-haiku-20241022"];
 
-/// Pick the model for a turn: a session's stored model survives while the
-/// provider stays the same and the id is not retired; otherwise the provider
-/// default applies.
+/// Pick the model for a turn: a model the user chose for the session survives
+/// while the provider stays the same and the id is not retired; otherwise the
+/// current provider default applies, so a default bump reaches every session
+/// that never chose a model.
 pub fn resolve_session_model(
     provider: LlmProvider,
     previous_provider: Option<&str>,
-    stored_model: Option<&str>,
+    chosen_model: Option<&str>,
 ) -> String {
-    match stored_model {
+    match chosen_model {
         Some(model)
             if previous_provider == Some(provider.as_str())
                 && !model.trim().is_empty()

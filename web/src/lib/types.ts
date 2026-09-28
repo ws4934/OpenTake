@@ -1309,7 +1309,10 @@ export interface ChatSession {
   createdAt: number;
   isOpen: boolean;
   provider?: string;
+  /** The model the last turn used (display only). */
   model?: string;
+  /** The model the user chose; unset follows the provider default. */
+  chosenModel?: string;
 }
 
 function hasOwn(value: object, property: string): boolean {

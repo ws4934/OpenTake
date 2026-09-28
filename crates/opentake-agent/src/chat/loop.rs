@@ -493,10 +493,16 @@ impl ChatLoop {
         let provider = provider_from_choice(&provider_choice)
             .map_err(|error| LoopError::llm(error, &first_message_id, 0))?;
         let previous_provider = session.provider.replace(provider_choice);
+        if previous_provider.as_deref() != Some(provider.as_str()) {
+            // A choice belongs to the provider it was made for.
+            session.chosen_model = None;
+        }
+        // `session.model` only records the model used, for display; reading it
+        // back would pin whatever default was current when the session began.
         session.model = Some(resolve_session_model(
             provider,
             previous_provider.as_deref(),
-            session.model.as_deref(),
+            session.chosen_model.as_deref(),
         ));
         if !has_trailing_user_message(session, &user_text) {
             session.messages.push(ChatMessage::user(user_text));
