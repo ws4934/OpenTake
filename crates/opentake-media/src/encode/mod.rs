@@ -65,16 +65,21 @@ fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> V
 /// `pcm_in`, copy the video stream untouched, encode the audio with `acodec`,
 /// and write the muxed container to `out`. Pure so the CLI contract is testable.
 ///
-/// `-shortest` trims the muxed output to the shorter of the two streams, so a
-/// trailing audio tail past the last video frame doesn't extend the video.
+/// The video's length is authoritative. `apad` pads audio that ends early
+/// with silence and `-t` (the encoded frames' duration) trims a longer tail,
+/// so the output is never cut to the audio's length nor extended past the
+/// last frame. `-shortest` cannot be used for this: it cut the video to short
+/// audio, and combined with `apad` and a copied video stream it never ends.
+/// Without video frames the audio is muxed as-is.
 fn mux_args(
     video_in: &Path,
     pcm_in: &Path,
     out: &Path,
     sample_rate: u32,
     acodec: &str,
+    video_duration: Option<&str>,
 ) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "-y".into(),
         // Input 0: the encoded video (audio-less).
         "-i".into(),
@@ -93,9 +98,25 @@ fn mux_args(
         "copy".into(),
         "-c:a".into(),
         acodec.into(),
-        "-shortest".into(),
-        out.to_string_lossy().into_owned(),
-    ]
+    ];
+    if let Some(duration) = video_duration {
+        args.extend(["-af".into(), "apad".into(), "-t".into(), duration.into()]);
+    }
+    args.push(out.to_string_lossy().into_owned());
+    args
+}
+
+/// Exact duration of `frames` at `fps`, rounded up to the microsecond so a
+/// `-t` bound never drops the last frame. `None` without frames or rate.
+fn video_duration_arg(frames: u64, fps: i32) -> Option<String> {
+    let fps = u64::try_from(fps).ok().filter(|fps| *fps > 0)?;
+    if frames == 0 {
+        return None;
+    }
+    let micros = u128::from(frames)
+        .checked_mul(1_000_000)?
+        .div_ceil(u128::from(fps));
+    Some(format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000))
 }
 
 const ENCODE_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -117,6 +138,9 @@ pub struct VideoEncoder {
     output_pump: Option<JoinHandle<Result<()>>>,
     stderr_pump: Option<JoinHandle<Result<()>>>,
     expected_frame_bytes: usize,
+    fps: i32,
+    /// Frames fully written to the first pass; they fix the output duration.
+    frames_written: u64,
     workspace: tempfile::TempDir,
     first_pass: PathBuf,
     output: File,
@@ -217,6 +241,8 @@ impl VideoEncoder {
             output_pump: Some(output_pump),
             stderr_pump: Some(stderr_pump),
             expected_frame_bytes: w as usize * h as usize * 4,
+            fps,
+            frames_written: 0,
             workspace,
             first_pass,
             output,
@@ -243,6 +269,7 @@ impl VideoEncoder {
         stdin
             .write_all(&rgba.rgba)
             .map_err(|e| MediaError::Encode(format!("write frame: {e}")))?;
+        self.frames_written += 1;
         Ok(())
     }
 
@@ -498,12 +525,14 @@ impl VideoEncoder {
                 "muxed.mp4"
             },
         );
+        let video_duration = video_duration_arg(self.frames_written, self.fps);
         let args = mux_args(
             &self.first_pass,
             &audio.path,
             &mux_path,
             audio.spec.sample_rate,
             self.acodec,
+            video_duration.as_deref(),
         );
         let mut child = crate::ff::ffmpeg()
             .args(args)
@@ -879,6 +908,7 @@ mod tests {
             Path::new("/out.mp4"),
             48_000,
             "aac",
+            Some("4.000000"),
         );
         // video input first, then the raw s16le PCM input declared with rate/ch.
         assert!(args.windows(2).any(|w| w == ["-i", "/v.mp4"]));
@@ -889,8 +919,36 @@ mod tests {
         // copy the video stream, encode audio with the preset codec.
         assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]));
         assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert!(args.iter().any(|a| a == "-shortest"));
+        // Silence pads short audio; the video's duration bounds the output.
+        assert!(args.windows(2).any(|w| w == ["-af", "apad"]));
+        assert!(args.windows(2).any(|w| w == ["-t", "4.000000"]));
+        assert!(!args.iter().any(|a| a == "-shortest"));
         assert_eq!(args.last().unwrap(), "/out.mp4");
+    }
+
+    #[test]
+    fn mux_args_without_video_frames_mux_audio_as_is() {
+        let args = mux_args(
+            Path::new("/v.mp4"),
+            Path::new("/a.pcm"),
+            Path::new("/out.mp4"),
+            48_000,
+            "aac",
+            None,
+        );
+        assert!(!args
+            .iter()
+            .any(|a| a == "apad" || a == "-t" || a == "-shortest"));
+    }
+
+    #[test]
+    fn video_duration_covers_every_pushed_frame() {
+        assert_eq!(video_duration_arg(120, 30).as_deref(), Some("4.000000"));
+        // 100 / 24 s = 4.1666…: rounded up so the last frame stays inside.
+        assert_eq!(video_duration_arg(100, 24).as_deref(), Some("4.166667"));
+        assert_eq!(video_duration_arg(1, 60).as_deref(), Some("0.016667"));
+        assert_eq!(video_duration_arg(0, 30), None);
+        assert_eq!(video_duration_arg(10, 0), None);
     }
 
     #[test]
@@ -901,8 +959,97 @@ mod tests {
             Path::new("/out.mov"),
             48_000,
             "pcm_s16le",
+            Some("1.000000"),
         );
         assert!(args.windows(2).any(|w| w == ["-c:a", "pcm_s16le"]));
+    }
+
+    /// `(video frames, audio seconds)` of an encoded file, counted by decoding.
+    fn stream_lengths(path: &Path) -> (u64, f64) {
+        let output = std::process::Command::new(crate::ff::ffprobe_path())
+            .args(["-v", "error", "-count_frames", "-of", "json"])
+            .args(["-show_entries", "stream=codec_type,nb_read_frames,duration"])
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        assert!(output.status.success(), "ffprobe {}", path.display());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let streams = json["streams"].as_array().unwrap();
+        let of_type = |kind: &str| {
+            streams
+                .iter()
+                .find(|stream| stream["codec_type"] == kind)
+                .unwrap_or_else(|| panic!("no {kind} stream"))
+        };
+        let frames = of_type("video")["nb_read_frames"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let audio = of_type("audio")["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (frames, audio)
+    }
+
+    fn encode_with_audio(output: &Path, frames: usize, fps: i32, audio_secs: f64) {
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut encoder = VideoEncoder::new(output, 16, 16, fps, &preset).unwrap();
+        for index in 0..frames {
+            let value = (index % 256) as u8;
+            encoder
+                .push_frame(&RgbaFrame::new(16, 16, [value, 0, 0, 255].repeat(16 * 16)))
+                .unwrap();
+        }
+        let spec = PcmSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            format: PcmFormat::F32,
+        };
+        let samples = (audio_secs * 48_000.0) as usize;
+        encoder
+            .push_audio(PcmBuffer {
+                spec,
+                samples_f32: (0..samples)
+                    .map(|index| (index as f32 * 0.0575).sin() * 0.5)
+                    .collect(),
+            })
+            .unwrap();
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn short_audio_is_padded_instead_of_cutting_the_video() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("short-audio.mp4");
+
+        encode_with_audio(&output, 120, 30, 2.5);
+
+        let (frames, audio_secs) = stream_lengths(&output);
+        assert_eq!(frames, 120, "every encoded frame survives the mux");
+        assert!(
+            (audio_secs - 4.0).abs() <= 1.0 / 30.0,
+            "audio {audio_secs} s"
+        );
+    }
+
+    #[test]
+    fn long_audio_still_ends_with_the_video() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("long-audio.mp4");
+
+        encode_with_audio(&output, 120, 30, 5.0);
+
+        let (frames, audio_secs) = stream_lengths(&output);
+        assert_eq!(frames, 120);
+        assert!(
+            (audio_secs - 4.0).abs() <= 1.0 / 30.0,
+            "audio {audio_secs} s"
+        );
     }
 
     #[test]
