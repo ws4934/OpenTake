@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -72,6 +72,9 @@ use opentake_render::{
 };
 
 use crate::library::ProjectMediaCapability;
+#[cfg(test)]
+use crate::public_net::public_ip;
+use crate::public_net::{literal_host_ip, PublicTargetError};
 
 /// JPEG quality `inspect_timeline` encodes composited frames at (upstream
 /// `inspectTimelineJPEGQuality = 0.7`). `image` takes a 0–100 byte.
@@ -248,116 +251,31 @@ async fn resolve_public_target(
     url: &reqwest::Url,
     cancel: &opentake_media::MediaCancelToken,
 ) -> Result<(String, Option<SocketAddr>), BridgeError> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| BridgeError::new("source.url must include a host"))?
-        .to_string();
-    let port = url.port_or_known_default().unwrap_or(443);
-    if let Some(ip) = literal_host_ip(&host) {
-        ensure_public_ip(ip)?;
-        return Ok((host, None));
-    }
-
-    let addresses = {
-        let lookup = tokio::net::lookup_host((host.as_str(), port));
-        tokio::pin!(lookup);
-        let timeout = tokio::time::sleep(Duration::from_secs(10));
-        tokio::pin!(timeout);
-        tokio::select! {
-            result = &mut lookup => result.map_err(|_| BridgeError::new("source.url DNS resolution failed"))?,
-            () = wait_for_media_cancel(cancel) => return Err(BridgeError::new("source.url import was cancelled")),
-            () = &mut timeout => return Err(BridgeError::new("source.url DNS resolution timed out")),
-        }
-    };
-    let addresses = addresses.collect::<Vec<_>>();
-    Ok((host, Some(pin_public_address(addresses)?)))
+    crate::public_net::resolve_public_target(url, cancel, crate::public_net::system_lookup)
+        .await
+        .map_err(public_target_error)
 }
 
-fn pin_public_address(mut addresses: Vec<SocketAddr>) -> Result<SocketAddr, BridgeError> {
-    addresses.sort_unstable();
-    addresses.dedup();
-    if addresses.is_empty() {
-        return Err(BridgeError::new("source.url DNS returned no addresses"));
-    }
-    // Reject mixed public/private answers rather than choosing the public one:
-    // this makes split-horizon and rebinding responses fail closed.
-    for address in &addresses {
-        ensure_public_ip(address.ip())?;
-    }
-    Ok(addresses[0])
+fn public_target_error(error: PublicTargetError) -> BridgeError {
+    BridgeError::new(match error {
+        PublicTargetError::MissingHost => "source.url must include a host",
+        PublicTargetError::NonPublicAddress => {
+            "source.url resolved to a non-public network address"
+        }
+        PublicTargetError::NoAddresses => "source.url DNS returned no addresses",
+        PublicTargetError::LookupFailed => "source.url DNS resolution failed",
+        PublicTargetError::LookupTimedOut => "source.url DNS resolution timed out",
+        PublicTargetError::Cancelled => "source.url import was cancelled",
+    })
+}
+
+#[cfg(test)]
+fn pin_public_address(addresses: Vec<SocketAddr>) -> Result<SocketAddr, BridgeError> {
+    crate::public_net::pin_public_address(addresses).map_err(public_target_error)
 }
 
 fn ensure_public_ip(ip: IpAddr) -> Result<(), BridgeError> {
-    if public_ip(ip) {
-        Ok(())
-    } else {
-        Err(BridgeError::new(
-            "source.url resolved to a non-public network address",
-        ))
-    }
-}
-
-fn literal_host_ip(host: &str) -> Option<IpAddr> {
-    host.strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host)
-        .parse()
-        .ok()
-}
-
-fn public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => public_ipv4(ip),
-        IpAddr::V6(ip) => public_ipv6(ip),
-    }
-}
-
-fn public_ipv4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    !matches!(
-        (a, b, c),
-        (0, _, _)
-            | (10, _, _)
-            | (100, 64..=127, _)
-            | (127, _, _)
-            | (169, 254, _)
-            | (172, 16..=31, _)
-            | (192, 0, 0)
-            | (192, 0, 2)
-            | (192, 88, 99)
-            | (192, 168, _)
-            | (198, 18..=19, _)
-            | (198, 51, 100)
-            | (203, 0, 113)
-            | (224..=255, _, _)
-    )
-}
-
-fn public_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(ipv4) = ip.to_ipv4() {
-        return public_ipv4(ipv4);
-    }
-    let segments = ip.segments();
-    let first = segments[0];
-    if ip.is_unspecified()
-        || ip.is_loopback()
-        || (first & 0xfe00) == 0xfc00 // unique-local
-        || (first & 0xfe00) == 0xfe00 // link/site-local and reserved
-        || (first & 0xff00) == 0xff00 // multicast
-        || (first & 0xe000) != 0x2000
-    // fail closed outside global unicast 2000::/3
-    {
-        return false;
-    }
-    let is_special_purpose = matches!(
-        (segments[0], segments[1]),
-        (0x2001, 0x0000) // Teredo
-            | (0x2001, 0x0002) // benchmarking
-            | (0x2001, 0x0db8) // documentation
-            | (0x2002, _) // 6to4 transition
-    ) || (segments[0] == 0x2001
-        && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020));
-    !is_special_purpose
+    crate::public_net::ensure_public_ip(ip).map_err(public_target_error)
 }
 
 fn safe_reqwest_error(error: reqwest::Error) -> BridgeError {

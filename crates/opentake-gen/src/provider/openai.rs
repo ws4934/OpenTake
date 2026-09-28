@@ -8,7 +8,7 @@
 //! note (a)). A real deployment may instead persist to S3/R2.
 
 use super::{ModelRoute, ProviderAdapter};
-use crate::error::{map_http_error, GenError};
+use crate::error::{map_http_response, GenError};
 use crate::job::GenerationJob;
 use crate::params::GenerationParams;
 use crate::transport::{HttpRequest, HttpTransport};
@@ -91,12 +91,18 @@ impl OpenAiAdapter {
             body["quality"] = json!(quality);
         }
         let (hk, hv) = self.auth_header();
+        // `b64_json` images arrive inside the JSON body.
         let resp = self
             .http
-            .send(HttpRequest::post(url).header(hk, hv).json(body))
+            .send(
+                HttpRequest::post(url)
+                    .header(hk, hv)
+                    .json(body)
+                    .media_response(),
+            )
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         let urls = Self::extract_image_urls(&v);
@@ -133,10 +139,15 @@ impl OpenAiAdapter {
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(HttpRequest::post(url).header(hk, hv).json(body))
+            .send(
+                HttpRequest::post(url)
+                    .header(hk, hv)
+                    .json(body)
+                    .media_response(),
+            )
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         // Raw audio bytes -> data URL (no object storage configured).
         let data_url =
@@ -182,7 +193,7 @@ impl ProviderAdapter for OpenAiAdapter {
             .unwrap()
             .get(job_id)
             .cloned()
-            .ok_or_else(|| GenError::Transport(format!("openai: unknown job id {job_id}")))
+            .ok_or_else(|| GenError::Protocol(format!("openai: unknown job id {job_id}")))
     }
 
     async fn upload(&self, _path: &Path, _content_type: &str) -> Result<String, GenError> {
@@ -268,6 +279,16 @@ mod tests {
         assert_eq!(
             job.result_urls,
             Some(vec!["data:image/png;base64,QUJD".into()])
+        );
+        // Inline images need the media response ceiling and deadline.
+        let request = mock.last_call().unwrap();
+        assert_eq!(
+            request.max_response_bytes,
+            Some(crate::transport::MEDIA_RESPONSE_BYTES_MAX)
+        );
+        assert_eq!(
+            request.timeout,
+            Some(crate::transport::MEDIA_REQUEST_TIMEOUT)
         );
     }
 

@@ -4,10 +4,10 @@
 //! Succeeded, failed/canceled -> Failed. See gen-SPEC §2.2.2.
 
 use super::{normalize_output_urls, ModelRoute, ProviderAdapter};
-use crate::error::{map_http_error, GenError};
+use crate::error::{map_http_response, GenError};
 use crate::job::{GenerationJob, JobStatus};
 use crate::params::GenerationParams;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::transport::{file_upload_body, HttpRequest, HttpTransport};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -179,11 +179,11 @@ impl ProviderAdapter for ReplicateAdapter {
             .send(HttpRequest::post(url).header(hk, hv).json(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         if v.get("id").and_then(|x| x.as_str()).is_none() {
-            return Err(GenError::Transport(
+            return Err(GenError::Protocol(
                 "replicate: missing prediction id".into(),
             ));
         }
@@ -195,36 +195,31 @@ impl ProviderAdapter for ReplicateAdapter {
         let (hk, hv) = self.auth_header();
         let resp = self.http.send(HttpRequest::get(url).header(hk, hv)).await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         Ok(self.normalize(&v))
     }
 
     async fn upload(&self, path: &Path, content_type: &str) -> Result<String, GenError> {
-        // Replicate files API: POST /files -> urls.get
-        let data = tokio::fs::read(path)
-            .await
-            .map_err(|e| GenError::Transport(format!("read upload file: {e}")))?;
+        // Replicate files API: POST /files -> urls.get. The file is
+        // size-checked first and streamed from disk.
+        let body = file_upload_body(path, content_type).await?;
         let url = format!("{}/files", self.api_base);
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(
-                HttpRequest::post(url)
-                    .header(hk, hv)
-                    .bytes(content_type.to_string(), data),
-            )
+            .send(HttpRequest::post(url).header(hk, hv).file(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         v.get("urls")
             .and_then(|u| u.get("get"))
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| GenError::Transport("replicate: upload missing urls.get".into()))
+            .ok_or_else(|| GenError::Protocol("replicate: upload missing urls.get".into()))
     }
 }
 

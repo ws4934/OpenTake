@@ -19,9 +19,26 @@ pub enum GenError {
     #[error("{0}")]
     InsufficientCredits(String),
 
-    /// Transport-level failure (DNS, TCP, non-HTTP response, body read).
+    /// Transport-level failure after the connection was established (reset,
+    /// timeout, non-HTTP response, body read). The request may have reached
+    /// the server.
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// The connection could not be established (DNS, TCP connect, TLS), so
+    /// the request never reached the server.
+    #[error("connection failed: {0}")]
+    Connect(String),
+
+    /// The provider answered with a response or job identity this client
+    /// cannot use (missing ids, foreign URLs, a synchronous job that is no
+    /// longer cached). Repeating the same request cannot fix it.
+    #[error("unusable provider response: {0}")]
+    Protocol(String),
+
+    /// A reference file is larger than the upload limit; nothing was read.
+    #[error("upload file is {len} bytes, above the {limit}-byte limit")]
+    UploadTooLarge { len: u64, limit: u64 },
 
     /// Structured API error parsed from the `{"error":{code,message}}` envelope,
     /// or synthesized from an HTTP status when no envelope is present.
@@ -30,6 +47,8 @@ pub enum GenError {
         status: u16,
         code: String,
         message: String,
+        /// The server's `Retry-After` delay, when it sent one in seconds.
+        retry_after: Option<std::time::Duration>,
     },
 
     /// Any other internal error (serde, IO, keyring, logic).
@@ -51,7 +70,43 @@ impl From<keyring::Error> for GenError {
 
 impl From<url::ParseError> for GenError {
     fn from(e: url::ParseError) -> Self {
-        GenError::Transport(e.to_string())
+        GenError::Protocol(e.to_string())
+    }
+}
+
+impl GenError {
+    /// Whether the same request may succeed when repeated later: network
+    /// failures and HTTP 408, 429 and 5xx. Authentication, credits, other 4xx
+    /// and unusable responses are final.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            GenError::Transport(_) | GenError::Connect(_) => true,
+            GenError::Api { status, .. } => matches!(status, 408 | 429 | 500..=599),
+            _ => false,
+        }
+    }
+
+    /// The server-requested delay before retrying, if any.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            GenError::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// A short, credential- and URL-free label for logs.
+    pub fn kind_label(&self) -> String {
+        match self {
+            GenError::NotConfigured => "not configured".to_string(),
+            GenError::Unauthenticated => "unauthenticated".to_string(),
+            GenError::InsufficientCredits(_) => "insufficient credits".to_string(),
+            GenError::Transport(_) => "transport".to_string(),
+            GenError::Connect(_) => "connect".to_string(),
+            GenError::Protocol(_) => "protocol".to_string(),
+            GenError::UploadTooLarge { .. } => "upload too large".to_string(),
+            GenError::Api { status, .. } => format!("http {status}"),
+            GenError::Other(_) => "other".to_string(),
+        }
     }
 }
 
@@ -101,7 +156,21 @@ pub(crate) fn map_http_error(status: u16, body: &[u8]) -> GenError {
         status,
         code,
         message,
+        retry_after: None,
     }
+}
+
+/// [`map_http_error`] for a whole response, keeping a `Retry-After` delay
+/// given in seconds (an HTTP-date is ignored; the caller's backoff applies).
+pub(crate) fn map_http_response(response: &crate::transport::HttpResponse) -> GenError {
+    let mut error = map_http_error(response.status, &response.body);
+    if let GenError::Api { retry_after, .. } = &mut error {
+        *retry_after = response
+            .header("Retry-After")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+    }
+    error
 }
 
 #[cfg(test)]
@@ -158,6 +227,7 @@ mod tests {
                 status,
                 code,
                 message,
+                ..
             } => {
                 assert_eq!(status, 500);
                 assert_eq!(code, "server_error");
@@ -174,6 +244,7 @@ mod tests {
                 status,
                 code,
                 message,
+                ..
             } => {
                 assert_eq!(status, 418);
                 assert_eq!(code, "");
@@ -181,6 +252,40 @@ mod tests {
             }
             other => panic!("expected Api, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transient_errors_are_network_failures_and_retryable_statuses() {
+        assert!(GenError::Transport("reset".into()).is_transient());
+        assert!(GenError::Connect("refused".into()).is_transient());
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(map_http_error(status, b"").is_transient(), "{status}");
+        }
+        for final_error in [
+            map_http_error(400, b""),
+            map_http_error(401, b""),
+            map_http_error(402, b""),
+            map_http_error(404, b""),
+            map_http_error(422, b""),
+            GenError::NotConfigured,
+            GenError::Protocol("bad id".into()),
+            GenError::UploadTooLarge { len: 2, limit: 1 },
+        ] {
+            assert!(!final_error.is_transient(), "{final_error:?}");
+        }
+    }
+
+    #[test]
+    fn retry_after_seconds_are_kept_from_the_response() {
+        let mut response = crate::transport::HttpResponse::new(429, b"{}".to_vec());
+        response.headers.push(("retry-after".into(), " 7 ".into()));
+        let error = map_http_response(&response);
+        assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(7)));
+        let mut dated = crate::transport::HttpResponse::new(503, Vec::new());
+        dated
+            .headers
+            .push(("Retry-After".into(), "Wed, 21 Oct 2015 07:28:00 GMT".into()));
+        assert_eq!(map_http_response(&dated).retry_after(), None);
     }
 
     #[test]

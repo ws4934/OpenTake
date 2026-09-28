@@ -9,7 +9,7 @@ description = "Generation backend clients (BYOK direct / self-hosted proxy); Gen
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "fs", "sync"] }
 futures-util = "0.3"
 async-trait = "0.1"

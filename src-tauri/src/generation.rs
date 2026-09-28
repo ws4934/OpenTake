@@ -30,13 +30,74 @@ use opentake_gen::{
     build_params, plan_video_upscale, upscale_result_matches, video_upscale_resolution, Catalog,
     CatalogEntry, ElevenLabsAdapter, FalAdapter, GenClient, GenError, GenerationParams, JobStatus,
     KeyStore, KeyringStore, ModelKind, ModelRoute, OpenAiAdapter, ProviderKey, ProviderRegistry,
-    ReplicateAdapter, ReqwestTransport, StaticToken, UiCapabilities,
+    ReplicateAdapter, ReqwestTransport, StaticToken, UiCapabilities, WatchEvent,
 };
 use opentake_media::{MediaCancelToken, MediaEngine};
 
 const RESULT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
 const DATA_URL_ENCODED_MAX: usize = 512 * 1024 * 1024;
 const RESULT_REDIRECT_MAX: usize = 5;
+
+/// Failure code for a submission whose answer never arrived: the provider may
+/// or may not have accepted (and billed) the job, so the user must check the
+/// provider console before retrying. Nothing is resubmitted automatically.
+const SUBMIT_OUTCOME_UNKNOWN: &str = "GENERATION_SUBMIT_OUTCOME_UNKNOWN";
+
+/// Bound on waiting for a submission to answer. Transport deadlines normally
+/// end a submission first; synchronous media providers are allowed
+/// `opentake_gen::transport::MEDIA_REQUEST_TIMEOUT` for the call itself.
+const SUBMIT_OUTCOME_TIMEOUT: Duration = Duration::from_secs(11 * 60);
+
+/// Runtime bounds of background jobs (tests shorten them).
+#[derive(Clone, Copy, Debug)]
+struct GenerationTimings {
+    submit_timeout: Duration,
+    /// Replaces the per-kind polling deadline.
+    watch_deadline: Option<Duration>,
+}
+
+impl Default for GenerationTimings {
+    fn default() -> Self {
+        Self {
+            submit_timeout: SUBMIT_OUTCOME_TIMEOUT,
+            watch_deadline: None,
+        }
+    }
+}
+
+impl GenerationTimings {
+    /// How long one session polls a job before leaving it for recovery.
+    fn watch_deadline(&self, kind: Option<ModelKind>) -> Duration {
+        self.watch_deadline.unwrap_or(match kind {
+            Some(ModelKind::Image | ModelKind::Audio) => Duration::from_secs(20 * 60),
+            Some(ModelKind::Upscale) => Duration::from_secs(90 * 60),
+            Some(ModelKind::Video) | None => Duration::from_secs(60 * 60),
+        })
+    }
+}
+
+/// Why a background job stopped before it finalized.
+#[derive(Debug, PartialEq, Eq)]
+enum JobStop {
+    /// Persist this fixed code on every nonterminal placeholder.
+    Failed(String),
+    /// The user cancelled: nonterminal placeholders become Cancelled.
+    Cancelled,
+    /// Polling stopped while the provider job may still finish. Nothing is
+    /// written: the placeholders keep Generating and the provider job id, and
+    /// `recover_current_project` resumes them (upstream "retry on reopen").
+    Detached,
+}
+
+impl From<String> for JobStop {
+    fn from(code: String) -> Self {
+        if code == "GENERATION_CANCELLED" {
+            JobStop::Cancelled
+        } else {
+            JobStop::Failed(code)
+        }
+    }
+}
 
 #[derive(Default)]
 struct GenerationRuntime {
@@ -58,6 +119,7 @@ pub(crate) struct TauriGenerationBridge {
     runtime: Arc<GenerationRuntime>,
     clients: Arc<dyn GenerationClientFactory>,
     admission: crate::updater::InstallAdmissionGate,
+    timings: GenerationTimings,
 }
 
 trait GenerationClientFactory: Send + Sync {
@@ -175,6 +237,7 @@ pub(crate) fn build_bridge(
         runtime: Arc::new(GenerationRuntime::default()),
         clients: Arc::new(ProductionGenerationClientFactory),
         admission,
+        timings: GenerationTimings::default(),
     })
 }
 
@@ -202,6 +265,25 @@ fn build_bridge_with_clients_and_admission(
     clients: Arc<dyn GenerationClientFactory>,
     admission: crate::updater::InstallAdmissionGate,
 ) -> Arc<TauriGenerationBridge> {
+    build_bridge_with_timings(
+        core,
+        cache_root,
+        models_dir,
+        clients,
+        admission,
+        GenerationTimings::default(),
+    )
+}
+
+#[cfg(test)]
+fn build_bridge_with_timings(
+    core: AppCore,
+    cache_root: PathBuf,
+    models_dir: PathBuf,
+    clients: Arc<dyn GenerationClientFactory>,
+    admission: crate::updater::InstallAdmissionGate,
+    timings: GenerationTimings,
+) -> Arc<TauriGenerationBridge> {
     Arc::new(TauriGenerationBridge {
         core,
         engine: Arc::new(MediaEngine::new(cache_root.clone(), models_dir)),
@@ -209,6 +291,7 @@ fn build_bridge_with_clients_and_admission(
         runtime: Arc::new(GenerationRuntime::default()),
         clients,
         admission,
+        timings,
     })
 }
 
@@ -233,8 +316,12 @@ impl TauriGenerationBridge {
         jobs.len()
     }
 
+    /// Cancel a running job, or one whose polling was interrupted and left
+    /// for recovery (no task works on it, so its placeholders in the open
+    /// project are cancelled directly). Nothing is cancelled at the provider.
     pub(crate) fn cancel(&self, job_id: &str) -> bool {
-        self.runtime
+        let running = self
+            .runtime
             .jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -242,7 +329,40 @@ impl TauriGenerationBridge {
             .is_some_and(|job| {
                 job.cancel.cancel();
                 true
+            });
+        running || self.cancel_idle_job(job_id)
+    }
+
+    fn cancel_idle_job(&self, job_id: &str) -> bool {
+        let snapshot = self.core.runtime_snapshot();
+        let Some(project_dir) = snapshot.project_dir.as_deref() else {
+            return false;
+        };
+        let placeholder_ids = snapshot
+            .media
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.generation_input.as_ref().is_some_and(|input| {
+                    input.job_id.as_deref() == Some(job_id)
+                        && matches!(
+                            input.status,
+                            Some(
+                                GenerationJobStatus::Queued
+                                    | GenerationJobStatus::Generating
+                                    | GenerationJobStatus::Downloading
+                                    | GenerationJobStatus::Finalizing
+                            )
+                        )
+                })
             })
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        if placeholder_ids.is_empty() {
+            return false;
+        }
+        self.cancel_nonterminal_outputs(snapshot.project_epoch, project_dir, &placeholder_ids);
+        true
     }
 
     pub(crate) fn retry(
@@ -360,6 +480,7 @@ impl TauriGenerationBridge {
         #[derive(Default)]
         struct RecoveryJob {
             provider: String,
+            model: String,
             provider_job_id: Option<String>,
             placeholders: Vec<(usize, String)>,
             has_active_output: bool,
@@ -380,6 +501,9 @@ impl TauriGenerationBridge {
             let job = recoverable.entry(job_id.clone()).or_default();
             if job.provider.is_empty() {
                 job.provider = input.provider.clone().unwrap_or_default();
+            }
+            if job.model.is_empty() {
+                job.model = input.model.clone();
             }
             if job.provider_job_id.is_none() {
                 job.provider_job_id = input.provider_job_id.clone();
@@ -466,6 +590,9 @@ impl TauriGenerationBridge {
             let bridge = self.clone();
             let recovery_dir = project_dir.clone();
             let managed = !provider_job_id.starts_with(&format!("{}::", job.provider));
+            let deadline = self
+                .timings
+                .watch_deadline(Catalog::builtin().by_id(&job.model).map(|model| model.kind));
             tauri::async_runtime::spawn(async move {
                 bridge
                     .run_recovered_job(
@@ -476,6 +603,7 @@ impl TauriGenerationBridge {
                         job.provider,
                         managed,
                         provider_job_id,
+                        deadline,
                         cancel,
                     )
                     .await;
@@ -1036,18 +1164,54 @@ impl TauriGenerationBridge {
                 &cancel,
             )
             .await;
-        if let Err(code) = result {
-            if cancel.is_cancelled() {
-                self.cancel_nonterminal_outputs(project_epoch, &project_dir, &placeholder_ids);
-            } else {
-                self.fail_nonterminal_outputs(project_epoch, &project_dir, &placeholder_ids, &code);
-            }
-        }
+        self.settle_job(
+            project_epoch,
+            &project_dir,
+            &local_job_id,
+            &placeholder_ids,
+            result,
+            &cancel,
+        );
         self.runtime
             .jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&local_job_id);
+    }
+
+    /// Persist how a job ended. A user cancellation wins over a failure it
+    /// caused, except for an unknown submission outcome, which the user must
+    /// see because the provider may have billed the job.
+    fn settle_job(
+        &self,
+        project_epoch: u64,
+        project_dir: &Path,
+        local_job_id: &str,
+        placeholder_ids: &[String],
+        result: Result<(), JobStop>,
+        cancel: &MediaCancelToken,
+    ) {
+        match result {
+            Ok(()) => {}
+            Err(JobStop::Failed(code)) if code == SUBMIT_OUTCOME_UNKNOWN => {
+                self.fail_nonterminal_outputs(project_epoch, project_dir, placeholder_ids, &code);
+            }
+            Err(_) if cancel.is_cancelled() => {
+                self.cancel_nonterminal_outputs(project_epoch, project_dir, placeholder_ids);
+            }
+            Err(JobStop::Cancelled) => {
+                self.cancel_nonterminal_outputs(project_epoch, project_dir, placeholder_ids);
+            }
+            Err(JobStop::Failed(code)) => {
+                self.fail_nonterminal_outputs(project_epoch, project_dir, placeholder_ids, &code);
+            }
+            Err(JobStop::Detached) => {
+                tracing::warn!(
+                    job_id = %local_job_id,
+                    "generation job left for recovery with its provider job id"
+                );
+            }
+        }
     }
 
     async fn run_job_inner(
@@ -1058,11 +1222,12 @@ impl TauriGenerationBridge {
         placeholder_ids: &[String],
         prepared: &PreparedDispatch,
         cancel: &MediaCancelToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), JobStop> {
         cancelled(cancel)?;
         let client = self
             .clients
-            .build(&prepared.plan.provider, prepared.managed)?;
+            .build(&prepared.plan.provider, prepared.managed)
+            .map_err(|_| JobStop::Failed("GENERATION_AUTH_FAILED".to_string()))?;
         let mut references = prepared.references.clone();
         let timeline_cleanup = if let Some(span) = prepared.timeline_span.as_ref() {
             std::fs::create_dir_all(&self.staging_root)
@@ -1134,24 +1299,36 @@ impl TauriGenerationBridge {
                         "GENERATION_SOURCE_PREPROCESS_FAILED".to_string()
                     }
                 })?;
-                Some(destination)
+                Some(StagedCleanup::new(destination))
             } else {
                 None
             };
-            let upload_path = staged_trim.as_deref().unwrap_or(&reference.path);
+            let upload_path = staged_trim
+                .as_ref()
+                .map_or(reference.path.as_path(), |staged| staged.path.as_path());
             let content_type = opentake_gen::content_type_for(upload_path, reference.fallback);
-            let uploaded_url = if prepared.managed {
-                client.upload_reference(upload_path, &content_type).await
-            } else {
-                client
-                    .upload_reference_via(&prepared.plan.provider, upload_path, &content_type)
-                    .await
+            let upload = async {
+                if prepared.managed {
+                    client.upload_reference(upload_path, &content_type).await
+                } else {
+                    client
+                        .upload_reference_via(&prepared.plan.provider, upload_path, &content_type)
+                        .await
+                }
             };
-            if let Some(path) = staged_trim {
-                let _ = std::fs::remove_file(path);
-            }
+            // An upload has no provider-side effect worth keeping, so a
+            // cancellation abandons it at once instead of waiting on the
+            // network.
+            let uploaded_url = tokio::select! {
+                result = upload => result,
+                () = wait_for_cancel(cancel) => return Err(JobStop::Cancelled),
+            };
+            drop(staged_trim);
             let uploaded_url = uploaded_url.map_err(|error| {
-                generation_provider_error_code(&error, "GENERATION_REFERENCE_UPLOAD_FAILED")
+                JobStop::Failed(generation_provider_error_code(
+                    &error,
+                    "GENERATION_REFERENCE_UPLOAD_FAILED",
+                ))
             })?;
             uploaded.push(uploaded_url);
         }
@@ -1166,14 +1343,25 @@ impl TauriGenerationBridge {
         if let GenerationParams::Upscale(upscale) = &mut params {
             upscale.target_fps = prepared.upscale_target_fps;
         }
-        let provider_job_id = if prepared.managed {
-            client
-                .submit(&prepared.plan.input.model, params, Some(local_job_id))
-                .await
-        } else {
-            client.submit_byok(&prepared.plan.input.model, params).await
-        }
-        .map_err(|error| generation_provider_error_code(&error, "GENERATION_SUBMIT_FAILED"))?;
+        // A submission is not raced against cancellation: once sent, the
+        // provider may accept and bill it. Its answer is awaited within a
+        // bound, and an accepted job id is persisted before a cancellation is
+        // honored, so no paid job is left without a record.
+        let submission = async {
+            if prepared.managed {
+                client
+                    .submit(&prepared.plan.input.model, params, Some(local_job_id))
+                    .await
+            } else {
+                client.submit_byok(&prepared.plan.input.model, params).await
+            }
+        };
+        let provider_job_id =
+            match tokio::time::timeout(self.timings.submit_timeout, submission).await {
+                Err(_) => return Err(JobStop::Failed(SUBMIT_OUTCOME_UNKNOWN.to_string())),
+                Ok(Err(error)) => return Err(JobStop::Failed(submit_error_code(&error))),
+                Ok(Ok(provider_job_id)) => provider_job_id,
+            };
         self.core
             .update_generation_job_for_project(
                 project_epoch,
@@ -1188,7 +1376,8 @@ impl TauriGenerationBridge {
                     created_at: Some(now_apple_reference_seconds()),
                 },
             )
-            .map_err(|_| "GENERATION_STATE_PERSIST_FAILED".to_string())?;
+            .map_err(|_| JobStop::Failed("GENERATION_STATE_PERSIST_FAILED".to_string()))?;
+        cancelled(cancel)?;
 
         self.watch_and_finalize(
             project_epoch,
@@ -1197,6 +1386,7 @@ impl TauriGenerationBridge {
             placeholder_ids,
             client,
             &provider_job_id,
+            self.timings.watch_deadline(Some(prepared.model_kind)),
             cancel,
         )
         .await
@@ -1211,21 +1401,52 @@ impl TauriGenerationBridge {
         placeholder_ids: &[String],
         client: GenClient,
         provider_job_id: &str,
+        deadline: Duration,
         cancel: &MediaCancelToken,
-    ) -> Result<(), String> {
-        let stream = client.watch(provider_job_id);
+    ) -> Result<(), JobStop> {
+        let stream = client.watch(provider_job_id, deadline);
         futures_util::pin_mut!(stream);
         loop {
             cancelled(cancel)?;
-            let next = tokio::select! {
-                item = stream.next() => item,
-                () = wait_for_cancel(cancel) => return Err("GENERATION_CANCELLED".to_string()),
+            let event = tokio::select! {
+                event = stream.next() => event,
+                () = wait_for_cancel(cancel) => return Err(JobStop::Cancelled),
             };
-            let job = next
-                .ok_or_else(|| "GENERATION_PROVIDER_STREAM_ENDED".to_string())?
-                .map_err(|error| {
-                    generation_provider_error_code(&error, "GENERATION_PROVIDER_POLL_FAILED")
-                })?;
+            let job = match event {
+                Some(WatchEvent::Snapshot(job)) => job,
+                Some(WatchEvent::Retrying {
+                    attempt,
+                    delay,
+                    error,
+                }) => {
+                    // No URL or credential: only the failure kind is logged.
+                    tracing::warn!(
+                        job_id = %local_job_id,
+                        attempt,
+                        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        error = %error.kind_label(),
+                        "generation status poll failed; retrying"
+                    );
+                    continue;
+                }
+                Some(WatchEvent::Failed(error)) => {
+                    return Err(JobStop::Failed(generation_provider_error_code(
+                        &error,
+                        "GENERATION_PROVIDER_POLL_FAILED",
+                    )))
+                }
+                Some(WatchEvent::Interrupted(reason)) => {
+                    tracing::warn!(
+                        job_id = %local_job_id,
+                        ?reason,
+                        "generation polling stopped before the provider finished"
+                    );
+                    return Err(JobStop::Detached);
+                }
+                // The watch always ends with one of the events above; if it
+                // ever does not, the job must stay recoverable.
+                None => return Err(JobStop::Detached),
+            };
             match job.status {
                 JobStatus::Queued => {}
                 JobStatus::Running => {
@@ -1245,12 +1466,16 @@ impl TauriGenerationBridge {
                             created_at: Some(now_apple_reference_seconds()),
                         },
                     ) {
-                        eprintln!(
-                            "[generation] job {local_job_id}: progress update failed: {error}"
+                        tracing::warn!(
+                            job_id = %local_job_id,
+                            %error,
+                            "generation progress update failed"
                         );
                     }
                 }
-                JobStatus::Failed => return Err("GENERATION_PROVIDER_FAILED".to_string()),
+                JobStatus::Failed => {
+                    return Err(JobStop::Failed("GENERATION_PROVIDER_FAILED".to_string()))
+                }
                 JobStatus::Succeeded => {
                     self.core
                         .update_generation_job_for_project(
@@ -1266,7 +1491,9 @@ impl TauriGenerationBridge {
                                 created_at: Some(now_apple_reference_seconds()),
                             },
                         )
-                        .map_err(|_| "GENERATION_STATE_PERSIST_FAILED".to_string())?;
+                        .map_err(|_| {
+                            JobStop::Failed("GENERATION_STATE_PERSIST_FAILED".to_string())
+                        })?;
                     let store = TauriFinalizationStore {
                         bridge: self.clone(),
                         project_epoch,
@@ -1289,12 +1516,12 @@ impl TauriGenerationBridge {
                         )
                     })
                     .await
-                    .map_err(|_| "GENERATION_FINALIZE_TASK_FAILED".to_string())?
+                    .map_err(|_| JobStop::Failed("GENERATION_FINALIZE_TASK_FAILED".to_string()))?
                     .map_err(|error| {
                         if error == "GENERATION_CANCELLED" {
-                            error
+                            JobStop::Cancelled
                         } else {
-                            "GENERATION_FINALIZE_FAILED".to_string()
+                            JobStop::Failed("GENERATION_FINALIZE_FAILED".to_string())
                         }
                     })?;
                     return Ok(());
@@ -1313,6 +1540,7 @@ impl TauriGenerationBridge {
         provider: String,
         managed: bool,
         provider_job_id: String,
+        deadline: Duration,
         cancel: MediaCancelToken,
     ) {
         let result = match self.clients.build(&provider, managed) {
@@ -1324,19 +1552,23 @@ impl TauriGenerationBridge {
                     &placeholder_ids,
                     client,
                     &provider_job_id,
+                    deadline,
                     &cancel,
                 )
                 .await
             }
-            Err(_) => Err("GENERATION_RECOVERY_AUTH_UNAVAILABLE".to_string()),
+            Err(_) => Err(JobStop::Failed(
+                "GENERATION_RECOVERY_AUTH_UNAVAILABLE".to_string(),
+            )),
         };
-        if let Err(code) = result {
-            if cancel.is_cancelled() {
-                self.cancel_nonterminal_outputs(project_epoch, &project_dir, &placeholder_ids);
-            } else {
-                self.fail_nonterminal_outputs(project_epoch, &project_dir, &placeholder_ids, &code);
-            }
-        }
+        self.settle_job(
+            project_epoch,
+            &project_dir,
+            &local_job_id,
+            &placeholder_ids,
+            result,
+            &cancel,
+        );
         self.runtime
             .jobs
             .lock()
@@ -1548,28 +1780,89 @@ impl GenerationFinalizationStore for TauriFinalizationStore {
     }
 }
 
+/// Resolves a result host to its addresses (injected in tests).
+type ResultLookup = dyn Fn(
+        String,
+        u16,
+    ) -> futures_util::future::BoxFuture<'static, std::io::Result<Vec<std::net::SocketAddr>>>
+    + Send
+    + Sync;
+
+/// Downloads provider results from provider-chosen URLs. Before each request
+/// (every redirect hop included) the host is resolved, every address must be
+/// public (the same policy as `source.url` imports), and the connection is
+/// pinned to the checked address so the name cannot resolve elsewhere.
 struct SecureResultDownloader {
-    client: reqwest::blocking::Client,
     staging_root: PathBuf,
     cancel: MediaCancelToken,
+    /// Runs DNS lookups with a timeout and cancellation from blocking code.
+    dns: tokio::runtime::Runtime,
+    lookup: Arc<ResultLookup>,
 }
 
 impl SecureResultDownloader {
     fn new(staging_root: PathBuf, cancel: MediaCancelToken) -> Result<Self, String> {
+        Self::with_lookup(
+            staging_root,
+            cancel,
+            Arc::new(|host, port| Box::pin(crate::public_net::system_lookup(host, port))),
+        )
+    }
+
+    fn with_lookup(
+        staging_root: PathBuf,
+        cancel: MediaCancelToken,
+        lookup: Arc<ResultLookup>,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(&staging_root)
             .map_err(|_| "generation staging directory is unavailable".to_string())?;
-        let client = reqwest::blocking::Client::builder()
+        let dns = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "generation result resolver initialization failed".to_string())?;
+        Ok(Self {
+            staging_root,
+            cancel,
+            dns,
+            lookup,
+        })
+    }
+
+    /// A client for one request to `url` that can only connect to the
+    /// checked public address of its host.
+    fn pinned_client(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<(reqwest::blocking::Client, Option<std::net::SocketAddr>), String> {
+        let lookup = Arc::clone(&self.lookup);
+        let (host, pinned) = self
+            .dns
+            .block_on(crate::public_net::resolve_public_target(
+                url,
+                &self.cancel,
+                move |host, port| lookup(host, port),
+            ))
+            .map_err(|error| match error {
+                crate::public_net::PublicTargetError::Cancelled => {
+                    "GENERATION_CANCELLED".to_string()
+                }
+                crate::public_net::PublicTargetError::NonPublicAddress => {
+                    "generation result host is not a public address".to_string()
+                }
+                _ => "generation result host could not be resolved".to_string(),
+            })?;
+        let mut builder = reqwest::blocking::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(10 * 60))
+            .timeout(Duration::from_secs(10 * 60));
+        if let Some(address) = pinned {
+            builder = builder.resolve(&host, address);
+        }
+        let client = builder
             .build()
             .map_err(|_| "generation result client initialization failed".to_string())?;
-        Ok(Self {
-            client,
-            staging_root,
-            cancel,
-        })
+        Ok((client, pinned))
     }
 
     fn write_staging(
@@ -1634,16 +1927,23 @@ impl GenerationArtifactDownloader for SecureResultDownloader {
         let mut current = validate_result_https_url(raw_url)?;
         for redirect_count in 0..=RESULT_REDIRECT_MAX {
             cancelled(&self.cancel)?;
-            let mut response = self
-                .client
+            let (client, pinned) = self.pinned_client(&current)?;
+            let mut response = client
                 .get(current.clone())
                 .send()
                 .map_err(|_| "generation result download failed".to_string())?;
-            if response
-                .remote_addr()
-                .is_some_and(|address| !is_public_result_ip(address.ip()))
-            {
-                return Err("generation result resolved to a private address".to_string());
+            // Defense in depth: the connection must have gone to the checked
+            // address; an unknown peer is refused.
+            match response.remote_addr() {
+                Some(remote)
+                    if crate::public_net::public_ip(remote.ip())
+                        && pinned.is_none_or(|pinned| pinned.ip() == remote.ip()) => {}
+                _ => {
+                    return Err(
+                        "generation result connection did not reach the checked public address"
+                            .to_string(),
+                    )
+                }
             }
             if response.status().is_redirection() {
                 if redirect_count == RESULT_REDIRECT_MAX {
@@ -1785,9 +2085,20 @@ fn generation_provider_error_code(error: &GenError, fallback: &str) -> String {
         GenError::Unauthenticated | GenError::NotConfigured => "GENERATION_AUTH_FAILED",
         GenError::InsufficientCredits(_) => "GENERATION_INSUFFICIENT_CREDITS",
         GenError::Api { status: 429, .. } => "GENERATION_RATE_LIMITED",
+        GenError::UploadTooLarge { .. } => "GENERATION_REFERENCE_TOO_LARGE",
         _ => fallback,
     }
     .to_string()
+}
+
+/// A submission that failed after its request may have reached the provider
+/// (a reset connection or a timeout) has an unknown outcome; a connection
+/// that was never established, or an HTTP answer, is a plain failure.
+fn submit_error_code(error: &GenError) -> String {
+    match error {
+        GenError::Transport(_) => SUBMIT_OUTCOME_UNKNOWN.to_string(),
+        _ => generation_provider_error_code(error, "GENERATION_SUBMIT_FAILED"),
+    }
 }
 
 fn select_model<'a>(
@@ -2033,46 +2344,12 @@ fn validate_result_https_url(raw: &str) -> Result<reqwest::Url, String> {
         || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| !is_public_result_ip(address))
+        || crate::public_net::literal_host_ip(&host)
+            .is_some_and(|address| !crate::public_net::public_ip(address))
     {
         return Err("generation result URL host is not public".to_string());
     }
     Ok(url)
-}
-
-fn is_public_result_ip(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || a == 0
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 198 && (18..=19).contains(&b)))
-        }
-        std::net::IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_public_result_ip(std::net::IpAddr::V4(mapped));
-            }
-            let octets = ip.octets();
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
-                || octets[..4] == [0x20, 0x01, 0x0d, 0xb8]
-                || (octets[0] == 0xfe && octets[1] & 0xc0 == 0xc0))
-        }
-    }
 }
 
 fn cancelled(cancel: &MediaCancelToken) -> Result<(), String> {
@@ -2085,7 +2362,7 @@ fn cancelled(cancel: &MediaCancelToken) -> Result<(), String> {
 
 async fn wait_for_cancel(cancel: &MediaCancelToken) {
     while !cancel.is_cancelled() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -2097,12 +2374,17 @@ fn now_apple_reference_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Cancelling a job whose polling was interrupted persists its placeholders,
+/// so this runs off the UI thread.
 #[tauri::command]
-pub fn generation_cancel(
+pub async fn generation_cancel(
     bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
     job_id: String,
 ) -> Result<bool, String> {
-    Ok(bridge.cancel(&job_id))
+    let bridge = Arc::clone(&bridge);
+    tauri::async_runtime::spawn_blocking(move || bridge.cancel(&job_id))
+        .await
+        .map_err(|error| format!("generation cancel worker failed: {error}"))
 }
 
 #[tauri::command]
@@ -2152,7 +2434,13 @@ mod tests {
     }
 
     fn fixture_client_with_interval(mock: &MockTransport, interval: Duration) -> GenClient {
-        let transport = Arc::new(mock.clone());
+        fixture_client_with_transport(mock, Arc::new(mock.clone())).with_poll_interval(interval)
+    }
+
+    fn fixture_client_with_transport(
+        mock: &MockTransport,
+        transport: Arc<dyn opentake_gen::HttpTransport>,
+    ) -> GenClient {
         let fal = FalAdapter::new(transport.clone(), "fixture-secret").with_base("https://mockfal");
         let openai =
             OpenAiAdapter::new(transport.clone(), "fixture-secret").with_base("https://mockoai/v1");
@@ -2168,8 +2456,98 @@ mod tests {
             },
             Arc::new(mock.clone()),
         )
-        .with_poll_interval(interval)
     }
+
+    /// Scripted poll failures retry at once instead of after seconds.
+    fn quick_poll_policy(retry_budget: u32) -> opentake_gen::PollPolicy {
+        opentake_gen::PollPolicy {
+            interval: Duration::ZERO,
+            retry_base: Duration::from_millis(1),
+            retry_max: Duration::from_millis(2),
+            retry_after_max: Duration::from_millis(2),
+            retry_budget,
+            poll_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn quick_retry_client(mock: &MockTransport, retry_budget: u32) -> GenClient {
+        fixture_client_with_transport(mock, Arc::new(mock.clone()))
+            .with_poll_policy(quick_poll_policy(retry_budget))
+    }
+
+    /// Delays the listed requests before the mock answers, like a slow
+    /// provider.
+    struct SlowTransport {
+        mock: MockTransport,
+        slow_url: String,
+        delay: Duration,
+        /// Set when the slow request has been sent.
+        sent: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    // The trait is declared with `async_trait`; this is its expanded form.
+    impl opentake_gen::HttpTransport for SlowTransport {
+        fn send<'life0, 'async_trait>(
+            &'life0 self,
+            request: opentake_gen::HttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<HttpResponse, GenError>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if request.url == self.slow_url {
+                    self.sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                }
+                self.mock.send(request).await
+            })
+        }
+    }
+
+    fn placeholder_input(core: &AppCore, asset_id: &str) -> GenerationInput {
+        core.media()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == asset_id)
+            .and_then(|entry| entry.generation_input)
+            .unwrap()
+    }
+
+    async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn submit_fixture_image(bridge: &TauriGenerationBridge) -> GenerationSubmission {
+        bridge
+            .submit(
+                GenerationRequest::Image(GenerateImageArgs {
+                    cost_authorized: Some(true),
+                    prompt: "network fixture".to_string(),
+                    model: Some("fal:flux-pro".to_string()),
+                    aspect_ratio: Some("1:1".to_string()),
+                    num_images: Some(1),
+                    ..Default::default()
+                }),
+                &MediaCancelToken::new(),
+            )
+            .unwrap()
+    }
+
+    const FLUX_SUBMIT: &str = "https://mockfal/fal-ai/flux-pro/v1.1";
 
     fn fixture_client(mock: &MockTransport) -> GenClient {
         fixture_client_with_interval(mock, Duration::ZERO)
@@ -3425,6 +3803,433 @@ mod tests {
         let still = input("still", None);
         assert!(check(&still, 6, 4).is_ok());
         assert!(check(&still, 9, 6).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_poll_failures_are_retried_and_the_result_downloads_once() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        let status = "https://mockfal/fal-ai/flux-pro/requests/flaky-1/status";
+        let result = "https://mockfal/fal-ai/flux-pro/requests/flaky-1";
+        mock.on(
+            Method::Post,
+            FLUX_SUBMIT,
+            200,
+            json!({"request_id": "flaky-1", "status": "IN_QUEUE"}),
+        );
+        mock.on(Method::Get, status, 200, json!({"status": "IN_PROGRESS"}));
+        mock.on_transport_error(Method::Get, status, "connection reset by peer");
+        mock.on(Method::Get, status, 503, json!({}));
+        mock.on(
+            Method::Get,
+            status,
+            429,
+            json!({"error": {"code": "rate_limited", "message": "slow down"}}),
+        );
+        mock.on(Method::Get, status, 200, json!({"status": "IN_PROGRESS"}));
+        mock.on(Method::Get, status, 200, json!({"status": "COMPLETED"}));
+        mock.on(
+            Method::Get,
+            result,
+            200,
+            json!({"images": [{"url": png_data_url()}]}),
+        );
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: quick_retry_client(&mock, 5),
+            }),
+        );
+
+        let submitted = submit_fixture_image(&bridge);
+        let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
+        assert_eq!(ready.id, submitted.placeholder_asset_ids[0]);
+        wait_until("the job to finish", || !bridge.has_active()).await;
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|call| call.url == status).count(), 6);
+        assert_eq!(calls.iter().filter(|call| call.url == result).count(), 1);
+        let log = Project::open(&bundle).unwrap().generation_log.unwrap();
+        assert!(log
+            .entries
+            .iter()
+            .all(|entry| entry.status != Some(GenerationJobStatus::Failed)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exhausted_poll_retries_leave_the_job_recoverable() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        let status = "https://mockfal/fal-ai/flux-pro/requests/offline-1/status";
+        mock.on(
+            Method::Post,
+            FLUX_SUBMIT,
+            200,
+            json!({"request_id": "offline-1", "status": "IN_QUEUE"}),
+        );
+        mock.on_connect_error(Method::Get, status, "network is unreachable");
+        mock.on(
+            Method::Get,
+            "https://mockfal/fal-ai/flux-pro/requests/offline-1",
+            200,
+            json!({"images": [{"url": png_data_url()}]}),
+        );
+        let (cache, models) = runtime_dirs(&bundle);
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let bridge = build_bridge_with_clients_and_admission(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: quick_retry_client(&mock, 3),
+            }),
+            admission.clone(),
+        );
+
+        let submitted = submit_fixture_image(&bridge);
+        let asset_id = submitted.placeholder_asset_ids[0].clone();
+        wait_until("the job to stop polling", || !bridge.has_active()).await;
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.url == status)
+                .count(),
+            4,
+            "one poll plus three retries"
+        );
+        let input = placeholder_input(&core, &asset_id);
+        assert_eq!(input.status, Some(GenerationJobStatus::Generating));
+        assert_eq!(input.error_code, None);
+        assert_eq!(
+            input.provider_job_id.as_deref(),
+            Some("fal::fal-ai/flux-pro/v1.1|offline-1")
+        );
+        let persisted = Project::open(&bundle).unwrap();
+        let on_disk = persisted
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.id == asset_id)
+            .and_then(|entry| entry.generation_input.as_ref())
+            .unwrap();
+        assert_eq!(on_disk.status, Some(GenerationJobStatus::Generating));
+        assert!(on_disk.provider_job_id.is_some());
+        // The interrupted job holds no install lease.
+        drop(admission.begin_install().unwrap());
+
+        // The network is back: recovery takes the same provider job over,
+        // without submitting again.
+        mock.on(Method::Get, status, 200, json!({"status": "COMPLETED"}));
+        assert_eq!(bridge.recover_current_project(), 1);
+        let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
+        assert_eq!(ready.id, asset_id);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.url == FLUX_SUBMIT)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_left_for_recovery_can_still_be_cancelled() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            FLUX_SUBMIT,
+            200,
+            json!({"request_id": "stuck-1", "status": "IN_QUEUE"}),
+        );
+        mock.on(
+            Method::Get,
+            "https://mockfal/fal-ai/flux-pro/requests/stuck-1/status",
+            502,
+            json!({}),
+        );
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: quick_retry_client(&mock, 1),
+            }),
+        );
+        let submitted = submit_fixture_image(&bridge);
+        wait_until("the job to stop polling", || !bridge.has_active()).await;
+        assert!(bridge.cancel(&submitted.job_id));
+        assert_eq!(
+            placeholder_input(&core, &submitted.placeholder_asset_ids[0]).status,
+            Some(GenerationJobStatus::Cancelled)
+        );
+        assert!(!bridge.cancel(&submitted.job_id));
+        assert!(!bridge.cancel("unknown-job"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_job_survives_a_failed_first_poll() {
+        let (_temp, bundle, core) = saved_core();
+        let runtime = core.runtime_snapshot();
+        let committed = core
+            .begin_generation_job_for_project(runtime.project_epoch, &bundle, image_plan())
+            .unwrap();
+        core.update_generation_job_for_project(
+            runtime.project_epoch,
+            &bundle,
+            &committed.job_id,
+            GenerationStateUpdate {
+                status: GenerationJobStatus::Generating,
+                progress: Some(0.25),
+                error_code: None,
+                provider_job_id: Some("fal::flux-pro|offline-open".to_string()),
+                cost_credits: None,
+                created_at: None,
+            },
+        )
+        .unwrap();
+        drop(core);
+        let reopened = AppCore::new();
+        reopened.open_project(&bundle).unwrap();
+        let mock = MockTransport::new();
+        let status = "https://mockfal/flux-pro/requests/offline-open/status";
+        mock.on_connect_error(Method::Get, status, "offline");
+        mock.on(Method::Get, status, 200, json!({"status": "COMPLETED"}));
+        mock.on(
+            Method::Get,
+            "https://mockfal/flux-pro/requests/offline-open",
+            200,
+            json!({"images": [{"url": png_data_url()}]}),
+        );
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            reopened.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: quick_retry_client(&mock, 5),
+            }),
+        );
+
+        assert_eq!(bridge.recover_current_project(), 1);
+        let ready = wait_for_ready_model(&reopened, "fal:flux-pro").await;
+        assert_eq!(ready.id, committed.placeholder_asset_ids[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_hung_upload_ends_the_job_promptly() {
+        let (_temp, bundle, core) = saved_core_with_source_videos(&[("clip", 640, 360, 30.0)]);
+        let mock = MockTransport::new();
+        mock.on_pending(Method::Post, "https://mockrep/v1/files");
+        let (cache, models) = runtime_dirs(&bundle);
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let bridge = build_bridge_with_clients_and_admission(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client(&mock),
+            }),
+            admission.clone(),
+        );
+        let submitted = bridge
+            .submit(
+                GenerationRequest::Upscale(UpscaleMediaArgs {
+                    cost_authorized: Some(true),
+                    media_ref: "clip".to_string(),
+                    model: Some("replicate:topaz-upscale".to_string()),
+                    source_clip_id: None,
+                }),
+                &MediaCancelToken::new(),
+            )
+            .unwrap();
+        wait_until("the upload to start", || {
+            mock.calls()
+                .iter()
+                .any(|call| call.url == "https://mockrep/v1/files")
+        })
+        .await;
+        match &mock.calls().last().unwrap().body {
+            opentake_gen::Body::File { len, .. } => assert!(*len > 0),
+            other => panic!("the reference must stream from disk, got {other:?}"),
+        }
+
+        let started = std::time::Instant::now();
+        assert!(bridge.cancel(&submitted.job_id));
+        wait_until("the cancelled job to exit", || !bridge.has_active()).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "cancel took {elapsed:?}");
+        assert_eq!(
+            placeholder_input(&core, &submitted.placeholder_asset_ids[0]).status,
+            Some(GenerationJobStatus::Cancelled)
+        );
+        drop(admission.begin_install().unwrap());
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|call| call.url.contains("/predictions")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_during_submission_keeps_the_accepted_provider_job() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            FLUX_SUBMIT,
+            200,
+            json!({"request_id": "late-1", "status": "IN_QUEUE"}),
+        );
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Arc::new(SlowTransport {
+            mock: mock.clone(),
+            slow_url: FLUX_SUBMIT.to_string(),
+            delay: Duration::from_millis(300),
+            sent: sent.clone(),
+        });
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client_with_transport(&mock, transport),
+            }),
+        );
+        let submitted = submit_fixture_image(&bridge);
+        wait_until("the submission to be sent", || {
+            sent.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        assert!(bridge.cancel(&submitted.job_id));
+        assert!(
+            mock.calls().is_empty(),
+            "the cancellation arrived while the provider was still answering"
+        );
+        wait_until("the job to exit", || !bridge.has_active()).await;
+
+        let input = placeholder_input(&core, &submitted.placeholder_asset_ids[0]);
+        assert_eq!(input.status, Some(GenerationJobStatus::Cancelled));
+        assert_eq!(
+            input.provider_job_id.as_deref(),
+            Some("fal::fal-ai/flux-pro/v1.1|late-1"),
+            "the accepted job is recorded before the cancellation"
+        );
+        assert!(!mock.calls().iter().any(|call| call.url.contains("/status")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_submission_that_never_answers_fails_with_an_unknown_outcome() {
+        for cancel_while_waiting in [false, true] {
+            let (_temp, bundle, core) = saved_core();
+            let mock = MockTransport::new();
+            mock.on_pending(Method::Post, FLUX_SUBMIT);
+            let (cache, models) = runtime_dirs(&bundle);
+            let admission = crate::updater::InstallAdmissionGate::default();
+            let bridge = build_bridge_with_timings(
+                core.clone(),
+                cache,
+                models,
+                Arc::new(FixtureClients {
+                    client: fixture_client(&mock),
+                }),
+                admission.clone(),
+                GenerationTimings {
+                    submit_timeout: Duration::from_millis(300),
+                    watch_deadline: None,
+                },
+            );
+            let submitted = submit_fixture_image(&bridge);
+            wait_until("the submission to be sent", || {
+                mock.calls().iter().any(|call| call.url == FLUX_SUBMIT)
+            })
+            .await;
+            if cancel_while_waiting {
+                assert!(bridge.cancel(&submitted.job_id));
+            }
+            wait_until("the job to exit", || !bridge.has_active()).await;
+            let input = placeholder_input(&core, &submitted.placeholder_asset_ids[0]);
+            assert_eq!(input.status, Some(GenerationJobStatus::Failed));
+            assert_eq!(input.error_code.as_deref(), Some(SUBMIT_OUTCOME_UNKNOWN));
+            assert_eq!(input.provider_job_id, None);
+            drop(admission.begin_install().unwrap());
+            assert_eq!(mock.call_count(), 1, "nothing is resubmitted");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_submission_is_an_unknown_outcome_but_a_refused_connection_is_not() {
+        for (connect_failure, expected) in [
+            (false, SUBMIT_OUTCOME_UNKNOWN),
+            (true, "GENERATION_SUBMIT_FAILED"),
+        ] {
+            let (_temp, bundle, core) = saved_core();
+            let mock = MockTransport::new();
+            if connect_failure {
+                mock.on_connect_error(Method::Post, FLUX_SUBMIT, "connection refused");
+            } else {
+                mock.on_transport_error(Method::Post, FLUX_SUBMIT, "connection reset");
+            }
+            let (cache, models) = runtime_dirs(&bundle);
+            let bridge = build_bridge_with_clients(
+                core.clone(),
+                cache,
+                models,
+                Arc::new(FixtureClients {
+                    client: fixture_client(&mock),
+                }),
+            );
+            let submitted = submit_fixture_image(&bridge);
+            let failed =
+                wait_for_job_status(&core, &submitted.job_id, GenerationJobStatus::Failed).await;
+            assert_eq!(failed.error_code.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn result_downloads_refuse_private_resolutions_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let staging = tempfile::tempdir().unwrap();
+        for answer in [
+            vec!["127.0.0.1"],
+            vec!["10.0.0.1"],
+            vec!["64:ff9b::a00:1"],
+            vec!["2002:a00:1::1"],
+            vec!["93.184.216.34", "127.0.0.1"],
+        ] {
+            let addresses = answer
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), port))
+                .collect::<Vec<_>>();
+            let downloader = SecureResultDownloader::with_lookup(
+                staging.path().to_path_buf(),
+                MediaCancelToken::new(),
+                Arc::new(move |host, _port| {
+                    assert_eq!(host, "cdn.example.test");
+                    let addresses = addresses.clone();
+                    Box::pin(async move { Ok(addresses) })
+                }),
+            )
+            .unwrap();
+            let error = downloader
+                .download("asset", "https://cdn.example.test/result.png")
+                .unwrap_err();
+            assert_eq!(
+                error, "generation result host is not a public address",
+                "{answer:?}"
+            );
+        }
+        // Nothing ever connected to the local listener.
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     async fn assert_submit_failure(status: u16, body: serde_json::Value, expected_code: &str) {

@@ -37,6 +37,7 @@ mod media;
 mod media_tools;
 pub mod motion;
 mod motion_documents;
+mod public_net;
 // Public for the same reason as `export`: integration acceptance drives the
 // standalone compositing path against a generated project snapshot.
 pub mod render;

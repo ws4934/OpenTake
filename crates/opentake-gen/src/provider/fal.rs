@@ -4,10 +4,10 @@
 //! FAILED -> Failed. See gen-SPEC §2.2.1.
 
 use super::{normalize_output_urls, ModelRoute, ProviderAdapter};
-use crate::error::{map_http_error, GenError};
+use crate::error::{map_http_response, GenError};
 use crate::job::{GenerationJob, JobStatus};
 use crate::params::GenerationParams;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::transport::{file_upload_body, HttpRequest, HttpTransport};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ impl FalAdapter {
             || candidate.username() != ""
             || candidate.password().is_some()
         {
-            return Err(GenError::Transport(
+            return Err(GenError::Protocol(
                 "fal returned a status URL outside its queue origin".into(),
             ));
         }
@@ -218,13 +218,13 @@ impl ProviderAdapter for FalAdapter {
             .send(HttpRequest::post(url).header(hk, hv).json(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         let request_id = v
             .get("request_id")
             .and_then(|x| x.as_str())
-            .ok_or_else(|| GenError::Transport("fal: missing request_id".into()))?;
+            .ok_or_else(|| GenError::Protocol("fal: missing request_id".into()))?;
         // Encode the routing needed for polling into the job id.
         let job_id = if let (Some(status_url), Some(response_url)) = (
             v.get("status_url").and_then(|value| value.as_str()),
@@ -256,7 +256,7 @@ impl ProviderAdapter for FalAdapter {
         } else {
             let (vendor_model, request_id) = job_id
                 .split_once('|')
-                .ok_or_else(|| GenError::Transport("fal: malformed job id".into()))?;
+                .ok_or_else(|| GenError::Protocol("fal: malformed job id".into()))?;
             let app = vendor_model
                 .split('/')
                 .take(2)
@@ -273,7 +273,7 @@ impl ProviderAdapter for FalAdapter {
             .send(HttpRequest::get(status_url).header(hk.clone(), hv.clone()))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let sv: serde_json::Value = resp.json()?;
         let status = sv
@@ -289,7 +289,7 @@ impl ProviderAdapter for FalAdapter {
                     .send(HttpRequest::get(result_url).header(hk, hv))
                     .await?;
                 if !rresp.is_success() {
-                    return Err(map_http_error(rresp.status, &rresp.body));
+                    return Err(map_http_response(&rresp));
                 }
                 let output: serde_json::Value = rresp.json()?;
                 let urls = Self::extract_urls(&output);
@@ -307,30 +307,24 @@ impl ProviderAdapter for FalAdapter {
         }
     }
 
-    async fn upload(&self, _path: &Path, content_type: &str) -> Result<String, GenError> {
-        // fal storage upload: POST bytes, receive a hosted URL. The caller
-        // supplies content_type; the body read is performed here in production.
-        let data = tokio::fs::read(_path)
-            .await
-            .map_err(|e| GenError::Transport(format!("read upload file: {e}")))?;
+    async fn upload(&self, path: &Path, content_type: &str) -> Result<String, GenError> {
+        // fal storage upload: POST the file, receive a hosted URL. The file is
+        // size-checked first and streamed from disk.
+        let body = file_upload_body(path, content_type).await?;
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(
-                HttpRequest::post(STORAGE_UPLOAD)
-                    .header(hk, hv)
-                    .bytes(content_type.to_string(), data),
-            )
+            .send(HttpRequest::post(STORAGE_UPLOAD).header(hk, hv).file(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         v.get("access_url")
             .or_else(|| v.get("url"))
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| GenError::Transport("fal: upload missing url".into()))
+            .ok_or_else(|| GenError::Protocol("fal: upload missing url".into()))
     }
 }
 
