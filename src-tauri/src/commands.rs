@@ -1035,8 +1035,9 @@ pub fn export_xmeml(
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
     let snapshot = core.runtime_snapshot();
     // Resolve each source file's start timecode via ffprobe (upstream reads the
-    // QuickTime `tmcd` track; here `opentake_media::read_start_timecode_frame`
-    // reads `tags.timecode`). Per-file failures are silently dropped -> 0.
+    // QuickTime `tmcd` track; here `opentake_media::read_start_timecode` reads
+    // `tags.timecode` and its drop-frame separator). Per-file failures are
+    // silently dropped -> 0 with the frame-rate drop-frame rule.
     let start_timecodes = resolve_start_timecodes(
         &snapshot.timeline,
         &snapshot.media,
@@ -1051,20 +1052,21 @@ pub fn export_xmeml(
     std::fs::write(&path, xml).map_err(|e| e.to_string())
 }
 
-/// Build the `media_ref -> start-frame` map for [`export_xmeml`]. Iterates the
+/// Build the `media_ref -> start timecode` map for [`export_xmeml`]. Iterates the
 /// manifest, resolves each entry to an on-disk file, and reads its start timecode
 /// via ffprobe at the **same integer timebase** the XMEML `<file>` node uses for
 /// that source (`max(1, round(source_fps ?? timeline.fps))`, the upstream
 /// `rateTags` timebase — so the parsed frame count matches the `<rate>` written
 /// beside it). A missing manifest entry path, an unreadable file, or an absent
 /// timecode tag simply yields no map entry, and the exporter falls back to 0
-/// exactly as upstream's `sourceStartFrame(for:) ?? 0` does. Only entries with a
-/// nonzero timecode are inserted (zero is already the exporter default).
+/// exactly as upstream's `sourceStartFrame(for:) ?? 0` does. Every read
+/// timecode is inserted, even at frame 0, because its drop-frame flag replaces
+/// the exporter's frame-rate rule.
 fn resolve_start_timecodes(
     timeline: &opentake_domain::Timeline,
     manifest: &opentake_domain::MediaManifest,
     project_base: Option<&std::path::Path>,
-) -> std::collections::HashMap<String, i32> {
+) -> std::collections::HashMap<String, opentake_project::SourceTimecode> {
     let resolver = opentake_domain::MediaResolver::new(manifest, project_base);
     let mut map = std::collections::HashMap::new();
     for entry in &manifest.entries {
@@ -1074,10 +1076,14 @@ fn resolve_start_timecodes(
         let Some(path) = resolver.expected_path(&entry.id) else {
             continue;
         };
-        if let Some(frame) = opentake_media::read_start_timecode_frame(&path, timebase) {
-            if frame > 0 {
-                map.insert(entry.id.clone(), frame);
-            }
+        if let Some(timecode) = opentake_media::read_start_timecode(&path, timebase) {
+            map.insert(
+                entry.id.clone(),
+                opentake_project::SourceTimecode {
+                    start_frame: timecode.frame,
+                    drop_frame: timecode.drop_frame,
+                },
+            );
         }
     }
     map

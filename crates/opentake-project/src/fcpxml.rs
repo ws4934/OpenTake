@@ -30,7 +30,7 @@
 //! 与上游的两点差异(都是跨平台降级,语义对齐):
 //! - **源起始时间码**:上游用 AVFoundation 读 QuickTime `tmcd` 轨(读到的原始 UInt32
 //!   帧数)。Rust/Tauri 无等价实现,改由调用方(src-tauri)经 ffprobe 读
-//!   `tags.timecode` 字符串、用 [`opentake_media::read_start_timecode_frame`] 转成起始帧,
+//!   `tags.timecode` 字符串、用 `opentake_media::read_start_timecode` 转成起始帧与 DF 标记,
 //!   通过 [`export_xmeml_with_timecodes`] 注入本模块;读不到时退回 startFrame=0 +
 //!   `00:00:00:00`(正是上游 `sourceStartFrame(for:) ?? 0` 的回退分支)。本模块自身保持
 //!   零 IO,`export_xmeml` 不注入任何时间码即等价旧行为(全 0)。
@@ -67,17 +67,27 @@ pub fn export_xmeml(
     export_xmeml_with_timecodes(timeline, manifest, project_base, &HashMap::new())
 }
 
-/// 同 [`export_xmeml`],但注入每个源文件的**起始时间码帧**(`media_ref → start
-/// frame`)。命中的 `media_ref` 会把该帧写入其 `<file><timecode>`(1:1 对应上游
+/// A source file's start timecode for the XMEML `<file><timecode>` node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceTimecode {
+    /// Start frame at the file's XMEML timebase.
+    pub start_frame: i32,
+    /// Whether the source labels its timecode drop-frame (upstream
+    /// `SourceTimecode.dropFrame`). NTSC 29.97/59.94 footage may be either.
+    pub drop_frame: bool,
+}
+
+/// 同 [`export_xmeml`],但注入每个源文件的**起始时间码**(`media_ref → start
+/// frame + drop-frame flag`)。命中的 `media_ref` 会把该帧写入其 `<file><timecode>`(1:1 对应上游
 /// `sourceStartFrame(for:)` 的返回值,`Export/XMLExporter.swift:220,238-243`);未命中
-/// 或值缺失时退回 0(即上游读不到 tmcd 轨时的 `?? 0` 分支)。保持纯函数:时间码由
-/// 调用方(src-tauri)用 [`opentake_media::read_start_timecode_frame`] 经 ffprobe 解析后
+/// 或值缺失时退回 0(即上游读不到 tmcd 轨时的 `?? 0` 分支),drop-frame 退回按帧率判断。保持纯函数:时间码由
+/// 调用方(src-tauri)用 `opentake_media::read_start_timecode` 经 ffprobe 解析后
 /// 传入,本模块不做任何 IO。
 pub fn export_xmeml_with_timecodes(
     timeline: &Timeline,
     manifest: &MediaManifest,
     project_base: Option<&Path>,
-    start_timecodes: &HashMap<String, i32>,
+    start_timecodes: &HashMap<String, SourceTimecode>,
 ) -> String {
     let resolver = MediaResolver::new(manifest, project_base);
     Builder::new(timeline, &resolver, start_timecodes).build()
@@ -117,14 +127,14 @@ struct Builder<'a> {
     clips_by_link_group: HashMap<String, Vec<Clip>>,
     /// media_ref → 源起始时间码帧(注入,缺失即 0)。对应上游 `startFrameCache`
     /// 已解析的结果,只是这里由调用方经 ffprobe 预先算好传入。
-    start_timecodes: &'a HashMap<String, i32>,
+    start_timecodes: &'a HashMap<String, SourceTimecode>,
 }
 
 impl<'a> Builder<'a> {
     fn new(
         timeline: &'a Timeline,
         resolver: &'a MediaResolver<'a>,
-        start_timecodes: &'a HashMap<String, i32>,
+        start_timecodes: &'a HashMap<String, SourceTimecode>,
     ) -> Self {
         Builder {
             timeline,
@@ -425,8 +435,11 @@ impl<'a> Builder<'a> {
         // 读不到 tmcd 轨时的分支。`<string>` 由共享的 `format_timecode` 生成(上游
         // palmier-pro #361 修正后的 drop-frame 算法),与 `<frame>` 一致,即
         // `opentake_media::parse_smpte_timecode` 读到的源时间码标签(XMEML 全用 `;`)。
-        let drop_frame = ntsc && timebase % 30 == 0;
-        let start_frame = self.start_timecodes.get(media_ref).copied().unwrap_or(0);
+        // The drop-frame label is the source's own (a 29.97 camera may write
+        // non-drop); the frame-rate rule is only the fallback without one.
+        let source = self.start_timecodes.get(media_ref);
+        let drop_frame = source.map_or(ntsc && timebase % 30 == 0, |tc| tc.drop_frame);
+        let start_frame = source.map_or(0, |tc| tc.start_frame);
         let timecode = el(
             "timecode",
             vec![
@@ -1524,7 +1537,7 @@ mod tests {
 
         // 注入 1s 起始时间码:30 fps → 30 帧 → 00:00:01:00。
         let mut tcs = HashMap::new();
-        tcs.insert("v1".to_string(), 30);
+        tcs.insert("v1".to_string(), ndf(30));
         let xml = export_xmeml_with_timecodes(&tl, &manifest, None, &tcs);
 
         // <file><timecode> 里应出现注入的帧与其 SMPTE 串,而非 00:00:00:00。
@@ -1532,6 +1545,74 @@ mod tests {
         assert!(xml.contains("<string>00:00:01:00</string>"));
         // sequence 顶层 timecode 仍是固定的 00:00:00:00(未被 per-file 注入影响)。
         assert!(xml.contains("<string>00:00:00:00</string>"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn ndf(start_frame: i32) -> SourceTimecode {
+        SourceTimecode {
+            start_frame,
+            drop_frame: false,
+        }
+    }
+
+    fn df(start_frame: i32) -> SourceTimecode {
+        SourceTimecode {
+            start_frame,
+            drop_frame: true,
+        }
+    }
+
+    #[test]
+    fn export_ntsc_source_timecode_keeps_the_source_drop_frame_mode() {
+        let dir = std::env::temp_dir().join(format!("opentake-xmeml-ndf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut manifest = MediaManifest::new();
+        for (id, name, fps) in [
+            ("ndf30", "ndf30.mp4", 29.97),
+            ("df30", "df30.mp4", 29.97),
+            ("ndf60", "ndf60.mp4", 59.94),
+            ("untagged", "untagged.mp4", 29.97),
+        ] {
+            let mut entry = ext_entry(id, name, ClipType::Video, &touch(&dir, name), 4.0);
+            entry.source_fps = Some(fps);
+            manifest.entries.push(entry);
+        }
+        let mut tl = Timeline::new();
+        let mut vtrack = Track::new("vt", ClipType::Video);
+        for (index, id) in ["ndf30", "df30", "ndf60", "untagged"].iter().enumerate() {
+            let start = index as i32 * 30;
+            vtrack
+                .clips
+                .push(Clip::new(format!("c{index}"), *id, start, 30));
+        }
+        tl.tracks.push(vtrack);
+
+        // `01:00:00:00` non-drop at 29.97 is frame 108000; `01:00:00;00`
+        // drop-frame is 107892; `00:10:00:00` non-drop at 59.94 is 36000.
+        let tcs = HashMap::from([
+            ("ndf30".to_string(), ndf(108_000)),
+            ("df30".to_string(), df(107_892)),
+            ("ndf60".to_string(), ndf(36_000)),
+        ]);
+        let xml = export_xmeml_with_timecodes(&tl, &manifest, None, &tcs);
+        for (id, frame, string, format) in [
+            ("file-ndf30-video", 108_000, "01:00:00:00", "NDF"),
+            ("file-df30-video", 107_892, "01;00;00;00", "DF"),
+            ("file-ndf60-video", 36_000, "00:10:00:00", "NDF"),
+            // No source timecode: today's frame-rate rule.
+            ("file-untagged-video", 0, "00;00;00;00", "DF"),
+        ] {
+            let file = file_block(&xml, id);
+            assert!(file.contains(&format!("<frame>{frame}</frame>")), "{file}");
+            assert!(
+                file.contains(&format!("<string>{string}</string>")),
+                "{file}"
+            );
+            assert!(
+                file.contains(&format!("<displayformat>{format}</displayformat>")),
+                "{file}"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1569,7 +1650,10 @@ mod tests {
             (1_552_158, "14;23;10;12", 35_964, "00;10;00;00"),
         ];
         for (frame_30, string_30, frame_60, string_60) in cases {
-            let tcs = HashMap::from([("v1".to_string(), frame_30), ("v2".to_string(), frame_60)]);
+            let tcs = HashMap::from([
+                ("v1".to_string(), df(frame_30)),
+                ("v2".to_string(), df(frame_60)),
+            ]);
             let xml = export_xmeml_with_timecodes(&tl, &manifest, None, &tcs);
             for (id, frame, string) in [
                 ("file-v1-video", frame_30, string_30),
@@ -1635,7 +1719,7 @@ mod tests {
 
         // 一个不含本文件的 map(命中另一个 ref),该文件必须退回 0。
         let mut other = HashMap::new();
-        other.insert("someone-else".to_string(), 999);
+        other.insert("someone-else".to_string(), ndf(999));
         let injected = export_xmeml_with_timecodes(&tl, &manifest, None, &other);
         // 便捷入口(无注入)也应等价。
         let plain = export_xmeml(&tl, &manifest, None);

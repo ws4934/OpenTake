@@ -44,6 +44,22 @@ use crate::ff;
 /// `fps` is the integer timebase (upstream `rateTags` timebase: 30 for 29.97,
 /// 60 for 59.94, …); `<= 0` yields `None`.
 pub fn parse_smpte_timecode(input: &str, fps: i32) -> Option<i32> {
+    parse_start_timecode(input, fps).map(|timecode| timecode.frame)
+}
+
+/// A source's start timecode: its frame at the export timebase and whether the
+/// source labels it drop-frame (upstream `SourceTimecode.dropFrame`, read from
+/// the timecode track's `kCMTimeCodeFlag_DropFrame`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartTimecode {
+    pub frame: i32,
+    pub drop_frame: bool,
+}
+
+/// [`parse_smpte_timecode`], keeping the tag's drop-frame flag. The flag is set
+/// only when drop-frame math was applied (a `;`/`.` separator at a drop-frame
+/// rate), so the label rebuilt from `frame` matches the tag.
+pub fn parse_start_timecode(input: &str, fps: i32) -> Option<StartTimecode> {
     if fps <= 0 {
         return None;
     }
@@ -89,9 +105,15 @@ pub fn parse_smpte_timecode(input: &str, fps: i32) -> Option<i32> {
         let drop = drop_frames_per_minute(fps);
         let total_minutes = hh * 60 + mm;
         let dropped = drop * (total_minutes - total_minutes / 10);
-        Some(naive - dropped)
+        Some(StartTimecode {
+            frame: naive - dropped,
+            drop_frame: true,
+        })
     } else {
-        Some(naive)
+        Some(StartTimecode {
+            frame: naive,
+            drop_frame: false,
+        })
     }
 }
 
@@ -128,9 +150,15 @@ fn drop_frames_per_minute(fps: i32) -> i32 {
 /// `rateTags` timebase), so the frames-per-second used for parsing matches the
 /// `<rate>` written alongside the `<timecode>` node.
 pub fn read_start_timecode_frame(path: &Path, fps: i32) -> Option<i32> {
+    read_start_timecode(path, fps).map(|timecode| timecode.frame)
+}
+
+/// [`read_start_timecode_frame`], keeping the tag's drop-frame flag (see
+/// [`parse_start_timecode`]).
+pub fn read_start_timecode(path: &Path, fps: i32) -> Option<StartTimecode> {
     let json = ff::ffprobe_json(path).ok()?;
     let tag = timecode_tag(&json)?;
-    parse_smpte_timecode(&tag, fps)
+    parse_start_timecode(&tag, fps)
 }
 
 /// Extract the first `tags.timecode` string from ffprobe JSON, preferring a
@@ -170,6 +198,41 @@ fn tags_timecode(obj: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn start_timecode_keeps_the_tag_drop_frame_flag() {
+        // Non-drop at 29.97: the camera's `01:00:00:00` is frame 108000.
+        assert_eq!(
+            parse_start_timecode("01:00:00:00", 30),
+            Some(StartTimecode {
+                frame: 108_000,
+                drop_frame: false
+            })
+        );
+        assert_eq!(
+            parse_start_timecode("00:01:00;02", 30),
+            Some(StartTimecode {
+                frame: 1800,
+                drop_frame: true
+            })
+        );
+        assert_eq!(
+            parse_start_timecode("00:01:00.04", 60),
+            Some(StartTimecode {
+                frame: 3600,
+                drop_frame: true
+            })
+        );
+        // A stray `;` at a non-drop rate is honoured as non-drop.
+        assert_eq!(
+            parse_start_timecode("00:00:01;00", 25),
+            Some(StartTimecode {
+                frame: 25,
+                drop_frame: false
+            })
+        );
+        assert_eq!(parse_start_timecode("garbage", 30), None);
+    }
 
     // --- NDF: plain inverse of upstream formatTimecode's non-drop path ---
 
