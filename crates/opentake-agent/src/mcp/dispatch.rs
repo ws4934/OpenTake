@@ -1846,7 +1846,10 @@ impl Dispatcher {
             .enumerate()
             .map(|(i, raw)| decode_tool_args::<MoveEntry>(raw, &format!("moves[{i}]")))
             .collect::<Result<Vec<_>, _>>()?;
-        let requested_ids: BTreeSet<String> =
+        // Every clip that already has a move, starting with the requested ones.
+        // A partner shared by several leads moves once, with the delta of the
+        // first lead that reaches it (upstream `seen`).
+        let mut seen: BTreeSet<String> =
             entries.iter().map(|entry| entry.clip_id.clone()).collect();
         let mut moves = Vec::with_capacity(entries.len());
         for (i, m) in entries.into_iter().enumerate() {
@@ -1895,7 +1898,7 @@ impl Dispatcher {
                 for partner in &track.clips {
                     if partner.id == m.clip_id
                         || partner.link_group_id.as_deref() != Some(link_group_id)
-                        || requested_ids.contains(partner.id.as_str())
+                        || seen.contains(partner.id.as_str())
                     {
                         continue;
                     }
@@ -1906,6 +1909,7 @@ impl Dispatcher {
                     if earliest.is_none_or(|(_, _, frame)| partner_frame < frame) {
                         earliest = Some((&partner.id, partner.start_frame, partner_frame));
                     }
+                    seen.insert(partner.id.clone());
                     moves.push(ClipMove {
                         clip_id: partner.id.clone(),
                         to_track: track_index,
@@ -6130,6 +6134,43 @@ mod tests {
         );
         assert!(message.contains("toFrame >= 10"), "{message}");
         assert_unedited(&handle, &before);
+    }
+
+    #[test]
+    fn move_clips_moves_a_partner_shared_by_two_requested_clips_once() {
+        let mut tl = Timeline::new();
+        let mut video_track = Track::new("video-track", ClipType::Video);
+        let mut video = Clip::new("v", "video-asset", 30, 30);
+        video.link_group_id = Some("trio".into());
+        video_track.clips.push(video);
+        let mut audio_tracks = Vec::new();
+        for id in ["a1", "a2"] {
+            let mut track = Track::new(format!("{id}-track"), ClipType::Audio);
+            let mut audio = audio_clip(id, "audio-asset", 30, 30);
+            audio.link_group_id = Some("trio".into());
+            track.clips.push(audio);
+            audio_tracks.push(track);
+        }
+        tl.tracks = std::iter::once(video_track).chain(audio_tracks).collect();
+        let handle = Arc::new(StateHandle::new(tl, MediaManifest::new()));
+        let dispatcher = dispatcher_with(handle.clone());
+
+        let result = dispatcher.dispatch(
+            "move_clips",
+            serde_json::json!({"moves":[
+                {"clipId":"v","toFrame":60},
+                {"clipId":"a1","toFrame":60}
+            ]}),
+        );
+
+        assert!(!result.is_error, "{}", result.text_joined());
+        let starts = handle
+            .timeline()
+            .tracks
+            .iter()
+            .map(|track| track.clips[0].start_frame)
+            .collect::<Vec<_>>();
+        assert_eq!(starts, [60, 60, 60]);
     }
 
     #[test]
