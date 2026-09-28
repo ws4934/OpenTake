@@ -111,6 +111,36 @@ describe("trimSourceValues", () => {
     expect(trimSourceValues(tc({ trimEndFrame: 50 }), "right", 10)).toEqual({ trimStartFrame: 0, trimEndFrame: 40 });
   });
 
+  it("rounds half source frames away from zero like opentake-ops trim_values", () => {
+    // 0.5x: three timeline frames left is -1.5 source frames; f64::round gives -2.
+    expect(trimSourceValues(tc({ speed: 0.5, trimStartFrame: 10 }), "left", -3)).toEqual({
+      trimStartFrame: 8,
+      trimEndFrame: 0,
+    });
+    expect(trimSourceValues(tc({ speed: 0.5, trimEndFrame: 4 }), "right", -3)).toEqual({
+      trimStartFrame: 0,
+      trimEndFrame: 6,
+    });
+    // 1.5x: -1 -> -1.5 -> -2 and -3 -> -4.5 -> -5.
+    expect(trimSourceValues(tc({ speed: 1.5, trimStartFrame: 10 }), "left", -1)).toEqual({
+      trimStartFrame: 8,
+      trimEndFrame: 0,
+    });
+    expect(trimSourceValues(tc({ speed: 1.5, trimStartFrame: 10 }), "left", -3)).toEqual({
+      trimStartFrame: 5,
+      trimEndFrame: 0,
+    });
+    // Positive halves already rounded up; negative non-halves are unchanged.
+    expect(trimSourceValues(tc({ speed: 0.5, trimStartFrame: 10 }), "left", 3)).toEqual({
+      trimStartFrame: 12,
+      trimEndFrame: 0,
+    });
+    expect(trimSourceValues(tc({ speed: 1.5, trimStartFrame: 10 }), "left", -2)).toEqual({
+      trimStartFrame: 7,
+      trimEndFrame: 0,
+    });
+  });
+
   it("reversedTrimRightKeepsSourceWindow", () => {
     expect(trimSourceValues(tc({ reversed: true, trimStartFrame: 15, trimEndFrame: 7 }), "right", 10)).toEqual({
       trimStartFrame: 5,
@@ -166,6 +196,14 @@ describe("trimToPlayheadEdits", () => {
     // delta 50 → source +50 → trimStart 10+50=60, right edge fixed.
     expect(trimToPlayheadEdits([c], 150, "left")).toEqual([
       { clipId: "c", trimStartFrame: 60, trimEndFrame: 10 },
+    ]);
+  });
+
+  it("converts an odd 0.5x trim-to-playhead distance with Rust rounding", () => {
+    const slow = { ...c, speed: 0.5 } as Clip;
+    // delta -3 → source round(-1.5) = -2 → trimEnd 10+2 = 12 (Math.round gave 11).
+    expect(trimToPlayheadEdits([slow], 197, "right")).toEqual([
+      { clipId: "c", trimStartFrame: 10, trimEndFrame: 12 },
     ]);
   });
 

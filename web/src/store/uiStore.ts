@@ -185,6 +185,18 @@ function dedupePreviewTabIds(previewTabIds: string[]): string[] {
   return [...new Set(previewTabIds.filter((id) => id !== ""))];
 }
 
+/** State for an emptied clip selection. Any selection change ends on-canvas
+ *  crop editing (upstream InspectorView.swift:60-61,90, `resolvePreferredTab`)
+ *  and drops a motion-tracking region drawn for a deselected clip, so every
+ *  path that clears the selection spreads this instead of `selectedClipIds`. */
+function clearedClipSelection() {
+  return {
+    selectedClipIds: new Set<string>(),
+    cropEditingActive: false,
+    motionTrackingSelection: null,
+  };
+}
+
 function previewHistoryWithActivation(previewTabHistory: string[], mediaId: string): string[] {
   return [...previewTabHistory.filter((id) => id !== mediaId), mediaId];
 }
@@ -277,7 +289,7 @@ function previewSelectionState(
       options?.updateHistory === false
         ? normalizedPreviewTabHistory
         : previewHistoryWithActivation(normalizedPreviewTabHistory, mediaId),
-    selectedClipIds: new Set<string>(),
+    ...clearedClipSelection(),
     selectedFolderIds: new Set<string>(),
     selectedMediaAssetIds: new Set([mediaId]),
   };
@@ -533,7 +545,7 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
   enterNestedSequence: (activeNestedSequenceId) =>
     set({
       activeNestedSequenceId,
-      selectedClipIds: new Set(),
+      ...clearedClipSelection(),
       selectedGap: null,
       selectedTimelineRange: null,
       currentFrame: 0,
@@ -544,7 +556,7 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
   exitNestedSequence: () =>
     set({
       activeNestedSequenceId: null,
-      selectedClipIds: new Set(),
+      ...clearedClipSelection(),
       selectedGap: null,
       selectedTimelineRange: null,
       currentFrame: 0,
@@ -627,7 +639,12 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
     // ticker stopped), rewind to the start so `next >= last` doesn't fire on the
     // very first tick and stall play. Without media there's nothing to rewind.
     // Reset the Rust-engine fallback here too (both start-play paths clear it).
-    const last = Math.max(0, totalFrames(useProjectStore.getState().timeline) - 1);
+    // The end is the shown timeline's: an open nested sequence, else the root.
+    const root = useProjectStore.getState().timeline;
+    const shown =
+      root.nestedSequences?.find((sequence) => sequence.id === get().activeNestedSequenceId)
+        ?.timeline ?? root;
+    const last = Math.max(0, totalFrames(shown) - 1);
     if (activeFrame >= last) {
       set({ currentFrame: 0, activeFrame: 0, isPlaying: true, isScrubbing: false, rustEngineFailed: false });
     } else {
@@ -655,11 +672,9 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
     })),
   clearSelection: () =>
     set({
-      selectedClipIds: new Set(),
+      ...clearedClipSelection(),
       selectedGap: null,
       isMarqueeSelecting: false,
-      cropEditingActive: false,
-      motionTrackingSelection: null,
     }),
   selectMediaAssets: (selectedMediaAssetIds) => set({ selectedMediaAssetIds }),
   clearMediaSelection: () => set({ selectedMediaAssetIds: new Set() }),
@@ -743,19 +758,19 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
   markRangeStart: (frame) =>
     set((s) => ({
       selectedTimelineRange: withRangeStart(s.selectedTimelineRange, frame),
-      selectedClipIds: new Set(),
+      ...clearedClipSelection(),
       selectedGap: null,
     })),
   markRangeEnd: (frame) =>
     set((s) => ({
       selectedTimelineRange: withRangeEnd(s.selectedTimelineRange, frame),
-      selectedClipIds: new Set(),
+      ...clearedClipSelection(),
       selectedGap: null,
     })),
   clearTimelineRange: () => set({ selectedTimelineRange: null }),
   // Selecting a gap clears clip selection (mutual exclusivity, upstream behavior).
   selectGap: (selectedGap) =>
-    set(selectedGap ? { selectedGap, selectedClipIds: new Set() } : { selectedGap: null }),
+    set(selectedGap ? { selectedGap, ...clearedClipSelection() } : { selectedGap: null }),
 
   setZoomScale: (zoomScale) => {
     const requested = Number.isFinite(zoomScale) ? zoomScale : ZOOM.default;
@@ -783,7 +798,7 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
     // Transition authoring is the one media-panel flow that consumes the
     // timeline cut selection, so its marked controls focus without clearing it.
     if (panel === "media" && !preserveTimelineSelection)
-      set({ focusedPanel: panel, selectedClipIds: new Set() });
+      set({ focusedPanel: panel, ...clearedClipSelection() });
     else if (panel === "media") set({ focusedPanel: panel });
     else if (panel === "timeline")
       set({ focusedPanel: panel, selectedMediaAssetIds: new Set() });

@@ -9,6 +9,7 @@
 import { ACCENT, CLIP, FADE, TEXT, TRIM, BORDER } from "../../lib/theme";
 import { trackColor, clipLabel, isLinked } from "../../lib/clip";
 import type { ClipRect } from "../../lib/geometry";
+import { volumeEnvelopeMapping } from "./hitTest";
 import type { Clip } from "../../lib/types";
 
 /** Selection outline colour: a vivid blue that stays obvious on any clip body
@@ -639,10 +640,9 @@ function drawVolumeEnvelope(
   rect: ClipRect,
   ghost?: { fromFrame: number; ghostFrame: number },
 ) {
-  if (clip.durationFrames <= 0) return;
-  const ppf = (rect.width - 2 * TRIM.handleWidth) / clip.durationFrames;
-  if (ppf <= 0) return;
-  const baseX = rect.x + TRIM.handleWidth;
+  const mapping = volumeEnvelopeMapping(rect, clip.durationFrames);
+  if (!mapping) return;
+  const { baseX, pixelsPerFrame: ppf } = mapping;
   const bodyTop = rect.y + CLIP.labelBarHeight;
   const bodyH = rect.height - CLIP.labelBarHeight;
   if (bodyH <= 6) return;

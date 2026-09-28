@@ -244,6 +244,38 @@ describe("AccountPane interactions", () => {
     expect(input("account-backend-url").value).toBe(savedBackend);
   });
 
+  it("leaves Enter that confirms an IME candidate to the input method", async () => {
+    savedBackend = "https://accounts.example.com";
+    await renderPane();
+    // Chromium/Firefox order, then WebKit's compositionend-first order.
+    const confirmCandidate = async (element: HTMLInputElement) => {
+      await act(async () => {
+        element.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+        element.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", isComposing: true, keyCode: 229, bubbles: true }),
+        );
+        element.dispatchEvent(new Event("compositionend", { bubbles: true }));
+        element.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+        element.dispatchEvent(new Event("compositionend", { bubbles: true }));
+        element.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true }));
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    await setInputValue(input("account-backend-url"), "https://新しい.example.com");
+    await confirmCandidate(input("account-backend-url"));
+    expect(accountApi.setBackendUrl).not.toHaveBeenCalled();
+
+    await setInputValue(input("account-backend-url"), "https://accounts.example.com");
+    await setInputValue(input("account-token"), "token");
+    await confirmCandidate(input("account-token"));
+    expect(accountApi.login).not.toHaveBeenCalled();
+
+    await pressEnter(input("account-token"));
+    expect(accountApi.login).toHaveBeenCalledWith("token");
+  });
+
   it("logs out a stored credential without exposing it", async () => {
     savedBackend = "https://accounts.example.com";
     status = { type: "stored" };

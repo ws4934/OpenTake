@@ -6,7 +6,7 @@
  */
 
 import { TRIM, CLIP, FADE } from "../../lib/theme";
-import { clipRect } from "../../lib/geometry";
+import { clipRect, type ClipRect } from "../../lib/geometry";
 import type { Timeline, Clip } from "../../lib/types";
 
 export type ClipRegion = "trimLeft" | "trimRight" | "body";
@@ -103,6 +103,32 @@ export function clipsInRect(
  *  plus 3px of grab tolerance so a fast click still grabs it. */
 const VOLUME_KF_HIT_RADIUS = 8;
 
+/** Horizontal volume-envelope mapping shared by `drawVolumeEnvelope`, the dot
+ *  hit test, and dot drags / Cmd-click stamps. The dots live inside the trim
+ *  handles, so frame 0 is not hidden under the left handle; the linear
+ *  timeline mapping (`frameAt`) is off by the handle width and scale. */
+export function volumeEnvelopeMapping(
+  rect: ClipRect,
+  durationFrames: number,
+): { baseX: number; pixelsPerFrame: number } | null {
+  if (durationFrames <= 0) return null;
+  const pixelsPerFrame = (rect.width - 2 * TRIM.handleWidth) / durationFrames;
+  if (!(pixelsPerFrame > 0)) return null;
+  return { baseX: rect.x + TRIM.handleWidth, pixelsPerFrame };
+}
+
+/** Clip-relative envelope frame whose dot is drawn nearest to `docX` (the
+ *  inverse of `volumeEnvelopeMapping`). Callers clamp it to the clip span. */
+export function volumeEnvelopeFrameAt(
+  rect: ClipRect,
+  durationFrames: number,
+  docX: number,
+): number | null {
+  const mapping = volumeEnvelopeMapping(rect, durationFrames);
+  if (!mapping) return null;
+  return Math.round((docX - mapping.baseX) / mapping.pixelsPerFrame);
+}
+
 /** Result of hitting a draggable volume-keyframe dot. `frame` is clip-relative
  *  (0 = clip start), matching `Keyframe.frame` storage. */
 export interface VolumeKfHit {
@@ -142,10 +168,9 @@ export function audioVolumeKfHit(
       const track2 = clip.volumeTrack;
       if (!track2 || track2.keyframes.length === 0) continue;
       const rect = clipRect(timeline, ti, clip, pixelsPerFrame, trackHeights);
-      if (clip.durationFrames <= 0) continue;
-      const ppf = (rect.width - 2 * TRIM.handleWidth) / clip.durationFrames;
-      if (ppf <= 0) continue;
-      const baseX = rect.x + TRIM.handleWidth;
+      const mapping = volumeEnvelopeMapping(rect, clip.durationFrames);
+      if (!mapping) continue;
+      const { baseX, pixelsPerFrame: ppf } = mapping;
       const bodyTop = rect.y + CLIP.labelBarHeight;
       const bodyH = rect.height - CLIP.labelBarHeight;
       for (const kf of track2.keyframes) {

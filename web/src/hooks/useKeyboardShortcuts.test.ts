@@ -4,7 +4,9 @@ import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import { useEditorUiStore } from "../store/uiStore";
+import { useProjectStore } from "../store/projectStore";
 import { useUpdateStore } from "../store/updateStore";
+import type { Clip, Timeline } from "../lib/types";
 import * as edit from "../store/editActions";
 import {
   DOCUMENTED_SHORTCUT_ROWS,
@@ -523,5 +525,102 @@ describe("keyboard edit failures", () => {
       container.remove();
       undo.mockRestore();
     }
+  });
+});
+
+describe("Space follows the preview's playback gate", () => {
+  function clip(overrides: Partial<Clip>): Clip {
+    return {
+      id: "clip",
+      mediaRef: "media",
+      mediaType: "video",
+      sourceClipType: "video",
+      startFrame: 0,
+      durationFrames: 90,
+      trimStartFrame: 0,
+      trimEndFrame: 0,
+      speed: 1,
+      volume: 1,
+      fadeInFrames: 0,
+      fadeOutFrames: 0,
+      fadeInInterpolation: "linear",
+      fadeOutInterpolation: "linear",
+      opacity: 1,
+      transform: {
+        centerX: 0.5,
+        centerY: 0.5,
+        width: 1,
+        height: 1,
+        rotation: 0,
+        flipHorizontal: false,
+        flipVertical: false,
+      },
+      crop: { left: 0, top: 0, right: 0, bottom: 0 },
+      ...overrides,
+    };
+  }
+
+  function timelineOf(item: Clip): Timeline {
+    return {
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      settingsConfigured: true,
+      tracks: [{ id: `track-${item.id}`, type: "video", muted: false, hidden: false, syncLocked: false, clips: [item] }],
+    };
+  }
+
+  async function pressSpaceInside(root: Timeline, nested: Timeline): Promise<boolean> {
+    useProjectStore.setState({
+      timeline: { ...root, nestedSequences: [{ id: "seq-1", name: "Compound", timeline: nested }] },
+    });
+    useEditorUiStore.setState({
+      view: "editor",
+      settingsOpen: false,
+      exportDialogOpen: false,
+      saveAsProgress: null,
+      projectSettingsPrompt: null,
+      pendingSwapClipId: null,
+      previewMediaId: null,
+      focusedPanel: "timeline",
+      activeNestedSequenceId: "seq-1",
+      isPlaying: false,
+      activeFrame: 0,
+      currentFrame: 0,
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const reactRoot = createRoot(container);
+    const Harness = () => {
+      useKeyboardShortcuts();
+      return null;
+    };
+    try {
+      await act(async () => reactRoot.render(createElement(Harness)));
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: " ", code: "Space", bubbles: true, cancelable: true }),
+        );
+      });
+      return useEditorUiStore.getState().isPlaying;
+    } finally {
+      await act(async () => reactRoot.unmount());
+      container.remove();
+      useEditorUiStore.setState({ activeNestedSequenceId: null, isPlaying: false });
+      useProjectStore.getState().clearProjectSnapshot();
+    }
+  }
+
+  it("does not start a nested sequence the preview cannot play", async () => {
+    const title = clip({ id: "title", mediaType: "text", sourceClipType: "text" });
+    expect(await pressSpaceInside(timelineOf(clip({ id: "root-video" })), timelineOf(title))).toBe(false);
+  });
+
+  it("plays a nested sequence even when the root timeline is unsupported", async () => {
+    const unknownEffect = clip({
+      id: "root-effect",
+      effects: [{ name: "not-an-effect", params: {}, enabled: true }],
+    });
+    expect(await pressSpaceInside(timelineOf(unknownEffect), timelineOf(clip({ id: "nested-video" })))).toBe(true);
   });
 });

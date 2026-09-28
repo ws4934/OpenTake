@@ -6,6 +6,7 @@
 
 import { TRACK_COLOR } from "./theme";
 import { formatClipDuration } from "./geometry";
+import { roundHalfAwayFromZero } from "./rounding";
 import type {
   AnimPair,
   Clip,
@@ -471,8 +472,8 @@ export function clampTrimDeltaFrames(clip: TrimClip & Pick<Clip, "startFrame">, 
 /**
  * New SOURCE-frame `(trimStartFrame, trimEndFrame)` for an edge drag of `delta`
  * TIMELINE frames. 1:1 with opentake-ops `trim_values`: source delta =
- * round(delta * speed); video/audio clamp the moved edge at 0, image/text are
- * unbounded.
+ * round(delta * speed) with Rust's half-away-from-zero rounding; video/audio
+ * clamp the moved edge at 0, image/text are unbounded.
  */
 export function trimSourceValues(
   clip: TrimClip,
@@ -480,7 +481,7 @@ export function trimSourceValues(
   delta: number,
 ): { trimStartFrame: number; trimEndFrame: number } {
   const speed = clip.speed > 0 ? clip.speed : 1;
-  const sourceDelta = Math.round(delta * speed);
+  const sourceDelta = roundHalfAwayFromZero(delta * speed);
   if (isReversedVideo(clip)) {
     if (edge === "left") {
       const ne = clip.trimEndFrame + sourceDelta;

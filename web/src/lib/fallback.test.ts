@@ -861,6 +861,21 @@ describe("browser fallback edit store", () => {
     expect(settingsStore.getTimeline()).toEqual(beforeSettings);
   });
 
+  it("projects negative half trims away from zero like the Rust settings command", () => {
+    const base = createFallbackStore().getTimeline().timeline;
+    const image = base.tracks[0].clips.find((clip) => clip.mediaType === "image")!;
+    image.trimStartFrame = -3;
+    image.trimEndFrame = -5;
+    const store = createFallbackStore(base);
+
+    expect(store.editApply({ type: "setTimelineSettings", fps: 15, width: 1920, height: 1080 }).changed)
+      .toBe(true);
+
+    const projected = store.getTimeline().timeline.tracks[0].clips.find((clip) => clip.id === image.id)!;
+    expect(projected.trimStartFrame).toBe(-2);
+    expect(projected.trimEndFrame).toBe(-3);
+  });
+
   it("rejects malformed root or nested loaded clips before any edit", () => {
     for (const nested of [false, true]) {
       const timeline = createFallbackStore().getTimeline().timeline;

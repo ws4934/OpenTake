@@ -16,6 +16,7 @@ import { validRange, type TimelineRange } from "../lib/timelineRange";
 import { planNudge } from "../lib/timelineNudge";
 import { buildInsertPlan, type InsertPlan } from "../lib/timelineInsert";
 import { checkProjectSettings } from "../lib/projectSettings";
+import { roundHalfAwayFromZero } from "../lib/rounding";
 import { expandLinkGroup } from "../components/timeline/hitTest";
 import { useClipboardStore } from "./clipboardStore";
 import { t } from "../i18n";
@@ -303,6 +304,24 @@ async function applyAndRefresh(
       retryOnStale: STALE_RETRYABLE_EDIT_REQUEST_TYPES.has(cmd.type),
     }),
   );
+}
+
+/** Controls that preview a gesture locally and commit it when the gesture
+ *  ends (a held arrow key, a color picker's debounce) register a flush here
+ *  while that commit is pending. Undo and redo run the flushes first, so the
+ *  gesture's edit is queued ahead of the history command and undo reverts
+ *  it instead of an earlier edit. Returns the unregister function. */
+const pendingGestureCommits = new Set<() => void>();
+
+export function holdGestureCommit(flush: () => void): () => void {
+  pendingGestureCommits.add(flush);
+  return () => {
+    pendingGestureCommits.delete(flush);
+  };
+}
+
+function flushPendingGestureCommits(): void {
+  for (const flush of [...pendingGestureCommits]) flush();
 }
 
 /** Error exit for fire-and-forget edit gestures (keyboard, menus, drag
@@ -859,11 +878,13 @@ export async function tightenSilenceRanges(trackIndex: number, ranges: FrameRang
 // Undo/redo act on core history, not on the mirror's view, so re-sending one
 // after a stale rejection still does exactly what the user asked for.
 export async function undo() {
+  flushPendingGestureCommits();
   await enqueueEdit(() => commitEdit(api.undo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }
 
 export async function redo() {
+  flushPendingGestureCommits();
   await enqueueEdit(() => commitEdit(api.redo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }
@@ -1390,8 +1411,8 @@ function timelineAfterSettings(
     const clips = [...track.clips]
       .sort((left, right) => left.startFrame - right.startFrame)
       .map((clip) => {
-        const scaledStart = Math.round(clip.startFrame * scale);
-        const scaledEnd = Math.round((clip.startFrame + clip.durationFrames) * scale);
+        const scaledStart = roundHalfAwayFromZero(clip.startFrame * scale);
+        const scaledEnd = roundHalfAwayFromZero((clip.startFrame + clip.durationFrames) * scale);
         const startFrame = Math.max(scaledStart, previousEnd ?? scaledStart);
         const durationFrames = Math.max(1, scaledEnd - startFrame);
         previousEnd = startFrame + durationFrames;

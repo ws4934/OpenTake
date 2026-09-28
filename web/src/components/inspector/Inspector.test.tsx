@@ -332,8 +332,13 @@ describe("Inspector completion surface", () => {
     const opacity = container.querySelector<HTMLElement>(
       '[role="spinbutton"][aria-label="不透明度"]',
     )!;
+    // Arrow keys preview locally and commit once the key is released.
     await act(async () => {
       opacity.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    });
+    expect(upsert).not.toHaveBeenCalled();
+    await act(async () => {
+      opacity.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowDown", bubbles: true }));
     });
     expect(upsert).toHaveBeenCalledWith(
       clip.id,
@@ -807,6 +812,8 @@ describe("Inspector completion surface", () => {
       }
       amount?.dispatchEvent(new InputEvent("input", { bubbles: true }));
     });
+    expect(setEffects.mock.calls.at(-1)?.[1][0]?.params.amount).not.toBe(0.35);
+    await act(async () => amount?.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));
     expect(setEffects.mock.calls.at(-1)?.[1][0]?.params.amount).toBe(0.35);
 
     const enabled = items[0]?.querySelector<HTMLInputElement>('input[type="checkbox"]');
@@ -819,5 +826,211 @@ describe("Inspector completion surface", () => {
 
     setEffects.mockRestore();
     await act(async () => root.unmount());
+  });
+  describe("generic effect amount slider", () => {
+    async function renderAmountSlider(setEffects: ReturnType<typeof vi.spyOn>) {
+      const clip = visualClip({ effects: [{ name: "grayscale", params: { amount: 0 }, enabled: true }] });
+      useProjectStore.setState({ timeline: timelineWith(clip), projectPath: "/tmp/demo.opentake" });
+      useEditorUiStore.setState({ selectedClipIds: new Set([clip.id]), inspectorTab: "video", toast: null });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<Inspector />));
+      const slider = container.querySelector<HTMLInputElement>(
+        '[data-testid="generic-effect-item"] input[type="range"]',
+      )!;
+      const setValue = (value: string, type: "input" | "change" = "input") => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(slider, value);
+        slider.dispatchEvent(new Event(type, { bubbles: true }));
+      };
+      return { clip, container, root, slider, setValue, setEffects };
+    }
+
+    it("previews a drag locally and commits the final amount once on release", async () => {
+      const { clip, container, root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockResolvedValue(),
+      );
+      await act(async () => {
+        for (let step = 1; step <= 20; step++) setValue(String(step / 20));
+      });
+      expect(setEffects).not.toHaveBeenCalled();
+      expect(container.querySelector('[data-testid="generic-effect-item"]')?.textContent).toContain("100%");
+
+      await act(async () => {
+        slider.dispatchEvent(new Event("change", { bubbles: true }));
+        slider.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      });
+      expect(setEffects).toHaveBeenCalledOnce();
+      expect(setEffects).toHaveBeenCalledWith([clip.id], [
+        expect.objectContaining({ name: "grayscale", params: { amount: 1 } }),
+      ]);
+
+      setEffects.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("commits a held arrow key once on key release instead of on every change", async () => {
+      const { root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockResolvedValue(),
+      );
+      await act(async () => {
+        for (let step = 1; step <= 5; step++) {
+          slider.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "ArrowRight", repeat: step > 1, bubbles: true }),
+          );
+          setValue(String(step / 100));
+          setValue(String(step / 100), "change");
+        }
+      });
+      expect(setEffects).not.toHaveBeenCalled();
+      await act(async () => {
+        slider.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowRight", bubbles: true }));
+      });
+      expect(setEffects).toHaveBeenCalledOnce();
+      expect(setEffects.mock.calls[0]?.[1][0]?.params.amount).toBe(0.05);
+
+      setEffects.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("reports a rejected commit and restores the committed amount", async () => {
+      const unhandled = vi.fn();
+      const onUnhandled = (event: PromiseRejectionEvent) => unhandled(event.reason);
+      window.addEventListener("unhandledrejection", onUnhandled);
+      const stale = Object.assign(new Error("project changed"), { code: "staleProject" });
+      const { container, root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockRejectedValue(stale),
+      );
+      try {
+        await act(async () => setValue("0.8"));
+        await act(async () => slider.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+        expect(setEffects).toHaveBeenCalledOnce();
+        expect(useEditorUiStore.getState().toast?.message).toContain("project changed");
+        expect(container.querySelector('[data-testid="generic-effect-item"]')?.textContent).toContain("0%");
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        window.removeEventListener("unhandledrejection", onUnhandled);
+        setEffects.mockRestore();
+        await act(async () => root.unmount());
+      }
+    });
+  });
+  describe("async section tasks follow their own target", () => {
+    const audioClip = (overrides: Partial<Clip> = {}) =>
+      visualClip({ id: "clip-a", mediaRef: "mix-a", ...overrides });
+
+    function setMedia(...ids: string[]) {
+      useMediaStore.setState({
+        items: ids.map((id) => ({ id, name: `${id}.wav`, type: "video" as const, duration: 5, hasAudio: true })),
+        folders: [],
+        importing: false,
+        error: null,
+      });
+    }
+
+    async function renderAudioTab(clips: Clip[], selected: string) {
+      useProjectStore.setState({
+        timeline: { ...timelineWith(clips[0]!), tracks: [{ ...timelineWith(clips[0]!).tracks[0]!, clips }] },
+        projectPath: "/tmp/demo.opentake",
+      });
+      useEditorUiStore.setState({ selectedClipIds: new Set([selected]), inspectorTab: "audio" });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<Inspector />));
+      return { container, root };
+    }
+
+    const buttonIn = (container: HTMLElement, section: string, label: string) =>
+      [...(container.querySelector(`[data-testid="${section}"]`)?.querySelectorAll("button") ?? [])].find(
+        (button) => button.textContent === label,
+      );
+
+    it("drops a stem result that finishes after the clip's source media changed", async () => {
+      setMedia("mix-a", "mix-b");
+      const listen = vi.spyOn(api, "onStemSeparationProgress").mockResolvedValue(() => {});
+      let finish!: (result: api.StemSeparationResult) => void;
+      const separate = vi.spyOn(api, "separateAudioStems").mockImplementation(
+        () => new Promise((resolve) => { finish = resolve; }),
+      );
+      const { container, root } = await renderAudioTab([audioClip()], "clip-a");
+      await act(async () => {
+        buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(separate).toHaveBeenCalledWith("mix-a", "local", null, null, false);
+
+      // Swap Media keeps the clip (and this section instance) but changes its source.
+      await act(async () =>
+        useProjectStore.setState({ timeline: timelineWith(audioClip({ mediaRef: "mix-b" })) }),
+      );
+      await act(async () => {
+        finish({
+          vocalsAssetId: "vocals-a",
+          accompanimentAssetId: "music-a",
+          sourceSha256: "a".repeat(64),
+          execution: "local:opentake-center-v1",
+          modelSha256: "b".repeat(64),
+          vocalSdrImprovementDb: 60,
+        });
+        await Promise.resolve();
+      });
+
+      expect(container.querySelector('[data-testid="stem-separation-result"]')).toBeNull();
+      expect(buttonIn(container, "stem-separation-section", "导入为两条对齐音轨")).toBeUndefined();
+      expect(buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.disabled).toBe(false);
+
+      listen.mockRestore();
+      separate.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("keeps a stem result and a loudness failure on the clip that started them", async () => {
+      setMedia("mix-a", "mix-b");
+      const other = audioClip({ id: "clip-b", mediaRef: "mix-b", startFrame: 90 });
+      vi.spyOn(api, "onStemSeparationProgress").mockResolvedValue(() => {});
+      vi.spyOn(api, "onLoudnessProgress").mockResolvedValue(() => {});
+      let finishStems!: (result: api.StemSeparationResult) => void;
+      vi.spyOn(api, "separateAudioStems").mockImplementation(
+        () => new Promise((resolve) => { finishStems = resolve; }),
+      );
+      let failLoudness!: (reason: Error) => void;
+      vi.spyOn(edit, "analyzeAndApplyLoudness").mockImplementation(
+        () => new Promise((_resolve, reject) => { failLoudness = reject; }),
+      );
+      const { container, root } = await renderAudioTab([audioClip(), other], "clip-a");
+      await act(async () => {
+        buttonIn(container, "stem-separation-section", "分离人声与伴奏")?.click();
+        buttonIn(container, "loudness-section", "分析并应用")?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      await act(async () => useEditorUiStore.setState({ selectedClipIds: new Set([other.id]) }));
+      await act(async () => {
+        finishStems({
+          vocalsAssetId: "vocals-a",
+          accompanimentAssetId: "music-a",
+          sourceSha256: "a".repeat(64),
+          execution: "local:opentake-center-v1",
+          modelSha256: "b".repeat(64),
+          vocalSdrImprovementDb: 60,
+        });
+        failLoudness(new Error("decoder failed"));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(container.querySelector('[data-testid="stem-separation-result"]')).toBeNull();
+      expect(container.querySelector('[data-testid="loudness-section"] [role="alert"]')).toBeNull();
+      // The first clip's failed normalization is still reported, as a toast.
+      expect(useEditorUiStore.getState().toast?.message).toContain("decoder failed");
+
+      vi.restoreAllMocks();
+      await act(async () => root.unmount());
+    });
   });
 });

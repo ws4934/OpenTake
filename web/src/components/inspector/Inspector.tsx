@@ -9,7 +9,7 @@
  * command layer as direct Inspector edits.
  */
 
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -1072,18 +1072,29 @@ function ShaderEffectsSection({ clip, t }: { clip: Clip; t: TFunction }) {
 function GenericEffectsSection({ clip, t }: { clip: Clip; t: TFunction }) {
   const [draft, setDraft] = useState<Effect[]>(() => clip.effects ?? []);
   const [selectedName, setSelectedName] = useState<AdvertisedEffectName>("grayscale");
+  // The mirrored chain a rejected commit falls back to.
+  const committedEffects = useRef(clip.effects);
+  committedEffects.current = clip.effects;
 
   useEffect(() => setDraft(clip.effects ?? []), [clip.id, clip.effects]);
 
   const commit = (next: Effect[]) => {
     setDraft(next);
-    void edit.setEffects([clip.id], next);
+    edit.runTimelineEdit(
+      edit.setEffects([clip.id], next).catch((error: unknown) => {
+        setDraft(committedEffects.current ?? []);
+        throw error;
+      }),
+    );
   };
   const replace = (index: number, nextEffect: Effect) => {
     const next = [...draft];
     next[index] = nextEffect;
     commit(next);
   };
+  // An amount gesture only previews in the draft until it ends.
+  const preview = (index: number, nextEffect: Effect) =>
+    setDraft((current) => current.map((effect, itemIndex) => (itemIndex === index ? nextEffect : effect)));
   const move = (from: number, to: number) => {
     if (to < 0 || to >= draft.length) return;
     const next = [...draft];
@@ -1143,17 +1154,11 @@ function GenericEffectsSection({ clip, t }: { clip: Clip; t: TFunction }) {
             </div>
             {advertised && (
               <Row label={t("inspector.effects.amount")}>
-                <input
-                  aria-label={`${label} ${t("inspector.effects.amount")}`}
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
+                <EffectAmountSlider
+                  label={`${label} ${t("inspector.effects.amount")}`}
                   value={amount}
-                  onChange={(event) => replace(index, {
-                    ...effect,
-                    params: { amount: Number(event.target.value) },
-                  })}
+                  onPreview={(next) => preview(index, { ...effect, params: { amount: next } })}
+                  onCommit={(next) => replace(index, { ...effect, params: { amount: next } })}
                 />
                 <span className="tabular" style={{ marginLeft: SPACE.xs }}>{Math.round(amount * 100)}%</span>
               </Row>
@@ -1163,6 +1168,120 @@ function GenericEffectsSection({ clip, t }: { clip: Clip; t: TFunction }) {
       })}
     </section>
   );
+}
+
+/** Keys that step a focused range input; browsers fire `input` and `change`
+ *  for each step, including auto-repeat. */
+const SLIDER_STEP_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
+
+/** Effect amount slider. Like upstream `AdjustSlider` (live `onChanged`, one
+ *  `onCommit` when the drag ends), a drag or held key only previews the amount
+ *  and the chain is committed once when the gesture ends: pointer release (or
+ *  the native `change` it fires), key release, blur, unmount, or a history
+ *  command. `change` also fires for every keyboard step, so it never ends a
+ *  key gesture. */
+function EffectAmountSlider({
+  label,
+  value,
+  onPreview,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  onPreview: (amount: number) => void;
+  onCommit: (amount: number) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const pending = useRef<{ amount: number; release: () => void } | null>(null);
+  const keyHeld = useRef(false);
+  const commitRef = useRef(onCommit);
+  commitRef.current = onCommit;
+
+  const flush = useCallback(() => {
+    const current = pending.current;
+    pending.current = null;
+    if (!current) return;
+    current.release();
+    commitRef.current(current.amount);
+  }, []);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    const onNativeChange = () => {
+      if (!keyHeld.current) flush();
+    };
+    input.addEventListener("change", onNativeChange);
+    return () => input.removeEventListener("change", onNativeChange);
+  }, [flush]);
+  // A gesture cut short by a selection switch still lands on its own clip.
+  useEffect(() => flush, [flush]);
+
+  return (
+    <input
+      ref={inputRef}
+      aria-label={label}
+      type="range"
+      min={0}
+      max={1}
+      step={0.01}
+      value={value}
+      onChange={(event) => {
+        const amount = Number(event.target.value);
+        pending.current = { amount, release: pending.current?.release ?? edit.holdGestureCommit(flush) };
+        onPreview(amount);
+      }}
+      onPointerUp={flush}
+      onKeyDown={(event) => {
+        if (SLIDER_STEP_KEYS.has(event.key)) keyHeld.current = true;
+      }}
+      onKeyUp={(event) => {
+        if (!SLIDER_STEP_KEYS.has(event.key)) return;
+        keyHeld.current = false;
+        flush();
+      }}
+      onBlur={() => {
+        keyHeld.current = false;
+        flush();
+      }}
+    />
+  );
+}
+
+/** Scope a section's async task to the target it started for (the pattern
+ *  AiEditTab follows with an AbortController). A new target or unmount
+ *  retires the running task, so its late progress, result or error never
+ *  lands on another clip or source; `beginTask()` returns the task's
+ *  `isCurrent` check. Backend work keeps running under each section's own
+ *  cancel command, and a retired task's failure is still reported through
+ *  `reportRetiredTaskFailure`. */
+function useTaskScope(target: string): () => () => boolean {
+  const generation = useRef(0);
+  useEffect(
+    () => () => {
+      generation.current += 1;
+    },
+    [target],
+  );
+  return useCallback(() => {
+    const started = ++generation.current;
+    return () => started === generation.current;
+  }, []);
+}
+
+/** A failure of a task whose section moved on is shown as a toast instead of
+ *  being dropped: it may mean an edit the user started was not applied. */
+function reportRetiredTaskFailure(section: string, message: string) {
+  useEditorUiStore.getState().pushToast(`${section}: ${message}`);
 }
 
 function LoudnessSection({ clip, t }: { clip: Clip; t: TFunction }) {
@@ -1181,23 +1300,28 @@ function LoudnessSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id, clip.loudnessNormalization]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const analyze = async () => {
+    const isCurrent = beginTask();
     setAnalyzing(true);
     setProgress(0);
     setError(null);
     let unlisten = () => {};
     try {
       unlisten = await api.onLoudnessProgress(clip.id, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       await edit.analyzeAndApplyLoudness(clip.id, target, ceiling);
-      setProgress(1);
+      if (isCurrent()) setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/loudness_cancelled/i.test(message)) setError(message);
+      if (/loudness_cancelled/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.loudness"), message);
     } finally {
       unlisten();
-      setAnalyzing(false);
+      if (isCurrent()) setAnalyzing(false);
     }
   };
 
@@ -1280,23 +1404,28 @@ function DenoiseSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id, clip.audioDenoise]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const apply = async () => {
+    const isCurrent = beginTask();
     setApplying(true);
     setProgress(0);
     setError(null);
     let unlisten = () => {};
     try {
       unlisten = await api.onDenoiseProgress(clip.id, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       await edit.prepareAndApplyAudioDenoise(clip.id, mode, strength, previewEnabled);
-      setProgress(1);
+      if (isCurrent()) setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/denoise_cancelled/i.test(message)) setError(message);
+      if (/denoise_cancelled/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.denoise"), message);
     } finally {
       unlisten();
-      setApplying(false);
+      if (isCurrent()) setApplying(false);
     }
   };
 
@@ -1411,7 +1540,10 @@ function StemSeparationSection({
     setError(null);
   }, [sourceAssetId]);
 
+  const beginTask = useTaskScope(sourceAssetId);
+
   const separate = async () => {
+    const isCurrent = beginTask();
     setRunning(true);
     setProgress(0);
     setResult(null);
@@ -1419,7 +1551,7 @@ function StemSeparationSection({
     let unlisten = () => {};
     try {
       unlisten = await api.onStemSeparationProgress(sourceAssetId, ({ done, total }) => {
-        setProgress(total > 0 ? Math.min(1, done / total) : 0);
+        if (isCurrent()) setProgress(total > 0 ? Math.min(1, done / total) : 0);
       });
       const separated = await api.separateAudioStems(
         sourceAssetId,
@@ -1428,23 +1560,23 @@ function StemSeparationSection({
         execution === "hosted" ? model : null,
         execution === "hosted" && uploadConfirmed,
       );
+      if (!isCurrent()) return;
       setResult(separated);
       setImported(false);
       setProgress(1);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/stem_separation_cancelled/i.test(message)) {
-        if (/stem_hosted_privacy_confirmation_required/i.test(message)) {
-          setError(t("inspector.stems.error.confirm"));
-        } else if (/stem_hosted_provider_not_configured/i.test(message)) {
-          setError(t("inspector.stems.error.notConfigured"));
-        } else {
-          setError(message);
-        }
-      }
+      if (/stem_separation_cancelled/i.test(message)) return;
+      const shown = /stem_hosted_privacy_confirmation_required/i.test(message)
+        ? t("inspector.stems.error.confirm")
+        : /stem_hosted_provider_not_configured/i.test(message)
+          ? t("inspector.stems.error.notConfigured")
+          : message;
+      if (isCurrent()) setError(shown);
+      else reportRetiredTaskFailure(t("inspector.section.stems"), shown);
     } finally {
       unlisten();
-      setRunning(false);
+      if (isCurrent()) setRunning(false);
     }
   };
 
@@ -1567,16 +1699,21 @@ function StabilizationSection({ clip, t }: { clip: Clip; t: TFunction }) {
     setError(null);
   }, [clip.id]);
 
+  const beginTask = useTaskScope(clip.id);
+
   const analyze = async () => {
+    const isCurrent = beginTask();
     setAnalyzing(true);
     setError(null);
     try {
       await edit.analyzeAndApplyStabilization(clip.id);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (!/\bcancell?ed\b/i.test(message)) setError(message);
+      if (/\bcancell?ed\b/i.test(message)) return;
+      if (isCurrent()) setError(message);
+      else reportRetiredTaskFailure(t("inspector.section.stabilization"), message);
     } finally {
-      setAnalyzing(false);
+      if (isCurrent()) setAnalyzing(false);
     }
   };
 
@@ -1613,7 +1750,7 @@ function StabilizationSection({ clip, t }: { clip: Clip; t: TFunction }) {
               suffix="%"
               width={56}
               onCommit={(value) =>
-                void edit.adjustStabilization(clip.id, { strength: value / 100 })
+                edit.adjustStabilization(clip.id, { strength: value / 100 })
               }
             />
           </Row>
@@ -1628,7 +1765,7 @@ function StabilizationSection({ clip, t }: { clip: Clip; t: TFunction }) {
               suffix="%"
               width={56}
               onCommit={(value) =>
-                void edit.adjustStabilization(clip.id, { cropMargin: value / 100 })
+                edit.adjustStabilization(clip.id, { cropMargin: value / 100 })
               }
             />
           </Row>
@@ -1708,7 +1845,7 @@ function ColorGradeSection({ clip, t }: { clip: Clip; t: TFunction }) {
 
   const commitGrade = (next: ColorGrade) => {
     setDraft(next);
-    void edit.setColorGrade([clip.id], next);
+    edit.runTimelineEdit(edit.setColorGrade([clip.id], next));
   };
   const updateField = (field: keyof Omit<ColorGrade, "liftGammaGain" | "hslSecondary">, value: number) =>
     setDraft((g) => ({ ...g, [field]: value }));
@@ -1819,7 +1956,7 @@ function ColorGradeSection({ clip, t }: { clip: Clip; t: TFunction }) {
             {t("inspector.action.importLut")}
           </button>
           {clip.lut && (
-            <button type="button" style={controlStyle} onClick={() => void edit.setLut([clip.id], null)}>
+            <button type="button" style={controlStyle} onClick={() => edit.runTimelineEdit(edit.setLut([clip.id], null))}>
               {t("inspector.action.removeLut")}
             </button>
           )}
@@ -1834,7 +1971,7 @@ function ColorGradeSection({ clip, t }: { clip: Clip; t: TFunction }) {
           sensitivity={0.005}
           format={(value) => value.toFixed(3)}
           onChange={setLutIntensity}
-          onCommit={(intensity) => void edit.setLut([clip.id], { ...clip.lut!, intensity })}
+          onCommit={(intensity) => edit.setLut([clip.id], { ...clip.lut!, intensity })}
         />
       )}
       {lutError && (
@@ -1903,7 +2040,7 @@ function ChromaKeySection({ clip, t }: { clip: Clip; t: TFunction }) {
 
   const commitKey = (next: ChromaKey) => {
     setDraft(next);
-    if (enabled) void edit.setChromaKey([clip.id], next);
+    if (enabled) edit.runTimelineEdit(edit.setChromaKey([clip.id], next));
   };
   const updateField = (field: keyof Omit<ChromaKey, "keyColor">, value: number) =>
     setDraft((k) => ({ ...k, [field]: value }));
@@ -1914,9 +2051,9 @@ function ChromaKeySection({ clip, t }: { clip: Clip; t: TFunction }) {
     if (nextEnabled) {
       const next = completeChromaKey(clip.chromaKey);
       setDraft(next);
-      void edit.setChromaKey([clip.id], next);
+      edit.runTimelineEdit(edit.setChromaKey([clip.id], next));
     } else {
-      void edit.setChromaKey([clip.id], null);
+      edit.runTimelineEdit(edit.setChromaKey([clip.id], null));
     }
   };
 
@@ -1999,16 +2136,16 @@ function MaskSection({ clip, t }: { clip: Clip; t: TFunction }) {
 
   const commitMask = (next: Mask) => {
     setDraft(next);
-    void edit.setMasks([clip.id], [next, ...(clip.masks?.slice(1) ?? [])]);
+    edit.runTimelineEdit(edit.setMasks([clip.id], [next, ...(clip.masks?.slice(1) ?? [])]));
   };
   const setMaskEnabled = (nextEnabled: boolean) => {
     setEnabled(nextEnabled);
     if (nextEnabled) {
       const next = completeMask(clip.masks?.[0]);
       setDraft(next);
-      void edit.setMasks([clip.id], [next, ...(clip.masks?.slice(1) ?? [])]);
+      edit.runTimelineEdit(edit.setMasks([clip.id], [next, ...(clip.masks?.slice(1) ?? [])]));
     } else {
-      void edit.setMasks([clip.id], []);
+      edit.runTimelineEdit(edit.setMasks([clip.id], []));
     }
   };
   const setShape = (shape: MaskShape) => commitMask({ ...draft, shape });
@@ -2334,7 +2471,7 @@ function EffectNumberRow({
   suffix?: string;
   width?: number;
   onChange: (v: number) => void;
-  onCommit: (v: number) => void;
+  onCommit: (v: number) => void | PromiseLike<unknown>;
 }) {
   return (
     <Row label={label}>

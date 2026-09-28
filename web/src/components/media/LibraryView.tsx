@@ -32,6 +32,7 @@ import { Icon } from "../ui/Icon";
 import { useT } from "../../i18n";
 import { useEditorUiStore } from "../../store/uiStore";
 import { assetUrl } from "../../lib/asset";
+import { releaseMediaElement } from "../../lib/mediaElement";
 import type { LibraryEntry } from "../../lib/libraryApi";
 import {
   useLibraryStore,
@@ -427,11 +428,12 @@ export function LibraryEntryCard({ entry }: { entry: LibraryEntry }) {
   const [hovered, setHovered] = useState(false);
   const [actionsFocused, setActionsFocused] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Lazy-mount the thumbnail: a video entry without a cached poster falls back
-  // to the full source file, so mounting every card's <video> at once loads
-  // dozens of clips (slow + heavy). Only load once the card scrolls into view.
+  // Lazy-mount the thumbnail once the card nears the viewport. A video
+  // thumbnail also holds a decoder, so it only stays mounted while the card is
+  // in view; an image stays once loaded.
   const cardRef = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(false);
+  const [inView, setInView] = useState(false);
+  const [seen, setSeen] = useState(false);
 
   const name = sourceName(entry.source ?? entry.storedPath) || entry.id;
   // 缩略图优先；否则使用库拥有的持久副本，原始 source 只作最后回退。
@@ -440,14 +442,17 @@ export function LibraryEntryCard({ entry }: { entry: LibraryEntry }) {
   useEffect(() => {
     const el = cardRef.current;
     if (!el || typeof IntersectionObserver === "undefined") {
-      setVisible(true);
+      setInView(true);
+      setSeen(true);
       return;
     }
     const observer = new IntersectionObserver(
-      ([e]) => {
-        if (!e?.isIntersecting) return;
-        setVisible(true);
-        observer.disconnect();
+      (entries) => {
+        // Entries are queued oldest first; the last one is the current state.
+        const latest = entries[entries.length - 1];
+        if (!latest) return;
+        setInView(latest.isIntersecting);
+        if (latest.isIntersecting) setSeen(true);
       },
       { root: null, rootMargin: "200px" },
     );
@@ -499,20 +504,15 @@ export function LibraryEntryCard({ entry }: { entry: LibraryEntry }) {
           overflow: "hidden",
         }}
       >
-        {visible && thumb && entry.type === "image" ? (
+        {seen && thumb && entry.type === "image" ? (
           <img
             src={thumb}
             alt={name}
             loading="lazy"
             style={{ width: "100%", height: "100%", objectFit: "cover" }}
           />
-        ) : visible && thumb && entry.type === "video" ? (
-          <video
-            src={`${thumb}#t=0.1`}
-            muted
-            preload="metadata"
-            style={{ width: "100%", height: "100%", objectFit: "cover" }}
-          />
+        ) : inView && thumb && entry.type === "video" ? (
+          <LibraryVideoThumbnail src={`${thumb}#t=0.1`} />
         ) : (
           <Icon icon={typeIcon(entry.type)} size={26} strokeWidth={1.4} />
         )}
@@ -564,6 +564,26 @@ export function LibraryEntryCard({ entry }: { entry: LibraryEntry }) {
 export function libraryEntryPreviewSource(entry: LibraryEntry): string | undefined {
   const thumb = entry.thumb;
   return thumb?.startsWith("data:") || thumb?.startsWith("blob:") ? thumb : undefined;
+}
+
+/** A muted first-frame video thumbnail that releases its decoder on unmount. */
+function LibraryVideoThumbnail({ src }: { src: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const video = videoRef.current;
+    return () => {
+      if (video) releaseMediaElement(video);
+    };
+  }, []);
+  return (
+    <video
+      ref={videoRef}
+      src={src}
+      muted
+      preload="metadata"
+      style={{ width: "100%", height: "100%", objectFit: "cover" }}
+    />
+  );
 }
 
 function CardAction({

@@ -1,9 +1,11 @@
 /**
  * TextTab (SPEC §6.3). Inspector tab for text clips. Edits `textContent` (text
  * box) plus the full `textStyle` (font / size / color / alignment / background /
- * border / shadow). Text commits on blur; style controls commit immediately via
- * SetClipProperties (the backend writes `clip.text_style`, the render layer
- * re-rasterizes the text box on the next `timeline_changed`).
+ * border / shadow). Text commits on blur; discrete style controls commit
+ * immediately via SetClipProperties (the backend writes `clip.text_style`, the
+ * render layer re-rasterizes the text box on the next `timeline_changed`).
+ * Color pickers report continuously while dragging, so a pick previews locally
+ * and commits once, like upstream's `debouncedCommitTextStyles`.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -16,6 +18,25 @@ import type { TFunction } from "../../i18n";
 import type { Clip, Rgba, TextAlignment, TextStyle } from "../../lib/types";
 
 const COLOR_SWATCH_SIZE = SPACE.lgXl;
+
+/** Idle time after the last color a picker reports before it commits
+ *  (upstream `debouncedCommitClipProperties` uses the same 400 ms). WebKit
+ *  fires `change` together with every `input` while its color panel is
+ *  dragged, so no native event marks the end of the gesture there. */
+const COLOR_COMMIT_DELAY_MS = 400;
+
+/** Style colors a picker can preview before they are committed. */
+type PendingColors = Partial<Record<"color" | "background" | "border" | "shadow", Rgba>>;
+
+function withColors(style: TextStyle, colors: PendingColors): TextStyle {
+  return {
+    ...style,
+    ...(colors.color && { color: colors.color }),
+    ...(colors.background && { background: { ...style.background, color: colors.background } }),
+    ...(colors.border && { border: { ...style.border, color: colors.border } }),
+    ...(colors.shadow && { shadow: { ...style.shadow, color: colors.shadow } }),
+  };
+}
 
 /** Same default as `DEFAULT_TEXT_STYLE` in editActions / domain `TextStyle`. */
 function completeTextStyle(style: TextStyle | undefined): TextStyle {
@@ -65,6 +86,17 @@ const ALIGN_ICON: Record<TextAlignment, LucideIcon> = {
 export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
   const [value, setValue] = useState(clip.textContent ?? "");
   const [style, setStyle] = useState<TextStyle>(() => completeTextStyle(clip.textStyle));
+  const styleRef = useRef(style);
+  styleRef.current = style;
+  // The mirrored style a rejected commit falls back to.
+  const committedStyle = useRef(clip.textStyle);
+  committedStyle.current = clip.textStyle;
+  // Color picks previewed locally and not yet committed.
+  const pendingColors = useRef<{
+    colors: PendingColors;
+    timer: ReturnType<typeof setTimeout>;
+    release: () => void;
+  } | null>(null);
 
   // Typed text not yet committed (null when clean).
   const pendingText = useRef<string | null>(null);
@@ -82,7 +114,13 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
     const next = pendingText.current;
     pendingText.current = null;
     if (next === null || next === (clip.textContent ?? "")) return;
-    void edit.setClipProperties([clip.id], { textContent: next });
+    edit.runTimelineEdit(
+      edit.setClipProperties([clip.id], { textContent: next }).catch((error: unknown) => {
+        // Keep the typed text so the next blur retries it.
+        if (pendingText.current === null) pendingText.current = next;
+        throw error;
+      }),
+    );
   };
   // The Inspector remounts per clip, so switching clips mid-edit unmounts this
   // tab before the textarea blurs: commit to the clip the text was typed for.
@@ -90,10 +128,44 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
   commitTextRef.current = commitText;
   useEffect(() => () => commitTextRef.current(), []);
 
-  // Commit a whole new style (style edits are immediate, like the grade panel).
+  // Commit a whole new style. Pending color picks are folded into it, so a
+  // discrete edit made while a pick is pending commits both at once.
   const commitStyle = (next: TextStyle) => {
-    setStyle(next);
-    void edit.setClipProperties([clip.id], { textStyle: next });
+    const pending = pendingColors.current;
+    pendingColors.current = null;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.release();
+    }
+    const style = pending ? withColors(next, pending.colors) : next;
+    setStyle(style);
+    edit.runTimelineEdit(
+      edit.setClipProperties([clip.id], { textStyle: style }).catch((error: unknown) => {
+        setStyle(completeTextStyle(committedStyle.current));
+        throw error;
+      }),
+    );
+  };
+
+  const flushStyle = () => {
+    if (pendingColors.current) commitStyle(styleRef.current);
+  };
+  const flushStyleRef = useRef(flushStyle);
+  flushStyleRef.current = flushStyle;
+  // Switching clips unmounts this tab: land a pending color on its own clip.
+  useEffect(() => () => flushStyleRef.current(), []);
+
+  // Preview a color the picker reports and commit it once the picker goes
+  // idle, loses focus, or a history command needs it landed first.
+  const previewColor = (target: keyof PendingColors, color: Rgba) => {
+    setStyle((current) => withColors(current, { [target]: color }));
+    const pending = pendingColors.current;
+    if (pending) clearTimeout(pending.timer);
+    pendingColors.current = {
+      colors: { ...pending?.colors, [target]: color },
+      timer: setTimeout(() => flushStyleRef.current(), COLOR_COMMIT_DELAY_MS),
+      release: pending?.release ?? edit.holdGestureCommit(() => flushStyleRef.current()),
+    };
   };
 
   return (
@@ -172,7 +244,8 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
           <ColorSwatch
             label={t("inspector.field.textColor")}
             color={style.color}
-            onCommit={(color) => commitStyle({ ...style, color })}
+            onPreview={(color) => previewColor("color", color)}
+            onDone={flushStyle}
           />
         </Row>
 
@@ -197,9 +270,8 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
           onToggle={(enabled) =>
             commitStyle({ ...style, background: { ...style.background, enabled } })
           }
-          onColor={(color) =>
-            commitStyle({ ...style, background: { ...style.background, color } })
-          }
+          onColor={(color) => previewColor("background", color)}
+          onColorDone={flushStyle}
         />
 
         <ToggleColorRow
@@ -209,7 +281,8 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
           onToggle={(enabled) =>
             commitStyle({ ...style, border: { ...style.border, enabled } })
           }
-          onColor={(color) => commitStyle({ ...style, border: { ...style.border, color } })}
+          onColor={(color) => previewColor("border", color)}
+          onColorDone={flushStyle}
         />
 
         <ToggleColorRow
@@ -219,7 +292,8 @@ export function TextTab({ clip, t }: { clip: Clip; t: TFunction }) {
           onToggle={(enabled) =>
             commitStyle({ ...style, shadow: { ...style.shadow, enabled } })
           }
-          onColor={(color) => commitStyle({ ...style, shadow: { ...style.shadow, color } })}
+          onColor={(color) => previewColor("shadow", color)}
+          onColorDone={flushStyle}
         />
       </div>
     </section>
@@ -284,12 +358,14 @@ function ToggleColorRow({
   color,
   onToggle,
   onColor,
+  onColorDone,
 }: {
   label: string;
   enabled: boolean;
   color: Rgba;
   onToggle: (enabled: boolean) => void;
   onColor: (color: Rgba) => void;
+  onColorDone: () => void;
 }) {
   return (
     <Row label={label}>
@@ -300,7 +376,9 @@ function ToggleColorRow({
         style={{ accentColor: "var(--accent-primary)", cursor: "pointer" }}
         onChange={(e) => onToggle(e.target.checked)}
       />
-      {enabled && <ColorSwatch label={label} color={color} onCommit={onColor} />}
+      {enabled && (
+        <ColorSwatch label={label} color={color} onPreview={onColor} onDone={onColorDone} />
+      )}
     </Row>
   );
 }
@@ -341,22 +419,26 @@ function AlignButton({
 }
 
 /** A native color picker bound to an `Rgba`. The picker edits RGB; alpha is
- *  preserved verbatim (text colors are usually opaque, fills keep their alpha). */
+ *  preserved verbatim (text colors are usually opaque, fills keep their alpha).
+ *  Every reported color is a preview; `onDone` (blur) ends the gesture. */
 function ColorSwatch({
   label,
   color,
-  onCommit,
+  onPreview,
+  onDone,
 }: {
   label: string;
   color: Rgba;
-  onCommit: (color: Rgba) => void;
+  onPreview: (color: Rgba) => void;
+  onDone: () => void;
 }) {
   return (
     <input
       aria-label={label}
       type="color"
       value={rgbaToHex(color)}
-      onChange={(e) => onCommit({ ...hexToRgb(e.target.value), a: color.a })}
+      onChange={(e) => onPreview({ ...hexToRgb(e.target.value), a: color.a })}
+      onBlur={onDone}
       style={{
         width: COLOR_SWATCH_SIZE,
         height: COLOR_SWATCH_SIZE,

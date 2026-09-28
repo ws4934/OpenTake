@@ -2,7 +2,9 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useEditorUiStore } from "../../store/uiStore";
+import * as edit from "../../store/editActions";
 import { ScrubbableNumberField } from "./ScrubbableNumberField";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -208,4 +210,164 @@ it("cancels text and pointer commits when the field becomes disabled", async () 
   });
   expect(onCommit).not.toHaveBeenCalled();
   expect(container.querySelector("input")).toBeNull();
+});
+
+it("leaves IME candidate keys in text-entry mode to the input method", async () => {
+  const input = await enterTextMode();
+  await setInput(input, "８");
+  await act(async () => {
+    input.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", isComposing: true, keyCode: 229, bubbles: true }),
+    );
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", isComposing: true, keyCode: 229, bubbles: true }),
+    );
+    input.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true }));
+  });
+  expect(onCommit).not.toHaveBeenCalled();
+  expect(container.querySelector("input[aria-label='Opacity']")).toBe(input);
+
+  await setInput(input, "8");
+  await act(async () => {
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+  });
+  expect(onCommit).toHaveBeenCalledExactlyOnceWith(8);
+});
+
+describe("arrow-key stepping", () => {
+  function renderWide(
+    commit: (value: number) => void | Promise<unknown> = onCommit,
+    value = 5,
+  ): HTMLElement {
+    act(() =>
+      root.render(
+        <ScrubbableNumberField
+          ariaLabel="Size"
+          value={value}
+          min={0}
+          max={100}
+          sensitivity={0.5}
+          format={(v) => v.toFixed(1)}
+          onChange={onChange}
+          onCommit={commit}
+        />,
+      ),
+    );
+    return container.querySelector<HTMLElement>("[role='spinbutton']")!;
+  }
+
+  function key(target: HTMLElement, type: "keydown" | "keyup", key: string, repeat = false) {
+    act(() => {
+      target.dispatchEvent(new KeyboardEvent(type, { key, repeat, bubbles: true, cancelable: true }));
+    });
+  }
+
+  afterEach(() => {
+    useEditorUiStore.setState({ toast: null });
+  });
+
+  it("previews a held arrow key and commits the accumulated value once on release", () => {
+    const display = renderWide();
+    display.focus();
+    for (let press = 0; press < 10; press++) key(display, "keydown", "ArrowUp", press > 0);
+
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onChange).toHaveBeenLastCalledWith(10);
+    expect(display.textContent).toBe("10.0");
+
+    key(display, "keyup", "ArrowUp");
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(10);
+    expect(display.textContent).toBe("5.0");
+  });
+
+  it("steps quick taps from the committed value while the mirror lags behind", async () => {
+    const commits: Array<{ value: number; resolve: () => void }> = [];
+    const commit = vi.fn((value: number) =>
+      new Promise<void>((resolve) => {
+        commits.push({ value, resolve });
+      }),
+    );
+    const display = renderWide(commit);
+    for (let tap = 0; tap < 4; tap++) {
+      key(display, "keydown", "ArrowDown");
+      key(display, "keyup", "ArrowDown");
+    }
+    expect(commits.map((entry) => entry.value)).toEqual([4.5, 4, 3.5, 3]);
+    expect(display.textContent).toBe("3.0");
+
+    // The edits land and the mirror refreshes: the next tap steps from it.
+    await act(async () => commits.forEach((entry) => entry.resolve()));
+    renderWide(commit, 3);
+    key(display, "keydown", "ArrowUp");
+    key(display, "keyup", "ArrowUp");
+    expect(commits.at(-1)?.value).toBe(3.5);
+  });
+
+  it("commits through the onCommit of the render the key gesture started in", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const display = renderWide(first);
+    key(display, "keydown", "ArrowUp");
+    // e.g. the playhead moved while the key is held: a new target frame.
+    renderWide(second);
+    key(display, "keydown", "ArrowUp", true);
+    key(display, "keyup", "ArrowUp");
+
+    expect(first).toHaveBeenCalledExactlyOnceWith(6);
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it("commits a held key on blur, on unmount and before history, and cancels it on Escape", () => {
+    const hold = vi.spyOn(edit, "holdGestureCommit");
+    let display = renderWide();
+    display.focus();
+    key(display, "keydown", "ArrowUp");
+    act(() => display.blur());
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(5.5);
+
+    onCommit.mockClear();
+    onChange.mockClear();
+    key(display, "keydown", "ArrowUp");
+    key(display, "keydown", "Escape");
+    key(display, "keyup", "ArrowUp");
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onChange).toHaveBeenLastCalledWith(5);
+    expect(display.textContent).toBe("5.0");
+
+    // Undo/redo flush the held gesture first (editActions.holdGestureCommit).
+    key(display, "keydown", "ArrowDown");
+    act(() => hold.mock.calls.at(-1)![0]());
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(4.5);
+    key(display, "keyup", "ArrowDown");
+    expect(onCommit).toHaveBeenCalledOnce();
+
+    onCommit.mockClear();
+    display = renderWide();
+    key(display, "keydown", "ArrowUp");
+    key(display, "keydown", "ArrowUp", true);
+    act(() => root.unmount());
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(6);
+    root = createRoot(container);
+  });
+
+  it("reports a rejected commit as an edit-failure toast and shows the mirror again", async () => {
+    const stale = Object.assign(new Error("project changed"), { code: "staleProject" });
+    const unhandled = vi.fn();
+    const onUnhandled = (event: PromiseRejectionEvent) => unhandled(event.reason);
+    window.addEventListener("unhandledrejection", onUnhandled);
+    try {
+      const display = renderWide(() => Promise.reject(stale));
+      key(display, "keydown", "ArrowUp");
+      key(display, "keyup", "ArrowUp");
+      expect(display.textContent).toBe("5.5");
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+      expect(useEditorUiStore.getState().toast?.message).toContain("project changed");
+      expect(display.textContent).toBe("5.0");
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+    }
+  });
 });

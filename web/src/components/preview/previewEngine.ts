@@ -48,6 +48,7 @@ import {
 import { rustEngineEnabled } from "./rustEngine";
 import { resolveTimelinePlaybackRoute } from "./playbackRoute";
 import { createPreviewAudioGainController } from "./audioGain";
+import { releaseMediaElement } from "../../lib/mediaElement";
 
 interface NativeFrameListenerSlot {
   registration: NativeFrameListenerRegistration | null;
@@ -74,6 +75,15 @@ export interface RustPlaybackCapability {
   endpoint: string | null;
 }
 
+let probedRustPlaybackCapability: RustPlaybackCapability | null = null;
+
+/** Latest capability a mounted preview probed, for callers outside React (the
+ *  Space shortcut). Before any probe answers it matches the hook's initial
+ *  state, so both gates agree from the first keystroke. */
+export function lastRustPlaybackCapability(): RustPlaybackCapability {
+  return probedRustPlaybackCapability ?? { checked: !isTauri, available: false, endpoint: null };
+}
+
 /** The preview endpoint doubles as the feature handshake: it is registered only
  * when `playback-engine` is compiled into the Tauri shell. */
 export function useRustPlaybackCapability(): RustPlaybackCapability {
@@ -86,21 +96,13 @@ export function useRustPlaybackCapability(): RustPlaybackCapability {
   useEffect(() => {
     if (!isTauri) return;
     let disposed = false;
+    const publish = (next: RustPlaybackCapability) => {
+      probedRustPlaybackCapability = next;
+      if (!disposed) setCapability(next);
+    };
     void getPreviewEndpoint().then(
-      (endpoint) => {
-        if (!disposed) {
-          setCapability({
-            checked: true,
-            available: endpoint !== null,
-            endpoint,
-          });
-        }
-      },
-      () => {
-        if (!disposed) {
-          setCapability({ checked: true, available: false, endpoint: null });
-        }
-      },
+      (endpoint) => publish({ checked: true, available: endpoint !== null, endpoint }),
+      () => publish({ checked: true, available: false, endpoint: null }),
     );
     return () => {
       disposed = true;
@@ -211,7 +213,7 @@ export async function startNativePlaybackAfterListener<T>(
 // playback key -> media element, written by <TimelinePlayback> ref callbacks and
 // read by this engine loop. A DOM media element REMOVED from the tree keeps playing
 // (the browser does not auto-pause it), so the renderer pauses on detach via
-// `remove` before dropping the entry.
+// `remove` before dropping the entry, then releases the element's decoder.
 const elements = new Map<string, HTMLMediaElement>();
 const previewAudioGain = createPreviewAudioGainController();
 
@@ -223,9 +225,11 @@ export const previewElements = {
   },
   remove(id: string): void {
     const element = elements.get(id);
-    element?.pause();
-    if (element) previewAudioGain.remove(element);
     elements.delete(id);
+    if (!element) return;
+    element.pause();
+    previewAudioGain.remove(element);
+    releaseMediaElement(element);
   },
   get(id: string): HTMLMediaElement | null {
     return elements.get(id) ?? null;
