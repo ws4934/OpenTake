@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 use opentake_domain::{
     AudioDenoise, CaptionTranslationInput, ChromaKey, Clip, ClipType, ColorGrade, ColorMatchInput,
     Crop, Effect, Interpolation, LoudnessNormalization, LutReference, Mask, MaskShape,
-    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, StabilizationTrack, TextStyle,
-    Timeline, Track, Transform, Transition, TransitionKind, VoiceModelRecord, VolumeScale,
-    MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
+    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, SourceMapping, StabilizationTrack,
+    TextStyle, Timeline, Track, Transform, Transition, TransitionKind, VoiceModelRecord,
+    VolumeScale, MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
 };
 
 use crate::editor_state::EditorState;
@@ -176,6 +176,65 @@ mod motion_media_transaction_tests {
         apply(&mut state, EditCommand::Undo, &ids).unwrap();
         assert_eq!(state.manifest.entries.len(), 1);
         assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "motion-a");
+    }
+
+    #[test]
+    fn register_and_swap_drops_a_stabilization_bound_to_the_replaced_source() {
+        let mut state = EditorState::default();
+        let ids = SeqIdGen::default();
+        let added = apply(
+            &mut state,
+            EditCommand::RegisterMediaAndAddClip {
+                media: media("motion-a"),
+                entry: clip("motion-a", 0),
+                auto_track: true,
+            },
+            &ids,
+        )
+        .unwrap();
+        let clip_id = added.affected_clip_ids[0].clone();
+        let solution = StabilizationTrack {
+            model: "test".into(),
+            model_version: 1,
+            source_identity: "motion-a".into(),
+            strength: 1.0,
+            crop_margin: 0.0,
+            keyframes: vec![
+                opentake_domain::StabilizationKeyframe::default(),
+                opentake_domain::StabilizationKeyframe {
+                    frame: 29,
+                    translation_x: 0.02,
+                    ..opentake_domain::StabilizationKeyframe::default()
+                },
+            ],
+        };
+        apply(
+            &mut state,
+            EditCommand::ApplyStabilization {
+                clip_id: clip_id.clone(),
+                solution: solution.clone(),
+            },
+            &ids,
+        )
+        .unwrap();
+
+        apply(
+            &mut state,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: media("motion-b"),
+                clip_id: clip_id.clone(),
+            },
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "motion-b");
+        assert!(state.timeline.tracks[0].clips[0].stabilization.is_none());
+
+        apply(&mut state, EditCommand::Undo, &ids).unwrap();
+        assert_eq!(
+            state.timeline.tracks[0].clips[0].stabilization,
+            Some(solution)
+        );
     }
 
     #[test]
@@ -2191,7 +2250,7 @@ fn transact(
             return Err(error);
         }
     };
-    if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+    if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
         state.restore(before);
         return Err(error);
     }
@@ -2214,12 +2273,88 @@ fn transact(
 }
 
 /// One post-edit invariant boundary for normal and ripple transactions.
-fn validate_edited_timeline(timeline: &mut Timeline) -> Result<(), EditError> {
+fn finish_edited_timeline(before: &Timeline, timeline: &mut Timeline) -> Result<(), EditError> {
+    rebase_stabilization_after_edit(before, timeline);
     validate_timeline_frame_arithmetic(timeline, "timeline")?;
     prune_invalid_transitions(timeline);
     timeline
         .validate_nested_sequences()
         .map_err(EditError::Invalid)
+}
+
+/// Keep every surviving clip's stabilization on the source frames it was
+/// measured on. An edit that keeps a clip's id but changes which source frame
+/// it shows at each clip-relative frame (a head trim, overwrite or ripple
+/// delete, slip, speed or direction change, timeline frame-rate change) leaves
+/// the corrections on the old clip-relative frames; move them with the source
+/// here, once, so no edit path can forget to. A clip whose media changed
+/// drops a solution measured on other media. Solutions the command itself
+/// replaced (apply, split, dissolve) are left alone, and undo/redo restore
+/// snapshots without passing through here.
+fn rebase_stabilization_after_edit(before: &Timeline, after: &mut Timeline) {
+    let mut previous = HashMap::new();
+    collect_stabilized_clips(before, &mut previous);
+    if !previous.is_empty() {
+        rebase_stabilized_clips(after, &previous);
+    }
+}
+
+fn collect_stabilized_clips<'a>(
+    timeline: &'a Timeline,
+    out: &mut HashMap<&'a str, (&'a Clip, i32)>,
+) {
+    for clip in timeline.tracks.iter().flat_map(|track| &track.clips) {
+        if clip.stabilization.is_some() {
+            out.insert(clip.id.as_str(), (clip, timeline.fps));
+        }
+    }
+    for sequence in &timeline.nested_sequences {
+        collect_stabilized_clips(&sequence.timeline, out);
+    }
+}
+
+fn rebase_stabilized_clips(timeline: &mut Timeline, previous: &HashMap<&str, (&Clip, i32)>) {
+    let fps = timeline.fps;
+    for clip in timeline
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.clips)
+    {
+        let Some(&(old, old_fps)) = previous.get(clip.id.as_str()) else {
+            continue;
+        };
+        if clip.stabilization != old.stabilization {
+            continue;
+        }
+        if clip.media_ref != old.media_ref {
+            if clip
+                .stabilization
+                .as_ref()
+                .is_some_and(|solution| solution.source_identity != clip.media_ref)
+            {
+                clip.stabilization = None;
+            }
+            continue;
+        }
+        let fps_ratio = if old_fps > 0 && fps > 0 {
+            f64::from(fps) / f64::from(old_fps)
+        } else {
+            1.0
+        };
+        let (Some(from), Some(to)) = (SourceMapping::of(old), SourceMapping::of(clip)) else {
+            continue;
+        };
+        if from == to && fps_ratio == 1.0 {
+            continue;
+        }
+        clip.stabilization = clip
+            .stabilization
+            .as_ref()
+            .and_then(|solution| solution.rebased(from, to, fps_ratio));
+    }
+    for sequence in &mut timeline.nested_sequences {
+        rebase_stabilized_clips(&mut sequence.timeline, previous);
+    }
 }
 
 /// Keep transition pair identity aligned with the actual cut graph after every
@@ -6107,7 +6242,7 @@ fn ripple_delete_ranges(
             Err(EditError::Refused(reason))
         }
         RippleOutcome::Ok(report) => {
-            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+            if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }
@@ -6164,7 +6299,7 @@ fn ripple_delete_clips(
             Err(EditError::Refused(reason))
         }
         Ok(()) => {
-            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+            if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }

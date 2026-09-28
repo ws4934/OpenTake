@@ -13,6 +13,7 @@
 
 use crate::clip::Clip;
 use crate::keyframe::{split_keyframe_track, AnimPair};
+use crate::stabilization::SourceMapping;
 
 /// Split `clip` at the timeline frame `at_frame`, returning `(left, right)`.
 ///
@@ -100,6 +101,18 @@ pub fn split_clip(clip: &Clip, at_frame: i32, right_id: impl Into<String>) -> Op
         split_keyframe_track(clip.rotation_track.as_ref(), split_offset, 0.0);
     (left.crop_track, right.crop_track) =
         split_keyframe_track(clip.crop_track.as_ref(), split_offset, clip.crop);
+
+    // Stabilization corrections belong to source frames: each half moves them
+    // with the source frame it now starts on. Unlike the animatable tracks,
+    // both halves keep every correction, because the conservative crop zoom is
+    // computed over all of them and the picture must not change at the cut.
+    if let Some(stabilization) = &clip.stabilization {
+        let from = SourceMapping::of(clip)?;
+        for half in [&mut left, &mut right] {
+            half.stabilization =
+                SourceMapping::of(half).and_then(|to| stabilization.rebased(from, to, 1.0));
+        }
+    }
 
     Some((left, right))
 }

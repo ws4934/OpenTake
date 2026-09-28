@@ -13,7 +13,7 @@ use opentake_domain::{
 };
 use opentake_domain::{
     Clip, ClipType, LoudnessNormalization, MediaManifest, MediaManifestEntry, MediaSource,
-    Timeline, Track, Transform,
+    StabilizationKeyframe, StabilizationTrack, Timeline, Track, Transform,
 };
 use opentake_ops::command::{
     NewTrackClipMode, PasteClipEntry, PlaceMediaTarget, ProjectTimelineSettings, UnplacedClipEntry,
@@ -2868,6 +2868,249 @@ fn ripple_delete_clips_rejects_unknown_clip() {
         Err(EditError::Invalid(_))
     ));
     assert_eq!(st.version(), 0);
+}
+
+// ---- stabilization follows the source ------------------------------------
+
+/// Correction of `0.001 * s` for source frame `s` of `media_ref`.
+fn stabilization_ramp(media_ref: &str) -> StabilizationTrack {
+    StabilizationTrack {
+        model: "test".into(),
+        model_version: 1,
+        source_identity: media_ref.into(),
+        strength: 1.0,
+        crop_margin: 0.0,
+        keyframes: vec![
+            StabilizationKeyframe::default(),
+            StabilizationKeyframe {
+                frame: 100,
+                translation_x: 0.1,
+                ..StabilizationKeyframe::default()
+            },
+        ],
+    }
+}
+
+fn stabilized_clip(id: &str, start: i32, duration: i32) -> Clip {
+    let mut clip = Clip::new(id, "asset-shaky", start, duration);
+    clip.stabilization = Some(stabilization_ramp("asset-shaky"));
+    clip
+}
+
+fn stabilized_state() -> EditorState {
+    state(vec![video_track(
+        "v",
+        true,
+        vec![stabilized_clip("c", 0, 100)],
+    )])
+}
+
+/// Horizontal correction the renderer applies to `clip_id` at `timeline_frame`.
+fn correction_at(st: &EditorState, clip_id: &str, timeline_frame: i32) -> f64 {
+    let clip = find_clip(st, clip_id);
+    clip.stabilization
+        .as_ref()
+        .expect("stabilization is kept")
+        .sample(timeline_frame - clip.start_frame)
+        .translation_x
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+}
+
+#[test]
+fn split_and_head_trims_keep_stabilization_on_the_source_frames() {
+    let ids = SeqIdGen::new("stabilized-");
+
+    let mut st = stabilized_state();
+    let right = apply(
+        &mut st,
+        EditCommand::SplitClip {
+            clip_id: "c".into(),
+            at_frame: 50,
+        },
+        &ids,
+    )
+    .unwrap()
+    .affected_clip_ids[0]
+        .clone();
+    assert_close(correction_at(&st, &right, 60), 0.06);
+    assert_close(correction_at(&st, "c", 30), 0.03);
+
+    let mut st = stabilized_state();
+    apply(
+        &mut st,
+        EditCommand::TrimClips {
+            edits: vec![("c".into(), 20, 0)],
+        },
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(find_clip(&st, "c").start_frame, 20);
+    assert_close(correction_at(&st, "c", 60), 0.06);
+
+    // Placing a clip over the head trims it through the overwrite path.
+    let mut st = stabilized_state();
+    apply(
+        &mut st,
+        EditCommand::AddClips {
+            entries: vec![entry(0, ClipType::Video, 0, 30)],
+        },
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(find_clip(&st, "c").start_frame, 30);
+    assert_close(correction_at(&st, "c", 60), 0.06);
+
+    // Ripple-deleting the head pulls the remaining source frames left.
+    let mut st = stabilized_state();
+    apply(
+        &mut st,
+        EditCommand::RippleDeleteRanges {
+            track_index: 0,
+            ranges: vec![FrameRange { start: 0, end: 20 }],
+        },
+        &ids,
+    )
+    .unwrap();
+    let clip = &st.timeline.tracks[0].clips[0];
+    assert_eq!((clip.start_frame, clip.trim_start_frame), (0, 20));
+    let id = clip.id.clone();
+    assert_close(correction_at(&st, &id, 40), 0.06);
+}
+
+#[test]
+fn retime_slip_reverse_and_frame_rate_keep_stabilization_on_the_source_frames() {
+    let ids = SeqIdGen::new("stabilized-");
+    let set = |st: &mut EditorState, properties: ClipProperties| {
+        apply(
+            st,
+            EditCommand::SetClipProperties {
+                clip_ids: vec!["c".into()],
+                properties: Box::new(properties),
+            },
+            &ids,
+        )
+        .unwrap();
+    };
+
+    let mut st = stabilized_state();
+    apply(
+        &mut st,
+        EditCommand::SetClipSpeed {
+            clip_ids: vec!["c".into()],
+            speed: 2.0,
+            ripple: true,
+        },
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(find_clip(&st, "c").duration_frames, 50);
+    assert_close(correction_at(&st, "c", 25), 0.05);
+    assert_close(correction_at(&st, "c", 40), 0.08);
+
+    let mut st = stabilized_state();
+    set(
+        &mut st,
+        ClipProperties {
+            trim_start_frame: Some(10),
+            ..ClipProperties::default()
+        },
+    );
+    assert_close(correction_at(&st, "c", 20), 0.03);
+
+    let mut st = stabilized_state();
+    set(
+        &mut st,
+        ClipProperties {
+            reversed: Some(true),
+            ..ClipProperties::default()
+        },
+    );
+    assert_close(correction_at(&st, "c", 0), 0.099);
+    assert_close(correction_at(&st, "c", 99), 0.0);
+
+    let mut st = stabilized_state();
+    apply(
+        &mut st,
+        EditCommand::SetTimelineSettings {
+            fps: 60,
+            width: 1920,
+            height: 1080,
+        },
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(find_clip(&st, "c").duration_frames, 200);
+    assert_close(correction_at(&st, "c", 100), 0.05);
+}
+
+#[test]
+fn dissolve_keeps_a_childs_stabilization_on_its_source_frames() {
+    let mut st = state(vec![video_track("top", true, vec![])]);
+    let ids = SeqIdGen::new("stabilized-");
+    let compound = create_compound(
+        &mut st,
+        &ids,
+        vec![video_track(
+            "child-track",
+            true,
+            vec![stabilized_clip("child", 0, 100)],
+        )],
+        100,
+    );
+    apply(
+        &mut st,
+        EditCommand::TrimClips {
+            edits: vec![(compound.clone(), 20, 0)],
+        },
+        &ids,
+    )
+    .unwrap();
+
+    apply(
+        &mut st,
+        EditCommand::DissolveNestedSequence { clip_id: compound },
+        &ids,
+    )
+    .unwrap();
+
+    // Root frame f showed child frame f, i.e. source frame f.
+    let (_, leaf) = clip_by_media(&st, "asset-shaky");
+    let id = leaf.id.clone();
+    assert_eq!(leaf.start_frame, 20);
+    assert_close(correction_at(&st, &id, 60), 0.06);
+}
+
+#[test]
+fn swap_media_drops_a_stabilization_bound_to_the_old_source() {
+    let mut st = state_with_media(
+        vec![video_track("v", true, vec![stabilized_clip("c", 0, 30)])],
+        vec![
+            media_entry("asset-shaky", ClipType::Video, 2.0),
+            media_entry("asset-other", ClipType::Video, 2.0),
+        ],
+    );
+    let ids = SeqIdGen::new("stabilized-");
+
+    apply(
+        &mut st,
+        EditCommand::SwapMedia {
+            clip_id: "c".into(),
+            media_ref: "asset-other".into(),
+        },
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(find_clip(&st, "c").media_ref, "asset-other");
+    assert!(find_clip(&st, "c").stabilization.is_none());
+
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    assert_eq!(
+        find_clip(&st, "c").stabilization,
+        Some(stabilization_ramp("asset-shaky"))
+    );
 }
 
 // ---- swap_media ------------------------------------------------------------

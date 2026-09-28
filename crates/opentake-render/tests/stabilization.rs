@@ -1,4 +1,4 @@
-use opentake_domain::{Clip, ClipType, Timeline, Track};
+use opentake_domain::{Clip, ClipType, StabilizationKeyframe, StabilizationTrack, Timeline, Track};
 use opentake_media::analysis::{
     analyze_stabilization, StabilizationConfig, StabilizationMotionSample,
 };
@@ -146,4 +146,41 @@ fn synthetic_shake_produces_editable_undoable_preview_export_solution() {
         &cancelled,
     )
     .is_err());
+}
+
+#[test]
+fn a_solution_measured_on_other_media_is_not_applied() {
+    let solution = |source_identity: &str| StabilizationTrack {
+        model: "test".into(),
+        model_version: 1,
+        source_identity: source_identity.into(),
+        strength: 1.0,
+        crop_margin: 0.0,
+        keyframes: vec![
+            StabilizationKeyframe {
+                frame: 0,
+                translation_x: 0.05,
+                ..StabilizationKeyframe::default()
+            },
+            StabilizationKeyframe {
+                frame: 10,
+                translation_x: 0.05,
+                ..StabilizationKeyframe::default()
+            },
+        ],
+    };
+    let draw_at_frame_5 = |stabilization: Option<StabilizationTrack>| {
+        let mut clip = Clip::new("clip", "asset-new", 0, 10);
+        clip.stabilization = stabilization;
+        let mut track = Track::new("video-track", ClipType::Video);
+        track.clips.push(clip);
+        let mut timeline = Timeline::new();
+        timeline.tracks.push(track);
+        let plan = build_render_plan(&timeline, RenderSize::new(1920, 1080), &FullHdSource);
+        plan.frame(&timeline, 5).draws[0].affine
+    };
+
+    let plain = draw_at_frame_5(None);
+    assert_ne!(draw_at_frame_5(Some(solution("asset-new"))), plain);
+    assert_eq!(draw_at_frame_5(Some(solution("asset-old"))), plain);
 }
