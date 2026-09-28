@@ -1537,7 +1537,17 @@ impl LibraryStore {
             )));
         }
         self.rebind_stage_if_moved(&mut prepared)?;
-        let _guard = self.lock_writes();
+        let guard = self.lock_writes();
+        let outcome = self.publish_locked(&mut prepared);
+        // Close the retained stage/final handles before other writers can look
+        // the content up: on Windows they carry DELETE access, which would make
+        // a concurrent verification open fail with a sharing violation.
+        drop(prepared);
+        drop(guard);
+        outcome
+    }
+
+    fn publish_locked(&self, prepared: &mut PreparedFavorite) -> Result<FavoriteOutcome> {
         let mut manifest = self.load_manifest()?;
         let manifest_before = manifest.clone();
         manifest.version = MANIFEST_VERSION;
@@ -1548,7 +1558,7 @@ impl LibraryStore {
             .cloned()
         {
             if prepared.stage.is_some() && self.stored_index()?.lookup(&existing.id)?.is_none() {
-                let mut final_leaf = self.publish_stage(&mut prepared)?;
+                let mut final_leaf = self.publish_stage(prepared)?;
                 final_leaf.disarm_cleanup();
             }
             return Ok(FavoriteOutcome {
@@ -1558,7 +1568,7 @@ impl LibraryStore {
         }
 
         if prepared.final_leaf.is_none() {
-            let final_leaf = self.publish_stage(&mut prepared)?;
+            let final_leaf = self.publish_stage(prepared)?;
             prepared.final_leaf = Some(final_leaf);
         }
         if !prepared
@@ -2517,6 +2527,9 @@ mod tests {
         // One copy: the published file is the very inode the source was
         // streamed into, moved by rename.
         assert_eq!(Handle::from_path(&stored).unwrap(), staged);
+        // Windows: the cloned stage handle carries DELETE access; release it
+        // like publication releases its own before other writers look it up.
+        drop(staged);
         assert_eq!(
             nonempty_file_count(&store.files_dir().join(STAGING_SUBDIR)),
             0
