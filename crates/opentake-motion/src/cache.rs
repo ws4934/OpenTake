@@ -9,15 +9,23 @@
 //! The keying ([`content_hash`]) is **pure** and unit-tested with no filesystem.
 //! [`MotionCache`] is the thin directory wrapper that maps a key to a folder and
 //! reports hit/miss; the renderer writes frames into that folder.
+//!
+//! The cache is bounded: [`MotionCache::evict`] removes the least recently used
+//! entries above a byte budget (and abandoned partial renders past an age
+//! limit), and [`MotionCache::clear`] empties it. Both skip every directory a
+//! [`MotionCachePin`] holds, so a render in progress, or frames still being
+//! encoded or read, are never deleted underneath their owner.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::MotionResult;
+use crate::error::{MotionError, MotionResult};
 use crate::source::{MotionRenderRequest, MotionSource, ParamValue};
 
 const COMPLETION_MARKER_FILE: &str = ".opentake-motion-complete-v4";
@@ -26,7 +34,61 @@ const COMPLETION_MARKER_FILE: &str = ".opentake-motion-complete-v4";
 /// resume from them; frames without it are never reused. Bump it together
 /// with the completion marker whenever the captured pixels change.
 const PARTIAL_MARKER_FILE: &str = ".opentake-motion-partial-v4";
+/// Evicted entries are renamed to this prefix before deletion so a concurrent
+/// cache lookup can never observe a half-deleted frame set.
+const EVICTING_PREFIX: &str = ".evicting-";
 static COMPLETION_MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
+static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PINNED_DIRS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+/// Default byte budget for one Motion frame cache. Single-frame previews and
+/// abandoned partial renders are rebuilt on demand, so the cache keeps only
+/// the most recently used entries within this budget.
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Default age after which an unfinished (not completed) render directory is
+/// removed even when the cache is within its byte budget.
+pub const DEFAULT_INCOMPLETE_RENDER_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Bounds applied by [`MotionCache::evict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionCacheLimits {
+    /// Total bytes the cache may keep; least recently used entries beyond it
+    /// are removed.
+    pub max_bytes: u64,
+    /// Unfinished render directories untouched for this long are removed.
+    pub max_incomplete_age: Duration,
+}
+
+impl Default for MotionCacheLimits {
+    fn default() -> Self {
+        MotionCacheLimits {
+            max_bytes: DEFAULT_CACHE_MAX_BYTES,
+            max_incomplete_age: DEFAULT_INCOMPLETE_RENDER_MAX_AGE,
+        }
+    }
+}
+
+/// What an eviction or clear pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MotionCacheSweep {
+    /// Cache entries (render directories) removed.
+    pub removed_entries: usize,
+    /// Bytes those entries held.
+    pub removed_bytes: u64,
+    /// Bytes still held by the remaining entries, pinned ones included.
+    pub retained_bytes: u64,
+}
+
+/// Keeps one render directory out of [`MotionCache::evict`] and
+/// [`MotionCache::clear`] while its frames are being written, encoded or read.
+/// Pins are process-wide, so every renderer and cache handle sharing a
+/// directory observes them. Dropping the pin releases it.
+#[must_use = "dropping the pin immediately makes the directory evictable"]
+#[derive(Debug)]
+pub struct MotionCachePin {
+    dir: Option<PathBuf>,
+}
 
 /// Compute the content hash (lowercase hex SHA-256) for a render request.
 ///
@@ -168,7 +230,10 @@ impl MotionCache {
     pub(crate) fn begin_render(&self, req: &MotionRenderRequest) -> MotionResult<PathBuf> {
         let dir = self.ensure_dir(req)?;
         Self::remove_completion_marker(&dir)?;
-        if !partial_marker(&dir).is_file() {
+        let marker = partial_marker(&dir);
+        if marker.is_file() {
+            touch_file(&marker);
+        } else {
             remove_frame_files(&dir)?;
             publish_marker(&dir, PARTIAL_MARKER_FILE, b"opentake-motion-partial/v4\n")?;
         }
@@ -213,11 +278,284 @@ impl MotionCache {
         Ok(req.duration_frames as usize)
     }
 
+    /// Record a cache hit so least-recently-used eviction keeps this entry.
+    pub(crate) fn touch(dir: &Path) {
+        touch_file(&completion_marker(dir));
+    }
+
     /// The expected per-frame file path inside a render dir: zero-padded so
     /// lexical order == playback order (`frame_00000.png`).
     pub fn frame_file(dir: &Path, frame_index: usize) -> PathBuf {
         dir.join(format!("frame_{frame_index:05}.png"))
     }
+
+    /// Keep the directory of `req` out of eviction and clearing until the
+    /// returned pin is dropped or discarded.
+    pub fn pin(&self, req: &MotionRenderRequest) -> MotionCachePin {
+        MotionCachePin::new(self.dir_for(req))
+    }
+
+    /// Remove least recently used entries until the cache fits
+    /// `limits.max_bytes`, and every unfinished render untouched for
+    /// `limits.max_incomplete_age`. Pinned entries and unknown files are never
+    /// removed. Returns the first removal failure after trying every candidate.
+    pub fn evict(&self, limits: MotionCacheLimits) -> MotionResult<MotionCacheSweep> {
+        let now = SystemTime::now();
+        let mut failures = Vec::new();
+        let mut entries = self.entries(&mut failures)?;
+        let mut sweep = MotionCacheSweep {
+            retained_bytes: entries.iter().map(|entry| entry.bytes).sum(),
+            ..MotionCacheSweep::default()
+        };
+        entries.sort_by_key(|entry| entry.last_used);
+        for entry in entries {
+            let abandoned = !entry.complete
+                && now
+                    .duration_since(entry.last_used)
+                    .is_ok_and(|age| age >= limits.max_incomplete_age);
+            if sweep.retained_bytes <= limits.max_bytes && !abandoned {
+                continue;
+            }
+            match self.remove_unpinned(&entry.path) {
+                Ok(true) => {
+                    sweep.removed_entries += 1;
+                    sweep.removed_bytes += entry.bytes;
+                    sweep.retained_bytes = sweep.retained_bytes.saturating_sub(entry.bytes);
+                }
+                Ok(false) => {}
+                Err(error) => failures.push(format!("{}: {error}", entry.path.display())),
+            }
+        }
+        sweep_result(sweep, failures)
+    }
+
+    /// Remove every unpinned entry and recreate the (empty) cache root. Pinned
+    /// entries, which renders or encoders are using, stay in place.
+    pub fn clear(&self) -> MotionResult<MotionCacheSweep> {
+        let mut failures = Vec::new();
+        let entries = self.entries(&mut failures)?;
+        let mut sweep = MotionCacheSweep::default();
+        for entry in entries {
+            match self.remove_unpinned(&entry.path) {
+                Ok(true) => {
+                    sweep.removed_entries += 1;
+                    sweep.removed_bytes += entry.bytes;
+                }
+                Ok(false) => sweep.retained_bytes += entry.bytes,
+                Err(error) => {
+                    sweep.retained_bytes += entry.bytes;
+                    failures.push(format!("{}: {error}", entry.path.display()));
+                }
+            }
+        }
+        if let Err(error) = std::fs::create_dir_all(&self.root) {
+            failures.push(format!("recreate {}: {error}", self.root.display()));
+        }
+        sweep_result(sweep, failures)
+    }
+
+    /// Scan the cache root: content-hash directories become eviction
+    /// candidates; leftovers of an interrupted eviction are deleted here.
+    fn entries(&self, failures: &mut Vec<String>) -> MotionResult<Vec<CacheEntry>> {
+        let read = match std::fs::read_dir(&self.root) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut entries = Vec::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Symlinks and plain files are never followed or removed.
+            if !metadata.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with(EVICTING_PREFIX) {
+                if let Err(error) = std::fs::remove_dir_all(&path) {
+                    failures.push(format!("{}: {error}", path.display()));
+                }
+                continue;
+            }
+            if !is_content_hash(name) {
+                continue;
+            }
+            // Completion is refreshed on every cache hit and a partial render
+            // on every (re)start; entries without either predate both markers.
+            let last_used = modified(&completion_marker(&path))
+                .or_else(|| modified(&partial_marker(&path)))
+                .or_else(|| metadata.modified().ok())
+                .unwrap_or(UNIX_EPOCH);
+            entries.push(CacheEntry {
+                bytes: tree_bytes(&path),
+                complete: completion_marker(&path).is_file(),
+                last_used,
+                path,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Move an unpinned entry out of the cache namespace, then delete it. The
+    /// rename happens under the pin lock, so a render that pins the entry
+    /// afterwards simply starts from an empty directory.
+    fn remove_unpinned(&self, dir: &Path) -> std::io::Result<bool> {
+        let trash = {
+            let pins = pinned_dirs();
+            if pins.contains_key(dir) {
+                return Ok(false);
+            }
+            let Some(trash) = trash_path(dir) else {
+                return Ok(false);
+            };
+            match std::fs::rename(dir, &trash) {
+                Ok(()) => trash,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        };
+        std::fs::remove_dir_all(trash).map(|()| true)
+    }
+}
+
+impl MotionCachePin {
+    fn new(dir: PathBuf) -> Self {
+        *pinned_dirs().entry(dir.clone()).or_insert(0) += 1;
+        MotionCachePin { dir: Some(dir) }
+    }
+
+    /// The pinned render directory.
+    pub fn dir(&self) -> &Path {
+        self.dir
+            .as_deref()
+            .expect("a live cache pin always holds its directory")
+    }
+
+    /// Release the pin and delete the directory unless another pin still holds
+    /// it, e.g. once its frames were encoded into a published video. Returns
+    /// whether the directory was removed.
+    pub fn discard(mut self) -> MotionResult<bool> {
+        let dir = self
+            .dir
+            .take()
+            .expect("a live cache pin always holds its directory");
+        let trash = {
+            let mut pins = pinned_dirs();
+            if release(&mut pins, &dir) > 0 {
+                return Ok(false);
+            }
+            let Some(trash) = trash_path(&dir) else {
+                return Ok(false);
+            };
+            match std::fs::rename(&dir, &trash) {
+                Ok(()) => trash,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        std::fs::remove_dir_all(trash)?;
+        Ok(true)
+    }
+}
+
+impl Drop for MotionCachePin {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            release(&mut pinned_dirs(), &dir);
+        }
+    }
+}
+
+struct CacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    complete: bool,
+    last_used: SystemTime,
+}
+
+fn pinned_dirs() -> MutexGuard<'static, HashMap<PathBuf, usize>> {
+    PINNED_DIRS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop one pin of `dir`, returning how many remain.
+fn release(pins: &mut HashMap<PathBuf, usize>, dir: &Path) -> usize {
+    let Some(count) = pins.get_mut(dir) else {
+        return 0;
+    };
+    *count = count.saturating_sub(1);
+    let remaining = *count;
+    if remaining == 0 {
+        pins.remove(dir);
+    }
+    remaining
+}
+
+/// A sibling name outside the content-hash namespace for an entry that is
+/// about to be deleted.
+fn trash_path(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_str()?;
+    let counter = EVICTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Some(dir.parent()?.join(format!(
+        "{EVICTING_PREFIX}{name}-{pid}-{counter}",
+        pid = std::process::id()
+    )))
+}
+
+fn sweep_result(sweep: MotionCacheSweep, failures: Vec<String>) -> MotionResult<MotionCacheSweep> {
+    if failures.is_empty() {
+        Ok(sweep)
+    } else {
+        Err(MotionError::Io(std::io::Error::other(format!(
+            "Motion frame cache cleanup failed: {}",
+            failures.join("; ")
+        ))))
+    }
+}
+
+fn is_content_hash(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Best-effort recency update; a failure only makes the entry look older to
+/// eviction.
+fn touch_file(path: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Recursive size of the regular files under `path`; symlinks are neither
+/// followed nor counted.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => tree_bytes(&path),
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                _ => 0,
+            }
+        })
+        .sum()
 }
 
 /// Write `contents` to `dir/name` with a write-sync-rename sequence so
@@ -567,6 +905,159 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// A completed cache entry of roughly `bytes` whose last use was `age` ago.
+    fn cached_entry(cache: &MotionCache, body: &str, bytes: usize, age: Duration) -> PathBuf {
+        let req = MotionRenderRequest::new(MotionSource::code(body), 30, 1, 4, 4);
+        let dir = cache.begin_render(&req).unwrap();
+        std::fs::write(MotionCache::frame_file(&dir, 0), vec![0_u8; bytes]).unwrap();
+        MotionCache::mark_complete(&dir).unwrap();
+        let used = SystemTime::now() - age;
+        for marker in [completion_marker(&dir), partial_marker(&dir)] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(marker)
+                .unwrap()
+                .set_modified(used)
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn eviction_keeps_the_most_recently_used_entries_within_the_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let oldest = cached_entry(&cache, "<oldest/>", 1000, Duration::from_secs(400));
+        let pinned_old = cached_entry(&cache, "<pinned/>", 1000, Duration::from_secs(300));
+        let older = cached_entry(&cache, "<older/>", 1000, Duration::from_secs(200));
+        let newer = cached_entry(&cache, "<newer/>", 1000, Duration::from_secs(100));
+        let newest = cached_entry(&cache, "<newest/>", 1000, Duration::from_secs(1));
+        let unknown = tmp.path().join("not-a-cache-entry");
+        std::fs::create_dir(&unknown).unwrap();
+        std::fs::write(unknown.join("keep.bin"), vec![0_u8; 5000]).unwrap();
+        let pin = MotionCachePin::new(pinned_old.clone());
+
+        let sweep = cache
+            .evict(MotionCacheLimits {
+                max_bytes: 3500,
+                max_incomplete_age: Duration::from_secs(3600),
+            })
+            .unwrap();
+
+        assert!(!oldest.exists() && !older.exists());
+        assert!(
+            pinned_old.is_dir(),
+            "a pinned render directory is never evicted"
+        );
+        assert!(newer.is_dir() && newest.is_dir());
+        assert!(
+            unknown.join("keep.bin").is_file(),
+            "unknown entries are never swept"
+        );
+        assert_eq!(sweep.removed_entries, 2);
+        assert!(sweep.retained_bytes <= 3500, "{sweep:?}");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(EVICTING_PREFIX)),
+            "eviction must not leave renamed entries behind"
+        );
+
+        drop(pin);
+        cache
+            .evict(MotionCacheLimits {
+                max_bytes: 2500,
+                max_incomplete_age: Duration::from_secs(3600),
+            })
+            .unwrap();
+        assert!(
+            !pinned_old.exists(),
+            "a released pin makes the entry evictable"
+        );
+        assert!(newer.is_dir() && newest.is_dir());
+    }
+
+    #[test]
+    fn eviction_removes_abandoned_partial_renders_by_age_and_keeps_recent_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let abandoned_req = MotionRenderRequest::new(MotionSource::code("<a/>"), 30, 4, 4, 4);
+        let abandoned = cache.begin_render(&abandoned_req).unwrap();
+        write_frames(&abandoned, 2, 4, 4);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(partial_marker(&abandoned))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        let recent_req = MotionRenderRequest::new(MotionSource::code("<b/>"), 30, 4, 4, 4);
+        let recent = cache.begin_render(&recent_req).unwrap();
+        write_frames(&recent, 2, 4, 4);
+
+        let sweep = cache
+            .evict(MotionCacheLimits {
+                max_bytes: u64::MAX,
+                max_incomplete_age: Duration::from_secs(3600),
+            })
+            .unwrap();
+        assert_eq!(sweep.removed_entries, 1);
+        assert!(!abandoned.exists());
+        assert_eq!(
+            MotionCache::completed_prefix(&recent, &recent_req).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn clear_skips_pinned_entries_and_recreates_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("motion-frames");
+        let cache = MotionCache::new(&root);
+        let idle = cached_entry(&cache, "<idle/>", 64, Duration::ZERO);
+        let active_req = MotionRenderRequest::new(MotionSource::code("<active/>"), 30, 1, 4, 4);
+        let active = cache.begin_render(&active_req).unwrap();
+        let pin = cache.pin(&active_req);
+        assert_eq!(pin.dir(), active);
+
+        let sweep = cache.clear().unwrap();
+        assert!(!idle.exists());
+        assert!(active.is_dir(), "a render in progress keeps its directory");
+        assert_eq!(sweep.removed_entries, 1);
+
+        drop(pin);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(cache.clear().unwrap(), MotionCacheSweep::default());
+        assert!(root.is_dir(), "clearing recreates the cache root");
+    }
+
+    #[test]
+    fn discarding_a_pin_removes_its_directory_once_no_other_pin_holds_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let req = MotionRenderRequest::new(MotionSource::code("<published/>"), 30, 1, 4, 4);
+        let dir = cache.begin_render(&req).unwrap();
+        write_frames(&dir, 1, 4, 4);
+        MotionCache::mark_complete(&dir).unwrap();
+
+        let publisher = cache.pin(&req);
+        let reader = cache.pin(&req);
+        assert!(
+            !publisher.discard().unwrap(),
+            "another pin still reads the frames"
+        );
+        assert!(cache.is_cached(&req));
+        assert!(reader.discard().unwrap());
+        assert!(!dir.exists());
+        assert!(
+            !cache.pin(&req).discard().unwrap(),
+            "a missing directory is not an error"
+        );
     }
 
     #[test]

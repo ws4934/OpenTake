@@ -83,6 +83,12 @@ fn sandbox_progress_cancel_validated_mp4_result() {
         ]
     );
 
+    let frame_cache = root.path().join("cache").join("motion-frames");
+    assert!(
+        !frame_cache.join(&added.content_hash).exists(),
+        "a published motion graphic must not leave its PNG frames in the cache"
+    );
+
     let snapshot = core.runtime_snapshot();
     let clip = snapshot
         .timeline
@@ -291,6 +297,7 @@ fn sandbox_progress_cancel_validated_mp4_result() {
         )
         .unwrap();
     assert_eq!(edited.output.output_file, "output.mp4");
+    assert!(!frame_cache.join(&edited.content_hash).exists());
     assert_eq!(edited.clip_id, added.clip_id);
     assert_ne!(edited.asset_id, added.asset_id);
     assert_eq!(core.media().entries.len(), 2);
@@ -397,6 +404,15 @@ fn transparent_motion_publishes_prores_alpha_and_marks_manifest() {
         .expect("transparent motion publish");
 
     assert_eq!(added.output.output_file, "output.mov");
+    assert!(
+        !root
+            .path()
+            .join("cache")
+            .join("motion-frames")
+            .join(&added.content_hash)
+            .exists(),
+        "a published motion graphic must not leave its PNG frames in the cache"
+    );
     let snapshot = core.runtime_snapshot();
     let entry = snapshot
         .media

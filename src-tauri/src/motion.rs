@@ -25,9 +25,9 @@ use opentake_core::{
 };
 use opentake_domain::{GenerationInput, GenerationJobStatus};
 use opentake_motion::{
-    limits, read_single_preview_png, HeadlessChromiumRenderer, MotionCache,
-    MotionCancellationToken, MotionDocumentSource, MotionError, MotionRenderRequest, MotionSource,
-    MotionSourceDiagnostic, RenderedClip, SandboxPolicy,
+    limits, read_single_preview_png, HeadlessChromiumRenderer, MotionCache, MotionCacheLimits,
+    MotionCachePin, MotionCancellationToken, MotionDocumentSource, MotionError,
+    MotionRenderRequest, MotionSource, MotionSourceDiagnostic, RenderedClip, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -35,6 +35,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 
 const MOTION_PROVIDER: &str = "opentake-motion";
+/// Rendered Motion frames live under this subdirectory of the media cache
+/// root. The Settings "Storage" pane counts and clears it with the other
+/// derived caches.
+pub(crate) const MOTION_FRAMES_SUBDIR: &str = "motion-frames";
 const MOTION_MODEL: &str = "opentake.motion-v1";
 const LEGACY_MOTION_MODEL: &str = "opentake.motion-html-v1";
 
@@ -546,6 +550,8 @@ fn render_document_preview(
 ) -> Result<MotionPreviewResponse, MotionPreviewError> {
     let (render_request, revision_hash) =
         prepare_document_preview(documents, authority.clone(), &request)?;
+    // Cache eviction must not delete the frame before its PNG is read.
+    let _frame = bridge.renderer.cache().pin(&render_request);
     let rendered = bridge
         .renderer
         .render_with_cancellation(&render_request, cancellation)
@@ -779,16 +785,32 @@ enum StoredMotionSource {
     },
 }
 
-/// Remove Chromium profiles that an earlier run left behind (for example
-/// after a crash), off the UI thread.
-pub(crate) fn spawn_stale_browser_profile_cleanup() {
+/// A rendered and encoded motion graphic, ready to be committed.
+struct RenderedMotion {
+    /// Owns the temporary directory holding `output`.
+    _output_dir: tempfile::TempDir,
+    output: std::path::PathBuf,
+    probe: ProbedMedia,
+    content_hash: String,
+    /// Keeps the frame sequence out of cache eviction until it is discarded
+    /// after a successful commit.
+    frames: MotionCachePin,
+}
+
+/// Remove Chromium profiles and stale Motion frames that an earlier run left
+/// behind (for example after a crash), off the UI thread.
+pub(crate) fn spawn_startup_cache_maintenance(cache_root: &std::path::Path) {
+    let frames = MotionCache::new(cache_root.join(MOTION_FRAMES_SUBDIR));
     let spawned = std::thread::Builder::new()
-        .name("motion-profile-cleanup".into())
-        .spawn(|| {
+        .name("motion-cache-maintenance".into())
+        .spawn(move || {
             HeadlessChromiumRenderer::remove_stale_browser_profiles();
+            if let Err(error) = frames.evict(MotionCacheLimits::default()) {
+                eprintln!("[motion] frame cache eviction failed: {error}");
+            }
         });
     if let Err(error) = spawned {
-        eprintln!("[motion] stale browser profile cleanup could not start: {error}");
+        eprintln!("[motion] cache maintenance could not start: {error}");
     }
 }
 
@@ -814,14 +836,15 @@ impl TauriMotionBridge {
         Self {
             core,
             renderer: HeadlessChromiumRenderer::new(
-                MotionCache::new(cache_root.join("motion-frames")),
+                MotionCache::new(cache_root.join(MOTION_FRAMES_SUBDIR)),
                 // The timeout is a watchdog per render phase: launching the
                 // browser, loading the document, and each frame (scaled up for
                 // large and transparent frames). Generous for a complex scene
                 // on a slow machine, yet a stalled frame still fails closed;
                 // the clip length itself is unbounded apart from cancellation.
                 SandboxPolicy::offline_with_timeout(Duration::from_secs(180)),
-            ),
+            )
+            .with_cache_limits(Some(MotionCacheLimits::default())),
             progress: Arc::new(|_| {}),
         }
     }
@@ -994,8 +1017,7 @@ impl TauriMotionBridge {
         transparent: bool,
         render_dimensions: Option<(u32, u32, u32)>,
         cancel: &opentake_media::MediaCancelToken,
-    ) -> Result<(tempfile::TempDir, std::path::PathBuf, ProbedMedia, String), MotionBridgeError>
-    {
+    ) -> Result<RenderedMotion, MotionBridgeError> {
         (self.progress)(MotionProgress::Validating);
         let snapshot = self.core.runtime_snapshot();
         snapshot.project_dir.as_ref().ok_or_else(|| {
@@ -1050,6 +1072,9 @@ impl TauriMotionBridge {
                 .with_transparent(transparent)
                 .with_start_frame(source_start_frame);
         request.validate().map_err(map_motion_error)?;
+        // Keep the frames out of cache eviction until they are encoded and
+        // the result is committed; `commit` then discards them.
+        let rendered_frames = self.renderer.cache().pin(&request);
         let render_cancel = MotionCancellationToken::new();
         if cancel.is_cancelled() {
             render_cancel.cancel();
@@ -1121,10 +1146,10 @@ impl TauriMotionBridge {
                 "rendered motion video metadata did not match the request",
             ));
         }
-        Ok((
-            output_dir,
+        Ok(RenderedMotion {
+            _output_dir: output_dir,
             output,
-            ProbedMedia {
+            probe: ProbedMedia {
                 duration_secs: probe.duration_secs,
                 width: probe.width.and_then(|value| i32::try_from(value).ok()),
                 height: probe.height.and_then(|value| i32::try_from(value).ok()),
@@ -1132,8 +1157,9 @@ impl TauriMotionBridge {
                 has_audio: probe.has_audio,
                 color: probe.color,
             },
-            rendered.content_hash,
-        ))
+            content_hash: rendered.content_hash,
+            frames: rendered_frames,
+        })
     }
 
     fn commit(
@@ -1179,7 +1205,7 @@ impl TauriMotionBridge {
             )
         })?;
         ensure_motion_active(cancel)?;
-        let (_temporary_output, output, probe, content_hash) = self.render_and_encode(
+        let rendered = self.render_and_encode(
             &stored_source,
             document_source.as_ref(),
             duration_frames,
@@ -1189,6 +1215,13 @@ impl TauriMotionBridge {
             render_dimensions,
             cancel,
         )?;
+        let RenderedMotion {
+            _output_dir: _temporary_output,
+            output,
+            probe,
+            content_hash,
+            frames,
+        } = rendered;
         let motion_canvas = matches!(
             &stored_source,
             StoredMotionSource::Template { template_id, .. } if template_id == "title-card"
@@ -1356,6 +1389,11 @@ impl TauriMotionBridge {
         drop(identity);
         drop(publication);
         self.core.emit_deferred(events);
+        // The published video now lives in the project; its PNG sequence is
+        // only a cache and would otherwise stay on disk indefinitely.
+        if let Err(error) = frames.discard() {
+            eprintln!("[motion] rendered frames were not removed: {error}");
+        }
         let clip_id = committed
             .edit
             .affected_clip_ids

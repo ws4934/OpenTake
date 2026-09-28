@@ -25,7 +25,7 @@ use std::sync::{
     Arc,
 };
 
-use crate::cache::{content_hash, MotionCache};
+use crate::cache::{content_hash, MotionCache, MotionCacheLimits};
 use crate::error::{MotionError, MotionResult};
 use crate::sandbox::SandboxPolicy;
 use crate::source::{MotionRenderRequest, MotionSource, RenderedClip};
@@ -189,6 +189,7 @@ impl MotionRenderer for StubRenderer {
         let hash = content_hash(req);
         if self.cache.is_cached(req) {
             let dir = self.cache.dir_for(req);
+            MotionCache::touch(&dir);
             return Ok(RenderedClip {
                 content_hash: hash,
                 frames: (0..req.duration_frames as usize)
@@ -392,6 +393,8 @@ pub struct HeadlessChromiumRenderer {
     browser_path: Option<PathBuf>,
     cancellation: MotionCancellationToken,
     #[cfg(feature = "chromium")]
+    cache_limits: Option<MotionCacheLimits>,
+    #[cfg(feature = "chromium")]
     browser_pool: Arc<chromium_backend::BrowserPool>,
 }
 
@@ -400,7 +403,9 @@ impl HeadlessChromiumRenderer {
     pub const DEFAULT_BROWSER_IDLE_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(120);
 
-    /// Build the renderer with a cache and sandbox policy.
+    /// Build the renderer with a cache and sandbox policy. After each render
+    /// that writes new frames the cache is evicted to
+    /// [`MotionCacheLimits::default`]; see [`Self::with_cache_limits`].
     pub fn new(cache: MotionCache, policy: SandboxPolicy) -> Self {
         #[cfg(feature = "chromium")]
         let browser_pool = chromium_backend::BrowserPool::registered();
@@ -409,6 +414,8 @@ impl HeadlessChromiumRenderer {
             policy,
             browser_path: None,
             cancellation: MotionCancellationToken::new(),
+            #[cfg(feature = "chromium")]
+            cache_limits: Some(MotionCacheLimits::default()),
             #[cfg(feature = "chromium")]
             browser_pool,
         }
@@ -436,6 +443,23 @@ impl HeadlessChromiumRenderer {
         #[cfg(not(feature = "chromium"))]
         let _ = timeout;
         self
+    }
+
+    /// Bound the frame cache after renders that write new frames, or never
+    /// evict with `None`.
+    pub fn with_cache_limits(self, limits: Option<MotionCacheLimits>) -> Self {
+        #[cfg(feature = "chromium")]
+        {
+            HeadlessChromiumRenderer {
+                cache_limits: limits,
+                ..self
+            }
+        }
+        #[cfg(not(feature = "chromium"))]
+        {
+            let _ = limits;
+            self
+        }
     }
 
     /// Attach a cooperative cancellation token.
@@ -1189,9 +1213,14 @@ mod chromium_backend {
             host_wrapper_document(&author_document, req.width, req.height, &renderer.policy);
 
         let hash = content_hash(req);
+        // Keeps cache eviction away from this directory while it is read or
+        // written by this render.
+        let _pin = renderer.cache.pin(req);
+        let cached_dir = renderer.cache.dir_for(req);
         if renderer.cache.is_cached(req) {
+            MotionCache::touch(&cached_dir);
             progress(req.duration_frames, req.duration_frames);
-            return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
+            return Ok(clip_from_cache(req, hash, cached_dir));
         }
 
         let budget = RenderBudget::new(
@@ -1226,8 +1255,9 @@ mod chromium_backend {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
                 browser.commit_reuse();
+                MotionCache::touch(&cached_dir);
                 progress(req.duration_frames, req.duration_frames);
-                return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
+                return Ok(clip_from_cache(req, hash, cached_dir));
             }
             Err(error) => {
                 browser.commit_reuse();
@@ -1276,6 +1306,14 @@ mod chromium_backend {
             Ok(()) => {
                 browser.restore_pipe(cdp.into_pipe());
                 browser.commit_reuse();
+                drop(browser);
+                // New frames grew the cache. `_pin` still protects them from
+                // this pass until the caller has consumed the clip.
+                if let Some(limits) = renderer.cache_limits {
+                    if let Err(error) = renderer.cache.evict(limits) {
+                        trace(format!("Motion frame cache eviction failed: {error}"));
+                    }
+                }
                 Ok(RenderedClip {
                     content_hash: hash,
                     frames: (0..req.duration_frames as usize)

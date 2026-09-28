@@ -214,7 +214,7 @@ pub fn run() {
                 core.clone(),
                 cache_root.clone(),
             ));
-            motion::spawn_stale_browser_profile_cleanup();
+            motion::spawn_startup_cache_maintenance(&cache_root);
             let advanced_bridge = Arc::new(advanced::TauriAdvancedWorkflowBridge::new(
                 core.clone(),
                 cache_root.clone(),

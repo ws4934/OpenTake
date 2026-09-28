@@ -51,7 +51,10 @@ pub mod sandbox;
 pub mod source;
 
 // Flat re-export of the public API for ergonomic downstream use.
-pub use cache::{content_hash, MotionCache};
+pub use cache::{
+    content_hash, MotionCache, MotionCacheLimits, MotionCachePin, MotionCacheSweep,
+    DEFAULT_CACHE_MAX_BYTES, DEFAULT_INCOMPLETE_RENDER_MAX_AGE,
+};
 pub use error::{MotionError, MotionResult};
 pub use integration::{
     read_single_preview_png, FrameDecoder, MotionClipSource, MAX_PREVIEW_PNG_BYTES,
