@@ -228,8 +228,8 @@ pub fn redo(
 /// succeeds.
 #[cfg(feature = "playback-engine")]
 #[tauri::command]
-pub async fn project_new(
-    app: AppHandle,
+pub async fn project_new<R: tauri::Runtime>(
+    app: AppHandle<R>,
     path: Option<String>,
 ) -> Result<TimelineSnapshotDto, crate::playback::session::PlaybackCommandError> {
     let _update_activity = crate::updater::begin_mutating_activity(
@@ -315,8 +315,8 @@ fn project_new_with_playback_and_prewarm(
 
 #[cfg(not(feature = "playback-engine"))]
 #[tauri::command]
-pub async fn project_new(
-    app: AppHandle,
+pub async fn project_new<R: tauri::Runtime>(
+    app: AppHandle<R>,
     path: Option<String>,
 ) -> Result<TimelineSnapshotDto, String> {
     let _update_activity = crate::updater::begin_mutating_activity(
@@ -435,8 +435,8 @@ async fn prepare_saved_project_off_thread(
 
 #[cfg(feature = "playback-engine")]
 #[tauri::command]
-pub async fn project_open(
-    app: AppHandle,
+pub async fn project_open<R: tauri::Runtime>(
+    app: AppHandle<R>,
     path: String,
 ) -> Result<TimelineSnapshotDto, crate::playback::session::PlaybackCommandError> {
     let _update_activity = crate::updater::begin_mutating_activity(
@@ -526,7 +526,10 @@ fn commit_prepared_project_open_with_playback_and_prewarm(
 
 #[cfg(not(feature = "playback-engine"))]
 #[tauri::command]
-pub async fn project_open(app: AppHandle, path: String) -> Result<TimelineSnapshotDto, String> {
+pub async fn project_open<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<TimelineSnapshotDto, String> {
     let _update_activity = crate::updater::begin_mutating_activity(
         &app.state::<crate::updater::InstallAdmissionGate>(),
     )?;
@@ -685,7 +688,12 @@ pub(crate) fn authorize_project_dialog_path(
         grants,
         raw,
         crate::dialog_output::SavePurpose::Project,
-        &[opentake_project::layout::BUNDLE_EXTENSION],
+        crate::dialog_output::OutputRule {
+            // Bundle detection compares `.opentake` case-sensitively.
+            extensions: &[opentake_project::layout::BUNDLE_EXTENSION],
+            ignore_case: false,
+            foreign: crate::dialog_output::ForeignExtension::Append,
+        },
     )
     .map(|output| output.path)
     .map_err(|error| {
@@ -1065,15 +1073,18 @@ mod default_project_dir_tests {
 /// appends the extension when the user did not type it (see
 /// [`crate::dialog_output`]).
 #[tauri::command]
-pub async fn export_xmeml(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn export_xmeml<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<(), String> {
     run_interchange_export(app, path, InterchangeFormat::Xmeml).await
 }
 
 /// Authorize, render and write one interchange export on a blocking worker:
 /// XMEML probes source timecodes and the write fsyncs, neither of which may
 /// run on the UI thread.
-async fn run_interchange_export(
-    app: AppHandle,
+async fn run_interchange_export<R: tauri::Runtime>(
+    app: AppHandle<R>,
     path: String,
     format: InterchangeFormat,
 ) -> Result<(), String> {
@@ -1126,7 +1137,11 @@ fn export_interchange(
         grants,
         path,
         crate::dialog_output::SavePurpose::Interchange,
-        &[format.extension()],
+        crate::dialog_output::OutputRule {
+            extensions: &[format.extension()],
+            ignore_case: true,
+            foreign: crate::dialog_output::ForeignExtension::Append,
+        },
     )?;
     let snapshot = core.runtime_snapshot();
     let body = match format {
@@ -1210,7 +1225,10 @@ fn resolve_start_timecodes(
 /// New code (and the format picker) should call `export_xmeml`; native FCPXML is
 /// `export_fcpxml_modern`.
 #[tauri::command]
-pub async fn export_fcpxml(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn export_fcpxml<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<(), String> {
     run_interchange_export(app, path, InterchangeFormat::Xmeml).await
 }
 
@@ -1220,7 +1238,7 @@ pub async fn export_fcpxml(app: AppHandle, path: String) -> Result<(), String> {
 /// Avid / 剪映 import. Effects, transforms, opacity, and multi-track layering are
 /// dropped — see `opentake_project::edl` for the documented limitations.
 #[tauri::command]
-pub async fn export_edl(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn export_edl<R: tauri::Runtime>(app: AppHandle<R>, path: String) -> Result<(), String> {
     run_interchange_export(app, path, InterchangeFormat::Edl).await
 }
 
@@ -1230,7 +1248,7 @@ pub async fn export_edl(app: AppHandle, path: String) -> Result<(), String> {
 /// per-clip media references; see `opentake_project::otio` for what is dropped
 /// (effects, transforms, keyframes).
 #[tauri::command]
-pub async fn export_otio(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn export_otio<R: tauri::Runtime>(app: AppHandle<R>, path: String) -> Result<(), String> {
     run_interchange_export(app, path, InterchangeFormat::Otio).await
 }
 
@@ -1240,7 +1258,10 @@ pub async fn export_otio(app: AppHandle, path: String) -> Result<(), String> {
 /// FCPXML — use `export_xmeml` for Premiere / DaVinci / 剪映. See
 /// `opentake_project::fcpxml_modern`.
 #[tauri::command]
-pub async fn export_fcpxml_modern(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn export_fcpxml_modern<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<(), String> {
     run_interchange_export(app, path, InterchangeFormat::FcpxmlModern).await
 }
 
@@ -1275,8 +1296,8 @@ pub struct SubtitleExportSummary {
 /// carrying a `caption_group_id` + non-empty `text_content`), serialized, and
 /// written to disk. Returns the cue count so the UI can report an empty result.
 #[tauri::command]
-pub async fn export_subtitles(
-    app: AppHandle,
+pub async fn export_subtitles<R: tauri::Runtime>(
+    app: AppHandle<R>,
     path: String,
     format: SubtitleFormat,
 ) -> Result<SubtitleExportSummary, String> {
@@ -1316,7 +1337,11 @@ fn authorize_subtitle_output(
         grants,
         path,
         crate::dialog_output::SavePurpose::Subtitles,
-        &[format.extension()],
+        crate::dialog_output::OutputRule {
+            extensions: &[format.extension()],
+            ignore_case: true,
+            foreign: crate::dialog_output::ForeignExtension::Append,
+        },
     )
 }
 
@@ -5328,5 +5353,196 @@ mod xmeml_timecode_tests {
                 "{file}"
             );
         }
+    }
+}
+
+/// Command-level authorization: every writing command, called as the WebView
+/// calls it, refuses a forged path and a path that only holds an asset-scope
+/// grant (what imports, proxies and open dialogs leave behind), and writes a
+/// save-dialog result for its own purpose.
+#[cfg(all(test, feature = "playback-engine"))]
+mod command_authorization_tests {
+    use crate::dialog_output::{SaveGrants, SavePurpose, UNAPPROVED_OUTPUT};
+    use crate::safe_asset_protocol::scope_allows_lexical_path;
+    use opentake_core::AppCore;
+    use tauri::Manager as _;
+
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        let core = AppCore::new();
+        let epoch = core.project_revision().project_epoch;
+        tauri::test::mock_builder()
+            .manage(core)
+            .manage(crate::updater::InstallAdmissionGate::default())
+            .manage(super::ProjectLifecycleCoordinator::default())
+            .manage(crate::playback::PlaybackState::new())
+            .manage(crate::media::prewarm::PrewarmScheduler::new(epoch))
+            .manage(crate::render::RenderState::new())
+            .manage(crate::export::ExportControl::default())
+            .manage(SaveGrants::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build managed mock app")
+    }
+
+    fn issue(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        path: &std::path::Path,
+        purpose: SavePurpose,
+    ) {
+        app.state::<SaveGrants>().issue(path, purpose);
+    }
+
+    #[test]
+    fn project_new_creates_only_a_granted_bundle_and_reopens_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = mock_app();
+        let raw = dir.path().join("Vlog");
+        let bundle = dir.path().join("Vlog.opentake");
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_file(&raw).expect("asset-scope grant only");
+        issue(&app, &raw, SavePurpose::Interchange);
+
+        let refused = tauri::async_runtime::block_on(super::project_new(
+            app.handle().clone(),
+            Some(raw.to_string_lossy().into_owned()),
+        ));
+        assert!(refused.is_err());
+        assert!(!bundle.exists());
+        assert!(!scope_allows_lexical_path(&scope, &bundle));
+
+        issue(&app, &raw, SavePurpose::Project);
+        let snapshot = tauri::async_runtime::block_on(super::project_new(
+            app.handle().clone(),
+            Some(raw.to_string_lossy().into_owned()),
+        ))
+        .expect("granted New Project");
+
+        assert_eq!(snapshot.project_path.as_deref(), Some(bundle.as_path()));
+        assert!(bundle.is_dir());
+        // `grant_saved_project_bundle`: reopenable from the recent-projects list.
+        assert!(scope_allows_lexical_path(&scope, &bundle));
+        tauri::async_runtime::block_on(super::project_open(
+            app.handle().clone(),
+            bundle.to_string_lossy().into_owned(),
+        ))
+        .expect("the new bundle reopens through project_open");
+    }
+
+    #[test]
+    fn save_as_writes_only_a_granted_bundle_and_grants_it_after_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = mock_app();
+        let first = dir.path().join("First");
+        issue(&app, &first, SavePurpose::Project);
+        let snapshot = tauri::async_runtime::block_on(super::project_new(
+            app.handle().clone(),
+            Some(first.to_string_lossy().into_owned()),
+        ))
+        .expect("create project");
+        let scope = app.handle().asset_protocol_scope();
+        let copy = dir.path().join("Copy");
+        let copy_bundle = dir.path().join("Copy.opentake");
+        let save_as = |path: &std::path::Path, epoch: u64| {
+            tauri::async_runtime::block_on(super::save_project_with_composite_cover(
+                app.handle().clone(),
+                Some(path.to_string_lossy().into_owned()),
+                epoch,
+                snapshot
+                    .project_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            ))
+        };
+
+        // Forged, and asset-scope only.
+        assert!(save_as(&copy, snapshot.project_epoch).is_err());
+        scope.allow_file(&copy).expect("asset-scope grant only");
+        assert!(save_as(&copy, snapshot.project_epoch).is_err());
+        assert!(!copy_bundle.exists());
+
+        // A granted save that fails (stale project epoch) grants nothing.
+        issue(&app, &copy, SavePurpose::Project);
+        assert!(save_as(&copy, snapshot.project_epoch + 1).is_err());
+        assert!(!scope_allows_lexical_path(&scope, &copy_bundle));
+
+        issue(&app, &copy, SavePurpose::Project);
+        let saved = save_as(&copy, snapshot.project_epoch).expect("granted Save As");
+        assert_eq!(saved, copy_bundle.to_string_lossy());
+        assert!(copy_bundle.is_dir());
+        assert!(scope_allows_lexical_path(&scope, &copy_bundle));
+    }
+
+    #[test]
+    fn subtitle_and_interchange_commands_refuse_forged_and_asset_scope_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = mock_app();
+        let victim = dir.path().join("notes.srt");
+        std::fs::write(&victim, b"keep").expect("seed");
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&victim)
+            .expect("asset-scope grant only");
+
+        let subtitles = tauri::async_runtime::block_on(super::export_subtitles(
+            app.handle().clone(),
+            victim.to_string_lossy().into_owned(),
+            super::SubtitleFormat::Srt,
+        ));
+        assert_eq!(subtitles.unwrap_err(), UNAPPROVED_OUTPUT);
+        let edl = tauri::async_runtime::block_on(super::export_edl(
+            app.handle().clone(),
+            victim.to_string_lossy().into_owned(),
+        ));
+        assert_eq!(edl.unwrap_err(), UNAPPROVED_OUTPUT);
+        assert_eq!(std::fs::read(&victim).expect("read"), b"keep");
+
+        let raw = dir.path().join("captions");
+        issue(&app, &raw, SavePurpose::Subtitles);
+        let summary = tauri::async_runtime::block_on(super::export_subtitles(
+            app.handle().clone(),
+            raw.to_string_lossy().into_owned(),
+            super::SubtitleFormat::Srt,
+        ))
+        .expect("granted subtitle export");
+        assert_eq!(
+            summary.out_path,
+            dir.path().join("captions.srt").to_string_lossy()
+        );
+
+        let cut = dir.path().join("cut");
+        issue(&app, &cut, SavePurpose::Interchange);
+        tauri::async_runtime::block_on(super::export_edl(
+            app.handle().clone(),
+            cut.to_string_lossy().into_owned(),
+        ))
+        .expect("granted EDL export");
+        assert!(dir.path().join("cut.edl").is_file());
+    }
+
+    #[test]
+    fn export_video_refuses_forged_and_asset_scope_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = mock_app();
+        let footage = dir.path().join("footage.mp4");
+        std::fs::write(&footage, b"original footage").expect("seed");
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&footage)
+            .expect("asset-scope grant only");
+        issue(&app, &footage, SavePurpose::ExtractAudio);
+
+        let result = tauri::async_runtime::block_on(crate::export::export_video(
+            app.handle().clone(),
+            app.state::<AppCore>(),
+            app.state::<crate::export::ExportControl>(),
+            crate::export::ExportRequest {
+                out_path: footage.to_string_lossy().into_owned(),
+                codec: crate::export::ExportCodec::H264,
+                quality: crate::export::ExportQuality::P1080,
+            },
+            "video-operation-test".to_string(),
+        ));
+
+        assert_eq!(result.unwrap_err(), UNAPPROVED_OUTPUT);
+        assert_eq!(std::fs::read(&footage).expect("read"), b"original footage");
     }
 }

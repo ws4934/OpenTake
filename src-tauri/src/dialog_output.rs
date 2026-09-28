@@ -67,14 +67,17 @@ impl SaveGrants {
         });
     }
 
-    /// Consume the grant for exactly `path` and `purpose`, if one is live.
-    fn take(&self, path: &Path, purpose: SavePurpose) -> bool {
+    /// Consume the grant for `path` and `purpose`, if one is live, and return
+    /// the path exactly as the dialog returned it. Writers use that spelling,
+    /// not the caller's, so a case-insensitive match can never redirect a write
+    /// in a case-sensitive directory.
+    fn take(&self, path: &Path, purpose: SavePurpose) -> Option<PathBuf> {
         let mut grants = self.grants.lock().unwrap_or_else(PoisonError::into_inner);
         grants.retain(|grant| grant.issued.elapsed() < SAVE_GRANT_TTL);
         let position = grants
             .iter()
-            .position(|grant| grant.purpose == purpose && same_path(&grant.path, path));
-        position.map(|index| grants.remove(index)).is_some()
+            .position(|grant| grant.purpose == purpose && same_path(&grant.path, path))?;
+        Some(grants.remove(position).path)
     }
 }
 
@@ -156,6 +159,26 @@ pub async fn pick_save_path(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// What a dialog result without an allowed extension turns into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignExtension {
+    /// Append the default extension (`cut.txt` becomes `cut.txt.xml`).
+    Append,
+    /// Refuse a result that already carries another extension, so the
+    /// consumer's own "unsupported extension" error is what the user sees.
+    Reject,
+}
+
+/// How a purpose's consumer recognizes its extensions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutputRule<'a> {
+    /// Allowed extensions; the first one is appended when none is present.
+    pub extensions: &'a [&'a str],
+    /// Whether the consumer compares extensions ignoring ASCII case.
+    pub ignore_case: bool,
+    pub foreign: ForeignExtension,
+}
+
 /// A write target resolved from a save-dialog result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DialogOutput {
@@ -178,9 +201,10 @@ pub(crate) fn authorize_dialog_output(
     grants: &SaveGrants,
     raw_path: &str,
     purpose: SavePurpose,
-    extensions: &[&str],
+    rule: OutputRule<'_>,
 ) -> Result<DialogOutput, String> {
-    let default_extension = extensions
+    let default_extension = rule
+        .extensions
         .first()
         .ok_or_else(|| "no output extension configured".to_string())?;
     if raw_path.is_empty() || raw_path.contains('\0') {
@@ -197,24 +221,42 @@ pub(crate) fn authorize_dialog_output(
     {
         return Err("output path must name a file without relative segments".to_string());
     }
-    let Some(file_name) = raw.file_name() else {
+    if raw.file_name().is_none() {
         return Err("output path must name a file".to_string());
-    };
-    if !grants.take(raw, purpose) {
-        return Err(UNAPPROVED_OUTPUT.to_string());
     }
-    let normalized: PathBuf = raw.components().collect();
-    // Exact-case match: consumers such as the project bundle detection and
-    // the audio codec table compare extensions case-sensitively.
-    let has_extension = raw
+    let Some(normalized) = grants.take(raw, purpose) else {
+        return Err(UNAPPROVED_OUTPUT.to_string());
+    };
+    // Match extensions the way the purpose's consumer does: the project
+    // bundle detection and the audio codec table are case-sensitive, video
+    // presets are not.
+    let extension = normalized
         .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extensions.contains(&extension));
+        .map(|extension| extension.to_string_lossy().into_owned());
+    let has_extension = extension.as_deref().is_some_and(|extension| {
+        rule.extensions.iter().any(|allowed| {
+            if rule.ignore_case {
+                allowed.eq_ignore_ascii_case(extension)
+            } else {
+                *allowed == extension
+            }
+        })
+    });
     if has_extension {
         return Ok(DialogOutput {
             path: normalized,
             appended: false,
         });
+    }
+    if let (Some(extension), ForeignExtension::Reject) = (&extension, rule.foreign) {
+        return Err(format!(
+            "unsupported extension .{extension} (use {})",
+            rule.extensions
+                .iter()
+                .map(|allowed| format!(".{allowed}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     match std::fs::symlink_metadata(&normalized) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -226,7 +268,10 @@ pub(crate) fn authorize_dialog_output(
         }
         Err(error) => return Err(format!("cannot inspect output path: {error}")),
     }
-    let mut name = file_name.to_os_string();
+    let mut name = normalized
+        .file_name()
+        .ok_or_else(|| "output path must name a file".to_string())?
+        .to_os_string();
     name.push(".");
     name.push(default_extension);
     let resolved = normalized.with_file_name(name);
@@ -284,40 +329,63 @@ fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
 /// by rename; an appended one is published without replacing anything, so a
 /// file created there in the meantime is never overwritten.
 pub(crate) fn write_file_atomically(output: &DialogOutput, bytes: &[u8]) -> Result<(), String> {
+    let (staging, mut file) = create_staging(output)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write output: {error}"));
+    drop(file);
+    if let Err(error) = written {
+        remove_staging(&staging);
+        return Err(error);
+    }
+    publish_staged(&staging, output)
+}
+
+/// Create an exclusive, empty staging file beside `output` that keeps its
+/// extension (tools such as ffmpeg pick the container from it). The caller
+/// fills it and hands it to [`publish_staged`], or removes it on failure.
+pub(crate) fn create_staging(output: &DialogOutput) -> Result<(PathBuf, std::fs::File), String> {
     let path = output.path.as_path();
     ensure_replaceable_regular_file(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| "output path has no parent directory".to_string())?;
-    let file_name = path
-        .file_name()
+    let stem = path
+        .file_stem()
         .ok_or_else(|| "output path must name a file".to_string())?;
-    let (staging, mut file) = create_staging_file(parent, file_name)?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("write output: {error}"));
-    drop(file);
-    let published = written.and_then(|()| {
-        if output.appended {
-            publish_new(&staging, path)
-        } else {
-            ensure_replaceable_regular_file(path).and_then(|()| {
-                std::fs::rename(&staging, path).map_err(|error| format!("replace output: {error}"))
-            })
-        }
-    });
+    create_staging_file(parent, stem, path.extension())
+}
+
+/// Publish a filled staging file at `output`: a confirmed target is replaced
+/// by rename, an appended one only if nothing exists there. The staging file
+/// is removed when publishing fails.
+pub(crate) fn publish_staged(staging: &Path, output: &DialogOutput) -> Result<(), String> {
+    let path = output.path.as_path();
+    let published = if output.appended {
+        publish_new(staging, path)
+    } else {
+        ensure_replaceable_regular_file(path).and_then(|()| {
+            std::fs::rename(staging, path).map_err(|error| format!("replace output: {error}"))
+        })
+    };
     if let Err(error) = published {
-        remove_staging(&staging);
+        remove_staging(staging);
         return Err(error);
     }
     // The file is already in place; a failed directory sync only weakens
     // durability across a power loss, so report it without failing the save.
-    if let Err(error) = sync_parent_directory(parent) {
-        eprintln!("[dialog-output] could not sync output directory: {error}");
+    if let Some(parent) = path.parent() {
+        if let Err(error) = sync_parent_directory(parent) {
+            eprintln!("[dialog-output] could not sync output directory: {error}");
+        }
     }
     Ok(())
+}
+
+pub(crate) fn remove_staging_file(staging: &Path) {
+    remove_staging(staging);
 }
 
 /// Publish `staging` at `path` only if nothing exists there. A hard link fails
@@ -353,18 +421,23 @@ fn remove_staging(staging: &Path) {
 
 fn create_staging_file(
     parent: &Path,
-    file_name: &std::ffi::OsStr,
+    stem: &std::ffi::OsStr,
+    extension: Option<&std::ffi::OsStr>,
 ) -> Result<(PathBuf, std::fs::File), String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut last_error = None;
     for _ in 0..16 {
         let mut name = std::ffi::OsString::from(".");
-        name.push(file_name);
+        name.push(stem);
         name.push(format!(
             ".{}-{}.tmp",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        if let Some(extension) = extension {
+            name.push(".");
+            name.push(extension);
+        }
         let staging = parent.join(name);
         // `create_new` is O_CREAT|O_EXCL: it never follows or reuses an
         // existing entry, symlinks included.
@@ -410,16 +483,24 @@ pub(crate) mod tests {
         grants
     }
 
+    fn rule(extensions: &'static [&'static str]) -> OutputRule<'static> {
+        OutputRule {
+            extensions,
+            ignore_case: false,
+            foreign: ForeignExtension::Append,
+        }
+    }
+
     fn authorize(
         grants: &SaveGrants,
         path: &Path,
-        extensions: &[&str],
+        extensions: &'static [&'static str],
     ) -> Result<DialogOutput, String> {
         authorize_dialog_output(
             grants,
             &path.to_string_lossy(),
             SavePurpose::Interchange,
-            extensions,
+            rule(extensions),
         )
     }
 
@@ -447,7 +528,7 @@ pub(crate) mod tests {
                 &grants,
                 &raw.to_string_lossy(),
                 SavePurpose::Video,
-                &["xml"]
+                rule(&["xml"])
             ),
             Err(UNAPPROVED_OUTPUT.to_string())
         );
@@ -494,6 +575,67 @@ pub(crate) mod tests {
         let resolved = authorize(&grants, &raw, &["opentake"]).expect("approved");
 
         assert_eq!(resolved.path, dir.path().join("Vlog.OPENTAKE.opentake"));
+    }
+
+    #[test]
+    fn case_insensitive_rules_accept_an_upper_case_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("Film.MP4");
+        let grants = granted(&raw, SavePurpose::Interchange);
+
+        let resolved = authorize_dialog_output(
+            &grants,
+            &raw.to_string_lossy(),
+            SavePurpose::Interchange,
+            OutputRule {
+                extensions: &["mp4"],
+                ignore_case: true,
+                foreign: ForeignExtension::Append,
+            },
+        )
+        .expect("approved");
+
+        assert_eq!(resolved.path, raw);
+        assert!(!resolved.appended);
+    }
+
+    #[test]
+    fn a_reject_rule_refuses_a_foreign_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("voice.ogg");
+        let grants = granted(&raw, SavePurpose::Interchange);
+
+        let error = authorize_dialog_output(
+            &grants,
+            &raw.to_string_lossy(),
+            SavePurpose::Interchange,
+            OutputRule {
+                extensions: &["m4a", "mp3"],
+                ignore_case: false,
+                foreign: ForeignExtension::Reject,
+            },
+        )
+        .expect_err("foreign extension");
+
+        assert!(error.contains("unsupported extension .ogg"), "{error}");
+    }
+
+    #[test]
+    fn staged_output_keeps_the_extension_and_publishes_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = DialogOutput {
+            path: dir.path().join("voice.m4a"),
+            appended: true,
+        };
+
+        let (staging, file) = create_staging(&output).expect("staging");
+        drop(file);
+        assert_eq!(staging.extension().and_then(|e| e.to_str()), Some("m4a"));
+        std::fs::write(&staging, b"audio").expect("fill staging");
+        publish_staged(&staging, &output).expect("publish");
+
+        assert_eq!(std::fs::read(&output.path).expect("read"), b"audio");
+        assert!(!staging.exists());
     }
 
     #[test]

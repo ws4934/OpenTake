@@ -145,6 +145,9 @@ const CAPTION_TRANSLATION_MAX_RATE_LIMITS: u32 = 3;
 const CAPTION_TRANSLATION_MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 const CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER: std::time::Duration =
     std::time::Duration::from_secs(5);
+/// Total time one run may spend waiting out rate limits.
+const CAPTION_TRANSLATION_MAX_RATE_LIMIT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
 
 /// Split `captions` into provider batches bounded by count and source bytes.
 fn caption_translation_batches(
@@ -256,6 +259,7 @@ fn translate_caption_batches(
     // otherwise repeat indefinitely, so they share one budget per run.
     let max_retries = pending.len() + 8;
     let mut retries = 0_usize;
+    let mut rate_limit_waited = std::time::Duration::ZERO;
     let mut consecutive_unavailable = 0_u32;
     let mut consecutive_rate_limits = 0_u32;
     while let Some((batch, splits)) = pending.pop() {
@@ -298,7 +302,14 @@ fn translate_caption_batches(
             Ok(CaptionBatchReply::Incomplete) => {
                 outcome.fail(batch, "provider output was truncated or skipped captions");
             }
-            Ok(CaptionBatchReply::RateLimited(_)) if retries >= max_retries => {
+            Ok(CaptionBatchReply::RateLimited(retry_after))
+                if retries >= max_retries
+                    || rate_limit_waited
+                        + retry_after
+                            .unwrap_or(CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER)
+                            .min(CAPTION_TRANSLATION_MAX_RETRY_AFTER)
+                        > CAPTION_TRANSLATION_MAX_RATE_LIMIT_WAIT =>
+            {
                 let message = "caption translation stopped after too many rate-limited requests; retry the remaining captions later";
                 outcome.fail(batch, message);
                 for (rest, _) in pending.drain(..) {
@@ -313,6 +324,7 @@ fn translate_caption_batches(
                 let wait = retry_after
                     .unwrap_or(CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER)
                     .min(CAPTION_TRANSLATION_MAX_RETRY_AFTER);
+                rate_limit_waited += wait;
                 if !wait_cancellably(wait, cancel) {
                     return Err(cancelled_workflow("caption translation cancelled"));
                 }
@@ -333,6 +345,19 @@ fn translate_caption_batches(
                     for (rest, _) in pending.drain(..) {
                         outcome.fail(rest, &stopped);
                     }
+                }
+            }
+            Err(error) if error.kind == AdvancedWorkflowErrorKind::Cancelled => return Err(error),
+            // A rejected key or request after some batches succeeded: stop
+            // sending, but keep the already-billed translations for review.
+            Err(error)
+                if caption_translation_error_is_fatal(&error)
+                    && !outcome.merged.translations.is_empty() =>
+            {
+                let message = format!("caption translation stopped: {}", error.message);
+                outcome.fail(batch, &message);
+                for (rest, _) in pending.drain(..) {
+                    outcome.fail(rest, &message);
                 }
             }
             Err(error) if caption_translation_error_is_fatal(&error) => return Err(error),
@@ -5975,6 +6000,36 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[test]
+    fn a_fatal_error_after_successful_batches_keeps_them_for_review() {
+        let captions = drafts(200);
+        let rejected = classify_translation_status("openai", 400, None).map(|_| unreachable!());
+        let translator = BatchingCaptionTranslator::scripted([
+            Ok(CaptionBatchReply::Translated(
+                CaptionTranslationProviderResult {
+                    translations: captions[..CAPTION_TRANSLATION_BATCH_SIZE]
+                        .iter()
+                        .map(|caption| CaptionTranslationDraft {
+                            id: caption.id.clone(),
+                            text: "ok".into(),
+                        })
+                        .collect(),
+                    errors: vec![],
+                },
+            )),
+            rejected,
+        ]);
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new())
+            .expect("finished batches survive a later rejection");
+
+        assert_eq!(result.translations.len(), CAPTION_TRANSLATION_BATCH_SIZE);
+        assert_eq!(result.errors.len(), 200 - CAPTION_TRANSLATION_BATCH_SIZE);
+        assert!(result.errors.iter().all(|e| e.message.contains("HTTP 400")));
+        assert_eq!(translator.calls.lock().unwrap().len(), 2);
+        assert_each_id_once(&captions, &result);
     }
 
     #[test]

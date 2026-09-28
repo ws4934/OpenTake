@@ -2575,15 +2575,21 @@ export function MediaCard({
     e.preventDefault();
     const save = await saveDialog("extractAudio");
     if (!save) return; // non-Tauri / dialog unavailable
-    const chosen = await save({
-      title: t("media.extractAudio"),
-      defaultPath: `${item.name}.m4a`,
-      filters: [
-        { name: "Audio (M4A)", extensions: ["m4a"] },
-        { name: "Audio (MP3)", extensions: ["mp3"] },
-        { name: "Audio (WAV)", extensions: ["wav"] },
-      ],
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t("media.extractAudio"),
+        defaultPath: `${item.name}.m4a`,
+        filters: [
+          { name: "Audio (M4A)", extensions: ["m4a"] },
+          { name: "Audio (MP3)", extensions: ["mp3"] },
+          { name: "Audio (WAV)", extensions: ["wav"] },
+        ],
+      });
+    } catch (err) {
+      setFeedback(t("media.extractAudioFailed", { error: String(err) }));
+      return;
+    }
     if (typeof chosen !== "string") return; // user cancelled
     setFeedback(null);
     try {

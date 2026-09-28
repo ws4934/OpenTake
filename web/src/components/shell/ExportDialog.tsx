@@ -274,10 +274,17 @@ export function ExportDialog() {
       ? `${dir}${sep}${defaultExportName(projectPath, ext)}`
       : undefined;
 
-    const chosen = await save({
-      title: t("export.saveDialog"),
-      defaultPath,
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t("export.saveDialog"),
+        defaultPath,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      pushToast(t("export.failed"));
+      return;
+    }
     if (typeof chosen !== "string") return; // cancelled
 
     setBusy(true);
@@ -357,58 +364,12 @@ export function ExportDialog() {
     if (busy) return;
     setError(null);
     setBundleMissing(null);
-
-    const save = await saveDialog("project");
-    if (!save) {
-      // No native save panel (outside Tauri) — the export can't run here.
-      pushToast(t("export.bundle.unavailable"));
-      return;
-    }
-    const projectPath = useProjectStore.getState().projectPath;
-    const dir = projectPath
-      ? projectPath.replace(/[\\/][^\\/]*$/, "")
-      : await api.getDefaultProjectDir().catch(() => "");
-    const sep = dir && !dir.endsWith("/") ? "/" : "";
-    const defaultPath = dir
-      ? `${dir}${sep}${defaultBundleName(projectPath)}`
-      : undefined;
-
-    const chosen = await save({
-      title: t("export.bundle.saveDialog"),
-      defaultPath,
-      filters: [{ name: t("export.bundle.saveFilter"), extensions: [BUNDLE_EXT] }],
-    });
-    if (typeof chosen !== "string") return; // cancelled
-
-    setBusy(true);
-    try {
-      const report = await api.exportBundle(withExt(chosen, BUNDLE_EXT));
-      if (report.missing.length === 0) {
-        // Clean success: close with a summary toast (upstream reveals the file
-        // in Finder; no reveal capability is wired here, so surface via toast).
-        pushToast(
-          report.collected.length > 0
-            ? t("export.bundle.done", {
-                collected: report.collected.length,
-                size: formatBytes(report.totalBytes),
-              })
-            : t("export.bundle.doneNoMedia"),
-        );
-        setOpen(false);
-      } else {
-        // Exported, but some media couldn't be found — keep the dialog open and
-        // list them (distinct from the failure path).
-        setBundleMissing(report.missing);
-        pushToast(t("export.bundle.missing", { count: report.missing.length }));
-      }
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setError(message);
-      pushToast(t("export.bundle.failed"));
-    } finally {
-      setBusy(false);
-    }
+    // The secure bundle workflow is not available in this build
+    // (`api.exportBundle` fails closed) and no backend command would consume a
+    // save grant, so report it without opening a save dialog.
+    pushToast(t("export.bundle.unavailable"));
   }
+
 
   async function onCancel(): Promise<void> {
     if (!busy) {

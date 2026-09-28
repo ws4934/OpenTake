@@ -1724,7 +1724,12 @@ fn authorize_export_output(
         grants,
         &req.out_path,
         crate::dialog_output::SavePurpose::Video,
-        &[extension],
+        crate::dialog_output::OutputRule {
+            // `resolve_preset` compares the container extension ignoring case.
+            extensions: &[extension],
+            ignore_case: true,
+            foreign: crate::dialog_output::ForeignExtension::Append,
+        },
     )
     .map(|output| output.path.to_string_lossy().into_owned())
 }
@@ -1746,8 +1751,8 @@ fn authorize_export_output(
 /// `Err(String)` (the Tauri boundary contract); a mid-export cancel surfaces as
 /// `Err(`[`CANCELLED_SENTINEL`]`)`.
 #[tauri::command]
-pub async fn export_video(
-    app: AppHandle,
+pub async fn export_video<R: tauri::Runtime>(
+    app: AppHandle<R>,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,
     mut req: ExportRequest,

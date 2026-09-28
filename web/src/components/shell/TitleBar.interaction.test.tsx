@@ -307,6 +307,24 @@ describe("TitleBar interchange export", () => {
     );
   });
 
+  it("reports a save dialog that fails instead of dropping the error", async () => {
+    mocks.save.mockRejectedValueOnce(new Error("save dialog failed"));
+    await act(async () => root?.render(<TitleBar />));
+    const trigger = container?.querySelector<HTMLButtonElement>('button[aria-label="title.export"]');
+    await act(async () => trigger?.click());
+    const edl = [...(container?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [])]
+      .find((button) => button.textContent === "title.exportEdl");
+
+    await act(async () => {
+      edl?.click();
+      await Promise.resolve();
+    });
+    expect(mocks.exportEdl).not.toHaveBeenCalled();
+    expect(useEditorUiStore.getState().toast?.message).toBe(
+      "title.exportInterchangeFailed: save dialog failed",
+    );
+  });
+
   it("control-0d98e5e5a0c417ed export XMEML/FCPXML/OTIO/EDL preserves cancel and default-directory behavior", async () => {
     useProjectStore.setState({ projectPath: null });
     mocks.save.mockResolvedValueOnce(null);

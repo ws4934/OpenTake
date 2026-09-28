@@ -3850,22 +3850,29 @@ fn validate_extract_output(out_path: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Only the exact path a native save dialog returned may be written (#95); the
-/// default `.m4a` is appended when the user typed no audio extension. An
-/// existing target must be a regular file so ffmpeg never writes through a
-/// symlink.
+/// Only a save-dialog result granted for audio extraction may be written
+/// (#95); the default `.m4a` is appended when the user typed no extension.
+/// ffmpeg writes to a staging file beside the target, which is then published
+/// by [`crate::dialog_output::publish_staged`], so it never writes through a
+/// symlink or over a file created at an appended path.
 fn authorize_extract_output(
     grants: &crate::dialog_output::SaveGrants,
     out_path: &str,
-) -> Result<PathBuf, String> {
+) -> Result<crate::dialog_output::DialogOutput, String> {
     let output = crate::dialog_output::authorize_dialog_output(
         grants,
         out_path,
         crate::dialog_output::SavePurpose::ExtractAudio,
-        &["m4a", "m4r", "aac", "mp3", "wav"],
+        crate::dialog_output::OutputRule {
+            // The codec table matches exact lower-case extensions; any other
+            // extension is reported as unsupported instead of being extended.
+            extensions: &["m4a", "m4r", "aac", "mp3", "wav"],
+            ignore_case: false,
+            foreign: crate::dialog_output::ForeignExtension::Reject,
+        },
     )?;
-    let output = validate_extract_output(&output.path.to_string_lossy())?;
-    crate::dialog_output::ensure_replaceable_regular_file(&output)?;
+    validate_extract_output(&output.path.to_string_lossy())?;
+    crate::dialog_output::ensure_replaceable_regular_file(&output.path)?;
     Ok(output)
 }
 
@@ -3932,15 +3939,19 @@ fn extract_audio_blocking(
     if !input.is_file() {
         return Err(format!("source file not found: {}", input.display()));
     }
-    if std::fs::canonicalize(&input).ok() == std::fs::canonicalize(&output).ok() && output.exists()
+    if output.path.exists()
+        && std::fs::canonicalize(&input).ok() == std::fs::canonicalize(&output.path).ok()
     {
         return Err("the audio file cannot replace its own source".into());
     }
-    media
-        .engine()
-        .extract_audio(&input, &output)
-        .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| e.to_string())
+    let (staging, file) = crate::dialog_output::create_staging(&output)?;
+    drop(file);
+    if let Err(error) = media.engine().extract_audio(&input, &staging) {
+        crate::dialog_output::remove_staging_file(&staging);
+        return Err(error.to_string());
+    }
+    crate::dialog_output::publish_staged(&staging, &output)?;
+    Ok(output.path.to_string_lossy().into_owned())
 }
 
 /// `relink_media`: point a missing/offline asset at a newly chosen file, KEEPING
@@ -4008,10 +4019,13 @@ fn relink_media_in_core(
         ));
     }
 
+    // Same rule as imports: unreadable video and audio are refused so good
+    // metadata is never overwritten with zeros, while images (for example HEIF
+    // stills an older ffprobe cannot parse) relink without dimensions.
     let probe = if is_lottie_path(new) {
         probe_lottie(new)
     } else {
-        try_probe_media(engine, new).map_err(|error| error.to_string())
+        probe_result_for_import(Some(new_kind), try_probe_media(engine, new))
     }
     .map_err(|error| {
         format!(
@@ -9647,6 +9661,110 @@ mod tests {
     }
 
     #[test]
+    fn relink_to_an_unprobeable_image_still_relinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let engine = engine_for(tmp.path());
+        let original = tmp.path().join("still.png");
+        touch(&original);
+        let id = core
+            .import_media_file(&original, "still".to_string(), &ProbedMedia::default())
+            .unwrap()
+            .id;
+        let moved = tmp.path().join("moved.png");
+        fs::write(&moved, b"not decodable").unwrap();
+
+        relink_media_in_core(&core, &engine, &id, &moved).expect("images relink leniently");
+
+        let entry = core
+            .media()
+            .entries
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
+        assert_eq!(
+            entry.source,
+            MediaSource::External {
+                absolute_path: moved.to_string_lossy().into_owned()
+            }
+        );
+    }
+
+    /// Command-level authorization of `extract_audio`: neither a forged path
+    /// nor an asset-scope grant (what imports and open dialogs leave behind)
+    /// may be written; only a save-dialog grant for audio extraction.
+    #[test]
+    fn extract_audio_writes_only_through_an_audio_save_grant() {
+        use crate::dialog_output::{SaveGrants, SavePurpose};
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let media = MediaState::new(engine_for(tmp.path()));
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let source = tmp.path().join("interview.wav");
+        let samples = vec![0.0_f32; 4_800];
+        fs::File::create(&source).unwrap();
+        crate::export::write_wav_s16le(&samples, 48_000, &source).unwrap();
+        let id = core
+            .import_media_file(
+                &source,
+                "interview".to_string(),
+                &ProbedMedia {
+                    duration_secs: 0.1,
+                    has_audio: true,
+                    ..ProbedMedia::default()
+                },
+            )
+            .unwrap()
+            .id;
+        let victim = tmp.path().join("imported.wav");
+        fs::write(&victim, b"keep").unwrap();
+        let app = tauri::test::mock_app();
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&victim)
+            .unwrap();
+        let grants = SaveGrants::default();
+        grants.issue(&victim, SavePurpose::Interchange);
+
+        let error = extract_audio_blocking(
+            &core,
+            &media,
+            &admission,
+            &grants,
+            &id,
+            &victim.to_string_lossy(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, crate::dialog_output::UNAPPROVED_OUTPUT);
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            eprintln!("skip: the granted extraction needs ffmpeg");
+            return;
+        }
+        let raw = tmp.path().join("voice");
+        grants.issue(&raw, SavePurpose::ExtractAudio);
+        let written = extract_audio_blocking(
+            &core,
+            &media,
+            &admission,
+            &grants,
+            &id,
+            &raw.to_string_lossy(),
+        )
+        .expect("granted extraction");
+        assert_eq!(PathBuf::from(&written), tmp.path().join("voice.m4a"));
+        assert!(fs::metadata(&written).unwrap().len() > 0);
+        let leftovers = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp.m4a"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
     fn extract_output_requires_a_dialog_grant() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("existing.m4a");
@@ -9663,13 +9781,13 @@ mod tests {
         let raw = dir.path().join("voice");
         scope.issue(&raw, SavePurpose::ExtractAudio);
         assert_eq!(
-            authorize_extract_output(&scope, &raw.to_string_lossy()),
+            authorize_extract_output(&scope, &raw.to_string_lossy()).map(|output| output.path),
             Ok(dir.path().join("voice.m4a"))
         );
         let mp3 = dir.path().join("voice.mp3");
         scope.issue(&mp3, SavePurpose::ExtractAudio);
         assert_eq!(
-            authorize_extract_output(&scope, &mp3.to_string_lossy()),
+            authorize_extract_output(&scope, &mp3.to_string_lossy()).map(|output| output.path),
             Ok(mp3)
         );
     }

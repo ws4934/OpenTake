@@ -108,13 +108,19 @@ export function TitleBar() {
       ? `${dir}${sep}${projectStem(projectPath)}.${format.ext}`
       : undefined;
 
-    const chosen = await save({
-      title: t(`title.export${format.key}Dialog`),
-      defaultPath,
-      // rfd's deprecated macOS allowedFileTypes path disables Save for
-      // interchange extensions on macOS 26. The backend appends the format's
-      // extension next to the dialog-approved path, so pass it through as is.
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t(`title.export${format.key}Dialog`),
+        defaultPath,
+        // rfd's deprecated macOS allowedFileTypes path disables Save for
+        // interchange extensions on macOS 26. The backend appends the format's
+        // extension next to the dialog-approved path, so pass it through as is.
+      });
+    } catch (error) {
+      pushToast(t("title.exportInterchangeFailed", { error: errorText(error) }));
+      return;
+    }
     if (typeof chosen !== "string") return; // cancelled
 
     try {
@@ -143,16 +149,22 @@ export function TitleBar() {
       ? `${dir}${sep}${projectStem(projectPath)}.${format}`
       : undefined;
 
-    const chosen = await save({
-      title: t(format === "srt" ? "title.exportSrtDialog" : "title.exportVttDialog"),
-      defaultPath,
-      filters: [
-        {
-          name: t(format === "srt" ? "title.exportSrtFilter" : "title.exportVttFilter"),
-          extensions: [format],
-        },
-      ],
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t(format === "srt" ? "title.exportSrtDialog" : "title.exportVttDialog"),
+        defaultPath,
+        filters: [
+          {
+            name: t(format === "srt" ? "title.exportSrtFilter" : "title.exportVttFilter"),
+            extensions: [format],
+          },
+        ],
+      });
+    } catch (error) {
+      pushToast(t("title.exportSubtitlesFailed", { error: errorText(error) }));
+      return;
+    }
     if (typeof chosen !== "string") return; // cancelled
 
     try {
