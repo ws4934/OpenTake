@@ -548,10 +548,11 @@ impl Dispatcher {
         drop(plugin_guard);
 
         // 7. Shorten outbound ids against the post-run id universe (so newly
-        //    created ids in summaries shorten too).
-        let post_manifest = self.handle.media();
-        let post_universe = short_id::current_id_universe(&after, &post_manifest);
-        let result = short_id::shorten_ids(result, &post_universe);
+        //    created ids in summaries shorten too). The universe is only
+        //    collected when the result text carries a UUID.
+        let result = short_id::shorten_ids(result, || {
+            short_id::current_id_universe(&after, &self.handle.media())
+        });
         let timeline_result =
             self.timeline_result_completion(tool, &args, &before, &after, &result, cancel);
         DispatchReceipt {
@@ -587,11 +588,9 @@ impl Dispatcher {
                 }
                 TimelineResultCompletion::MotionDocument { tool, operation } => {
                     let result = finish_motion_document_operation(tool, operation, cancel);
-                    let universe = short_id::current_id_universe(
-                        &self.handle.timeline(),
-                        &self.handle.media(),
-                    );
-                    return short_id::shorten_ids(result, &universe);
+                    return short_id::shorten_ids(result, || {
+                        short_id::current_id_universe(&self.handle.timeline(), &self.handle.media())
+                    });
                 }
                 TimelineResultCompletion::Capture(request) => request,
             };
@@ -1402,7 +1401,14 @@ impl Dispatcher {
         }
 
         // Caption-eligible fragments in timeline order (mirrors `captionTargets`).
-        let frags = caption_target_fragments(before, manifest, a.clip_id.as_deref());
+        // A clipId scope falls back to the clip's linked audio (upstream
+        // `resolveTranscriptionScope`), so the rows carry the audio clip's id.
+        let frags = match a.clip_id.as_ref() {
+            Some(clip_id) => {
+                scoped_caption_target_fragments(before, manifest, std::slice::from_ref(clip_id))
+            }
+            None => caption_target_fragments(before, manifest),
+        };
         if a.clip_id.is_some() && frags.is_empty() {
             return Ok(ToolResult::error(format!(
                 "Clip {} not found, or it has no audio/video to transcribe.",
@@ -1423,56 +1429,21 @@ impl Dispatcher {
 
         // Transcribe each UNIQUE source once (cached), via the bridge. Skip —
         // don't fail — on per-source errors, collecting `{file, reason}`.
-        let unique_sources = unique_transcript_sources(&frags);
         let Some(bridge) = self.bridge.as_ref() else {
             return Ok(ToolResult::error(
                 "get_transcript: transcription is not available in this build",
             ));
         };
-        let source_results = bridge
-            .transcribe_sources(&unique_sources)
-            .map_err(|e| ToolError::new(e.message))?;
+        let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
 
-        // Index transcripts + collect skips by media_ref.
-        let mut transcripts: BTreeMap<String, opentake_media::TranscriptionResult> =
-            BTreeMap::new();
-        let mut skipped: Vec<serde_json::Value> = Vec::new();
-        for r in source_results {
-            if let Some(t) = r.transcript {
-                transcripts.insert(r.media_ref, t);
-            } else if let Some(reason) = r.error {
-                let file = manifest
-                    .entries
-                    .iter()
-                    .find(|e| e.id == r.media_ref)
-                    .map(|e| e.name.clone())
-                    .unwrap_or_else(|| r.media_ref.clone());
-                tracing::warn!(
-                    target: "opentake::agent::private",
-                    media_ref = %r.media_ref,
-                    detail = %reason,
-                    "transcript source was skipped"
-                );
-                skipped.push(serde_json::json!({
-                    "file": file,
-                    "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
-                    "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
-                }));
-            }
-        }
-
-        // Assemble via the pure mapper: attach each frag's transcript by media_ref.
-        let mapper_frags: Vec<opentake_media::ClipFragment<'_>> = frags
-            .iter()
-            .map(|f| opentake_media::ClipFragment {
-                clip_id: f.clip.id.clone(),
-                track_index: f.track_index,
-                clip: f.clip,
-                transcript: transcripts.get(&f.clip.media_ref),
-            })
-            .collect();
-        let assembled =
-            opentake_media::timeline_transcript(mapper_frags, fps, a.start_frame, a.end_frame);
+        // Assemble via the pure mapper, capped for the model-facing response.
+        let assembled = assemble_fragment_transcript(
+            &frags,
+            &sources,
+            fps,
+            (a.start_frame, a.end_frame),
+            opentake_media::TIMELINE_MAX_WORDS,
+        );
 
         // Serialize the upstream envelope: clips with nested compact word rows.
         let clips_json: Vec<serde_json::Value> = assembled
@@ -1511,8 +1482,8 @@ impl Dispatcher {
                 ));
             }
         }
-        if !skipped.is_empty() {
-            out["skipped"] = serde_json::json!(skipped);
+        if !sources.skipped.is_empty() {
+            out["skipped"] = serde_json::json!(sources.skipped);
         }
         Ok(ToolResult::ok(out.to_string()))
     }
@@ -1599,19 +1570,15 @@ impl Dispatcher {
 
         // Caption-eligible clips (all, or restricted to clipIds). Reuses the same
         // eligibility as get_transcript (`captionTargets`), plus each clip's track id.
+        // A requested video whose linked audio is the caption target resolves to
+        // that audio (upstream `resolveTranscriptionScope`); an ineligible id
+        // without such a partner contributes nothing.
         let clip_ids = a.clip_ids.clone().unwrap_or_default();
         let auto_detect = clip_ids.is_empty();
         let frags = if auto_detect {
-            caption_target_fragments(before, manifest, None)
+            caption_target_fragments(before, manifest)
         } else {
-            // Restrict to the requested clips (each filtered individually so an
-            // ineligible id simply contributes nothing, as upstream).
-            let wanted: std::collections::BTreeSet<&str> =
-                clip_ids.iter().map(String::as_str).collect();
-            caption_target_fragments(before, manifest, None)
-                .into_iter()
-                .filter(|f| wanted.contains(f.clip.id.as_str()))
-                .collect()
+            scoped_caption_target_fragments(before, manifest, &clip_ids)
         };
         if frags.is_empty() {
             return Ok(ToolResult::error(
@@ -1737,14 +1704,11 @@ impl Dispatcher {
         let mut explicit_count = 0usize;
         for (i, raw) in a.entries.iter().enumerate() {
             let e: AddClipEntry = decode_tool_args(raw, &format!("entries[{i}]"))?;
-            if let Some(entry) = manifest
-                .entries
-                .iter()
-                .find(|entry| entry.id == e.media_ref)
-            {
-                ensure_generation_output_ready(entry, &format!("entries[{i}]"))?;
-            }
-            let (media_type, has_audio) = resolve_media_kind(manifest, &e.media_ref);
+            let Some(media) = placement_media(manifest, &e.media_ref) else {
+                return Ok(media_not_found(ToolName::AddClips, i, &e.media_ref));
+            };
+            ensure_generation_output_ready(media, &format!("entries[{i}]"))?;
+            let (media_type, has_audio) = (media.kind, media.has_audio.unwrap_or(false));
             if e.track_index.is_some() {
                 explicit_count += 1;
             } else {
@@ -1807,21 +1771,15 @@ impl Dispatcher {
                     "entries[{i}]: trimStartFrame and trimEndFrame must be non-negative"
                 )));
             }
-            if let Some(entry) = manifest
-                .entries
-                .iter()
-                .find(|entry| entry.id == e.media_ref)
-            {
-                ensure_generation_output_ready(entry, &format!("entries[{i}]"))?;
-            }
-            let (media_type, has_audio) = resolve_media_kind(manifest, &e.media_ref);
+            let Some(media) = placement_media(manifest, &e.media_ref) else {
+                return Ok(media_not_found(ToolName::InsertClips, i, &e.media_ref));
+            };
+            ensure_generation_output_ready(media, &format!("entries[{i}]"))?;
+            let (media_type, has_audio) = (media.kind, media.has_audio.unwrap_or(false));
             let duration_frames = match e.duration_frames {
                 Some(d) => d,
                 None => {
-                    let full_frames = manifest
-                        .entries
-                        .iter()
-                        .find(|entry| entry.id == e.media_ref)
+                    let full_frames = Some(media)
                         .filter(|entry| entry.duration > 0.0)
                         .map(|entry| entry.duration * fps)
                         .ok_or_else(|| {
@@ -1888,10 +1846,20 @@ impl Dispatcher {
             .enumerate()
             .map(|(i, raw)| decode_tool_args::<MoveEntry>(raw, &format!("moves[{i}]")))
             .collect::<Result<Vec<_>, _>>()?;
-        let requested_ids: BTreeSet<String> =
+        // Every clip that already has a move, starting with the requested ones.
+        // A partner shared by several leads moves once, with the delta of the
+        // first lead that reaches it (upstream `seen`).
+        let mut seen: BTreeSet<String> =
             entries.iter().map(|entry| entry.clip_id.clone()).collect();
         let mut moves = Vec::with_capacity(entries.len());
-        for m in entries {
+        for (i, m) in entries.into_iter().enumerate() {
+            // Upstream `moveClips` rejects a negative destination instead of
+            // letting the ops layer clamp it to 0.
+            if let Some(frame) = m.to_frame.filter(|frame| *frame < 0) {
+                return Err(ToolError::new(format!(
+                    "moves[{i}]: toFrame must be >= 0 (got {frame})"
+                )));
+            }
             // Optional to_track / to_frame default to the clip's current location.
             let (cur_track, cur_frame) = clip_location(before, &m.clip_id);
             let to_frame = m.to_frame.or(cur_frame).unwrap_or(0);
@@ -1921,25 +1889,42 @@ impl Dispatcher {
             if delta == 0 {
                 continue;
             }
+            // Every partner keeps its offset to the lead. Upstream
+            // `partnerMoves` clamps a partner at frame 0, which silently
+            // changes a J/L-cut offset; like `auto_cut_to_beats`, OpenTake
+            // rejects the move instead and names the smallest valid toFrame.
+            let mut earliest: Option<(&str, i32, i32)> = None;
             for (track_index, track) in before.tracks.iter().enumerate() {
                 for partner in &track.clips {
                     if partner.id == m.clip_id
                         || partner.link_group_id.as_deref() != Some(link_group_id)
-                        || requested_ids.contains(partner.id.as_str())
+                        || seen.contains(partner.id.as_str())
                     {
                         continue;
                     }
                     let partner_frame = partner
                         .start_frame
                         .checked_add(delta)
-                        .ok_or_else(|| ToolError::new("linked partner move frame overflow"))?
-                        .max(0);
+                        .ok_or_else(|| ToolError::new("linked partner move frame overflow"))?;
+                    if earliest.is_none_or(|(_, _, frame)| partner_frame < frame) {
+                        earliest = Some((&partner.id, partner.start_frame, partner_frame));
+                    }
+                    seen.insert(partner.id.clone());
                     moves.push(ClipMove {
                         clip_id: partner.id.clone(),
                         to_track: track_index,
                         to_frame: partner_frame,
                     });
                 }
+            }
+            if let Some((partner_id, partner_start, partner_frame)) =
+                earliest.filter(|(_, _, frame)| *frame < 0)
+            {
+                let min_to_frame = i64::from(current_frame) - i64::from(partner_start);
+                return Err(ToolError::new(format!(
+                    "moves[{i}]: moving clip {} to frame {to_frame} would move its linked partner {partner_id} to frame {partner_frame}, before frame 0; use toFrame >= {min_to_frame} to keep their offset",
+                    m.clip_id
+                )));
             }
         }
         let res = self.apply(EditCommand::MoveClips { moves })?;
@@ -2290,15 +2275,10 @@ impl Dispatcher {
             ));
         }
 
-        let transcript = self.get_transcript(&serde_json::json!({}), before, manifest)?;
-        if transcript.is_error {
-            return Ok(transcript);
-        }
-        let transcript_json: Value = serde_json::from_str(&transcript.text_joined())
-            .map_err(|_| ToolError::new("remove_filler_words: transcript response is invalid"))?;
-        let clips = transcript_json["clips"]
-            .as_array()
-            .ok_or_else(|| ToolError::new("remove_filler_words: transcript clips are missing"))?;
+        // Resolve the scope before transcribing: the requested clips (or every
+        // clip on trackIndex) plus their link-group partners. Only those clips'
+        // sources are transcribed, and every word is kept — get_transcript's
+        // model-facing word cap would silently drop later clips here.
         let requested_ids = a
             .clip_ids
             .as_ref()
@@ -2333,6 +2313,32 @@ impl Dispatcher {
             }
             expanded
         });
+        let frags: Vec<TranscriptFrag<'_>> = caption_target_fragments(before, manifest)
+            .into_iter()
+            .filter(|f| {
+                selected_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(f.clip.id.as_str()))
+            })
+            .collect();
+        let (clips, skipped) = if frags.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let Some(bridge) = self.bridge.as_ref() else {
+                return Ok(ToolResult::error(
+                    "remove_filler_words: transcription is not available in this build",
+                ));
+            };
+            let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
+            let transcript = assemble_fragment_transcript(
+                &frags,
+                &sources,
+                before.fps,
+                (None, None),
+                usize::MAX,
+            );
+            (transcript.clips, sources.skipped)
+        };
         let padding = a.padding_frames.unwrap_or(1).max(0) as i64;
         let mut cuts = Vec::new();
         let mut ranges_by_track: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
@@ -2340,34 +2346,20 @@ impl Dispatcher {
         // member's cuts go to the first member's track as one set of ranges.
         let mut link_group_tracks: BTreeMap<&str, usize> = BTreeMap::new();
 
-        for clip in clips {
-            let Some(clip_id) = clip["clipId"].as_str() else {
-                continue;
-            };
-            let Some(track_index) = clip["trackIndex"].as_u64() else {
-                continue;
-            };
+        for clip in &clips {
+            let clip_id = clip.clip_id.as_str();
+            let track_index = clip.track_index;
             let command_track =
                 match find_clip(before, clip_id).and_then(|clip| clip.link_group_id.as_deref()) {
-                    Some(group) => *link_group_tracks
-                        .entry(group)
-                        .or_insert(track_index as usize),
-                    None => track_index as usize,
+                    Some(group) => *link_group_tracks.entry(group).or_insert(track_index),
+                    None => track_index,
                 };
-            if selected_ids
-                .as_ref()
-                .is_some_and(|ids| !ids.contains(clip_id))
-            {
-                continue;
-            }
-            let clip_start = clip["startFrame"].as_i64().unwrap_or(0);
-            let clip_end = clip["endFrame"].as_i64().unwrap_or(clip_start);
-            let Some(rows) = clip["words"].as_array() else {
-                continue;
-            };
+            let clip_start = i64::from(clip.start_frame);
+            let clip_end = i64::from(clip.end_frame);
+            let rows = &clip.words;
             let normalized = rows
                 .iter()
-                .map(|row| normalize_spoken_token(row[0].as_str().unwrap_or_default()))
+                .map(|row| normalize_spoken_token(&row.text))
                 .collect::<Vec<_>>();
             let mut word_index = 0;
             while word_index < rows.len() {
@@ -2379,14 +2371,14 @@ impl Dispatcher {
                     continue;
                 };
                 let last_index = word_index + phrase.len() - 1;
-                let start = (rows[word_index][1].as_i64().unwrap_or(clip_start) + padding)
-                    .clamp(clip_start, clip_end);
-                let end = (rows[last_index][2].as_i64().unwrap_or(start) - padding)
-                    .clamp(clip_start, clip_end);
+                let start =
+                    (i64::from(rows[word_index].start_frame) + padding).clamp(clip_start, clip_end);
+                let end =
+                    (i64::from(rows[last_index].end_frame) - padding).clamp(clip_start, clip_end);
                 if end > start {
                     let text = rows[word_index..=last_index]
                         .iter()
-                        .filter_map(|row| row[0].as_str())
+                        .map(|row| row.text.as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
                     let cut_id = format!("filler-{clip_id}-{word_index}");
@@ -2418,15 +2410,17 @@ impl Dispatcher {
             )
         });
         let commands = ordered_ripple_commands(&ranges_by_track);
-        Ok(ToolResult::ok(
-            serde_json::json!({
-                "applied": false,
-                "cuts": cuts,
-                "commands": commands,
-                "note": "Review cuts and remove rejected ranges, then call the returned ripple_delete_ranges commands in the listed order; do not reorder them. Each command applies as one undoable edit.",
-            })
-            .to_string(),
-        ))
+        let mut out = serde_json::json!({
+            "applied": false,
+            "cuts": cuts,
+            "commands": commands,
+            "note": "Review cuts and remove rejected ranges, then call the returned ripple_delete_ranges commands in the listed order; do not reorder them. Each command applies as one undoable edit.",
+        });
+        // Sources that could not be transcribed were not searched for fillers.
+        if !skipped.is_empty() {
+            out["skipped"] = serde_json::json!(skipped);
+        }
+        Ok(ToolResult::ok(out.to_string()))
     }
 
     fn detect_beat_hints(
@@ -3493,9 +3487,6 @@ fn validate_optional_object<T: ToolArgs>(
 
 // MARK: - Free conversion helpers
 
-/// Resolve a clip's media type + has-audio from the manifest entry by id.
-/// Unknown refs fall back to video / no-audio; the ops layer then validates the
-/// id against the track and rejects an incompatible / missing asset.
 /// One caption-eligible clip located on the timeline: a borrowed [`Clip`] plus
 /// its track index and whether its source is video (drives audio extraction).
 /// The `get_transcript` body maps these through the pure timeline transcript
@@ -3528,12 +3519,10 @@ fn caption_can_transcribe(clip: &opentake_domain::Clip, manifest: &MediaManifest
 /// upstream `captionTargets(in:)`: keep audio/video clips that can be transcribed,
 /// but drop a **video** clip whose `linkGroupId` also has a linked **audio** clip
 /// (the audio partner is transcribed instead, so the video isn't double-counted).
-/// When `clip_filter` is set, restrict to that single clip id. Pure over the
-/// snapshot — unit-tested below.
+/// Pure over the snapshot — unit-tested below.
 fn caption_target_fragments<'a>(
     timeline: &'a Timeline,
     manifest: &MediaManifest,
-    clip_filter: Option<&str>,
 ) -> Vec<TranscriptFrag<'a>> {
     use opentake_domain::ClipType;
 
@@ -3549,11 +3538,6 @@ fn caption_target_fragments<'a>(
     let mut frags: Vec<TranscriptFrag<'a>> = Vec::new();
     for (track_index, track) in timeline.tracks.iter().enumerate() {
         for clip in &track.clips {
-            if let Some(filter) = clip_filter {
-                if clip.id != filter {
-                    continue;
-                }
-            }
             if !caption_can_transcribe(clip, manifest) {
                 continue;
             }
@@ -3582,6 +3566,115 @@ fn caption_target_fragments<'a>(
     }
     frags.sort_by_key(|f| f.clip.start_frame);
     frags
+}
+
+/// Caption-eligible fragments for an explicit clip scope, in `start_frame`
+/// order. Mirrors upstream `resolveTranscriptionScope` per requested id: a
+/// clip that is a caption target itself is kept; otherwise (typically a video
+/// whose linked audio partner is transcribed instead) its linked partners that
+/// are targets stand in for it (`linkedAudioScope`). Target selection is
+/// timeline-wide, so a video and its linked audio are never transcribed twice
+/// and an id listed alongside its partner resolves to one fragment.
+fn scoped_caption_target_fragments<'a>(
+    timeline: &'a Timeline,
+    manifest: &MediaManifest,
+    clip_ids: &[String],
+) -> Vec<TranscriptFrag<'a>> {
+    let targets = caption_target_fragments(timeline, manifest);
+    let target_ids: BTreeSet<&str> = targets.iter().map(|f| f.clip.id.as_str()).collect();
+    let mut selected: BTreeSet<String> = BTreeSet::new();
+    for id in clip_ids {
+        if target_ids.contains(id.as_str()) {
+            selected.insert(id.clone());
+            continue;
+        }
+        selected.extend(
+            opentake_ops::ops::linked_partner_ids(timeline, id)
+                .into_iter()
+                .filter(|partner| target_ids.contains(partner.as_str())),
+        );
+    }
+    targets
+        .into_iter()
+        .filter(|f| selected.contains(f.clip.id.as_str()))
+        .collect()
+}
+
+/// Per-source transcripts for a set of caption fragments, keyed by media ref,
+/// plus model-safe `skipped` entries for sources that could not be transcribed.
+struct FragmentTranscripts {
+    by_media_ref: BTreeMap<String, opentake_media::TranscriptionResult>,
+    skipped: Vec<Value>,
+}
+
+/// Transcribe each distinct source of `frags` once (cached) through the
+/// bridge. A per-source failure is skipped — not fatal — and reported as a
+/// `{file, code, reason}` entry without the private diagnostic; a backend
+/// failure (e.g. no model) is a tool error.
+fn transcribe_fragment_sources(
+    bridge: &dyn MediaBridge,
+    frags: &[TranscriptFrag<'_>],
+    manifest: &MediaManifest,
+) -> Result<FragmentTranscripts, ToolError> {
+    let source_results = bridge
+        .transcribe_sources(&unique_transcript_sources(frags))
+        .map_err(|e| ToolError::new(e.message))?;
+    let mut by_media_ref = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for r in source_results {
+        if let Some(t) = r.transcript {
+            by_media_ref.insert(r.media_ref, t);
+        } else if let Some(reason) = r.error {
+            let file = manifest
+                .entries
+                .iter()
+                .find(|e| e.id == r.media_ref)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| r.media_ref.clone());
+            tracing::warn!(
+                target: "opentake::agent::private",
+                media_ref = %r.media_ref,
+                detail = %reason,
+                "transcript source was skipped"
+            );
+            skipped.push(serde_json::json!({
+                "file": file,
+                "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
+                "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
+            }));
+        }
+    }
+    Ok(FragmentTranscripts {
+        by_media_ref,
+        skipped,
+    })
+}
+
+/// Map every fragment's words into project frames with the pure timeline
+/// assembler, keeping at most `max_words` words across all fragments.
+fn assemble_fragment_transcript(
+    frags: &[TranscriptFrag<'_>],
+    sources: &FragmentTranscripts,
+    fps: i32,
+    (window_start, window_end): (Option<i32>, Option<i32>),
+    max_words: usize,
+) -> opentake_media::TimelineTranscript {
+    let mapper_frags = frags
+        .iter()
+        .map(|f| opentake_media::ClipFragment {
+            clip_id: f.clip.id.clone(),
+            track_index: f.track_index,
+            clip: f.clip,
+            transcript: sources.by_media_ref.get(&f.clip.media_ref),
+        })
+        .collect();
+    opentake_media::timeline_transcript_with_limit(
+        mapper_frags,
+        fps,
+        window_start,
+        window_end,
+        max_words,
+    )
 }
 
 /// Caption style/placement defaults, 1:1 with upstream `AppTheme.Caption`
@@ -3648,16 +3741,22 @@ fn unique_transcript_sources(frags: &[TranscriptFrag<'_>]) -> Vec<TranscriptSour
     out
 }
 
-fn resolve_media_kind(
-    manifest: &MediaManifest,
+/// The manifest asset a clip-placing entry references (upstream `clipSource`).
+/// `None` means the asset does not exist; callers must reject the entry
+/// instead of placing a clip that references nothing.
+fn placement_media<'a>(
+    manifest: &'a MediaManifest,
     media_ref: &str,
-) -> (opentake_domain::ClipType, bool) {
-    manifest
-        .entries
-        .iter()
-        .find(|e| e.id == media_ref)
-        .map(|e| (e.kind, e.has_audio.unwrap_or(false)))
-        .unwrap_or((opentake_domain::ClipType::Video, false))
+) -> Option<&'a opentake_domain::MediaManifestEntry> {
+    manifest.entries.iter().find(|entry| entry.id == media_ref)
+}
+
+/// Not-found result for `entries[index].mediaRef`, returned before any edit.
+fn media_not_found(tool: ToolName, index: usize, media_ref: &str) -> ToolResult {
+    ToolResult::public_error(
+        PublicErrorKind::ResourceNotFound(tool),
+        format!("entries[{index}]: media asset not found: {media_ref}"),
+    )
 }
 
 fn generation_status_label(status: Option<GenerationJobStatus>) -> &'static str {
@@ -5189,17 +5288,24 @@ mod tests {
             TestHandle { core }
         }
 
-        /// Register a media asset directly on the manifest by applying through the
-        /// session is not exposed; instead we rely on `resolve_media_kind`'s
-        /// fallback (video) for unknown refs, which is what an un-imported ref
-        /// hits. For a known-asset path we inject via a manifest helper below.
-        fn with_asset(self, id: &str) -> Self {
-            // The public AppCore surface imports via probe; for a unit test we
-            // only need the manifest to contain the id so resolution succeeds.
-            // AppCore has no direct manifest setter, so we accept the video
-            // fallback (add_clips on a video track works regardless).
-            let _ = id;
-            self
+        /// Register a video asset through AppCore's real import path and
+        /// return its manifest id. The probe is supplied, so no file is read.
+        fn import_video(&self, name: &str) -> String {
+            self.core
+                .import_media_file(
+                    format!("/opentake-agent-test/{name}.mp4"),
+                    name,
+                    &opentake_core::ProbedMedia {
+                        duration_secs: 1.0,
+                        width: Some(1920),
+                        height: Some(1080),
+                        fps: Some(30.0),
+                        has_audio: false,
+                        color: None,
+                    },
+                )
+                .expect("import test video")
+                .id
         }
     }
 
@@ -5394,13 +5500,15 @@ mod tests {
 
     #[test]
     fn add_clips_then_get_timeline_reflects_clip() {
-        let d = dispatcher_with(Arc::new(TestHandle::new().with_asset("asset-1")));
+        let handle = TestHandle::new();
+        let media_ref = handle.import_video("asset-1");
+        let d = dispatcher_with(Arc::new(handle));
         // Track 0 is the seeded video track.
         let add = d.dispatch(
             "add_clips",
             serde_json::json!({
                 "entries": [{
-                    "mediaRef": "asset-1",
+                    "mediaRef": media_ref,
                     "trackIndex": 0,
                     "startFrame": 0,
                     "durationFrames": 30
@@ -5984,6 +6092,123 @@ mod tests {
         assert_eq!(timeline.tracks[1].clips[0].start_frame, 14);
     }
 
+    /// J-cut: the linked audio `audio-j` enters 10 frames before `video-j`.
+    fn jcut_handle() -> Arc<StateHandle> {
+        let mut tl = Timeline::new();
+        let mut video_track = Track::new("video-track", ClipType::Video);
+        let mut video = Clip::new("video-j", "video-asset", 30, 30);
+        video.link_group_id = Some("jcut".into());
+        video_track.clips.push(video);
+        let mut audio_track = Track::new("audio-track", ClipType::Audio);
+        let mut audio = audio_clip("audio-j", "audio-asset", 20, 30);
+        audio.link_group_id = Some("jcut".into());
+        audio_track.clips.push(audio);
+        tl.tracks = vec![video_track, audio_track];
+        Arc::new(StateHandle::new(tl, MediaManifest::new()))
+    }
+
+    /// `(video start, audio start)` of a two-track linked fixture.
+    fn linked_starts(handle: &StateHandle) -> (i32, i32) {
+        let timeline = handle.timeline();
+        (
+            timeline.tracks[0].clips[0].start_frame,
+            timeline.tracks[1].clips[0].start_frame,
+        )
+    }
+
+    #[test]
+    fn move_clips_rejects_a_linked_partner_crossing_frame_zero() {
+        let handle = jcut_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "move_clips",
+            serde_json::json!({"moves":[{"clipId":"video-j","toFrame":5}]}),
+        );
+
+        assert!(result.is_error, "{}", result.text_joined());
+        let message = result.text_joined();
+        assert!(
+            message.contains("linked partner audio-j to frame -5"),
+            "{message}"
+        );
+        assert!(message.contains("toFrame >= 10"), "{message}");
+        assert_unedited(&handle, &before);
+    }
+
+    #[test]
+    fn move_clips_moves_a_partner_shared_by_two_requested_clips_once() {
+        let mut tl = Timeline::new();
+        let mut video_track = Track::new("video-track", ClipType::Video);
+        let mut video = Clip::new("v", "video-asset", 30, 30);
+        video.link_group_id = Some("trio".into());
+        video_track.clips.push(video);
+        let mut audio_tracks = Vec::new();
+        for id in ["a1", "a2"] {
+            let mut track = Track::new(format!("{id}-track"), ClipType::Audio);
+            let mut audio = audio_clip(id, "audio-asset", 30, 30);
+            audio.link_group_id = Some("trio".into());
+            track.clips.push(audio);
+            audio_tracks.push(track);
+        }
+        tl.tracks = std::iter::once(video_track).chain(audio_tracks).collect();
+        let handle = Arc::new(StateHandle::new(tl, MediaManifest::new()));
+        let dispatcher = dispatcher_with(handle.clone());
+
+        let result = dispatcher.dispatch(
+            "move_clips",
+            serde_json::json!({"moves":[
+                {"clipId":"v","toFrame":60},
+                {"clipId":"a1","toFrame":60}
+            ]}),
+        );
+
+        assert!(!result.is_error, "{}", result.text_joined());
+        let starts = handle
+            .timeline()
+            .tracks
+            .iter()
+            .map(|track| track.clips[0].start_frame)
+            .collect::<Vec<_>>();
+        assert_eq!(starts, [60, 60, 60]);
+    }
+
+    #[test]
+    fn move_clips_rejects_a_negative_to_frame() {
+        for (handle, clip_id) in [(jcut_handle(), "video-j"), (seeded_handle(), "clip-1")] {
+            let dispatcher = dispatcher_with(handle.clone());
+            let before = handle.timeline();
+            let result = dispatcher.dispatch(
+                "move_clips",
+                serde_json::json!({"moves":[{"clipId":clip_id,"toFrame":-10}]}),
+            );
+
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(
+                result
+                    .text_joined()
+                    .contains("moves[0]: toFrame must be >= 0 (got -10)"),
+                "{}",
+                result.text_joined()
+            );
+            assert_unedited(&handle, &before);
+        }
+    }
+
+    #[test]
+    fn move_clips_keeps_the_linked_offset_when_every_partner_stays_on_the_timeline() {
+        let handle = jcut_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        for (to_frame, expected) in [(10, (10, 0)), (50, (50, 40)), (35, (35, 25))] {
+            let result = dispatcher.dispatch(
+                "move_clips",
+                serde_json::json!({"moves":[{"clipId":"video-j","toFrame":to_frame}]}),
+            );
+            assert!(!result.is_error, "{}", result.text_joined());
+            assert_eq!(linked_starts(&handle), expected, "toFrame {to_frame}");
+        }
+    }
+
     #[test]
     fn poisoned_agent_undo_mutex_does_not_break_later_edit_or_undo() {
         let handle = seeded_handle();
@@ -6331,6 +6556,156 @@ mod tests {
             "no linked audio track should be created"
         );
         assert!(tl.tracks[0].clips[0].link_group_id.is_none());
+    }
+
+    /// The handle still holds `before` and has recorded no edit or undo step.
+    fn assert_unedited(handle: &StateHandle, before: &Timeline) {
+        assert_eq!(&handle.timeline(), before);
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.version(), 0);
+        assert!(!state.can_undo());
+    }
+
+    #[test]
+    fn add_clips_rejects_an_unknown_media_ref_without_editing() {
+        // Video and audio destinations, plus auto-track placement: none may
+        // fall back to a video stand-in or create a dangling clip.
+        for (handle, args) in [
+            (
+                seeded_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                seeded_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                linked_move_handle(),
+                serde_json::json!({"entries":[{"mediaRef":"does-not-exist","trackIndex":1,"startFrame":80,"durationFrames":30}]}),
+            ),
+        ] {
+            let dispatcher = dispatcher_with(handle.clone());
+            let before = handle.timeline();
+            let result = dispatcher.dispatch("add_clips", args);
+
+            assert!(result.is_error, "{}", result.text_joined());
+            assert!(
+                result
+                    .text_joined()
+                    .contains("entries[0]: media asset not found: does-not-exist"),
+                "{}",
+                result.text_joined()
+            );
+            assert_eq!(
+                result.public_error_kind(),
+                Some(PublicErrorKind::ResourceNotFound(ToolName::AddClips))
+            );
+            assert_unedited(&handle, &before);
+            assert!(dispatcher.agent_undo_stacks().is_empty());
+        }
+    }
+
+    #[test]
+    fn insert_clips_rejects_an_unknown_media_ref_without_editing() {
+        let handle = seeded_handle();
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "insert_clips",
+            serde_json::json!({
+                "trackIndex": 0,
+                "atFrame": 0,
+                "entries": [{"mediaRef": "does-not-exist", "durationFrames": 30}]
+            }),
+        );
+
+        assert!(result.is_error, "{}", result.text_joined());
+        assert!(
+            result
+                .text_joined()
+                .contains("entries[0]: media asset not found: does-not-exist"),
+            "{}",
+            result.text_joined()
+        );
+        assert_eq!(
+            result.public_error_kind(),
+            Some(PublicErrorKind::ResourceNotFound(ToolName::InsertClips))
+        );
+        assert_unedited(&handle, &before);
+        assert!(dispatcher.agent_undo_stacks().is_empty());
+    }
+
+    #[test]
+    fn clip_placement_resolves_a_short_media_ref_prefix() {
+        const ASSET: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        for (tool, args) in [
+            (
+                "add_clips",
+                serde_json::json!({"entries":[{"mediaRef":&ASSET[..8],"trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                "insert_clips",
+                serde_json::json!({"trackIndex":0,"atFrame":0,"entries":[{"mediaRef":&ASSET[..8],"durationFrames":30}]}),
+            ),
+        ] {
+            let mut timeline = Timeline::new();
+            let mut track = Track::new("track-1", ClipType::Video);
+            track.clips.push(Clip::new("clip-1", ASSET, 0, 30));
+            timeline.tracks.push(track);
+            let mut manifest = MediaManifest::new();
+            manifest.entries.push(entry(ASSET, "Hero"));
+            let handle = Arc::new(StateHandle::new(timeline, manifest));
+            let dispatcher = dispatcher_with(handle.clone());
+
+            let result = dispatcher.dispatch(tool, args);
+
+            assert!(!result.is_error, "{tool}: {}", result.text_joined());
+            let clips = &handle.timeline().tracks[0].clips;
+            assert_eq!(clips.len(), 2, "{tool}");
+            assert!(clips.iter().all(|clip| clip.media_ref == ASSET), "{tool}");
+        }
+    }
+
+    #[test]
+    fn clip_placement_still_rejects_a_generating_placeholder() {
+        let mut placeholder = entry("generated-asset", "Pending");
+        placeholder.generation_input = Some(opentake_domain::GenerationInput {
+            status: Some(GenerationJobStatus::Generating),
+            ..opentake_domain::GenerationInput::default()
+        });
+        let mut timeline = Timeline::new();
+        let mut track = Track::new("track-1", ClipType::Video);
+        track
+            .clips
+            .push(Clip::new("clip-1", "generated-asset", 0, 30));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(placeholder);
+        let handle = Arc::new(StateHandle::new(timeline, manifest));
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+
+        for (tool, args) in [
+            (
+                "add_clips",
+                serde_json::json!({"entries":[{"mediaRef":"generated-asset","trackIndex":0,"startFrame":40,"durationFrames":30}]}),
+            ),
+            (
+                "insert_clips",
+                serde_json::json!({"trackIndex":0,"atFrame":0,"entries":[{"mediaRef":"generated-asset","durationFrames":30}]}),
+            ),
+        ] {
+            let result = dispatcher.dispatch(tool, args);
+            assert!(result.is_error, "{tool}: {}", result.text_joined());
+            assert!(
+                result.text_joined().contains(
+                    "entries[0]: generated media 'generated-asset' is not ready (status generating)"
+                ),
+                "{tool}: {}",
+                result.text_joined()
+            );
+        }
+        assert_unedited(&handle, &before);
     }
 
     #[test]
@@ -8964,6 +9339,72 @@ mod tests {
         assert!(r.is_error);
     }
 
+    #[test]
+    fn get_transcript_linked_video_clip_id_reads_its_linked_audio() {
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![
+            word("hello", 0.0, 0.5),
+            word("world", 0.5, 1.0),
+        ]));
+        for clip_id in ["clip-v", "clip-a"] {
+            let r = d.dispatch("get_transcript", serde_json::json!({ "clipId": clip_id }));
+            assert!(!r.is_error, "{clip_id}: {}", r.text_joined());
+            assert_eq!(
+                first_json(&r)["clips"],
+                serde_json::json!([{
+                    "clipId": "clip-a",
+                    "trackIndex": 1,
+                    "startFrame": 0,
+                    "endFrame": 900,
+                    "words": [["hello", 0, 15], ["world", 15, 30]]
+                }]),
+                "{clip_id}"
+            );
+        }
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["aud".to_string()], vec!["aud".to_string()]]
+        );
+    }
+
+    #[test]
+    fn get_transcript_unlinked_video_clip_id_transcribes_its_own_audio_track() {
+        let mut tl = Timeline::new();
+        tl.fps = 30;
+        let mut track = Track::new("track-v", ClipType::Video);
+        track.clips.push(Clip::new("clip-v", "vid", 0, 60));
+        tl.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        let mut video = entry("vid", "Camera");
+        video.has_audio = Some(true);
+        manifest.entries.push(video);
+
+        let frags = scoped_caption_target_fragments(&tl, &manifest, &["clip-v".to_string()]);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].clip.id, "clip-v");
+        assert!(
+            frags[0].is_video,
+            "audio is extracted from the video itself"
+        );
+
+        let bridge = Arc::new(
+            FakeBridge::default().with_transcript("vid", transcript(vec![word("hi", 0.0, 0.5)])),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(tl, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+        let r = d.dispatch("get_transcript", serde_json::json!({ "clipId": "clip-v" }));
+        assert!(!r.is_error, "{}", r.text_joined());
+        let v = first_json(&r);
+        assert_eq!(v["clips"][0]["clipId"], "clip-v");
+        assert_eq!(v["clips"][0]["words"], serde_json::json!([["hi", 0, 15]]));
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["vid".to_string()]]
+        );
+    }
+
     // MARK: - caption target selection (pure)
 
     #[test]
@@ -8986,7 +9427,7 @@ mod tests {
         m.entries.push(entry("vid_silent", "Silent")); // has_audio=false
         m.entries.push(audio_entry("aud", "A"));
 
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         let ids: Vec<&str> = frags.iter().map(|f| f.clip.id.as_str()).collect();
         assert!(ids.contains(&"v-with-audio"));
         assert!(ids.contains(&"a1"));
@@ -9016,10 +9457,58 @@ mod tests {
         m.entries.push(v_with);
         m.entries.push(audio_entry("aud", "A"));
 
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         let ids: Vec<&str> = frags.iter().map(|f| f.clip.id.as_str()).collect();
         assert!(!ids.contains(&"v1"), "linked video should be dropped");
         assert!(ids.contains(&"a1"));
+    }
+
+    #[test]
+    fn scoped_caption_targets_fall_back_only_to_transcribable_linked_partners() {
+        // v1 + a1: video with a linked audio clip. v2 + v3: two linked videos
+        // with their own audio and no audio clip. t1: a text clip.
+        let mut tl = Timeline::new();
+        let mut vt = Track::new("v", ClipType::Video);
+        let mut v1 = Clip::new("v1", "vid", 0, 60);
+        v1.link_group_id = Some("av".into());
+        vt.clips.push(v1);
+        let mut v2 = Clip::new("v2", "vid", 60, 60);
+        v2.link_group_id = Some("vv".into());
+        vt.clips.push(v2);
+        let mut t1 = Clip::new("t1", "", 120, 30);
+        t1.media_type = ClipType::Text;
+        vt.clips.push(t1);
+        tl.tracks.push(vt);
+        let mut vt2 = Track::new("v-2", ClipType::Video);
+        let mut v3 = Clip::new("v3", "vid", 60, 60);
+        v3.link_group_id = Some("vv".into());
+        vt2.clips.push(v3);
+        tl.tracks.push(vt2);
+        let mut at = Track::new("a", ClipType::Audio);
+        let mut a1 = audio_clip("a1", "vid", 0, 60);
+        a1.link_group_id = Some("av".into());
+        at.clips.push(a1);
+        tl.tracks.push(at);
+        let mut m = MediaManifest::new();
+        let mut video = entry("vid", "V");
+        video.has_audio = Some(true);
+        m.entries.push(video);
+
+        let ids = |requested: &[&str]| {
+            let requested: Vec<String> = requested.iter().map(|id| id.to_string()).collect();
+            scoped_caption_target_fragments(&tl, &m, &requested)
+                .iter()
+                .map(|f| f.clip.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&["v1"]), ["a1"]);
+        assert_eq!(ids(&["v1", "a1"]), ["a1"]);
+        assert_eq!(ids(&["a1"]), ["a1"]);
+        // A transcribable clip stays itself; its linked video is not pulled in.
+        assert_eq!(ids(&["v2"]), ["v2"]);
+        assert_eq!(ids(&["v1", "v3"]), ["a1", "v3"]);
+        assert!(ids(&["t1"]).is_empty());
+        assert!(ids(&["ghost"]).is_empty());
     }
 
     #[test]
@@ -9035,7 +9524,7 @@ mod tests {
         tl.tracks.push(at);
         let mut m = MediaManifest::new();
         m.entries.push(audio_entry("aud", "A"));
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         assert_eq!(frags.len(), 2);
         let sources = unique_transcript_sources(&frags);
         assert_eq!(sources.len(), 1);
@@ -9246,6 +9735,76 @@ mod tests {
         ));
         let r = d.dispatch("add_captions", serde_json::json!({ "bogus": 1 }));
         assert!(r.is_error);
+    }
+
+    fn talking_head_caption_transcript() -> TranscriptionResult {
+        caption_transcript(
+            vec![word("hello", 0.0, 0.5), word("world", 0.5, 1.0)],
+            vec![segment("Hello world.", 0.0, 1.0)],
+        )
+    }
+
+    fn caption_texts(d: &Dispatcher) -> Vec<String> {
+        d.handle
+            .timeline()
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter(|clip| clip.media_type == ClipType::Text)
+            .filter_map(|clip| clip.text_content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn add_captions_linked_video_clip_id_captions_its_linked_audio_once() {
+        for clip_ids in [
+            serde_json::json!(["clip-v"]),
+            serde_json::json!(["clip-v", "clip-a"]),
+        ] {
+            let (d, bridge) = linked_talking_head_dispatcher(talking_head_caption_transcript());
+            let r = d.dispatch("add_captions", serde_json::json!({ "clipIds": clip_ids }));
+            assert!(!r.is_error, "{clip_ids}: {}", r.text_joined());
+            assert_eq!(caption_texts(&d), ["Hello world."], "{clip_ids}");
+            assert_eq!(
+                *bridge.transcribe_calls.lock().unwrap(),
+                vec![vec!["aud".to_string()]],
+                "{clip_ids}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_captions_linked_video_mixed_with_other_clips_is_not_skipped() {
+        let (d, bridge) = linked_talking_head_dispatcher(talking_head_caption_transcript());
+        let mut timeline = d.handle.timeline();
+        let mut narration = Track::new("track-n", ClipType::Audio);
+        narration
+            .clips
+            .push(audio_clip("clip-n", "narration", 900, 60));
+        timeline.tracks.push(narration);
+        let mut manifest = d.handle.media();
+        manifest.entries.push(audio_entry("narration", "Narration"));
+        bridge.transcripts.lock().unwrap().insert(
+            "narration".into(),
+            caption_transcript(vec![word("bye", 0.0, 0.5)], vec![segment("Bye.", 0.0, 0.5)]),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+
+        let r = d.dispatch(
+            "add_captions",
+            serde_json::json!({ "clipIds": ["clip-v", "clip-n"] }),
+        );
+
+        assert!(!r.is_error, "{}", r.text_joined());
+        assert_eq!(caption_texts(&d), ["Hello world.", "Bye."]);
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["aud".to_string(), "narration".to_string()]]
+        );
     }
 
     // MARK: - add_texts (#194 auto-track dispatch, #195 auto-fit)
@@ -10245,5 +10804,176 @@ mod tests {
         let expected = vec![(0, 6, 0), (6, 48, 12)];
         assert_eq!(track_layout(&after, 0), expected);
         assert_eq!(track_layout(&after, 1), expected);
+    }
+
+    /// One audio track at 30 fps: `clip-long` (media `long`, 10_005 words with
+    /// an "um" at word 10_002, past the get_transcript cap) followed by
+    /// `clip-b` (media `short`, "Well um go").
+    fn long_interview_dispatcher() -> (Dispatcher, Arc<FakeBridge>) {
+        let mut timeline = Timeline::new();
+        timeline.fps = 30;
+        let mut track = Track::new("track-a", ClipType::Audio);
+        track.clips.push(audio_clip("clip-long", "long", 0, 30_100));
+        track.clips.push(audio_clip("clip-b", "short", 30_100, 60));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("long", "Interview"));
+        manifest.entries.push(audio_entry("short", "Outro"));
+        let long_words = (0..10_005)
+            .map(|index| {
+                let start = index as f64 * 0.1;
+                word(
+                    if index == 10_002 { "um" } else { "so" },
+                    start,
+                    start + 0.05,
+                )
+            })
+            .collect();
+        let bridge = Arc::new(
+            FakeBridge::default()
+                .with_transcript("long", transcript(long_words))
+                .with_transcript(
+                    "short",
+                    transcript(vec![
+                        word("Well", 0.0, 0.2),
+                        word("um", 0.2, 0.4),
+                        word("go", 0.5, 0.7),
+                    ]),
+                ),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+        (d, bridge)
+    }
+
+    /// `(clipId, text)` of every cut in a remove_filler_words preview.
+    fn filler_cuts(result: &ToolResult) -> Vec<(String, String)> {
+        assert!(!result.is_error, "{}", result.text_joined());
+        first_json(result)["cuts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cut| {
+                (
+                    cut["clipId"].as_str().unwrap().to_string(),
+                    cut["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn filler_cut(clip_id: &str) -> (String, String) {
+        (clip_id.to_string(), "um".to_string())
+    }
+
+    #[test]
+    fn remove_filler_words_finds_fillers_past_the_transcript_word_cap() {
+        let (d, bridge) = long_interview_dispatcher();
+        let args = |scope: Value| {
+            let mut args = serde_json::json!({"fillerWords": ["um"], "paddingFrames": 0});
+            args.as_object_mut()
+                .unwrap()
+                .extend(scope.as_object().unwrap().clone());
+            args
+        };
+
+        let scoped = d.dispatch(
+            "remove_filler_words",
+            args(serde_json::json!({"clipIds": ["clip-b"]})),
+        );
+        assert_eq!(filler_cuts(&scoped), [filler_cut("clip-b")]);
+        assert_eq!(
+            first_json(&scoped)["cuts"][0]["range"],
+            serde_json::json!([30_106, 30_112])
+        );
+
+        let long = d.dispatch(
+            "remove_filler_words",
+            args(serde_json::json!({"clipIds": ["clip-long"]})),
+        );
+        assert_eq!(filler_cuts(&long), [filler_cut("clip-long")]);
+
+        let whole_timeline = d.dispatch("remove_filler_words", args(serde_json::json!({})));
+        assert_eq!(
+            filler_cuts(&whole_timeline),
+            [filler_cut("clip-long"), filler_cut("clip-b")]
+        );
+
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![
+                vec!["short".to_string()],
+                vec!["long".to_string()],
+                vec!["long".to_string(), "short".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_filler_words_transcribes_only_the_requested_scope() {
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![
+            word("Well", 0.0, 0.2),
+            word("um", 0.2, 0.4),
+        ]));
+        let mut timeline = d.handle.timeline();
+        let mut other = Track::new("track-b", ClipType::Audio);
+        other.clips.push(audio_clip("clip-b", "aud-b", 0, 60));
+        timeline.tracks.push(other);
+        let mut manifest = d.handle.media();
+        manifest.entries.push(audio_entry("aud-b", "Room tone"));
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+
+        for scope in [
+            serde_json::json!({"clipIds": ["clip-v"]}),
+            serde_json::json!({"trackIndex": 2}),
+            // The video track resolves to the linked audio it carries.
+            serde_json::json!({"trackIndex": 0}),
+        ] {
+            let result = d.dispatch("remove_filler_words", scope.clone());
+            assert!(!result.is_error, "{scope}: {}", result.text_joined());
+        }
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![
+                vec!["aud".to_string()],
+                vec!["aud-b".to_string()],
+                vec!["aud".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_filler_words_reports_skipped_sources() {
+        const PRIVATE_DIAGNOSTIC: &str = "decode failed at /Users/private/voice.wav";
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![word("um", 0.2, 0.4)]));
+        bridge
+            .transcribe_errors
+            .lock()
+            .unwrap()
+            .insert("aud".into(), PRIVATE_DIAGNOSTIC.into());
+
+        let result = d.dispatch(
+            "remove_filler_words",
+            serde_json::json!({"clipIds": ["clip-v"], "fillerWords": ["um"]}),
+        );
+
+        assert!(filler_cuts(&result).is_empty());
+        assert!(!result.text_joined().contains("/Users/private"));
+        let json = first_json(&result);
+        assert_eq!(
+            json["skipped"],
+            serde_json::json!([{
+                "file": "Voice",
+                "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
+                "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
+            }])
+        );
     }
 }

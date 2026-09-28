@@ -2151,14 +2151,20 @@ mod tests {
         state
     }
 
+    /// Wait until the catalog has been published `expected` times. The
+    /// publication waits on blocking work on another thread, so bound the wait
+    /// by wall-clock time rather than a number of yields, which a loaded runner
+    /// can exhaust first. Tokio time would not do: a paused test clock jumps
+    /// ahead whenever every task is waiting on that blocking work.
     async fn wait_for_publish_count(state: &ExternalMcpState, expected: usize) {
-        for _ in 0..100 {
-            if state.catalog_publish_count_for_test() >= expected {
-                return;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.catalog_publish_count_for_test() < expected {
+            if std::time::Instant::now() >= deadline {
+                assert_eq!(state.catalog_publish_count_for_test(), expected);
             }
             tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(state.catalog_publish_count_for_test(), expected);
     }
 
     async fn assert_fixed_port_available() {
