@@ -9,7 +9,9 @@
 //! - `project.json` is mandatory; absence is [`ProjectError::MissingTimeline`]
 //!   (upstream throws `fileReadCorruptFile`).
 //! - `media.json`, if present, is parsed strictly; a parse failure is an error
-//!   (upstream throws `fileReadCorruptFile`).
+//!   (upstream throws `fileReadCorruptFile`). A `.project` media or proxy path
+//!   that is not a portable bundle path does not fail the open: that entry
+//!   opens offline and its original string is written back verbatim.
 //! - `generation-log.json`, if present, is parsed leniently; a parse failure
 //!   yields an in-memory `None` recovery (upstream `try?`) plus a compatibility
 //!   blocker, so the damaged bytes remain readable but cannot be overwritten.
@@ -34,8 +36,9 @@ use crate::compatibility;
 use crate::error::{ProjectError, Result};
 use crate::gen_log::{GenerationLog, GenerationLogEntry};
 use crate::layout;
+use crate::media_paths::{self, QuarantinedMediaPaths};
 use crate::project_root::ensure_component_fits;
-use crate::{is_safe_project_asset_relative_path, ProjectRoot};
+use crate::ProjectRoot;
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
@@ -69,34 +72,9 @@ pub mod test_hooks {
 pub struct ProjectCompatibility {
     blockers: Vec<String>,
     warnings: Vec<String>,
-}
-
-fn validate_manifest_paths(manifest: &MediaManifest) -> Result<()> {
-    for entry in &manifest.entries {
-        if let opentake_domain::MediaSource::Project { relative_path } = &entry.source {
-            if !is_safe_project_asset_relative_path(relative_path) {
-                return Err(ProjectError::InvalidMediaManifest {
-                    file: layout::MANIFEST_FILE,
-                    reason: format!(
-                        "project source for asset '{}' is not a safe bundle-relative path",
-                        entry.id
-                    ),
-                });
-            }
-        }
-        if let Some(proxy) = &entry.proxy {
-            if !is_safe_project_asset_relative_path(&proxy.relative_path) {
-                return Err(ProjectError::InvalidMediaManifest {
-                    file: layout::MANIFEST_FILE,
-                    reason: format!(
-                        "proxy for asset '{}' is not a safe bundle-relative path",
-                        entry.id
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
+    /// Unsafe `media.json` paths withheld from the live manifest on open and
+    /// written back verbatim by every manifest save.
+    quarantined_media: Vec<QuarantinedMediaPaths>,
 }
 
 impl ProjectCompatibility {
@@ -127,6 +105,31 @@ impl ProjectCompatibility {
         self.warnings.extend(warnings);
         self.warnings.sort();
         self.warnings.dedup();
+    }
+
+    /// Take every `.project` media or proxy path that is not a portable
+    /// bundle path out of a freshly decoded manifest. The entry stays, offline
+    /// and relinkable, with a `media.json:offline-media:<id>` or
+    /// `media.json:ignored-proxy:<id>` warning; its original string is kept
+    /// here for [`Self::manifest_for_write`].
+    fn quarantine_unsafe_media_paths(&mut self, manifest: &mut MediaManifest) {
+        let (quarantined, warnings) = media_paths::quarantine_unsafe_media_paths(manifest);
+        self.quarantined_media.extend(quarantined);
+        self.warn(warnings);
+    }
+
+    /// The manifest a writer must persist for the live `manifest`.
+    ///
+    /// Every `.project` media and proxy path must be a portable bundle path,
+    /// so no save can produce a manifest its reader would refuse; the error is
+    /// [`ProjectError::InvalidMediaManifest`]. Unsafe paths withheld when the
+    /// project was opened are restored verbatim for entries that were not
+    /// relinked, so saving never discards them.
+    pub fn manifest_for_write<'a>(
+        &self,
+        manifest: &'a MediaManifest,
+    ) -> Result<std::borrow::Cow<'a, MediaManifest>> {
+        media_paths::manifest_for_write(manifest, &self.quarantined_media)
     }
 
     /// Refuse a write that would discard unknown persisted data.
@@ -291,12 +294,14 @@ impl Project {
         let mut compatibility = ProjectCompatibility::default();
         compatibility.extend(timeline_blockers);
 
-        // media.json: strict when present, empty default when absent.
+        // media.json: strict when present, empty default when absent. An
+        // entry whose path is not a portable bundle path stays in the project
+        // as offline media instead of failing the whole open.
         let manifest = if let Some(bytes) = root.read_optional(layout::MANIFEST_FILE)? {
-            let (manifest, blockers, _) =
+            let (mut manifest, blockers, _) =
                 decode_component::<MediaManifest>(&bytes, layout::MANIFEST_FILE)?;
             compatibility.extend(blockers);
-            validate_manifest_paths(&manifest)?;
+            compatibility.quarantine_unsafe_media_paths(&mut manifest);
             manifest
         } else {
             MediaManifest::new()
@@ -386,7 +391,10 @@ impl Project {
     /// error result into a partially saved manifest.
     pub fn save_manifest(&self) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
         let root = ProjectRoot::create(&self.bundle_path)?;
         root.write_atomic(layout::MANIFEST_FILE, &manifest)
     }
@@ -394,7 +402,10 @@ impl Project {
     /// Persist only `media.json` through a retained bundle root.
     pub fn save_manifest_to_root(&self, root: &ProjectRoot) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
         root.write_atomic(layout::MANIFEST_FILE, &manifest)
     }
 
@@ -411,7 +422,10 @@ impl Project {
     /// worst outcome is that a resumed job records that transition twice.
     pub fn save_manifest_and_generation_log_to_root(&self, root: &ProjectRoot) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
         let log = self
             .generation_log
             .as_ref()
@@ -573,7 +587,12 @@ impl EncodedProject {
         }
         Ok(Self {
             timeline: encode_component(layout::TIMELINE_FILE, &project.timeline)?,
-            manifest: encode_component(layout::MANIFEST_FILE, &project.manifest)?,
+            manifest: encode_component(
+                layout::MANIFEST_FILE,
+                &*project
+                    .compatibility
+                    .manifest_for_write(&project.manifest)?,
+            )?,
             generation_log: project
                 .generation_log
                 .as_ref()
@@ -629,7 +648,8 @@ impl EncodedProject {
                     transition_manifest.folders.push(folder.clone());
                 }
             }
-            validate_manifest_paths(&transition_manifest)?;
+            // Entries carried over from disk are written back verbatim; the new
+            // entries passed the portable-path check when the save was prepared.
             let transition_bytes = encode_component(layout::MANIFEST_FILE, &transition_manifest)?;
             writes.write(root, layout::MANIFEST_FILE, &transition_bytes)?;
             self.write_non_manifest_components(root, &mut writes)?;
@@ -1115,14 +1135,44 @@ mod tests {
         ));
     }
 
+    fn write_manifest_json(bundle: &Path, manifest: &Value) {
+        fs::write(
+            bundle.join(layout::MANIFEST_FILE),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn disk_manifest_json(bundle: &Path) -> Value {
+        serde_json::from_slice(&fs::read(bundle.join(layout::MANIFEST_FILE)).unwrap()).unwrap()
+    }
+
+    fn assert_offline(entry: &MediaManifestEntry, bundle: &Path) {
+        assert_eq!(entry.source, media_paths::offline_source());
+        let manifest = MediaManifest {
+            entries: vec![entry.clone()],
+            ..MediaManifest::new()
+        };
+        let resolved = opentake_domain::MediaResolver::new(&manifest, Some(bundle))
+            .expected_path(&entry.id)
+            .unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::new(),
+            "offline media resolves to nothing"
+        );
+    }
+
     #[test]
-    fn project_open_rejects_unsafe_project_media_and_proxy_paths() {
+    fn unsafe_project_media_and_proxy_paths_open_offline_and_save_verbatim() {
         for (index, unsafe_path) in [
             "../private.mov",
             "media/../../private.mov",
             "/private.mov",
             r"C:\private.mov",
             "C:private.mov",
+            "media/Scene 1:2.png",
+            r"media\a\b.png",
         ]
         .into_iter()
         .enumerate()
@@ -1141,13 +1191,26 @@ mod tests {
                 }],
                 "folders": []
             });
-            fs::write(
-                bundle.join(layout::MANIFEST_FILE),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
+            write_manifest_json(&bundle, &manifest);
 
-            assert!(Project::open(&bundle).is_err());
+            let mut project = Project::open(&bundle).expect("one unsafe path must not block open");
+            assert_offline(&project.manifest.entries[0], &bundle);
+            assert_eq!(
+                project.compatibility().warnings(),
+                ["media.json:offline-media:asset-1"]
+            );
+            assert!(!project.compatibility().is_read_only());
+            project.timeline.fps = 48;
+            project.save().unwrap();
+            assert_eq!(
+                disk_manifest_json(&bundle)["entries"][0]["source"],
+                manifest["entries"][0]["source"],
+                "{unsafe_path} must be written back verbatim"
+            );
+            assert_offline(
+                &Project::open(&bundle).unwrap().manifest.entries[0],
+                &bundle,
+            );
 
             let mut proxy_manifest = manifest;
             proxy_manifest["entries"][0]["source"] = serde_json::json!({
@@ -1159,13 +1222,141 @@ mod tests {
                 "width": 320,
                 "height": 180
             });
-            fs::write(
-                bundle.join(layout::MANIFEST_FILE),
-                serde_json::to_vec(&proxy_manifest).unwrap(),
-            )
-            .unwrap();
-            assert!(Project::open(&bundle).is_err());
+            write_manifest_json(&bundle, &proxy_manifest);
+
+            let project = Project::open(&bundle).expect("an unsafe proxy must not block open");
+            let entry = &project.manifest.entries[0];
+            assert_eq!(
+                entry.source,
+                MediaSource::Project {
+                    relative_path: "media/valid.mov".into()
+                }
+            );
+            assert_eq!(
+                entry.proxy, None,
+                "{unsafe_path} proxy must never be resolved"
+            );
+            assert_eq!(
+                project.compatibility().warnings(),
+                ["media.json:ignored-proxy:asset-1"]
+            );
+            project.save().unwrap();
+            assert_eq!(
+                disk_manifest_json(&bundle)["entries"][0]["proxy"],
+                proxy_manifest["entries"][0]["proxy"]
+            );
         }
+    }
+
+    #[test]
+    fn one_unsafe_entry_goes_offline_while_the_rest_of_the_manifest_opens_normally() {
+        let tmp = TmpDir::new("mixed-media-paths");
+        let bundle = tmp.path().join("Mixed.opentake");
+        Project::new(&bundle).save().unwrap();
+        fs::create_dir_all(bundle.join("media")).unwrap();
+        fs::write(bundle.join("media/good.png"), b"good").unwrap();
+        write_manifest_json(
+            &bundle,
+            &serde_json::json!({
+                "version": 2,
+                "entries": [
+                    {
+                        "id": "asset-bad",
+                        "name": "Scene 1/2.png",
+                        "type": "image",
+                        "source": { "project": { "relativePath": "media/Scene 1:2.png" } },
+                        "duration": 0.0
+                    },
+                    {
+                        "id": "asset-good",
+                        "name": "good.png",
+                        "type": "image",
+                        "source": { "project": { "relativePath": "media/good.png" } },
+                        "duration": 0.0
+                    }
+                ],
+                "folders": []
+            }),
+        );
+
+        let project = Project::open(&bundle).expect("the valid entry must stay usable");
+
+        assert_offline(&project.manifest.entries[0], &bundle);
+        assert_eq!(project.manifest.entries[0].name, "Scene 1/2.png");
+        assert_eq!(
+            project.manifest.entries[1].source,
+            MediaSource::Project {
+                relative_path: "media/good.png".into()
+            }
+        );
+        assert_eq!(
+            project.compatibility().warnings(),
+            ["media.json:offline-media:asset-bad"]
+        );
+        assert!(!project.compatibility().is_read_only());
+        let root = ProjectRoot::open(&bundle).unwrap();
+        let mut good = root.open_asset_file(Path::new("media/good.png")).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut good, &mut bytes).unwrap();
+        assert_eq!(bytes, b"good");
+    }
+
+    #[test]
+    fn relinked_offline_entry_saves_its_new_source_instead_of_the_withheld_path() {
+        let tmp = TmpDir::new("relinked-offline-media");
+        let bundle = tmp.path().join("Relinked.opentake");
+        Project::new(&bundle).save().unwrap();
+        write_manifest_json(
+            &bundle,
+            &serde_json::json!({
+                "version": 2,
+                "entries": [{
+                    "id": "asset-1",
+                    "name": "clip.mov",
+                    "type": "video",
+                    "source": { "project": { "relativePath": "../escape.mov" } },
+                    "duration": 1.0
+                }],
+                "folders": []
+            }),
+        );
+        let mut project = Project::open(&bundle).unwrap();
+        let relinked = MediaSource::External {
+            absolute_path: tmp.path().join("found.mov").to_string_lossy().into_owned(),
+        };
+        project.manifest.entries[0].source = relinked.clone();
+
+        project.save().unwrap();
+
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(reopened.manifest.entries[0].source, relinked);
+        assert!(reopened.compatibility().warnings().is_empty());
+    }
+
+    #[test]
+    fn save_refuses_a_new_path_that_its_reader_would_withhold() {
+        let tmp = TmpDir::new("save-unsafe-media-path");
+        let bundle = tmp.path().join("SelfCheck.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let before = tree_receipt(&bundle);
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/Scene 1:2.mov"));
+
+        for error in [
+            project.save().expect_err("unportable path must be refused"),
+            project
+                .save_manifest()
+                .expect_err("unportable path must be refused"),
+        ] {
+            assert!(
+                matches!(error, ProjectError::InvalidMediaManifest { .. }),
+                "{error:?}"
+            );
+        }
+        assert_eq!(tree_receipt(&bundle), before);
     }
 
     #[test]

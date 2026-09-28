@@ -36,8 +36,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use opentake_domain::{
-    ClipType, GenerationInput, GenerationJobStatus, MediaAsset, MediaColorMetadata, MediaManifest,
-    MediaManifestEntry, MediaProxy, MediaSource, Timeline,
+    is_safe_project_asset_relative_path, ClipType, GenerationInput, GenerationJobStatus,
+    MediaAsset, MediaColorMetadata, MediaManifest, MediaManifestEntry, MediaProxy, MediaSource,
+    Timeline,
 };
 use opentake_ops::command::{self, EditCommand, EditResult};
 use opentake_ops::{EditorState, IdGen};
@@ -285,13 +286,13 @@ fn valid_generation_transition(
     }
 }
 
+/// Generated outputs live under `media/` and must satisfy the same portable
+/// bundle-path rule every manifest reader applies.
 fn validate_project_media_relative_path(value: &str) -> Result<()> {
-    let path = Path::new(value);
-    let mut components = path.components();
-    if components.next() != Some(std::path::Component::Normal("media".as_ref()))
-        || components.clone().next().is_none()
-        || path.is_absolute()
-        || components.any(|component| !matches!(component, std::path::Component::Normal(_)))
+    let mut components = Path::new(value).components();
+    if !is_safe_project_asset_relative_path(value)
+        || components.next() != Some(std::path::Component::Normal("media".as_ref()))
+        || components.next().is_none()
     {
         return Err(CoreError::Media(
             "generated output path must be a safe media-relative path".to_string(),
@@ -728,11 +729,12 @@ impl EditorSession {
         if let Some(proxy) = proxy.as_ref() {
             let path = Path::new(&proxy.relative_path);
             let components: Vec<_> = path.components().collect();
-            if path.is_absolute()
+            // The portable bundle-path rule every manifest reader applies,
+            // narrowed to one `.mp4` leaf directly under `media/proxies/`.
+            if !is_safe_project_asset_relative_path(&proxy.relative_path)
                 || components.len() != 3
                 || components[0] != std::path::Component::Normal("media".as_ref())
                 || components[1] != std::path::Component::Normal("proxies".as_ref())
-                || !matches!(components[2], std::path::Component::Normal(_))
                 || path.extension().and_then(|extension| extension.to_str()) != Some("mp4")
                 || proxy.width == 0
                 || proxy.height == 0
@@ -780,6 +782,16 @@ impl EditorSession {
     /// panel). The manifest is the persisted id→file catalog.
     pub fn media(&self) -> MediaManifest {
         self.state.manifest.clone()
+    }
+
+    /// The bytes-to-be of `manifest` for writers outside `opentake-project`:
+    /// only portable bundle paths, with any unsafe path withheld when the
+    /// project opened restored verbatim for entries that were not relinked.
+    pub(crate) fn persistable_manifest(&self, manifest: &MediaManifest) -> Result<MediaManifest> {
+        Ok(self
+            .compatibility
+            .manifest_for_write(manifest)?
+            .into_owned())
     }
 
     /// Count catalog entries without cloning the catalog under the session lock.
@@ -1926,6 +1938,84 @@ mod tests {
             .unwrap()
             .proxy
             .is_none());
+    }
+
+    /// Every path a manifest writer accepts must be one the bundle reader
+    /// keeps; issue #2 found writers applying their own, looser rules.
+    #[test]
+    fn manifest_writers_only_accept_paths_the_bundle_reader_keeps() {
+        let candidates = [
+            "media/out.png",
+            "media/nested/out.png",
+            "media/proxies/proxy.mp4",
+            "media/Scene 1:2.png",
+            r"media/a\b.png",
+            "media/proxies/C:proxy.mp4",
+            "media/proxies/proxy.mp4:stream",
+            r"media\proxies\proxy.mp4",
+            r"media/proxies/a\b.mp4",
+            "media/../out.png",
+            "/media/out.png",
+        ];
+
+        let mut session = EditorSession::new_project();
+        session
+            .import_media_file(
+                "/abs/source.mp4",
+                "asset",
+                "source",
+                &ProbedMedia::default(),
+            )
+            .unwrap();
+        for path in candidates {
+            let proxy = MediaProxy {
+                relative_path: path.into(),
+                source_sha256: "a".repeat(64),
+                source_stamp: None,
+                width: 640,
+                height: 360,
+            };
+            if session.set_media_proxy("asset", Some(proxy)).is_ok() {
+                assert!(is_safe_project_asset_relative_path(path), "proxy {path}");
+            }
+            if validate_project_media_relative_path(path).is_ok() {
+                assert!(is_safe_project_asset_relative_path(path), "output {path}");
+            }
+        }
+        assert!(session
+            .set_media_proxy(
+                "asset",
+                Some(MediaProxy {
+                    relative_path: "media/proxies/proxy.mp4".into(),
+                    source_sha256: "a".repeat(64),
+                    source_stamp: None,
+                    width: 640,
+                    height: 360,
+                }),
+            )
+            .is_ok());
+        assert!(validate_project_media_relative_path("media/nested/out.png").is_ok());
+
+        let tmp = TmpDir::new("writer-paths");
+        let bundle = tmp.path().join("Writers.opentake");
+        Project::new(&bundle).save().unwrap();
+        let session = EditorSession::open_project(&bundle).unwrap();
+        for path in candidates {
+            let Ok(entry) = session.prepare_media_file_entry(
+                bundle.join(path),
+                "id",
+                "name",
+                &ProbedMedia::default(),
+            ) else {
+                continue;
+            };
+            if let MediaSource::Project { relative_path } = &entry.source {
+                assert!(
+                    is_safe_project_asset_relative_path(relative_path),
+                    "import {path} -> {relative_path}"
+                );
+            }
+        }
     }
 
     #[test]

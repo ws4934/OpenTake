@@ -68,16 +68,43 @@ impl CoreError {
         matches!(self, CoreError::Project(error) if error.is_partial_commit())
     }
 
-    /// Machine-readable error class for the Tauri boundary (`core-SPEC.md` §6.3):
-    /// `"validation"` for rejected input, `"internal"` for everything else.
+    /// Machine-readable error code for the Tauri boundary (`core-SPEC.md` §6.3):
+    /// `"validation"` for rejected input, `"staleProject"` for a superseded
+    /// request, a `"project…"` code for a persistence failure the user can act
+    /// on (see [`project_error_code`]), and `"internal"` for everything else.
     pub fn code(&self) -> &'static str {
         match self {
             CoreError::Edit(_) | CoreError::Media(_) => "validation",
             CoreError::StaleProject => "staleProject",
-            CoreError::Project(ProjectError::CompatibilityReadOnly { .. }) => "validation",
-            CoreError::Project(_) | CoreError::NoProjectOpen | CoreError::Unsupported(_) => {
-                "internal"
-            }
+            CoreError::Project(error) => project_error_code(error),
+            CoreError::NoProjectOpen | CoreError::Unsupported(_) => "internal",
         }
+    }
+}
+
+/// Stable code for one persistence failure. Each condition a user can act on
+/// gets its own code so the front end can explain it without parsing text.
+pub(crate) fn project_error_code(error: &ProjectError) -> &'static str {
+    use std::io::ErrorKind;
+
+    match error {
+        ProjectError::CompatibilityReadOnly { .. } => "validation",
+        ProjectError::Io { source, .. } => match source.kind() {
+            ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "projectStorageFull",
+            ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+                "projectPermissionDenied"
+            }
+            _ => "projectIo",
+        },
+        ProjectError::ComponentTooLarge { .. } => "projectComponentTooLarge",
+        ProjectError::InvalidMediaManifest { .. } => "projectInvalidManifest",
+        ProjectError::PartialCommit { .. } => "projectPartialCommit",
+        ProjectError::DurabilityUnconfirmed { .. } => "projectDurabilityUnconfirmed",
+        ProjectError::RecoveryRequired { .. } => "projectRecoveryRequired",
+        ProjectError::MissingTimeline { .. }
+        | ProjectError::NotABundle(_)
+        | ProjectError::DestinationExists { .. }
+        | ProjectError::Json { .. }
+        | ProjectError::InvalidTimeline { .. } => "internal",
     }
 }

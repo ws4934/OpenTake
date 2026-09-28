@@ -2107,14 +2107,19 @@ impl AppCore {
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let before = session.editor.media();
             let result = (|| {
+                let persisted_before = session.editor.persistable_manifest(&before)?;
                 let entry = session.editor.import_media_file(path, id, name, probe)?;
                 session
                     .editor
                     .set_media_global_favorite(&entry.id, Some(library_id.to_string()))?;
-                write_manifest(&session.editor.media())?;
+                write_manifest(
+                    &session
+                        .editor
+                        .persistable_manifest(&session.editor.media())?,
+                )?;
                 let mut warning = None;
                 if let Err(postcondition) = validate_postcondition() {
-                    match write_manifest(&before) {
+                    match write_manifest(&persisted_before) {
                         Ok(()) => return Err(postcondition),
                         Err(rollback) => {
                             warning = Some(ImportCommitWarning::PostconditionRollbackFailed {
@@ -2202,7 +2207,11 @@ impl AppCore {
                 // so a returned writer error preserves the previous bytes and
                 // there is no validation-failure rollback/warning state.
                 validate_postcondition()?;
-                write_manifest(&session.editor.media())?;
+                write_manifest(
+                    &session
+                        .editor
+                        .persistable_manifest(&session.editor.media())?,
+                )?;
                 Ok((entry, None))
             })();
             match result {
@@ -2610,7 +2619,11 @@ impl AppCore {
         ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
         let before = session.editor.media();
         session.editor.restore_media(manifest);
-        if let Err(error) = write_manifest(&session.editor.media()) {
+        if let Err(error) = session
+            .editor
+            .persistable_manifest(&session.editor.media())
+            .and_then(|manifest| write_manifest(&manifest))
+        {
             session.editor.restore_media(before);
             return Err(error);
         }

@@ -53,6 +53,7 @@ pub mod fcpxml_modern;
 mod file_url;
 pub mod gen_log;
 pub mod layout;
+mod media_paths;
 pub mod otio;
 mod path_policy;
 mod project_root;

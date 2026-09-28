@@ -529,3 +529,100 @@ fn missing_generation_log_seeds_manifest_provenance_once() {
         "compatibility safety blocks overwriting the damaged component"
     );
 }
+
+/// Issue #2: a file inside the bundle whose name cannot be stored as a
+/// portable bundle path (`:` is `/` in a macOS Finder name; `\` is an ordinary
+/// Unix name byte) imports as an absolute reference to the same file, so the
+/// saved project reopens and the asset stays online.
+#[cfg(unix)]
+#[test]
+fn unportable_bundle_media_imports_as_external_and_the_project_reopens() {
+    for (index, name) in ["Scene 1:2.png", r"a\b.png"].into_iter().enumerate() {
+        let tmp = TempDir::new(&format!("unportable-import-{index}"));
+        let bundle = tmp.child("Import.opentake");
+        Project::new(&bundle).save().expect("create bundle");
+        std::fs::create_dir_all(bundle.join("media")).expect("create media");
+        let file = bundle.join("media").join(name);
+        std::fs::write(&file, b"image bytes").expect("write bundle media");
+        let core = AppCore::new();
+        core.open_project(&bundle).expect("open bundle");
+
+        let entry = core
+            .import_media_file(&file, "Scene", &opentake_core::ProbedMedia::default())
+            .expect("import bundle media");
+        core.save_project(None).expect("save after import");
+
+        let expected = MediaSource::External {
+            absolute_path: file.to_string_lossy().into_owned(),
+        };
+        assert_eq!(entry.source, expected, "{name}");
+        let reopened = AppCore::new();
+        let snapshot = reopened
+            .open_project(&bundle)
+            .expect("the saved project must reopen");
+        assert!(snapshot.compatibility.warnings().is_empty(), "{name}");
+        assert_eq!(reopened.media().entries[0].source, expected);
+        assert_eq!(std::fs::read(&file).unwrap(), b"image bytes");
+        assert!(!bundle.join("media/a/b.png").exists());
+    }
+}
+
+/// Issue #2: an unsafe path already on disk no longer blocks the project. The
+/// entry opens offline, is never exposed as a resolvable project path, and
+/// every core save writes the original string back unchanged.
+#[test]
+fn offline_media_is_never_resolved_and_core_saves_keep_its_original_path() {
+    let tmp = TempDir::new("offline-media");
+    let bundle = tmp.child("Offline.opentake");
+    let mut project = Project::new(&bundle);
+    project.manifest.entries.push(manifest_entry("good", None));
+    project.save().expect("create bundle");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("media.json")).unwrap()).unwrap();
+    let mut unsafe_entry = manifest["entries"][0].clone();
+    unsafe_entry["id"] = "escape".into();
+    unsafe_entry["source"] = serde_json::json!({ "project": { "relativePath": "../escape.mov" } });
+    manifest["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, unsafe_entry.clone());
+    std::fs::write(
+        bundle.join("media.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let core = AppCore::new();
+    let snapshot = core
+        .open_project(&bundle)
+        .expect("one unsafe entry must not block the project");
+
+    assert_eq!(
+        snapshot.compatibility.warnings(),
+        ["media.json:offline-media:escape"]
+    );
+    assert!(!snapshot.compatibility.is_read_only());
+    let media = core.media();
+    assert!(media.entries.iter().all(|entry| match &entry.source {
+        MediaSource::Project { relative_path } =>
+            opentake_domain::is_safe_project_asset_relative_path(relative_path),
+        MediaSource::External { absolute_path } => absolute_path.is_empty(),
+    }));
+    assert_eq!(
+        media.entries[1].source,
+        MediaSource::Project {
+            relative_path: "media/good.mov".into()
+        }
+    );
+
+    core.set_media_favorite(&["good".to_string()], true)
+        .expect("favorite");
+    core.save_media_manifest_for_project(snapshot.project_epoch, &bundle)
+        .expect("manifest-only save");
+    core.save_project(None).expect("full save");
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("media.json")).unwrap()).unwrap();
+    assert_eq!(persisted["entries"][0]["source"], unsafe_entry["source"]);
+    assert_eq!(persisted["favorites"], serde_json::json!(["good"]));
+}
