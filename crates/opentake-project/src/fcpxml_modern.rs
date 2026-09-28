@@ -64,6 +64,12 @@ use crate::xmlnode::{boolean_attr, el, el_attrs, leaf_text, render_document, Xml
 /// FCPXML version we target (FCP 10.5+; supported by current FCP and DaVinci).
 const FCPXML_VERSION: &str = "1.10";
 
+/// `tcFormat` of the sequence and its clips: always non-drop, as upstream
+/// writes it. Drop-frame belongs to NTSC rates (29.97 / 59.94), while a
+/// timeline's integer `fps` is an exact rate (`frameDuration="1/30s"`), so 30
+/// and 60 fps timelines count in non-drop timecode too.
+const TC_FORMAT: &str = "NDF";
+
 /// Export a [`Timeline`] as a native FCPXML 1.10 string. Pure function: takes the
 /// timeline, media manifest, and project base dir (to resolve `Project`-relative
 /// media into `file://` URLs).
@@ -126,7 +132,7 @@ impl<'a> Builder<'a> {
                 ("format", seq_format_id.as_str()),
                 ("duration", &time_value(total, self.fps)),
                 ("tcStart", "0s"),
-                ("tcFormat", tc_format(self.fps)),
+                ("tcFormat", TC_FORMAT),
                 ("audioLayout", "stereo"),
                 ("audioRate", "48k"),
             ],
@@ -334,7 +340,7 @@ impl<'a> Builder<'a> {
         if !format_ref.is_empty() {
             attrs.push(("format".to_string(), format_ref));
         }
-        attrs.push(("tcFormat".to_string(), tc_format(self.fps).to_string()));
+        attrs.push(("tcFormat".to_string(), TC_FORMAT.to_string()));
         if lane != 0 {
             attrs.push(("lane".to_string(), lane.to_string()));
         }
@@ -462,15 +468,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         a = t;
     }
     a.max(1)
-}
-
-/// `NDF` / `DF` for the sequence + clips. Drop-frame for 30/60 (NTSC nominal).
-fn tc_format(fps: i32) -> &'static str {
-    if fps == 30 || fps == 60 {
-        "DF"
-    } else {
-        "NDF"
-    }
 }
 
 /// `seconds * fps`, truncated (matches the rest of the export layer).

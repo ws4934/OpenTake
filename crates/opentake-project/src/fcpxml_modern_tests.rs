@@ -46,11 +46,27 @@ fn time_value_reduces_rational() {
 }
 
 #[test]
-fn tc_format_drop_for_30_60() {
-    assert_eq!(tc_format(30), "DF");
-    assert_eq!(tc_format(60), "DF");
-    assert_eq!(tc_format(24), "NDF");
-    assert_eq!(tc_format(25), "NDF");
+fn integer_fps_timelines_use_non_drop_timecode() {
+    // `Timeline::fps` is an exact integer rate (`frameDuration="1/30s"`), so even
+    // 30 / 60 fps sequences and clips count in non-drop timecode.
+    for fps in [24, 25, 30, 60] {
+        let mut tl = Timeline::new();
+        tl.fps = fps;
+        let mut vt = Track::new("v", ClipType::Video);
+        vt.clips.push(Clip::new("c1", "v1", 0, 30));
+        tl.tracks.push(vt);
+        let xml = export_fcpxml(
+            &tl,
+            &manifest(vec![entry("v1", "shot.mp4", ClipType::Video, 4.0)]),
+            None,
+        );
+        assert_eq!(
+            xml.matches("tcFormat=\"NDF\"").count(),
+            2,
+            "fps {fps}: {xml}"
+        );
+        assert!(!xml.contains("tcFormat=\"DF\""), "fps {fps}: {xml}");
+    }
 }
 
 #[test]

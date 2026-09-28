@@ -44,8 +44,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use opentake_domain::{
-    AnimatableProperty, Clip, ClipType, Crop, FadeEdge, MediaManifest, MediaResolver, Timeline,
-    Track, Transform,
+    format_timecode, AnimatableProperty, Clip, ClipType, Crop, DropFrameSeparator, FadeEdge,
+    MediaManifest, MediaResolver, Timeline, Track, Transform,
 };
 
 /// `seconds * fps` 截断取整。1:1 对应上游 `secondsToFrame`(`Int(seconds * fps)`)。
@@ -415,7 +415,9 @@ impl<'a> Builder<'a> {
 
         // timecode 是 DaVinci Resolve 必需的。源起始时间码由调用方经 ffprobe 注入
         // (`start_timecodes`);未命中退回 0——正是上游 `sourceStartFrame(for:) ?? 0`
-        // 读不到 tmcd 轨时的分支。
+        // 读不到 tmcd 轨时的分支。`<string>` 由共享的 `format_timecode` 生成(上游
+        // palmier-pro #361 修正后的 drop-frame 算法),与 `<frame>` 一致,即
+        // `opentake_media::parse_smpte_timecode` 读到的源时间码标签(XMEML 全用 `;`)。
         let drop_frame = ntsc && timebase % 30 == 0;
         let start_frame = self.start_timecodes.get(media_ref).copied().unwrap_or(0);
         let timecode = el(
@@ -424,7 +426,7 @@ impl<'a> Builder<'a> {
                 self.rate(timebase, ntsc),
                 leaf(
                     "string",
-                    &format_timecode(start_frame, timebase, drop_frame),
+                    &format_timecode(start_frame, timebase, drop_frame, DropFrameSeparator::All),
                 ),
                 leaf_i("frame", start_frame),
                 leaf("displayformat", if drop_frame { "DF" } else { "NDF" }),
@@ -996,29 +998,6 @@ fn rate_tags(raw_fps: f64) -> (i32, bool) {
     (timebase, ntsc)
 }
 
-/// 帧数 → SMPTE 字符串;drop-frame(29.97/59.94)用 `;` 分隔并跳过被丢弃的帧。
-/// 1:1 对应上游 `formatTimecode`。
-fn format_timecode(frame: i32, fps: i32, drop_frame: bool) -> String {
-    let mut f = frame;
-    if drop_frame {
-        let drop = (fps as f64 * 0.066666).round() as i32; // 30 → 2,60 → 4
-        let d = f / (fps * 600);
-        let m = f % (fps * 600);
-        f += drop * 9 * d
-            + if m > drop {
-                drop * ((m - drop) / (fps * 60))
-            } else {
-                0
-            };
-    }
-    let sep = if drop_frame { ";" } else { ":" };
-    let ff = f % fps;
-    let ss = (f / fps) % 60;
-    let mm = (f / (fps * 60)) % 60;
-    let hh = f / (fps * 3600);
-    format!("{hh:02}{sep}{mm:02}{sep}{ss:02}{sep}{ff:02}")
-}
-
 /// 按 `spec`(支持 `%.1f`/`%.2f`/`%.4f`/`%.5f`)格式化浮点。手写而非依赖外部 crate,
 /// 与上游 `String(format:)` 的小数位语义对齐。
 fn format_spec(spec: &str, value: f64) -> String {
@@ -1517,6 +1496,58 @@ mod tests {
         assert!(xml.contains("<string>00:00:01:00</string>"));
         // sequence 顶层 timecode 仍是固定的 00:00:00:00(未被 per-file 注入影响)。
         assert!(xml.contains("<string>00:00:00:00</string>"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `<file>` element with `id`, from its opening tag to its `</file>`.
+    fn file_block<'a>(xml: &'a str, id: &str) -> &'a str {
+        let start = xml
+            .find(&format!("<file id=\"{id}\">"))
+            .unwrap_or_else(|| panic!("no <file id=\"{id}\"> in {xml}"));
+        let len = xml[start..].find("</file>").expect("closing </file>");
+        &xml[start..start + len]
+    }
+
+    #[test]
+    fn export_drop_frame_source_timecode_string_matches_its_frame() {
+        let dir = std::env::temp_dir().join(format!("opentake-xmeml-df-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut manifest = MediaManifest::new();
+        for (id, name, fps) in [("v1", "ntsc30.mp4", 29.97), ("v2", "ntsc60.mp4", 59.94)] {
+            let mut entry = ext_entry(id, name, ClipType::Video, &touch(&dir, name), 4.0);
+            entry.source_fps = Some(fps);
+            manifest.entries.push(entry);
+        }
+        let mut tl = Timeline::new();
+        let mut vtrack = Track::new("vt", ClipType::Video);
+        vtrack.clips.push(Clip::new("c1", "v1", 0, 30));
+        vtrack.clips.push(Clip::new("c2", "v2", 30, 30));
+        tl.tracks.push(vtrack);
+
+        // Start frames as `parse_smpte_timecode` reads the sources' drop-frame
+        // tags: `00:01:00;02` → 1800 and `14:23:10;12` → 1552158 at 29.97,
+        // `00:01:00;04` → 3600 and `00:10:00;00` → 35964 at 59.94. XMEML
+        // writes drop-frame with `;` between every field.
+        let cases = [
+            (1800, "00;01;00;02", 3600, "00;01;00;04"),
+            (1_552_158, "14;23;10;12", 35_964, "00;10;00;00"),
+        ];
+        for (frame_30, string_30, frame_60, string_60) in cases {
+            let tcs = HashMap::from([("v1".to_string(), frame_30), ("v2".to_string(), frame_60)]);
+            let xml = export_xmeml_with_timecodes(&tl, &manifest, None, &tcs);
+            for (id, frame, string) in [
+                ("file-v1-video", frame_30, string_30),
+                ("file-v2-video", frame_60, string_60),
+            ] {
+                let file = file_block(&xml, id);
+                assert!(file.contains(&format!("<frame>{frame}</frame>")), "{file}");
+                assert!(
+                    file.contains(&format!("<string>{string}</string>")),
+                    "{file}"
+                );
+                assert!(file.contains("<displayformat>DF</displayformat>"), "{file}");
+            }
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

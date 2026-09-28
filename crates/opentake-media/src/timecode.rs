@@ -19,10 +19,10 @@
 //!   count (`drop * (total_minutes − total_minutes/10)`,
 //!   `drop = round(fps*0.066666)`) from the naive wall-clock frame count. This is
 //!   the canonical inverse of the **valid** drop-frame strings ffprobe emits.
-//!   (Upstream reads a raw tmcd frame count and never parses a DF *string*, and
-//!   its own `formatTimecode` linear-offsets rather than skipping the `;00`/`;01`
-//!   boundary frames — so there is no upstream string→frame DF reference to
-//!   mirror; canonical SMPTE is the correct target for real ffprobe input.)
+//!   (Upstream reads a raw tmcd frame count and never parses a DF *string*, so
+//!   there is no upstream string→frame DF reference to mirror; canonical SMPTE
+//!   is the correct target for real ffprobe input. It is also the exact inverse
+//!   of the exporters' `opentake_domain::format_timecode` in SMPTE notation.)
 //!
 //! The parser is pure and unit-tested; the ffprobe read ([`read_start_timecode_frame`])
 //! follows the invocation pattern in [`crate::probe`] / [`crate::ff`] and needs a
@@ -242,11 +242,11 @@ mod tests {
         // minute except every tenth). Encode a frame index to that canonical
         // string, then confirm parse() reads back the same integer.
         //
-        // NOTE: upstream `formatTimecode` does NOT skip those boundary frames —
-        // it linearly offsets and can emit the invalid `00:01:00;00`. Upstream
-        // never *parses* timecode (it reads a raw tmcd frame count), so it
-        // provides no string→frame DF reference; the canonical SMPTE encoding
-        // that real ffprobe output uses is the correct inverse target here.
+        // Upstream never *parses* timecode (it reads a raw tmcd frame count),
+        // so it provides no string→frame DF reference; the canonical SMPTE
+        // encoding that real ffprobe output uses is the correct inverse target
+        // here. The exporters' formatter is checked against this parser in
+        // `df_round_trips_with_the_exporters_format_timecode`.
         let fps = 30;
         let drop = (fps as f64 * 0.066666).round() as i32; // 2
                                                            // Canonical SMPTE drop-frame: frame index -> valid HH:MM:SS;FF.
@@ -273,6 +273,56 @@ mod tests {
                 Some(frame),
                 "frame {frame} via {s}"
             );
+        }
+    }
+
+    #[test]
+    fn df_round_trips_with_the_exporters_format_timecode() {
+        use opentake_domain::{format_timecode, DropFrameSeparator};
+        // Source tags read back to the same label; XMEML writes it with `;`s.
+        for (tag, fps, frame, xmeml) in [
+            ("00:01:00;02", 30, 1800, "00;01;00;02"),
+            ("14:23:10;12", 30, 1_552_158, "14;23;10;12"),
+            ("00:01:00;04", 60, 3600, "00;01;00;04"),
+            ("00:10:00;00", 60, 35_964, "00;10;00;00"),
+        ] {
+            assert_eq!(parse_smpte_timecode(tag, fps), Some(frame), "{tag}");
+            let smpte = format_timecode(frame, fps, true, DropFrameSeparator::FramesOnly);
+            assert_eq!(smpte, tag);
+            assert_eq!(
+                format_timecode(frame, fps, true, DropFrameSeparator::All),
+                xmeml
+            );
+        }
+        // `parse(format(f)) == f` at 29.97 / 59.94 drop-frame, over 24 hours.
+        for (fps, drop) in [(30, 2), (60, 4)] {
+            let format = |frame| format_timecode(frame, fps, true, DropFrameSeparator::FramesOnly);
+            let round_trip = |frame| {
+                let label = format(frame);
+                assert_eq!(
+                    parse_smpte_timecode(&label, fps),
+                    Some(frame),
+                    "frame {frame} @ {fps} DF via {label}"
+                );
+            };
+            for minute in 0..24 * 60 {
+                // Every minute but each tenth skips its first `drop` labels.
+                let start = minute * fps * 60 - drop * (minute - (minute + 9) / 10);
+                let first = if minute % 10 == 0 { 0 } else { drop };
+                let expected = format!("{:02}:{:02}:00;{first:02}", minute / 60, minute % 60);
+                assert_eq!(format(start), expected);
+                for frame in (start - drop - 2).max(0)..=start + drop + 2 {
+                    round_trip(frame);
+                }
+            }
+            // Every frame of the first eleven minutes, then a strided sweep.
+            let per_ten_minutes = fps * 600 - 9 * drop;
+            for frame in 0..=per_ten_minutes + fps * 60 {
+                round_trip(frame);
+            }
+            for frame in (0..24 * 6 * per_ten_minutes).step_by(97) {
+                round_trip(frame);
+            }
         }
     }
 
