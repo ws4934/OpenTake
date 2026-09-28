@@ -2256,30 +2256,30 @@ mod tests {
         bytes
     }
 
-    fn mp4_data_url(directory: &Path) -> String {
-        let path = directory.join("generation-fixture.mp4");
+    fn mp4_bytes(directory: &Path, width: u32, height: u32) -> Vec<u8> {
+        let path = directory.join(format!("generation-fixture-{width}x{height}.mp4"));
         let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=16x16:d=0.1:r=10",
-                "-pix_fmt",
-                "yuv420p",
-            ])
+            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("color=c=black:s={width}x{height}:d=0.1:r=10"))
+            .args(["-pix_fmt", "yuv420p"])
             .arg(&path)
             .status()
             .unwrap();
         assert!(status.success());
+        std::fs::read(path).unwrap()
+    }
+
+    fn mp4_data_url_for(directory: &Path, width: u32, height: u32) -> String {
         let encoded =
-            base64::engine::general_purpose::STANDARD.encode(std::fs::read(path).unwrap());
+            base64::engine::general_purpose::STANDARD.encode(mp4_bytes(directory, width, height));
         format!("data:video/mp4;base64,{encoded}")
     }
 
-    fn saved_core_with_source_image() -> (tempfile::TempDir, PathBuf, AppCore) {
+    fn mp4_data_url(directory: &Path) -> String {
+        mp4_data_url_for(directory, 16, 16)
+    }
+
+    fn saved_core_with_source_video() -> (tempfile::TempDir, PathBuf, AppCore) {
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("Upscale.opentake");
         let mut project = Project::new(&bundle);
@@ -2288,17 +2288,17 @@ mod tests {
             .manifest
             .entries
             .push(opentake_domain::MediaManifestEntry {
-                id: "source-image".to_string(),
-                name: "source.png".to_string(),
-                kind: ClipType::Image,
+                id: "source-video".to_string(),
+                name: "source.mp4".to_string(),
+                kind: ClipType::Video,
                 source: opentake_domain::MediaSource::Project {
-                    relative_path: "media/source.png".to_string(),
+                    relative_path: "media/source.mp4".to_string(),
                 },
-                duration: 0.0,
+                duration: 0.1,
                 generation_input: None,
-                source_width: Some(2),
-                source_height: Some(2),
-                source_fps: None,
+                source_width: Some(16),
+                source_height: Some(16),
+                source_fps: Some(10.0),
                 has_audio: Some(false),
                 color: None,
                 proxy: None,
@@ -2308,7 +2308,11 @@ mod tests {
             });
         project.save().unwrap();
         std::fs::create_dir_all(bundle.join("media")).unwrap();
-        std::fs::write(bundle.join("media/source.png"), png_bytes(2, 2)).unwrap();
+        std::fs::write(
+            bundle.join("media/source.mp4"),
+            mp4_bytes(temp.path(), 16, 16),
+        )
+        .unwrap();
         let core = AppCore::new();
         core.open_project(&bundle).unwrap();
         (temp, bundle, core)
@@ -2491,19 +2495,19 @@ mod tests {
         let mock = MockTransport::new();
         mock.on(
             Method::Post,
-            "https://mockfal/flux-pro",
+            "https://mockfal/fal-ai/flux-pro/v1.1",
             200,
             json!({"request_id": "dispatch-1", "status": "IN_QUEUE"}),
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/dispatch-1/status",
+            "https://mockfal/fal-ai/flux-pro/requests/dispatch-1/status",
             200,
             json!({"status": "COMPLETED"}),
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/dispatch-1",
+            "https://mockfal/fal-ai/flux-pro/requests/dispatch-1",
             200,
             json!({"images": [{"url": png_data_url()}, {"url": png_data_url()}]}),
         );
@@ -2627,7 +2631,7 @@ mod tests {
         let mock = MockTransport::new();
         mock.on(
             Method::Post,
-            "https://mockfal/flux-pro",
+            "https://mockfal/fal-ai/flux-pro/v1.1",
             200,
             json!({"request_id": "poll-1", "status": "IN_QUEUE"}),
         );
@@ -2635,12 +2639,12 @@ mod tests {
         polls.push((200, json!({"status": "COMPLETED"})));
         mock.on_sequence(
             Method::Get,
-            "https://mockfal/flux-pro/requests/poll-1/status",
+            "https://mockfal/fal-ai/flux-pro/requests/poll-1/status",
             polls,
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/poll-1",
+            "https://mockfal/fal-ai/flux-pro/requests/poll-1",
             200,
             json!({"images": [{"url": png_data_url()}]}),
         );
@@ -2708,19 +2712,19 @@ mod tests {
         let video_mock = MockTransport::new();
         video_mock.on(
             Method::Post,
-            "https://mockfal/kling-video",
+            "https://mockfal/fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
             200,
             json!({"request_id": "video-1", "status": "IN_QUEUE"}),
         );
         video_mock.on(
             Method::Get,
-            "https://mockfal/kling-video/requests/video-1/status",
+            "https://mockfal/fal-ai/kling-video/requests/video-1/status",
             200,
             json!({"status": "COMPLETED"}),
         );
         video_mock.on(
             Method::Get,
-            "https://mockfal/kling-video/requests/video-1",
+            "https://mockfal/fal-ai/kling-video/requests/video-1",
             200,
             json!({"video": {"url": mp4_data_url(video_temp.path())}}),
         );
@@ -2797,18 +2801,20 @@ mod tests {
         assert_eq!(audio.has_audio, Some(true));
         assert!(audio.duration > 0.0);
 
-        let (_upscale_temp, upscale_bundle, upscale_core) = saved_core_with_source_image();
-        let source_before = std::fs::read(upscale_bundle.join("media/source.png")).unwrap();
+        // The catalog's upscaler only accepts video, and results must be
+        // exactly twice the source size.
+        let (upscale_temp, upscale_bundle, upscale_core) = saved_core_with_source_video();
+        let source_before = std::fs::read(upscale_bundle.join("media/source.mp4")).unwrap();
         let upscale_mock = MockTransport::new();
         upscale_mock.on(
             Method::Post,
             "https://mockrep/v1/files",
             200,
-            json!({"urls": {"get": "https://fixtures.invalid/source.png"}}),
+            json!({"urls": {"get": "https://fixtures.invalid/source.mp4"}}),
         );
         upscale_mock.on(
             Method::Post,
-            "https://mockrep/v1/predictions",
+            "https://mockrep/v1/models/topazlabs/video-upscale/predictions",
             200,
             json!({"id": "upscale-1", "status": "starting"}),
         );
@@ -2816,7 +2822,11 @@ mod tests {
             Method::Get,
             "https://mockrep/v1/predictions/upscale-1",
             200,
-            json!({"id": "upscale-1", "status": "succeeded", "output": png_data_url_for(4, 4)}),
+            json!({
+                "id": "upscale-1",
+                "status": "succeeded",
+                "output": mp4_data_url_for(upscale_temp.path(), 32, 32)
+            }),
         );
         let (cache, models) = runtime_dirs(&upscale_bundle);
         let upscale_bridge = build_bridge_with_clients(
@@ -2837,17 +2847,17 @@ mod tests {
             "upscale_media",
             json!({
                 "costAuthorized": true,
-                "mediaRef": "source-image",
+                "mediaRef": "source-video",
                 "model": "replicate:topaz-upscale"
             }),
         );
         assert!(!upscale_result.is_error, "{}", upscale_result.text_joined());
         let upscale = wait_for_ready_model(&upscale_core, "replicate:topaz-upscale").await;
-        assert_eq!(upscale.kind, ClipType::Image);
-        assert_eq!(upscale.source_width, Some(4));
-        assert_eq!(upscale.source_height, Some(4));
+        assert_eq!(upscale.kind, ClipType::Video);
+        assert_eq!(upscale.source_width, Some(32));
+        assert_eq!(upscale.source_height, Some(32));
         assert_eq!(
-            std::fs::read(upscale_bundle.join("media/source.png")).unwrap(),
+            std::fs::read(upscale_bundle.join("media/source.mp4")).unwrap(),
             source_before
         );
     }
@@ -2858,13 +2868,13 @@ mod tests {
         let mock = MockTransport::new();
         mock.on(
             Method::Post,
-            "https://mockfal/flux-pro",
+            "https://mockfal/fal-ai/flux-pro/v1.1",
             200,
             json!({"request_id": "cancel-1", "status": "IN_QUEUE"}),
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/cancel-1/status",
+            "https://mockfal/fal-ai/flux-pro/requests/cancel-1/status",
             200,
             json!({"status": "IN_QUEUE"}),
         );
@@ -2893,6 +2903,8 @@ mod tests {
             }),
         );
         assert!(!accepted.is_error, "{}", accepted.text_joined());
+        // Bounded, so a submission failure fails the test instead of hanging it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (job_id, asset_id) = loop {
             if let Some(entry) = core
                 .media()
@@ -2905,6 +2917,11 @@ mod tests {
                     break (input.job_id.clone().unwrap(), entry.id);
                 }
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation job never reached the provider: {:?}",
+                core.media().entries
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert!(bridge.cancel(&job_id));
@@ -3064,7 +3081,12 @@ mod tests {
     async fn assert_submit_failure(status: u16, body: serde_json::Value, expected_code: &str) {
         let (_temp, bundle, core) = saved_core();
         let mock = MockTransport::new();
-        mock.on(Method::Post, "https://mockfal/flux-pro", status, body);
+        mock.on(
+            Method::Post,
+            "https://mockfal/fal-ai/flux-pro/v1.1",
+            status,
+            body,
+        );
         let (cache, models) = runtime_dirs(&bundle);
         let bridge = build_bridge_with_clients(
             core.clone(),
@@ -3152,19 +3174,19 @@ mod tests {
         let mock = MockTransport::new();
         mock.on(
             Method::Post,
-            "https://mockfal/flux-pro",
+            "https://mockfal/fal-ai/flux-pro/v1.1",
             200,
             json!({"request_id": "retry-1", "status": "IN_QUEUE"}),
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/retry-1/status",
+            "https://mockfal/fal-ai/flux-pro/requests/retry-1/status",
             200,
             json!({"status": "COMPLETED"}),
         );
         mock.on(
             Method::Get,
-            "https://mockfal/flux-pro/requests/retry-1",
+            "https://mockfal/fal-ai/flux-pro/requests/retry-1",
             200,
             json!({"images": [{"url": png_data_url()}]}),
         );

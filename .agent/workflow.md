@@ -16,15 +16,13 @@
 
 ## 3. Verification matrix
 
-The PR gate (`.github/workflows/pr.yml`) covers only:
+PR CI chooses its checks from the files a pull request changes:
 
-- `cargo fmt --all --check`
-- `cargo clippy --locked -p opentake-domain -p opentake-ops -p opentake-project -p opentake-process-tree -p opentake-core --all-targets -- -D warnings`
-- `cargo test --locked` for the same five crates
-- script unit tests and the bundled FFmpeg smoke test
-- web: `pnpm -C web install --frozen-lockfile`, `pnpm -C web build`, `pnpm -C web test`
+- `.github/workflows/pr.yml` (every PR, Linux): `cargo fmt --all --check`; clippy and tests for `opentake-domain`, `opentake-ops`, `opentake-project`, `opentake-process-tree` and `opentake-core`; script unit tests and the bundled FFmpeg smoke test; web `pnpm -C web install --frozen-lockfile`, `pnpm -C web build`, `pnpm -C web test`.
+- `.github/workflows/pr-native.yml` (Linux, Windows and macOS, when Rust code changes): `scripts/pr_native_scope.py` selects every workspace crate with a changed file plus the crates that depend on it (all crates when `Cargo.lock`, the toolchain or the FFmpeg pin changes); each runner then runs `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --locked` for the selected crates.
+- `.github/workflows/ci.yml` and the `*-qualification.yml` workflows run the release-time and hardware-dependent checks on tags or manual dispatch.
 
-It does **not** build `opentake-media`, `opentake-render`, `opentake-motion`, `opentake-agent`, `opentake-gen` or `src-tauri` (`opentake-tauri`). When a change touches any of them, run these locally before opening the PR for review and paste the results into `## Testing`:
+Tests that need a GPU, an audio device or a real browser skip on CI runners, and a skipped test is not a passed test. For those paths, and for fast feedback before pushing, run the same commands locally and paste the results into `## Testing`:
 
 ```bash
 cargo fmt --all --check
