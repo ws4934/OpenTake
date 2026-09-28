@@ -13,7 +13,7 @@ use crate::error::{ProjectError, Result};
 
 const TIMELINE_COMPONENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MANIFEST_COMPONENT_MAX_BYTES: usize = 32 * 1024 * 1024;
-const GENERATION_LOG_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const GENERATION_LOG_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const THUMBNAIL_COMPONENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PUBLISH_MARKER_FILE: &str = ".opentake-publish-marker";
 const PUBLISH_MARKER_MAX_BYTES: usize = 256;
@@ -27,6 +27,19 @@ fn project_component_max_bytes(name: &str) -> Option<usize> {
         crate::layout::THUMBNAIL_FILE => Some(THUMBNAIL_COMPONENT_MAX_BYTES),
         PUBLISH_MARKER_FILE => Some(PUBLISH_MARKER_MAX_BYTES),
         _ => None,
+    }
+}
+
+/// Refuse to produce a component its own reader would reject: the write side
+/// enforces exactly the limits [`ProjectRoot::read_optional`] applies.
+pub(crate) fn ensure_component_fits(name: &str, size: usize) -> Result<()> {
+    match project_component_max_bytes(name) {
+        Some(limit) if size > limit => Err(ProjectError::ComponentTooLarge {
+            file: name.to_string(),
+            size: size as u64,
+            limit: limit as u64,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -49,13 +62,14 @@ fn read_bounded_regular_file(
         ));
     }
     if metadata.len() > max_bytes as u64 {
-        return Err(ProjectError::io(
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{description} exceeds the {max_bytes}-byte limit"),
+        return Err(ProjectError::ComponentTooLarge {
+            file: path.file_name().map_or_else(
+                || description.to_string(),
+                |name| name.to_string_lossy().into_owned(),
             ),
-        ));
+            size: metadata.len(),
+            limit: max_bytes as u64,
+        });
     }
     read_bounded_contents(file, path, metadata.len() as usize, max_bytes, description)
 }
@@ -483,7 +497,8 @@ impl ProjectRoot {
             .dir
             .rename(&staging_name, &destination.dir, component)
             .map_err(|error| ProjectError::io(destination.path.join(component), error))?;
-        Ok(())
+        sync_directory(&destination.dir)
+            .map_err(|error| ProjectError::io(destination.path.join(component), error))
     }
 
     pub(crate) fn has_media_tree(&self) -> Result<bool> {
@@ -525,6 +540,7 @@ impl ProjectRoot {
 
     pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<()> {
         validate_leaf(name).map_err(|error| ProjectError::io(self.path.join(name), error))?;
+        ensure_component_fits(name, bytes.len())?;
         let tmp_name = unique_temp_name(name);
         let mut tmp = TransactionLeaf::create(&self.dir, &tmp_name)
             .map_err(|error| ProjectError::io(self.path.join(&tmp_name), error))?;
@@ -536,12 +552,74 @@ impl ProjectRoot {
             .as_file()
             .sync_all()
             .map_err(|error| ProjectError::io(self.path.join(&tmp_name), error))?;
-        tmp.replace(&self.dir, Path::new(name))
+        commit_leaf(tmp, &self.dir, &self.path, name)
+    }
+
+    /// Rename one configured component aside inside the bundle, as
+    /// `<stem>.<reason>-<unix milliseconds>.<extension>`, so a fresh component
+    /// can take its place without destroying the original bytes. Only a
+    /// no-follow regular file is moved. Returns the new leaf name.
+    pub(crate) fn move_component_aside(&self, name: &str, reason: &str) -> Result<String> {
+        validate_leaf(name).map_err(|error| ProjectError::io(self.path.join(name), error))?;
+        if project_component_max_bytes(name).is_none() {
+            return Err(ProjectError::io(
+                self.path.join(name),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "project component has no configured byte limit",
+                ),
+            ));
+        }
+        let metadata = self
+            .dir
+            .symlink_metadata(name)
             .map_err(|error| ProjectError::io(self.path.join(name), error))?;
-        // The single replace syscall is the commit point; nothing fallible runs
-        // after it before cleanup is disarmed.
-        tmp.cleanup_on_drop = false;
-        Ok(())
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ProjectError::io(
+                self.path.join(name),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "project component is not a nofollow regular file",
+                ),
+            ));
+        }
+        let (stem, extension) = name
+            .rsplit_once('.')
+            .map_or((name, None), |(stem, extension)| (stem, Some(extension)));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        for attempt in 0..1024_u32 {
+            let mut aside = format!("{stem}.{reason}-{stamp}");
+            if attempt > 0 {
+                aside.push_str(&format!("-{attempt}"));
+            }
+            if let Some(extension) = extension {
+                aside.push('.');
+                aside.push_str(extension);
+            }
+            match self.dir.symlink_metadata(&aside) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ProjectError::io(self.path.join(&aside), error)),
+            }
+            self.dir
+                .rename(name, &self.dir, &aside)
+                .map_err(|error| ProjectError::io(self.path.join(name), error))?;
+            // Moving aside destroys nothing, so the flush is best effort and its
+            // failure affects no data: if a crash reverts an unflushed rename,
+            // the next open finds the component again and moves it once more.
+            let _ = sync_directory(&self.dir);
+            return Ok(aside);
+        }
+        Err(ProjectError::io(
+            self.path.join(name),
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "no free name to move the project component aside",
+            ),
+        ))
     }
 
     /// Remove one configured optional project component through the retained
@@ -645,10 +723,7 @@ impl ProjectRoot {
             .as_file()
             .sync_all()
             .map_err(|error| ProjectError::io(directory_path.join(&tmp_name), error))?;
-        tmp.replace(&directory, Path::new(name))
-            .map_err(|error| ProjectError::io(directory_path.join(name), error))?;
-        tmp.cleanup_on_drop = false;
-        Ok(())
+        commit_leaf(tmp, &directory, &directory_path, name)
     }
 
     /// Read one project-managed LUT through retained no-follow directories.
@@ -738,10 +813,7 @@ impl ProjectRoot {
             .as_file()
             .sync_all()
             .map_err(|error| ProjectError::io(directory_path.join(&tmp_name), error))?;
-        tmp.replace(&directory, Path::new(name))
-            .map_err(|error| ProjectError::io(directory_path.join(name), error))?;
-        tmp.cleanup_on_drop = false;
-        Ok(())
+        commit_leaf(tmp, &directory, &directory_path, name)
     }
 
     /// List no-follow regular leaves in `chat-sessions/`. Callers own the
@@ -926,6 +998,10 @@ impl StagedMediaLeaf {
             .replace(&self.media, Path::new(&self.name))
             .map_err(|error| ProjectError::io(self.media_path.join(&self.name), error))?;
         self.leaf.cleanup_on_drop = !replaced_existing;
+        // The leaf must be durable before a manifest may name it. A failed
+        // flush drops the guard, which rolls the uncommitted leaf back.
+        sync_directory(&self.media)
+            .map_err(|error| ProjectError::io(self.media_path.join(&self.name), error))?;
         Ok(PublishedMediaLeaf { leaf: self.leaf })
     }
 }
@@ -1262,6 +1338,20 @@ impl BundlePublisher {
                 });
             }
             return Err(ProjectError::io(&self.target_path, publish_error));
+        }
+
+        // The rename committed the new target, but until the parent directory
+        // is flushed a crash could still revert it. Keep the backup and
+        // journal in that case: discarding them could lose both versions, and
+        // the next transaction's recovery reconciles either outcome.
+        if let Err(sync_error) = sync_directory(&self.parent) {
+            return Err(ProjectError::RecoveryRequired {
+                backup: self.parent_path.join(&self.backup_name),
+                publish: format!(
+                    "new target committed but its directory entry could not be flushed: {sync_error}"
+                ),
+                restore: "backup and journal kept for the next save to reconcile".to_string(),
+            });
         }
 
         // The rename committed the new target. Reopen it from the retained
@@ -1780,8 +1870,11 @@ fn write_new_file_artifact(
     let mut file = parent
         .open_with(name, &options)
         .map_err(|error| ProjectError::io(parent_path.join(name), error))?;
+    // Recovery depends on the journal: make its directory entry durable before
+    // any stage it describes can exist.
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
+        .and_then(|()| sync_directory(parent))
         .map_err(|error| ProjectError::io(parent_path.join(name), error))
 }
 
@@ -1802,7 +1895,9 @@ fn write_file_artifact_atomic(
     leaf.replace(parent, Path::new(name))
         .map_err(|error| ProjectError::io(parent_path.join(name), error))?;
     leaf.cleanup_on_drop = false;
-    Ok(())
+    // Journal phases gate recovery decisions, so an unflushed journal update
+    // fails this transaction step; the caller then restores or retries.
+    sync_directory(parent).map_err(|error| ProjectError::io(parent_path.join(name), error))
 }
 
 fn remove_file_artifact(parent: &Dir, parent_path: &Path, name: &OsStr) -> Result<()> {
@@ -2150,6 +2245,107 @@ fn recover_bundle_transaction(
     })
 }
 
+/// Replace `name` in `directory` with a fully written and synced temporary
+/// leaf, then flush the directory entry.
+///
+/// The rename is the commit point: cleanup is disarmed before the flush, and a
+/// flush failure reports [`ProjectError::DurabilityUnconfirmed`] while the new
+/// bytes stay live instead of rolling the replacement back.
+fn commit_leaf(
+    mut tmp: TransactionLeaf,
+    directory: &Dir,
+    directory_path: &Path,
+    name: &str,
+) -> Result<()> {
+    tmp.replace(directory, Path::new(name))
+        .map_err(|error| ProjectError::io(directory_path.join(name), error))?;
+    tmp.cleanup_on_drop = false;
+    sync_directory(directory).map_err(|source| ProjectError::DurabilityUnconfirmed {
+        path: directory_path.join(name),
+        source,
+    })
+}
+
+/// Flush one retained directory's entries after a rename or create inside it.
+///
+/// POSIX makes a rename durable only once its parent directory is synced; the
+/// renamed file's own `fsync` does not persist the new directory entry. The
+/// directory is reopened as `.` through its retained capability, never by
+/// path: cap-std may hold traversal handles with `O_PATH` on Linux, which
+/// `fsync(2)` rejects with `EBADF`. Filesystems that cannot sync a directory
+/// at all report `EINVAL` or `ENOTSUP`; as in PostgreSQL's `fsync_fname`,
+/// that leaves nothing to flush. Windows has no portable directory flush and
+/// NTFS journals the rename metadata itself, so this is a no-op there.
+fn sync_directory(directory: &Dir) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    sync_hooks::before_directory_sync()?;
+    #[cfg(unix)]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .custom_flags(libc::O_DIRECTORY);
+        match directory.open_with(".", &options)?.sync_all() {
+            Err(error)
+                if error.raw_os_error().is_some_and(|code| {
+                    code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+                }) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+/// Observation and failure injection for [`sync_directory`]. Thread-local, so
+/// parallel tests never see each other's syncs.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod sync_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SYNCS: Cell<usize> = const { Cell::new(0) };
+        static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn before_directory_sync() -> std::io::Result<()> {
+        SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+        match FAIL_AFTER.with(Cell::get) {
+            Some(0) => {
+                FAIL_AFTER.with(|fail| fail.set(None));
+                Err(std::io::Error::other("injected directory sync failure"))
+            }
+            Some(remaining) => {
+                FAIL_AFTER.with(|fail| fail.set(Some(remaining - 1)));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Directory syncs attempted on this thread so far.
+    pub(crate) fn directory_syncs() -> usize {
+        SYNCS.with(Cell::get)
+    }
+
+    /// Let `successes` more directory syncs succeed, then fail the next one.
+    pub(crate) fn fail_directory_sync_after(successes: usize) {
+        FAIL_AFTER.with(|fail| {
+            assert!(
+                fail.replace(Some(successes)).is_none(),
+                "previous test left a directory sync failure armed"
+            );
+        });
+    }
+}
+
 fn validate_leaf(name: &str) -> std::io::Result<()> {
     if matches!(
         Path::new(name).components().collect::<Vec<_>>().as_slice(),
@@ -2224,7 +2420,8 @@ fn copy_directory(source: &Dir, destination: &Dir) -> std::io::Result<()> {
         destination_file.flush()?;
         destination_file.sync_all()?;
     }
-    Ok(())
+    // Every copied entry must be durable before the tree can be published.
+    sync_directory(destination)
 }
 
 struct TransactionLeaf {
@@ -2546,9 +2743,46 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("metadata above the configured limit was accepted for {name}"),
             };
+            assert!(
+                matches!(&error, ProjectError::ComponentTooLarge { file, .. } if file == name),
+                "{error:?}"
+            );
             assert!(error.to_string().contains(name), "{error}");
             assert!(error.to_string().contains("byte limit"), "{error}");
+
+            // The write side enforces the same limit.
+            assert!(ensure_component_fits(name, max_bytes).is_ok());
+            assert!(matches!(
+                ensure_component_fits(name, max_bytes + 1),
+                Err(ProjectError::ComponentTooLarge { .. })
+            ));
         }
+    }
+
+    #[test]
+    fn atomic_writes_refuse_a_component_its_reader_would_reject() {
+        let tmp = TmpDir::new("component-write-limit");
+        let bundle = tmp.path().join("Bounded.opentake");
+        let root = ProjectRoot::create(&bundle).unwrap();
+        root.write_atomic(crate::layout::GENERATION_LOG_FILE, b"{}")
+            .unwrap();
+
+        let error = root
+            .write_atomic(
+                crate::layout::GENERATION_LOG_FILE,
+                &vec![b' '; GENERATION_LOG_COMPONENT_MAX_BYTES + 1],
+            )
+            .expect_err("an unreadable component must never be written");
+
+        assert!(
+            matches!(error, ProjectError::ComponentTooLarge { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(bundle.join(crate::layout::GENERATION_LOG_FILE)).unwrap(),
+            b"{}"
+        );
+        assert_eq!(fs::read_dir(&bundle).unwrap().count(), 1);
     }
 
     #[test]
@@ -2653,6 +2887,207 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
         assert!(!leaked, "failed transaction leaked its temporary leaf");
+    }
+
+    fn directory_syncs_during(operation: impl FnOnce()) -> usize {
+        let before = sync_hooks::directory_syncs();
+        operation();
+        sync_hooks::directory_syncs() - before
+    }
+
+    #[test]
+    fn every_atomic_replacement_flushes_its_directory_once_after_the_rename() {
+        let tmp = TmpDir::new("directory-sync-per-write");
+        let bundle = tmp.path().join("Sync.opentake");
+        let root = ProjectRoot::create(&bundle).unwrap();
+        let parent = Dir::open_ambient_dir(tmp.path(), ambient_authority()).unwrap();
+
+        assert_eq!(
+            directory_syncs_during(|| root
+                .write_atomic(crate::layout::MANIFEST_FILE, b"{}")
+                .unwrap()),
+            1
+        );
+        assert_eq!(
+            directory_syncs_during(|| root.write_chat_session_atomic("chat.json", b"{}").unwrap()),
+            1
+        );
+        assert_eq!(
+            directory_syncs_during(|| root.write_lut_atomic("grade.cube", b"LUT").unwrap()),
+            1
+        );
+        assert_eq!(
+            directory_syncs_during(|| write_file_artifact_atomic(
+                &parent,
+                tmp.path(),
+                OsStr::new(".Sync.opentake.opentake-journal"),
+                b"journal",
+            )
+            .unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn bundle_publication_flushes_the_parent_after_each_commit_rename() {
+        let tmp = TmpDir::new("directory-sync-publication");
+        let fresh = tmp.path().join("Fresh.opentake");
+        let publisher = ProjectRoot::begin_replace(&fresh).unwrap();
+        publisher
+            .stage()
+            .write_atomic("project.json", b"fresh timeline")
+            .unwrap();
+        // A first publication has no backup: only stage -> target is flushed.
+        assert_eq!(
+            directory_syncs_during(|| drop(publisher.publish().unwrap())),
+            1
+        );
+
+        let existing = tmp.path().join("Existing.opentake");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("project.json"), b"old timeline").unwrap();
+        let publisher = ProjectRoot::begin_replace(&existing).unwrap();
+        publisher
+            .stage()
+            .write_atomic("project.json", b"new timeline")
+            .unwrap();
+        // target -> backup is flushed by the backed-up journal write in the
+        // same parent, then stage -> target by the commit flush.
+        assert_eq!(
+            directory_syncs_during(|| drop(publisher.publish().unwrap())),
+            2
+        );
+        assert_eq!(
+            fs::read(existing.join("project.json")).unwrap(),
+            b"new timeline"
+        );
+    }
+
+    /// Local benchmark for the directory flush that now follows every atomic
+    /// component replacement: 1 MiB `project.json` replacements with and
+    /// without the trailing flush, interleaved to cancel drift. The numbers
+    /// depend on the disk, so it is ignored by default; run it with
+    /// `cargo test --release -p opentake-project --lib -- --ignored --nocapture directory_flush_cost`.
+    #[test]
+    #[ignore]
+    fn directory_flush_cost_of_a_one_mib_component_replacement() {
+        use std::time::{Duration, Instant};
+
+        const ITERATIONS: u32 = 50;
+        let tmp = TmpDir::new("directory-flush-cost");
+        let root = ProjectRoot::create(tmp.path().join("Bench.opentake")).unwrap();
+        let bytes = vec![b'x'; 1024 * 1024];
+        let replace_without_flush = || {
+            let tmp_name = unique_temp_name(crate::layout::TIMELINE_FILE);
+            let mut leaf = TransactionLeaf::create(&root.dir, &tmp_name).unwrap();
+            leaf.handle.as_file_mut().write_all(&bytes).unwrap();
+            leaf.handle.as_file().sync_all().unwrap();
+            leaf.replace(&root.dir, Path::new(crate::layout::TIMELINE_FILE))
+                .unwrap();
+            leaf.cleanup_on_drop = false;
+        };
+        root.write_atomic(crate::layout::TIMELINE_FILE, &bytes)
+            .unwrap();
+
+        let (mut without, mut with) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..ITERATIONS {
+            let started = Instant::now();
+            replace_without_flush();
+            without += started.elapsed();
+            let started = Instant::now();
+            root.write_atomic(crate::layout::TIMELINE_FILE, &bytes)
+                .unwrap();
+            with += started.elapsed();
+        }
+        let (without, with) = (without / ITERATIONS, with / ITERATIONS);
+        eprintln!(
+            "1 MiB write_atomic over {ITERATIONS} runs: {without:?} without the directory \
+             flush, {with:?} with it (+{:?})",
+            with.saturating_sub(without)
+        );
+    }
+
+    #[test]
+    fn unflushed_replacement_stays_committed_and_reports_unconfirmed_durability() {
+        let tmp = TmpDir::new("directory-sync-failure");
+        let bundle = tmp.path().join("Unflushed.opentake");
+        let root = ProjectRoot::create(&bundle).unwrap();
+        root.write_atomic(crate::layout::MANIFEST_FILE, b"old manifest")
+            .unwrap();
+
+        sync_hooks::fail_directory_sync_after(0);
+        let error = root
+            .write_atomic(crate::layout::MANIFEST_FILE, b"new manifest")
+            .expect_err("an unflushed rename must be reported");
+
+        assert!(
+            matches!(error, ProjectError::DurabilityUnconfirmed { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_partial_commit(), "the replacement is committed");
+        assert!(
+            error.to_string().contains("could not be flushed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(bundle.join(crate::layout::MANIFEST_FILE)).unwrap(),
+            b"new manifest",
+            "the committed rename must not be rolled back"
+        );
+        let prefix = format!(".{}.", crate::layout::MANIFEST_FILE);
+        assert!(!fs::read_dir(&bundle)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)));
+    }
+
+    #[test]
+    fn unflushed_publication_keeps_its_backup_and_journal_for_recovery() {
+        let tmp = TmpDir::new("publication-sync-failure");
+        let target = tmp.path().join("Existing.opentake");
+        let backup = tmp.path().join(".Existing.opentake.opentake-backup");
+        let journal = tmp.path().join(".Existing.opentake.opentake-journal");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("project.json"), b"old timeline").unwrap();
+        let publisher = ProjectRoot::begin_replace(&target).unwrap();
+        publisher
+            .stage()
+            .write_atomic("project.json", b"new timeline")
+            .unwrap();
+
+        // The backed-up journal flush succeeds; the commit flush fails.
+        sync_hooks::fail_directory_sync_after(1);
+        let error = publisher
+            .publish()
+            .expect_err("an unflushed publication must be reported");
+
+        assert!(
+            matches!(error, ProjectError::RecoveryRequired { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("could not be flushed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(target.join("project.json")).unwrap(),
+            b"new timeline"
+        );
+        assert_eq!(
+            fs::read(backup.join("project.json")).unwrap(),
+            b"old timeline"
+        );
+        assert!(journal.is_file());
+
+        let retry = ProjectRoot::begin_replace(&target)
+            .expect("the next transaction reconciles the committed publication");
+        assert!(!backup.exists());
+        drop(retry);
+        assert!(!journal.exists());
+        assert_eq!(
+            fs::read(target.join("project.json")).unwrap(),
+            b"new timeline"
+        );
     }
 
     #[test]

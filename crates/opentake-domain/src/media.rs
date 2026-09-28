@@ -17,7 +17,7 @@
 //! to the project/media layer and are intentionally NOT ported here.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -463,6 +463,41 @@ impl<'de> Deserialize<'de> for MediaManifest {
     }
 }
 
+/// Return whether `value` is a portable, non-empty bundle-relative path made
+/// exclusively from ordinary components.
+///
+/// This is the one rule every `.opentake` reader and writer applies to
+/// [`MediaSource::Project`] and [`MediaProxy`] paths. Bundles move between host
+/// platforms, so Windows separators, drive prefixes and ADS syntax are
+/// rejected even when parsing on Unix.
+pub fn is_safe_project_asset_relative_path(value: &str) -> bool {
+    if value.is_empty() || value.contains(['\\', ':']) {
+        return false;
+    }
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && path.components().next().is_some()
+}
+
+/// Spell `relative` as a portable bundle path: every component must be an
+/// ordinary UTF-8 name, the components are joined with `/`, and the result
+/// must satisfy [`is_safe_project_asset_relative_path`]. `None` when the path
+/// cannot be stored in that form without changing its meaning.
+fn portable_bundle_relative_path(relative: &Path) -> Option<String> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        components.push(name.to_str()?);
+    }
+    let joined = components.join("/");
+    is_safe_project_asset_relative_path(&joined).then_some(joined)
+}
+
 /// Resolves asset IDs against a manifest. Zero-IO: this computes *expected*
 /// paths only. Filesystem existence checks live in the project/media layer.
 /// 1:1 port of the pure parts of `MediaResolver`.
@@ -669,27 +704,27 @@ impl MediaAsset {
 
     /// Produce a serializable manifest entry. `Project` when `url` is inside
     /// `project_base`, else `External`. Expired cached URLs are dropped (their
-    /// expiry too). 1:1 port of `toManifestEntry(projectURL:)`, with `now`
+    /// expiry too). Port of `toManifestEntry(projectURL:)`, with `now`
     /// injected for the freshness check.
+    ///
+    /// Local departure from upstream: the bundle-relative path is spelled
+    /// component by component with `/` separators (so Windows writes forward
+    /// slashes), and a file inside the bundle whose relative path would not
+    /// be a portable bundle path (a name containing `:` or a backslash, or one
+    /// that is not UTF-8) is referenced as `External` by its absolute path
+    /// instead. Such a `Project` path would change meaning on another platform
+    /// and is refused by every bundle reader, while the absolute path keeps
+    /// resolving to the same file.
     pub fn to_manifest_entry(&self, project_base: Option<&Path>, now: f64) -> MediaManifestEntry {
-        let source = match project_base {
-            Some(base) if self.url.starts_with(base) => {
-                // Bundle paths must be portable between host platforms; the
-                // stripped path uses the host separator ('\' on Windows),
-                // which `path_policy` rejects — emit forward slashes everywhere.
-                let relative = self
-                    .url
-                    .strip_prefix(base)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                MediaSource::Project {
-                    relative_path: relative,
-                }
-            }
-            _ => MediaSource::External {
-                absolute_path: self.url.to_string_lossy().into_owned(),
-            },
-        };
+        let source = project_base
+            .and_then(|base| self.url.strip_prefix(base).ok())
+            .and_then(portable_bundle_relative_path)
+            .map_or_else(
+                || MediaSource::External {
+                    absolute_path: self.url.to_string_lossy().into_owned(),
+                },
+                |relative_path| MediaSource::Project { relative_path },
+            );
         let fresh = self.fresh_remote_url(now).map(|s| s.to_string());
         let expires = if fresh.is_none() {
             None
@@ -1125,6 +1160,85 @@ mod tests {
             MediaSource::External {
                 absolute_path: "/elsewhere/x.mp4".into()
             }
+        );
+    }
+
+    #[test]
+    fn project_asset_path_policy_accepts_only_portable_relative_paths() {
+        for safe in [
+            "media/clip.mov",
+            "media/nested/clip.mov",
+            "clip.mov",
+            "media/a b.mov",
+        ] {
+            assert!(is_safe_project_asset_relative_path(safe), "{safe}");
+        }
+        for unsafe_path in [
+            "",
+            "../private.mov",
+            "media/../../private.mov",
+            "./media/clip.mov",
+            "/private.mov",
+            r"C:\private.mov",
+            "C:private.mov",
+            "media/Scene 1:2.png",
+            r"media\a\b.png",
+            "media/clip.mov:stream",
+        ] {
+            assert!(
+                !is_safe_project_asset_relative_path(unsafe_path),
+                "{unsafe_path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_manifest_entry_keeps_unportable_bundle_names_as_external_paths() {
+        for name in ["Scene 1:2.png", r"a\b.png"] {
+            let url = Path::new("/proj.opentake/media").join(name);
+            let a = MediaAsset::new("a", &url, ClipType::Image, name, 0.0);
+
+            let e = a.to_manifest_entry(Some(Path::new("/proj.opentake")), 0.0);
+
+            assert_eq!(
+                e.source,
+                MediaSource::External {
+                    absolute_path: url.to_string_lossy().into_owned()
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_manifest_entry_keeps_non_utf8_bundle_names_out_of_project_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let url =
+            Path::new("/proj.opentake/media").join(std::ffi::OsStr::from_bytes(b"clip\xff.png"));
+        let a = MediaAsset::new("a", url, ClipType::Image, "clip", 0.0);
+
+        let e = a.to_manifest_entry(Some(Path::new("/proj.opentake")), 0.0);
+
+        assert!(
+            matches!(e.source, MediaSource::External { .. }),
+            "{:?}",
+            e.source
+        );
+    }
+
+    #[test]
+    fn to_manifest_entry_references_the_bundle_root_itself_externally() {
+        let a = MediaAsset::new("a", "/proj.opentake", ClipType::Image, "root", 0.0);
+
+        let e = a.to_manifest_entry(Some(Path::new("/proj.opentake")), 0.0);
+
+        assert!(
+            matches!(e.source, MediaSource::External { .. }),
+            "{:?}",
+            e.source
         );
     }
 

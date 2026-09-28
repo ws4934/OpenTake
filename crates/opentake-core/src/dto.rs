@@ -22,12 +22,14 @@ use crate::core::{AppCore, ProjectRevision, TimelineSnapshot};
 use crate::error::{CoreError, Result};
 
 /// Machine + human readable error for the Tauri boundary (`core-SPEC.md` §6.3).
-/// `code` is `"validation"` for rejected input or `"internal"` otherwise;
-/// `message` is the human-readable detail.
+/// `code` is `"validation"` for rejected input, `"staleProject"` for a
+/// superseded request, a `"project…"` code for a persistence failure the user
+/// can act on, or `"internal"` otherwise; `message` is the human-readable
+/// detail and never carries an absolute project path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CmdError {
-    /// Machine-readable class: `"validation"` | `"internal"`.
+    /// Machine-readable code (see [`CoreError::code`]).
     pub code: String,
     /// Human-readable message (carries precise validation paths when available).
     pub message: String,
@@ -45,9 +47,12 @@ impl From<CoreError> for CmdError {
             })
             | CoreError::NoProjectOpen
             | CoreError::Unsupported(_) => err.to_string(),
-            CoreError::Project(_) => {
+            CoreError::Project(project) => {
+                // The full error names absolute paths; keep it out of the
+                // IPC message and only in the local diagnostic log.
                 eprintln!("project command failed: {err}");
-                "Project operation failed".to_string()
+                project_error_message(project)
+                    .unwrap_or_else(|| "Project operation failed".to_string())
             }
         };
         CmdError {
@@ -55,6 +60,54 @@ impl From<CoreError> for CmdError {
             message,
         }
     }
+}
+
+/// A readable explanation of a persistence failure the user can act on, built
+/// only from error kinds, component names and limits so it never carries an
+/// absolute path. `None` keeps the generic message for internal failures.
+fn project_error_message(error: &opentake_project::ProjectError) -> Option<String> {
+    use opentake_project::ProjectError;
+    use std::io::ErrorKind;
+
+    const MIB: f64 = 1024.0 * 1024.0;
+    let message = match error {
+        ProjectError::Io { source, .. } => match source.kind() {
+            ErrorKind::StorageFull | ErrorKind::QuotaExceeded => {
+                "There is not enough disk space to save the project.".to_string()
+            }
+            ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+                "OpenTake is not allowed to write to the project folder.".to_string()
+            }
+            kind => format!("The project files could not be read or written ({kind})."),
+        },
+        ProjectError::ComponentTooLarge { file, size, limit } => format!(
+            "{file} is {:.1} MiB, more than the {:.0} MiB a project file may hold.",
+            *size as f64 / MIB,
+            *limit as f64 / MIB
+        ),
+        ProjectError::InvalidMediaManifest { .. } => {
+            "The media list contains a file path that could not be opened again, so the project \
+             was not saved."
+                .to_string()
+        }
+        ProjectError::PartialCommit { .. } => {
+            "The timeline was saved, but updating the media list failed. Save again to finish."
+                .to_string()
+        }
+        ProjectError::DurabilityUnconfirmed { .. } => {
+            "The project was saved, but the disk did not confirm the write. Save again to make \
+             sure the changes survive a power failure."
+                .to_string()
+        }
+        ProjectError::RecoveryRequired { .. } => {
+            "The project could not be saved safely. The previous version was kept next to the \
+             project in a hidden folder ending in \".opentake-backup\"; keep it until the project \
+             saves successfully again."
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some(message)
 }
 
 /// `get_timeline` response: the read-only mirror plus its version
@@ -333,6 +386,110 @@ mod tests {
         assert_eq!(error.code, "internal");
         assert_eq!(error.message, "Project operation failed");
         assert!(!error.message.contains("/private"));
+    }
+
+    #[test]
+    fn save_failures_map_to_distinct_codes_and_readable_path_free_messages() {
+        use opentake_project::ProjectError;
+        use std::io::{Error, ErrorKind};
+
+        let secret = "/private/customer/secret.opentake";
+        let cases = [
+            (
+                ProjectError::RecoveryRequired {
+                    backup: "/private/customer/.secret.opentake.opentake-backup".into(),
+                    publish: format!("new target committed but {secret} could not be flushed"),
+                    restore: "backup and journal kept".into(),
+                },
+                "projectRecoveryRequired",
+            ),
+            (
+                ProjectError::Io {
+                    path: secret.into(),
+                    source: Error::from(ErrorKind::StorageFull),
+                },
+                "projectStorageFull",
+            ),
+            (
+                ProjectError::Io {
+                    path: secret.into(),
+                    source: Error::from(ErrorKind::PermissionDenied),
+                },
+                "projectPermissionDenied",
+            ),
+            (
+                ProjectError::Io {
+                    path: secret.into(),
+                    source: Error::other(format!("{secret} vanished")),
+                },
+                "projectIo",
+            ),
+            (
+                ProjectError::InvalidMediaManifest {
+                    file: "media.json",
+                    reason: "project source for asset 'a' is not a safe bundle-relative path"
+                        .into(),
+                },
+                "projectInvalidManifest",
+            ),
+            (
+                ProjectError::ComponentTooLarge {
+                    file: "generation-log.json".into(),
+                    size: 17 * 1024 * 1024,
+                    limit: 16 * 1024 * 1024,
+                },
+                "projectComponentTooLarge",
+            ),
+            (
+                ProjectError::DurabilityUnconfirmed {
+                    path: format!("{secret}/project.json").into(),
+                    source: Error::other("injected"),
+                },
+                "projectDurabilityUnconfirmed",
+            ),
+        ];
+
+        let mut codes = std::collections::HashSet::new();
+        for (error, code) in cases {
+            let error = CmdError::from(CoreError::Project(error));
+            assert_eq!(error.code, code);
+            assert!(codes.insert(error.code.clone()), "{code} is not distinct");
+            assert_ne!(error.message, "Project operation failed", "{code}");
+            assert!(
+                !error.message.contains("/private"),
+                "{code}: {}",
+                error.message
+            );
+        }
+        let storage_full = CmdError::from(CoreError::Project(ProjectError::Io {
+            path: secret.into(),
+            source: Error::from(ErrorKind::StorageFull),
+        }));
+        assert!(
+            storage_full.message.contains("disk space"),
+            "{}",
+            storage_full.message
+        );
+        let too_large = CmdError::from(CoreError::Project(ProjectError::ComponentTooLarge {
+            file: "generation-log.json".into(),
+            size: 17 * 1024 * 1024,
+            limit: 16 * 1024 * 1024,
+        }));
+        assert!(
+            too_large.message.contains("generation-log.json"),
+            "{}",
+            too_large.message
+        );
+        let recovery = CmdError::from(CoreError::Project(ProjectError::RecoveryRequired {
+            backup: "/private/customer/.secret.opentake.opentake-backup".into(),
+            publish: "publish failed".into(),
+            restore: "restore failed".into(),
+        }));
+        assert!(
+            recovery.message.contains(".opentake-backup"),
+            "the user must learn where the retained backup is: {}",
+            recovery.message
+        );
     }
 
     #[test]

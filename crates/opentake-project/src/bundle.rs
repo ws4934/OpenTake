@@ -9,7 +9,9 @@
 //! - `project.json` is mandatory; absence is [`ProjectError::MissingTimeline`]
 //!   (upstream throws `fileReadCorruptFile`).
 //! - `media.json`, if present, is parsed strictly; a parse failure is an error
-//!   (upstream throws `fileReadCorruptFile`).
+//!   (upstream throws `fileReadCorruptFile`). A `.project` media or proxy path
+//!   that is not a portable bundle path does not fail the open: that entry
+//!   opens offline and its original string is written back verbatim.
 //! - `generation-log.json`, if present, is parsed leniently; a parse failure
 //!   yields an in-memory `None` recovery (upstream `try?`) plus a compatibility
 //!   blocker, so the damaged bytes remain readable but cannot be overwritten.
@@ -34,7 +36,9 @@ use crate::compatibility;
 use crate::error::{ProjectError, Result};
 use crate::gen_log::{GenerationLog, GenerationLogEntry};
 use crate::layout;
-use crate::{is_safe_project_asset_relative_path, ProjectRoot};
+use crate::media_paths::{self, QuarantinedMediaPaths};
+use crate::project_root::ensure_component_fits;
+use crate::ProjectRoot;
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
@@ -49,40 +53,28 @@ pub mod test_hooks {
             assert!(!fail.replace(true), "previous test left the failure armed");
         });
     }
+
+    /// Let `successes` more directory flushes on this thread succeed, then
+    /// fail the next one after its rename has already committed.
+    pub fn fail_directory_sync_after(successes: usize) {
+        crate::project_root::sync_hooks::fail_directory_sync_after(successes);
+    }
+
+    /// Directory flushes attempted on this thread so far.
+    pub fn directory_syncs() -> usize {
+        crate::project_root::sync_hooks::directory_syncs()
+    }
 }
 
-/// Persisted schema details this build cannot safely write back.
+/// Persisted schema details this build cannot safely write back, plus notices
+/// about recoverable problems found while opening.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectCompatibility {
     blockers: Vec<String>,
-}
-
-fn validate_manifest_paths(manifest: &MediaManifest) -> Result<()> {
-    for entry in &manifest.entries {
-        if let opentake_domain::MediaSource::Project { relative_path } = &entry.source {
-            if !is_safe_project_asset_relative_path(relative_path) {
-                return Err(ProjectError::InvalidMediaManifest {
-                    file: layout::MANIFEST_FILE,
-                    reason: format!(
-                        "project source for asset '{}' is not a safe bundle-relative path",
-                        entry.id
-                    ),
-                });
-            }
-        }
-        if let Some(proxy) = &entry.proxy {
-            if !is_safe_project_asset_relative_path(&proxy.relative_path) {
-                return Err(ProjectError::InvalidMediaManifest {
-                    file: layout::MANIFEST_FILE,
-                    reason: format!(
-                        "proxy for asset '{}' is not a safe bundle-relative path",
-                        entry.id
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
+    warnings: Vec<String>,
+    /// Unsafe `media.json` paths withheld from the live manifest on open and
+    /// written back verbatim by every manifest save.
+    quarantined_media: Vec<QuarantinedMediaPaths>,
 }
 
 impl ProjectCompatibility {
@@ -100,6 +92,44 @@ impl ProjectCompatibility {
         self.blockers.extend(blockers);
         self.blockers.sort();
         self.blockers.dedup();
+    }
+
+    /// Sorted, file-qualified notices about recoverable problems handled while
+    /// opening, such as a component moved aside. Unlike blockers they never
+    /// make the project read-only; the UI may surface them.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    fn warn(&mut self, warnings: impl IntoIterator<Item = String>) {
+        self.warnings.extend(warnings);
+        self.warnings.sort();
+        self.warnings.dedup();
+    }
+
+    /// Take every `.project` media or proxy path that is not a portable
+    /// bundle path out of a freshly decoded manifest. The entry stays, offline
+    /// and relinkable, with a `media.json:offline-media:<id>` or
+    /// `media.json:ignored-proxy:<id>` warning; its original string is kept
+    /// here for [`Self::manifest_for_write`].
+    fn quarantine_unsafe_media_paths(&mut self, manifest: &mut MediaManifest) {
+        let (quarantined, warnings) = media_paths::quarantine_unsafe_media_paths(manifest);
+        self.quarantined_media.extend(quarantined);
+        self.warn(warnings);
+    }
+
+    /// The manifest a writer must persist for the live `manifest`.
+    ///
+    /// Every `.project` media and proxy path must be a portable bundle path,
+    /// so no save can produce a manifest its reader would refuse; the error is
+    /// [`ProjectError::InvalidMediaManifest`]. Unsafe paths withheld when the
+    /// project was opened are restored verbatim for entries that were not
+    /// relinked, so saving never discards them.
+    pub fn manifest_for_write<'a>(
+        &self,
+        manifest: &'a MediaManifest,
+    ) -> Result<std::borrow::Cow<'a, MediaManifest>> {
+        media_paths::manifest_for_write(manifest, &self.quarantined_media)
     }
 
     /// Refuse a write that would discard unknown persisted data.
@@ -264,12 +294,14 @@ impl Project {
         let mut compatibility = ProjectCompatibility::default();
         compatibility.extend(timeline_blockers);
 
-        // media.json: strict when present, empty default when absent.
+        // media.json: strict when present, empty default when absent. An
+        // entry whose path is not a portable bundle path stays in the project
+        // as offline media instead of failing the whole open.
         let manifest = if let Some(bytes) = root.read_optional(layout::MANIFEST_FILE)? {
-            let (manifest, blockers, _) =
+            let (mut manifest, blockers, _) =
                 decode_component::<MediaManifest>(&bytes, layout::MANIFEST_FILE)?;
             compatibility.extend(blockers);
-            validate_manifest_paths(&manifest)?;
+            compatibility.quarantine_unsafe_media_paths(&mut manifest);
             manifest
         } else {
             MediaManifest::new()
@@ -278,6 +310,9 @@ impl Project {
 
         // generation-log.json: lenient read recovery — a parse error degrades
         // to None but records a blocker so no save can overwrite the bytes.
+        // A log beyond the reader's byte limit would keep the project
+        // read-only forever instead, so the complete original is moved aside
+        // inside the bundle and the project continues without a log.
         let generation_log = match root.read_optional(layout::GENERATION_LOG_FILE) {
             Ok(Some(bytes)) => {
                 match decode_component::<GenerationLog>(&bytes, layout::GENERATION_LOG_FILE) {
@@ -295,6 +330,19 @@ impl Project {
                 }
             }
             Ok(None) => None,
+            Err(ProjectError::ComponentTooLarge { .. }) => {
+                match root.move_component_aside(layout::GENERATION_LOG_FILE, "oversized") {
+                    Ok(aside) => compatibility.warn([format!(
+                        "{}:moved-aside:{aside}",
+                        layout::GENERATION_LOG_FILE
+                    )]),
+                    Err(_) => compatibility.extend([format!(
+                        "{}:invalid-or-unreadable",
+                        layout::GENERATION_LOG_FILE
+                    )]),
+                }
+                None
+            }
             Err(_) => {
                 compatibility.extend([format!(
                     "{}:invalid-or-unreadable",
@@ -330,7 +378,7 @@ impl Project {
             encoded.write_to(&root)
         } else {
             let publisher = ProjectRoot::begin_replace(&self.bundle_path)?;
-            encoded.write_to(publisher.stage())?;
+            encoded.write_to(publisher.stage()).map_err(unpublished)?;
             publisher.publish().map(|_| ())
         }
     }
@@ -343,7 +391,10 @@ impl Project {
     /// error result into a partially saved manifest.
     pub fn save_manifest(&self) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
         let root = ProjectRoot::create(&self.bundle_path)?;
         root.write_atomic(layout::MANIFEST_FILE, &manifest)
     }
@@ -351,7 +402,10 @@ impl Project {
     /// Persist only `media.json` through a retained bundle root.
     pub fn save_manifest_to_root(&self, root: &ProjectRoot) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
         root.write_atomic(layout::MANIFEST_FILE, &manifest)
     }
 
@@ -368,12 +422,21 @@ impl Project {
     /// worst outcome is that a resumed job records that transition twice.
     pub fn save_manifest_and_generation_log_to_root(&self, root: &ProjectRoot) -> Result<()> {
         self.compatibility.ensure_writable()?;
-        let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
-        if let Some(log) = &self.generation_log {
-            let log = encode_component(layout::GENERATION_LOG_FILE, log)?;
-            root.write_atomic(layout::GENERATION_LOG_FILE, &log)?;
+        let manifest = encode_component(
+            layout::MANIFEST_FILE,
+            &*self.compatibility.manifest_for_write(&self.manifest)?,
+        )?;
+        let log = self
+            .generation_log
+            .as_ref()
+            .map(|log| encode_component(layout::GENERATION_LOG_FILE, log))
+            .transpose()?;
+        let mut writes = ComponentWrites::default();
+        if let Some(log) = &log {
+            writes.write(root, layout::GENERATION_LOG_FILE, log)?;
         }
-        root.write_atomic(layout::MANIFEST_FILE, &manifest)
+        writes.write(root, layout::MANIFEST_FILE, &manifest)?;
+        writes.finish()
     }
 
     /// Like [`Self::save`] but targets an explicit `bundle` directory (used by
@@ -381,7 +444,7 @@ impl Project {
     pub fn save_to(&self, bundle: impl AsRef<Path>) -> Result<()> {
         let encoded = EncodedProject::prepare(self)?;
         let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
+        encoded.write_to(publisher.stage()).map_err(unpublished)?;
         publisher.publish().map(|_| ())
     }
 
@@ -430,16 +493,53 @@ impl Project {
         let preserve_thumbnail = matches!(thumbnail, ThumbnailUpdate::Preserve);
         let encoded = EncodedProject::prepare_with_thumbnail_update(self, thumbnail)?;
         let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
+        encoded.write_to(publisher.stage()).map_err(unpublished)?;
         if let Some(source) = media_source {
             source.copy_media_to(publisher.stage())?;
             source.copy_chat_sessions_to(publisher.stage())?;
             source.copy_motion_documents_to(publisher.stage())?;
             if preserve_thumbnail {
-                source.copy_thumbnail_to(publisher.stage())?;
+                source
+                    .copy_thumbnail_to(publisher.stage())
+                    .map_err(unpublished)?;
             }
         }
         publisher.publish()
+    }
+}
+
+/// A write into an unpublished stage commits nothing: only the stage's
+/// publication rename does. An unconfirmed flush there is an ordinary failure
+/// that aborts publication and discards the stage.
+fn unpublished(error: ProjectError) -> ProjectError {
+    match error {
+        ProjectError::DurabilityUnconfirmed { path, source } => ProjectError::io(path, source),
+        error => error,
+    }
+}
+
+/// The component replacements of one logical save. A replacement whose
+/// directory flush failed has still committed, so the save carries on to its
+/// commit point and reports the unconfirmed flush only after the remaining
+/// components are written; any other failure stops the save immediately.
+#[derive(Default)]
+struct ComponentWrites {
+    unconfirmed: Option<ProjectError>,
+}
+
+impl ComponentWrites {
+    fn write(&mut self, root: &ProjectRoot, name: &str, bytes: &[u8]) -> Result<()> {
+        match root.write_atomic(name, bytes) {
+            Err(error @ ProjectError::DurabilityUnconfirmed { .. }) => {
+                self.unconfirmed.get_or_insert(error);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        self.unconfirmed.map_or(Ok(()), Err)
     }
 }
 
@@ -482,9 +582,17 @@ impl EncodedProject {
                 file: layout::TIMELINE_FILE,
                 reason,
             })?;
+        if let ThumbnailUpdate::Replace(bytes) = &thumbnail {
+            ensure_component_fits(layout::THUMBNAIL_FILE, bytes.len())?;
+        }
         Ok(Self {
             timeline: encode_component(layout::TIMELINE_FILE, &project.timeline)?,
-            manifest: encode_component(layout::MANIFEST_FILE, &project.manifest)?,
+            manifest: encode_component(
+                layout::MANIFEST_FILE,
+                &*project
+                    .compatibility
+                    .manifest_for_write(&project.manifest)?,
+            )?,
             generation_log: project
                 .generation_log
                 .as_ref()
@@ -513,12 +621,14 @@ impl EncodedProject {
             .collect();
         let adds_assets = next_ids.iter().any(|id| !current_ids.contains(id));
         let removes_assets = current_ids.iter().any(|id| !next_ids.contains(id));
+        let mut writes = ComponentWrites::default();
 
         if removes_assets && !adds_assets {
-            self.write_non_manifest_components(root)?;
-            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
-            return write_final_manifest(root, &self.manifest)
-                .map_err(ProjectError::partial_commit);
+            self.write_non_manifest_components(root, &mut writes)?;
+            writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+            write_final_manifest(root, &mut writes, &self.manifest)
+                .map_err(ProjectError::partial_commit)?;
+            return writes.finish();
         }
 
         if adds_assets && removes_assets {
@@ -538,30 +648,37 @@ impl EncodedProject {
                     transition_manifest.folders.push(folder.clone());
                 }
             }
-            validate_manifest_paths(&transition_manifest)?;
+            // Entries carried over from disk are written back verbatim; the new
+            // entries passed the portable-path check when the save was prepared.
             let transition_bytes = encode_component(layout::MANIFEST_FILE, &transition_manifest)?;
-            root.write_atomic(layout::MANIFEST_FILE, &transition_bytes)?;
-            self.write_non_manifest_components(root)?;
-            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
-            return write_final_manifest(root, &self.manifest)
-                .map_err(ProjectError::partial_commit);
+            writes.write(root, layout::MANIFEST_FILE, &transition_bytes)?;
+            self.write_non_manifest_components(root, &mut writes)?;
+            writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+            write_final_manifest(root, &mut writes, &self.manifest)
+                .map_err(ProjectError::partial_commit)?;
+            return writes.finish();
         }
 
-        root.write_atomic(layout::MANIFEST_FILE, &self.manifest)?;
-        self.write_non_manifest_components(root)?;
+        writes.write(root, layout::MANIFEST_FILE, &self.manifest)?;
+        self.write_non_manifest_components(root, &mut writes)?;
         // New clip references become visible only after their manifest entries.
         // A failed timeline replacement can leave extra, unreferenced entries.
-        root.write_atomic(layout::TIMELINE_FILE, &self.timeline)
+        writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+        writes.finish()
     }
 
-    fn write_non_manifest_components(&self, root: &ProjectRoot) -> Result<()> {
+    fn write_non_manifest_components(
+        &self,
+        root: &ProjectRoot,
+        writes: &mut ComponentWrites,
+    ) -> Result<()> {
         if let Some(log) = &self.generation_log {
-            root.write_atomic(layout::GENERATION_LOG_FILE, log)?;
+            writes.write(root, layout::GENERATION_LOG_FILE, log)?;
         }
         match &self.thumbnail {
             ThumbnailUpdate::Preserve => {}
             ThumbnailUpdate::Replace(thumbnail) => {
-                root.write_atomic(layout::THUMBNAIL_FILE, thumbnail)?;
+                writes.write(root, layout::THUMBNAIL_FILE, thumbnail)?;
             }
             ThumbnailUpdate::Remove => root.remove_optional_component(layout::THUMBNAIL_FILE)?,
         }
@@ -569,7 +686,11 @@ impl EncodedProject {
     }
 }
 
-fn write_final_manifest(root: &ProjectRoot, manifest: &[u8]) -> Result<()> {
+fn write_final_manifest(
+    root: &ProjectRoot,
+    writes: &mut ComponentWrites,
+    manifest: &[u8],
+) -> Result<()> {
     #[cfg(any(test, feature = "test-hooks"))]
     if FAIL_FINAL_MANIFEST_WRITE.with(|fail| fail.replace(false)) {
         return Err(ProjectError::io(
@@ -577,11 +698,16 @@ fn write_final_manifest(root: &ProjectRoot, manifest: &[u8]) -> Result<()> {
             std::io::Error::other("injected final manifest failure"),
         ));
     }
-    root.write_atomic(layout::MANIFEST_FILE, manifest)
+    writes.write(root, layout::MANIFEST_FILE, manifest)
 }
 
+/// Encode one JSON component and refuse bytes its reader would reject, before
+/// any destination file is touched.
 fn encode_component<T: Serialize>(file_name: &str, value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(value).map_err(|error| ProjectError::json(file_name, error))
+    let bytes =
+        serde_json::to_vec_pretty(value).map_err(|error| ProjectError::json(file_name, error))?;
+    ensure_component_fits(file_name, bytes.len())?;
+    Ok(bytes)
 }
 
 fn decode_component<T: DeserializeOwned>(
@@ -747,6 +873,193 @@ mod tests {
             .any(|entry| entry.id == "asset-1"));
     }
 
+    fn video_entry(id: &str, relative_path: &str) -> MediaManifestEntry {
+        MediaManifestEntry {
+            id: id.into(),
+            name: format!("{id}.mp4"),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: relative_path.into(),
+            },
+            duration: 1.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn unflushed_component_does_not_stop_the_save_before_its_commit_point() {
+        let tmp = TmpDir::new("deferred-durability");
+        let bundle = tmp.path().join("Deferred.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let root = ProjectRoot::open(&bundle).unwrap();
+        project.timeline.fps = 48;
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/asset-1.mp4"));
+
+        // The manifest (written before the timeline commit) is not flushed.
+        crate::project_root::sync_hooks::fail_directory_sync_after(0);
+        let error = project
+            .save_to_root(&root)
+            .expect_err("the unconfirmed manifest flush must be reported");
+
+        assert!(
+            matches!(error, ProjectError::DurabilityUnconfirmed { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_partial_commit());
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(
+            reopened.timeline.fps, 48,
+            "the save reached its commit point"
+        );
+        assert_eq!(reopened.manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn unflushed_stage_component_aborts_publication_without_a_commit() {
+        let tmp = TmpDir::new("stage-durability");
+        let source = tmp.path().join("Source.opentake");
+        let destination = tmp.path().join("Copy.opentake");
+        let mut project = Project::new(&source);
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/asset-1.mp4"));
+
+        // Journal and stage marker flushes succeed; the staged manifest does not.
+        crate::project_root::sync_hooks::fail_directory_sync_after(2);
+        let error = project
+            .save_to(&destination)
+            .expect_err("an unflushed stage must not be published");
+
+        assert!(!error.is_partial_commit(), "{error:?}");
+        assert!(!destination.exists());
+        // Only the persistent transaction lock remains: no stage or journal.
+        let artifacts = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".Copy.opentake.opentake-"))
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts, [".Copy.opentake.opentake-lock"]);
+    }
+
+    #[test]
+    fn component_larger_than_its_read_limit_is_refused_before_any_write() {
+        let tmp = TmpDir::new("oversized-component");
+        let bundle = tmp.path().join("Oversized.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let before = tree_receipt(&bundle);
+        let mut entry = video_entry("asset-1", "media/asset-1.mp4");
+        // media.json is read with a 32 MiB limit.
+        entry.name = "n".repeat(32 * 1024 * 1024);
+        project.manifest.entries.push(entry);
+        project.timeline.fps = 48;
+
+        let error = project
+            .save()
+            .expect_err("a manifest its reader would refuse must not be written");
+        assert!(
+            matches!(
+                &error,
+                ProjectError::ComponentTooLarge { file, limit, .. }
+                    if file == layout::MANIFEST_FILE && *limit == 32 * 1024 * 1024
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("media.json"), "{error}");
+        assert_eq!(tree_receipt(&bundle), before);
+
+        let root = ProjectRoot::open(&bundle).unwrap();
+        assert!(matches!(
+            project.save_manifest_to_root(&root),
+            Err(ProjectError::ComponentTooLarge { .. })
+        ));
+        assert!(matches!(
+            project.save_manifest_and_generation_log_to_root(&root),
+            Err(ProjectError::ComponentTooLarge { .. })
+        ));
+        assert_eq!(tree_receipt(&bundle), before);
+    }
+
+    #[test]
+    fn oversized_required_component_fails_open_with_a_size_error() {
+        let tmp = TmpDir::new("oversized-manifest-open");
+        let bundle = tmp.path().join("Oversized.opentake");
+        Project::new(&bundle).save().unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(bundle.join(layout::MANIFEST_FILE))
+            .unwrap()
+            .set_len(32 * 1024 * 1024 + 1)
+            .unwrap();
+        let before = tree_receipt(&bundle);
+
+        let error = Project::open(&bundle).expect_err("an unreadable manifest must not open");
+
+        assert!(
+            matches!(
+                &error,
+                ProjectError::ComponentTooLarge { file, .. } if file == layout::MANIFEST_FILE
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains(tmp.path().to_str().unwrap()));
+        assert_eq!(tree_receipt(&bundle), before);
+    }
+
+    #[test]
+    fn oversized_generation_log_is_moved_aside_and_the_project_stays_writable() {
+        let tmp = TmpDir::new("oversized-generation-log");
+        let bundle = tmp.path().join("Log.opentake");
+        Project::new(&bundle).save().unwrap();
+        let log_path = bundle.join(layout::GENERATION_LOG_FILE);
+        let oversized = crate::project_root::GENERATION_LOG_COMPONENT_MAX_BYTES as u64 + 1;
+        fs::File::create(&log_path)
+            .unwrap()
+            .set_len(oversized)
+            .unwrap();
+
+        let mut project = Project::open(&bundle).expect("an oversized log must not block open");
+
+        assert!(!project.compatibility().is_read_only());
+        assert!(project.generation_log.is_none());
+        assert!(!log_path.exists());
+        let [warning] = project.compatibility().warnings() else {
+            panic!("expected one warning: {:?}", project.compatibility());
+        };
+        let aside = warning
+            .strip_prefix("generation-log.json:moved-aside:")
+            .expect("the warning names the moved-aside file")
+            .to_string();
+        assert!(
+            aside.starts_with("generation-log.oversized-") && aside.ends_with(".json"),
+            "{aside}"
+        );
+        assert_eq!(fs::metadata(bundle.join(&aside)).unwrap().len(), oversized);
+
+        project.timeline.fps = 48;
+        project.generation_log = Some(GenerationLog::new());
+        project.save().expect("the recovered project is writable");
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(reopened.timeline.fps, 48);
+        assert!(reopened.compatibility().warnings().is_empty());
+        assert!(!reopened.compatibility().is_read_only());
+        assert_eq!(fs::metadata(bundle.join(&aside)).unwrap().len(), oversized);
+    }
+
     fn tree_receipt(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         fn visit(base: &Path, path: &Path, receipt: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
             let mut entries = fs::read_dir(path)
@@ -822,14 +1135,44 @@ mod tests {
         ));
     }
 
+    fn write_manifest_json(bundle: &Path, manifest: &Value) {
+        fs::write(
+            bundle.join(layout::MANIFEST_FILE),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn disk_manifest_json(bundle: &Path) -> Value {
+        serde_json::from_slice(&fs::read(bundle.join(layout::MANIFEST_FILE)).unwrap()).unwrap()
+    }
+
+    fn assert_offline(entry: &MediaManifestEntry, bundle: &Path) {
+        assert_eq!(entry.source, media_paths::offline_source());
+        let manifest = MediaManifest {
+            entries: vec![entry.clone()],
+            ..MediaManifest::new()
+        };
+        let resolved = opentake_domain::MediaResolver::new(&manifest, Some(bundle))
+            .expected_path(&entry.id)
+            .unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::new(),
+            "offline media resolves to nothing"
+        );
+    }
+
     #[test]
-    fn project_open_rejects_unsafe_project_media_and_proxy_paths() {
+    fn unsafe_project_media_and_proxy_paths_open_offline_and_save_verbatim() {
         for (index, unsafe_path) in [
             "../private.mov",
             "media/../../private.mov",
             "/private.mov",
             r"C:\private.mov",
             "C:private.mov",
+            "media/Scene 1:2.png",
+            r"media\a\b.png",
         ]
         .into_iter()
         .enumerate()
@@ -848,13 +1191,26 @@ mod tests {
                 }],
                 "folders": []
             });
-            fs::write(
-                bundle.join(layout::MANIFEST_FILE),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
+            write_manifest_json(&bundle, &manifest);
 
-            assert!(Project::open(&bundle).is_err());
+            let mut project = Project::open(&bundle).expect("one unsafe path must not block open");
+            assert_offline(&project.manifest.entries[0], &bundle);
+            assert_eq!(
+                project.compatibility().warnings(),
+                ["media.json:offline-media:asset-1"]
+            );
+            assert!(!project.compatibility().is_read_only());
+            project.timeline.fps = 48;
+            project.save().unwrap();
+            assert_eq!(
+                disk_manifest_json(&bundle)["entries"][0]["source"],
+                manifest["entries"][0]["source"],
+                "{unsafe_path} must be written back verbatim"
+            );
+            assert_offline(
+                &Project::open(&bundle).unwrap().manifest.entries[0],
+                &bundle,
+            );
 
             let mut proxy_manifest = manifest;
             proxy_manifest["entries"][0]["source"] = serde_json::json!({
@@ -866,13 +1222,141 @@ mod tests {
                 "width": 320,
                 "height": 180
             });
-            fs::write(
-                bundle.join(layout::MANIFEST_FILE),
-                serde_json::to_vec(&proxy_manifest).unwrap(),
-            )
-            .unwrap();
-            assert!(Project::open(&bundle).is_err());
+            write_manifest_json(&bundle, &proxy_manifest);
+
+            let project = Project::open(&bundle).expect("an unsafe proxy must not block open");
+            let entry = &project.manifest.entries[0];
+            assert_eq!(
+                entry.source,
+                MediaSource::Project {
+                    relative_path: "media/valid.mov".into()
+                }
+            );
+            assert_eq!(
+                entry.proxy, None,
+                "{unsafe_path} proxy must never be resolved"
+            );
+            assert_eq!(
+                project.compatibility().warnings(),
+                ["media.json:ignored-proxy:asset-1"]
+            );
+            project.save().unwrap();
+            assert_eq!(
+                disk_manifest_json(&bundle)["entries"][0]["proxy"],
+                proxy_manifest["entries"][0]["proxy"]
+            );
         }
+    }
+
+    #[test]
+    fn one_unsafe_entry_goes_offline_while_the_rest_of_the_manifest_opens_normally() {
+        let tmp = TmpDir::new("mixed-media-paths");
+        let bundle = tmp.path().join("Mixed.opentake");
+        Project::new(&bundle).save().unwrap();
+        fs::create_dir_all(bundle.join("media")).unwrap();
+        fs::write(bundle.join("media/good.png"), b"good").unwrap();
+        write_manifest_json(
+            &bundle,
+            &serde_json::json!({
+                "version": 2,
+                "entries": [
+                    {
+                        "id": "asset-bad",
+                        "name": "Scene 1/2.png",
+                        "type": "image",
+                        "source": { "project": { "relativePath": "media/Scene 1:2.png" } },
+                        "duration": 0.0
+                    },
+                    {
+                        "id": "asset-good",
+                        "name": "good.png",
+                        "type": "image",
+                        "source": { "project": { "relativePath": "media/good.png" } },
+                        "duration": 0.0
+                    }
+                ],
+                "folders": []
+            }),
+        );
+
+        let project = Project::open(&bundle).expect("the valid entry must stay usable");
+
+        assert_offline(&project.manifest.entries[0], &bundle);
+        assert_eq!(project.manifest.entries[0].name, "Scene 1/2.png");
+        assert_eq!(
+            project.manifest.entries[1].source,
+            MediaSource::Project {
+                relative_path: "media/good.png".into()
+            }
+        );
+        assert_eq!(
+            project.compatibility().warnings(),
+            ["media.json:offline-media:asset-bad"]
+        );
+        assert!(!project.compatibility().is_read_only());
+        let root = ProjectRoot::open(&bundle).unwrap();
+        let mut good = root.open_asset_file(Path::new("media/good.png")).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut good, &mut bytes).unwrap();
+        assert_eq!(bytes, b"good");
+    }
+
+    #[test]
+    fn relinked_offline_entry_saves_its_new_source_instead_of_the_withheld_path() {
+        let tmp = TmpDir::new("relinked-offline-media");
+        let bundle = tmp.path().join("Relinked.opentake");
+        Project::new(&bundle).save().unwrap();
+        write_manifest_json(
+            &bundle,
+            &serde_json::json!({
+                "version": 2,
+                "entries": [{
+                    "id": "asset-1",
+                    "name": "clip.mov",
+                    "type": "video",
+                    "source": { "project": { "relativePath": "../escape.mov" } },
+                    "duration": 1.0
+                }],
+                "folders": []
+            }),
+        );
+        let mut project = Project::open(&bundle).unwrap();
+        let relinked = MediaSource::External {
+            absolute_path: tmp.path().join("found.mov").to_string_lossy().into_owned(),
+        };
+        project.manifest.entries[0].source = relinked.clone();
+
+        project.save().unwrap();
+
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(reopened.manifest.entries[0].source, relinked);
+        assert!(reopened.compatibility().warnings().is_empty());
+    }
+
+    #[test]
+    fn save_refuses_a_new_path_that_its_reader_would_withhold() {
+        let tmp = TmpDir::new("save-unsafe-media-path");
+        let bundle = tmp.path().join("SelfCheck.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let before = tree_receipt(&bundle);
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/Scene 1:2.mov"));
+
+        for error in [
+            project.save().expect_err("unportable path must be refused"),
+            project
+                .save_manifest()
+                .expect_err("unportable path must be refused"),
+        ] {
+            assert!(
+                matches!(error, ProjectError::InvalidMediaManifest { .. }),
+                "{error:?}"
+            );
+        }
+        assert_eq!(tree_receipt(&bundle), before);
     }
 
     #[test]

@@ -617,6 +617,83 @@ mod unix_contract {
     }
 
     #[test]
+    fn open_file_rejects_a_fifo_without_blocking() {
+        let _serial = test_seam::serialize_unix_test();
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let temp = TestDir::new("open-fifo");
+        let fifo = temp.path().join("pipe");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo")
+            .success());
+        for access in [FileAccess::Read, FileAccess::ReadWrite] {
+            let root = capture_absolute_directory(temp.path(), DirectoryAccess::MutateChildren)
+                .expect("capture");
+            let (sent, received) = mpsc::channel();
+            let opener = std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = open_file_nofollow(&root, &name("pipe"), access).map(|_| ());
+                sent.send((result, started.elapsed()))
+                    .expect("report FIFO open result");
+            });
+            let (result, elapsed) = match received.recv_timeout(Duration::from_secs(2)) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    // Rendezvous with the blocked reader so a regression never
+                    // strands the test worker, then fail.
+                    let _writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fifo)
+                        .expect("unblock FIFO reader");
+                    let _ = received.recv_timeout(Duration::from_secs(1));
+                    opener.join().expect("join FIFO opener");
+                    panic!("{access:?} open of a FIFO blocked instead of failing closed");
+                }
+            };
+            opener.join().expect("join FIFO opener");
+            assert!(
+                matches!(
+                    result,
+                    Err(SafeFsError::UnsupportedEntryType {
+                        operation: SafeFsOperation::OpenFile,
+                        kind: EntryKind::Fifo,
+                    })
+                ),
+                "{access:?}: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "{access:?} FIFO rejection took {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opened_regular_files_do_not_keep_the_nonblocking_open_flag() {
+        let _serial = test_seam::serialize_unix_test();
+        let temp = TestDir::new("open-regular-blocking");
+        std::fs::write(temp.path().join("leaf"), b"payload").expect("create file");
+        let root = capture_absolute_directory(temp.path(), DirectoryAccess::MutateChildren)
+            .expect("capture");
+        for access in [FileAccess::Read, FileAccess::ReadWrite] {
+            let capability =
+                open_file_nofollow(&root, &name("leaf"), access).expect("open regular file");
+            let super::super::unix::NativeFile::Open(file) = &capability.native else {
+                panic!("an opened regular file retains its descriptor");
+            };
+            let status = rustix::fs::fcntl_getfl(file).expect("read file status flags");
+            assert!(
+                !status.contains(rustix::fs::OFlags::NONBLOCK),
+                "{access:?} regular file kept O_NONBLOCK"
+            );
+        }
+    }
+
+    #[test]
     fn platform_dispatched_file_bytes_copy_seek_flush_and_sync() {
         let _serial = test_seam::serialize_unix_test();
         let temp = TestDir::new("bytes");

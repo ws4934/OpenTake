@@ -36,14 +36,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use opentake_domain::{
-    ClipType, GenerationInput, GenerationJobStatus, MediaAsset, MediaColorMetadata, MediaManifest,
-    MediaManifestEntry, MediaProxy, MediaSource, Timeline,
+    is_safe_project_asset_relative_path, ClipType, GenerationInput, GenerationJobStatus,
+    MediaAsset, MediaColorMetadata, MediaManifest, MediaManifestEntry, MediaProxy, MediaSource,
+    Timeline,
 };
 use opentake_ops::command::{self, EditCommand, EditResult};
 use opentake_ops::{EditorState, IdGen};
 use opentake_project::{
-    GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectRoot,
-    ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate,
+    GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectError, ProjectRoot,
+    ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate, GENERATION_LOG_RETENTION_BYTES,
 };
 use same_file::Handle;
 
@@ -135,7 +136,12 @@ pub(crate) struct GenerationStateCheckpoint {
     manifest: MediaManifest,
     log: GenerationLog,
     component_present: bool,
+    retention_check_at: usize,
 }
+
+/// Rows appended between two generation-log retention checks. A check
+/// measures the whole encoded log, so it does not run on every append.
+const GENERATION_LOG_RETENTION_CHECK_ROWS: usize = 1024;
 
 /// How far one generation mutation must propagate beyond the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,13 +286,13 @@ fn valid_generation_transition(
     }
 }
 
+/// Generated outputs live under `media/` and must satisfy the same portable
+/// bundle-path rule every manifest reader applies.
 fn validate_project_media_relative_path(value: &str) -> Result<()> {
-    let path = Path::new(value);
-    let mut components = path.components();
-    if components.next() != Some(std::path::Component::Normal("media".as_ref()))
-        || components.clone().next().is_none()
-        || path.is_absolute()
-        || components.any(|component| !matches!(component, std::path::Component::Normal(_)))
+    let mut components = Path::new(value).components();
+    if !is_safe_project_asset_relative_path(value)
+        || components.next() != Some(std::path::Component::Normal("media".as_ref()))
+        || components.next().is_none()
     {
         return Err(CoreError::Media(
             "generated output path must be a safe media-relative path".to_string(),
@@ -317,6 +323,10 @@ pub struct EditorSession {
     /// every new empty project create the optional component.
     generation_log_component_present: bool,
 
+    /// Log length at which the next retention check runs (see
+    /// [`Self::enforce_generation_log_retention`]).
+    generation_log_retention_check_at: usize,
+
     /// Persisted fields this build cannot safely write back.
     compatibility: ProjectCompatibility,
 }
@@ -338,6 +348,7 @@ impl EditorSession {
             project_root: None,
             generation_log: GenerationLog::new(),
             generation_log_component_present: false,
+            generation_log_retention_check_at: 0,
             compatibility: ProjectCompatibility::default(),
         }
     }
@@ -367,6 +378,7 @@ impl EditorSession {
             project_root: Some(project_root),
             generation_log,
             generation_log_component_present,
+            generation_log_retention_check_at: 0,
             compatibility,
         })
     }
@@ -717,11 +729,12 @@ impl EditorSession {
         if let Some(proxy) = proxy.as_ref() {
             let path = Path::new(&proxy.relative_path);
             let components: Vec<_> = path.components().collect();
-            if path.is_absolute()
+            // The portable bundle-path rule every manifest reader applies,
+            // narrowed to one `.mp4` leaf directly under `media/proxies/`.
+            if !is_safe_project_asset_relative_path(&proxy.relative_path)
                 || components.len() != 3
                 || components[0] != std::path::Component::Normal("media".as_ref())
                 || components[1] != std::path::Component::Normal("proxies".as_ref())
-                || !matches!(components[2], std::path::Component::Normal(_))
                 || path.extension().and_then(|extension| extension.to_str()) != Some("mp4")
                 || proxy.width == 0
                 || proxy.height == 0
@@ -769,6 +782,16 @@ impl EditorSession {
     /// panel). The manifest is the persisted id→file catalog.
     pub fn media(&self) -> MediaManifest {
         self.state.manifest.clone()
+    }
+
+    /// The bytes-to-be of `manifest` for writers outside `opentake-project`:
+    /// only portable bundle paths, with any unsafe path withheld when the
+    /// project opened restored verbatim for entries that were not relinked.
+    pub(crate) fn persistable_manifest(&self, manifest: &MediaManifest) -> Result<MediaManifest> {
+        Ok(self
+            .compatibility
+            .manifest_for_write(manifest)?
+            .into_owned())
     }
 
     /// Count catalog entries without cloning the catalog under the session lock.
@@ -1003,6 +1026,7 @@ impl EditorSession {
             placeholder_asset_ids.push(asset_id);
         }
         self.generation_log_component_present = true;
+        self.enforce_generation_log_retention();
         Ok(GenerationJobCommit {
             job_id,
             placeholder_asset_ids,
@@ -1247,9 +1271,16 @@ impl EditorSession {
         self.ensure_mutable()?;
         let target = self.project_dir.clone().ok_or(CoreError::NoProjectOpen)?;
         let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
-        self.generation_state_project(&target)
-            .save_manifest_and_generation_log_to_root(root)?;
-        self.generation_log_component_present = true;
+        let saved = self
+            .generation_state_project(&target)
+            .save_manifest_and_generation_log_to_root(root);
+        if saved
+            .as_ref()
+            .map_or_else(ProjectError::is_partial_commit, |()| true)
+        {
+            self.generation_log_component_present = true;
+        }
+        saved?;
         Ok(target)
     }
 
@@ -1270,9 +1301,18 @@ impl EditorSession {
         }
         let project = self.generation_state_project(&target);
         let published = media.publish()?;
-        project.save_manifest_and_generation_log_to_root(root)?;
-        published.commit();
-        self.generation_log_component_present = true;
+        let saved = project.save_manifest_and_generation_log_to_root(root);
+        if saved
+            .as_ref()
+            .map_or_else(ProjectError::is_partial_commit, |()| true)
+        {
+            // The manifest naming the leaf committed, even if its flush was
+            // not confirmed: the leaf must stay. Otherwise dropping the guard
+            // rolls the uncommitted leaf back.
+            published.commit();
+            self.generation_log_component_present = true;
+        }
+        saved?;
         Ok(target)
     }
 
@@ -1297,6 +1337,7 @@ impl EditorSession {
             manifest: self.state.manifest.clone(),
             log: self.generation_log.clone(),
             component_present: self.generation_log_component_present,
+            retention_check_at: self.generation_log_retention_check_at,
         }
     }
 
@@ -1304,6 +1345,22 @@ impl EditorSession {
         self.state.manifest = checkpoint.manifest;
         self.generation_log = checkpoint.log;
         self.generation_log_component_present = checkpoint.component_present;
+        self.generation_log_retention_check_at = checkpoint.retention_check_at;
+    }
+
+    /// Keep the generation log within [`GENERATION_LOG_RETENTION_BYTES`], half
+    /// the limit its reader enforces, so an audit log that grows with every
+    /// generation can never turn the project read-only. Finished jobs keep
+    /// their submission, outcome and billed rows; the oldest finished rows are
+    /// folded into one credit-preserving summary only when that is not enough.
+    fn enforce_generation_log_retention(&mut self) {
+        if self.generation_log.entries.len() < self.generation_log_retention_check_at {
+            return;
+        }
+        self.generation_log
+            .enforce_retention(GENERATION_LOG_RETENTION_BYTES);
+        self.generation_log_retention_check_at =
+            self.generation_log.entries.len() + GENERATION_LOG_RETENTION_CHECK_ROWS;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1336,6 +1393,7 @@ impl EditorSession {
                 input.source_clip_id.clone(),
             ));
         self.generation_log_component_present = true;
+        self.enforce_generation_log_retention();
     }
 
     /// Compatibility state inherited from the opened project.
@@ -1880,6 +1938,84 @@ mod tests {
             .unwrap()
             .proxy
             .is_none());
+    }
+
+    /// Every path a manifest writer accepts must be one the bundle reader
+    /// keeps; issue #2 found writers applying their own, looser rules.
+    #[test]
+    fn manifest_writers_only_accept_paths_the_bundle_reader_keeps() {
+        let candidates = [
+            "media/out.png",
+            "media/nested/out.png",
+            "media/proxies/proxy.mp4",
+            "media/Scene 1:2.png",
+            r"media/a\b.png",
+            "media/proxies/C:proxy.mp4",
+            "media/proxies/proxy.mp4:stream",
+            r"media\proxies\proxy.mp4",
+            r"media/proxies/a\b.mp4",
+            "media/../out.png",
+            "/media/out.png",
+        ];
+
+        let mut session = EditorSession::new_project();
+        session
+            .import_media_file(
+                "/abs/source.mp4",
+                "asset",
+                "source",
+                &ProbedMedia::default(),
+            )
+            .unwrap();
+        for path in candidates {
+            let proxy = MediaProxy {
+                relative_path: path.into(),
+                source_sha256: "a".repeat(64),
+                source_stamp: None,
+                width: 640,
+                height: 360,
+            };
+            if session.set_media_proxy("asset", Some(proxy)).is_ok() {
+                assert!(is_safe_project_asset_relative_path(path), "proxy {path}");
+            }
+            if validate_project_media_relative_path(path).is_ok() {
+                assert!(is_safe_project_asset_relative_path(path), "output {path}");
+            }
+        }
+        assert!(session
+            .set_media_proxy(
+                "asset",
+                Some(MediaProxy {
+                    relative_path: "media/proxies/proxy.mp4".into(),
+                    source_sha256: "a".repeat(64),
+                    source_stamp: None,
+                    width: 640,
+                    height: 360,
+                }),
+            )
+            .is_ok());
+        assert!(validate_project_media_relative_path("media/nested/out.png").is_ok());
+
+        let tmp = TmpDir::new("writer-paths");
+        let bundle = tmp.path().join("Writers.opentake");
+        Project::new(&bundle).save().unwrap();
+        let session = EditorSession::open_project(&bundle).unwrap();
+        for path in candidates {
+            let Ok(entry) = session.prepare_media_file_entry(
+                bundle.join(path),
+                "id",
+                "name",
+                &ProbedMedia::default(),
+            ) else {
+                continue;
+            };
+            if let MediaSource::Project { relative_path } = &entry.source {
+                assert!(
+                    is_safe_project_asset_relative_path(relative_path),
+                    "import {path} -> {relative_path}"
+                );
+            }
+        }
     }
 
     #[test]

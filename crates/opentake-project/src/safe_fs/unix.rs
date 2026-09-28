@@ -622,11 +622,14 @@ fn open_regular(
     access: FileAccess,
     operation: SafeFsOperation,
 ) -> Result<FileCapability> {
+    // O_NONBLOCK keeps open(2) itself from waiting for a FIFO writer (or a
+    // blocking device) before the type check below can reject the leaf.
     let flags = if access == FileAccess::Read {
         FILE_READ_FLAGS
     } else {
         FILE_RW_FLAGS
-    };
+    }
+    .union(OFlags::NONBLOCK);
     let fd = rustix::fs::openat(&parent.native.fd, name.as_os_str(), flags, Mode::empty())
         .map_err(|error| match error {
             rustix::io::Errno::NOENT => SafeFsError::NotFound { operation },
@@ -640,6 +643,11 @@ fn open_regular(
             kind: opened.kind,
         });
     }
+    // The flag has no effect on regular-file I/O; clear it so the returned
+    // capability carries ordinary blocking semantics.
+    let status = rustix::fs::fcntl_getfl(&fd).map_err(|error| io(operation, error))?;
+    rustix::fs::fcntl_setfl(&fd, status.difference(OFlags::NONBLOCK))
+        .map_err(|error| io(operation, error))?;
     let file = File::from(fd);
     Ok(FileCapability {
         native: NativeFile::Open(file),
