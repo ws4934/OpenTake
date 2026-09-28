@@ -3,7 +3,8 @@ name: PR native checks
 # The lightweight gate in pr.yml builds only the core crates on Linux. When a
 # pull request changes Rust code, this workflow lints the whole workspace and
 # tests every affected crate (see scripts/pr_native_scope.py) on Linux, Windows
-# and macOS. Documentation- or web-only changes skip it. Tests that need a GPU
+# and macOS, and lints the minimal-feature Tauri build on Linux.
+# Documentation- or web-only changes skip it. Tests that need a GPU
 # or an audio device skip themselves on hosted runners; ci.yml keeps the
 # release-time qualification.
 on:
@@ -118,6 +119,14 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
+
+      # The `--no-default-features` escape hatch (no cpal/axum/tokio) is
+      # otherwise linted only by ci.yml and release.yml at release time.
+      - name: Clippy (minimal-feature Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p opentake-tauri --no-default-features --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'minimal-feature clippy failed' }
 
       - name: Test affected crates
         env:
