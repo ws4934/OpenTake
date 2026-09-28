@@ -9,15 +9,24 @@ pub enum InpaintPlanError {
     Cancelled,
     EmptyMask,
     FullMask,
+    /// The frame has more pixels than a `u32` pixel index can address.
     TooLarge,
     Unfillable,
     DimensionsChanged,
 }
 
+/// One boundary fill in flood order. The plan holds one step per masked pixel
+/// at full source resolution for the whole job, so indices are `u32` (frames
+/// are limited to `u32::MAX` pixels) and the neighbour count (at most 8) is a
+/// `u8`: 40 bytes per step instead of 80.
 struct FillStep {
-    index: usize,
-    known_neighbours: [usize; 8],
-    count: usize,
+    index: u32,
+    known_neighbours: [u32; 8],
+    count: u8,
+}
+
+fn pixel_index(index: usize) -> Result<u32, InpaintPlanError> {
+    u32::try_from(index).map_err(|_| InpaintPlanError::TooLarge)
 }
 
 /// The mask coverage and boundary fill order depend on dimensions, but never
@@ -25,7 +34,10 @@ struct FillStep {
 pub struct InpaintPlan {
     width: u32,
     height: u32,
-    blend: Vec<(usize, f64)>,
+    /// Masked pixels and their coverage, stored apart so that an index costs
+    /// four bytes instead of a padded tuple's eight.
+    blend_indices: Vec<u32>,
+    blend_alphas: Vec<f64>,
     fill: Vec<FillStep>,
 }
 
@@ -49,6 +61,7 @@ impl InpaintPlan {
         let h = height as usize;
         let pixels = w.checked_mul(h).ok_or(InpaintPlanError::TooLarge)?;
         pixels.checked_mul(4).ok_or(InpaintPlanError::TooLarge)?;
+        pixel_index(pixels)?;
         let mut coverage = Vec::with_capacity(pixels);
         let mut known = Vec::with_capacity(pixels);
         let mut selected = 0_usize;
@@ -87,7 +100,7 @@ impl InpaintPlan {
             let mut count = 0;
             for neighbour in neighbours(index, w, h).into_iter().flatten() {
                 if known[neighbour] {
-                    known_neighbours[count] = neighbour;
+                    known_neighbours[count] = pixel_index(neighbour)?;
                     count += 1;
                 }
             }
@@ -95,9 +108,9 @@ impl InpaintPlan {
                 continue;
             }
             fill.push(FillStep {
-                index,
+                index: pixel_index(index)?,
                 known_neighbours,
-                count,
+                count: u8::try_from(count).expect("a pixel has at most 8 neighbours"),
             });
             known[index] = true;
             for neighbour in neighbours(index, w, h).into_iter().flatten() {
@@ -110,14 +123,19 @@ impl InpaintPlan {
         if known.iter().any(|value| !value) {
             return Err(InpaintPlanError::Unfillable);
         }
+        let mut blend_indices = Vec::new();
+        let mut blend_alphas = Vec::new();
+        for (index, alpha) in coverage.into_iter().enumerate() {
+            if alpha > 0.0 {
+                blend_indices.push(pixel_index(index)?);
+                blend_alphas.push(alpha);
+            }
+        }
         Ok(Self {
             width,
             height,
-            blend: coverage
-                .into_iter()
-                .enumerate()
-                .filter(|(_, alpha)| *alpha > 0.0)
-                .collect(),
+            blend_indices,
+            blend_alphas,
             fill,
         })
     }
@@ -138,19 +156,20 @@ impl InpaintPlan {
                 return Err(InpaintPlanError::Cancelled);
             }
             let mut sums = [0_u32; 3];
-            for &neighbour in &step.known_neighbours[..step.count] {
-                let offset = neighbour * 4;
+            let count = usize::from(step.count);
+            for &neighbour in &step.known_neighbours[..count] {
+                let offset = neighbour as usize * 4;
                 sums[0] += u32::from(filled[offset]);
                 sums[1] += u32::from(filled[offset + 1]);
                 sums[2] += u32::from(filled[offset + 2]);
             }
-            let offset = step.index * 4;
+            let offset = step.index as usize * 4;
             for channel in 0..3 {
-                filled[offset + channel] = (sums[channel] / step.count as u32) as u8;
+                filled[offset + channel] = (sums[channel] / u32::from(step.count)) as u8;
             }
         }
-        for &(index, alpha) in &self.blend {
-            let offset = index * 4;
+        for (&index, &alpha) in self.blend_indices.iter().zip(&self.blend_alphas) {
+            let offset = index as usize * 4;
             for channel in 0..3 {
                 rgba[offset + channel] = (f64::from(rgba[offset + channel]) * (1.0 - alpha)
                     + f64::from(filled[offset + channel]) * alpha)
@@ -309,6 +328,25 @@ mod tests {
             }
             assert_eq!(coverage_calls, 64 * 36);
         }
+    }
+
+    #[test]
+    fn plan_steps_use_compact_indices_and_reject_unaddressable_frames() {
+        assert_eq!(std::mem::size_of::<FillStep>(), 40);
+        let mut coverage_calls = 0;
+        // 65536 x 65536 pixels is one more than a u32 index can address.
+        let result = InpaintPlan::prepare_with_coverage(
+            65_536,
+            65_536,
+            || false,
+            |_, _| {
+                coverage_calls += 1;
+                0.0
+            },
+        );
+        assert!(matches!(result, Err(InpaintPlanError::TooLarge)));
+        assert_eq!(coverage_calls, 0, "rejected before scanning or allocating");
+        assert_eq!(pixel_index(u32::MAX as usize), Ok(u32::MAX));
     }
 
     #[test]

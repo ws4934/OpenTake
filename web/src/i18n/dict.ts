@@ -50,6 +50,12 @@ const zh: Dict = {
   "projectOpen.nameSeparator": "、",
   "projectOpen.title": "打开项目时已处理的问题",
   "projectOpen.dismiss": "知道了",
+  "project.failedSave.title": "工程未能保存",
+  "project.failedSave.message":
+    "当前工程无法保存（例如工程已被删除、所在磁盘已断开或空间已满）。可以另存为到其他位置，或不保存继续（丢弃未保存的修改，不会删除磁盘上的任何文件）。",
+  "project.failedSave.saveAs": "另存为…",
+  "project.failedSave.dontSave": "不保存",
+  "project.failedSave.cancel": "取消",
   "projectSettingsMismatch.title": "素材与项目设置不一致",
   "projectSettingsMismatch.description":
     "时间线还没有内容。你可以保留当前项目设置，或改为匹配第一个视频素材。",
@@ -1287,6 +1293,12 @@ const en: Dict = {
   "projectOpen.nameSeparator": ", ",
   "projectOpen.title": "Handled while opening this project",
   "projectOpen.dismiss": "Dismiss",
+  "project.failedSave.title": "The project could not be saved",
+  "project.failedSave.message":
+    "The current project cannot be saved (for example, it was deleted, its drive was disconnected or the disk is full). Save it somewhere else, or continue without saving: the unsaved changes are discarded and nothing on disk is deleted.",
+  "project.failedSave.saveAs": "Save As…",
+  "project.failedSave.dontSave": "Don't Save",
+  "project.failedSave.cancel": "Cancel",
   "projectSettingsMismatch.title": "Media and project settings differ",
   "projectSettingsMismatch.description":
     "The timeline is still empty. Keep the current project settings or match the first video asset.",

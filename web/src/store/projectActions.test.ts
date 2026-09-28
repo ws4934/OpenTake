@@ -68,6 +68,10 @@ const srv = vi.hoisted(() => {
     openDialog: vi.fn(async () => undefined),
     save: vi.fn(async (..._args: unknown[]): Promise<string | null> => "/tmp/fresh.opentake"),
     saveDialog: vi.fn(async () => srv.save),
+    message: vi.fn(async (..._args: unknown[]): Promise<string> => "Cancel"),
+    messageDialog: vi.fn(async () => srv.message),
+    lifecycleClaimFailedClose: vi.fn(async () => true),
+    lifecycleResolveFailedClose: vi.fn(async (_id: number, _choice: string) => {}),
     getDefaultProjectDir: vi.fn(async () => ""),
     checkPathExists: vi.fn(async (_path: string) => false),
     // A refresh snapshot to return instead of the default one.
@@ -82,6 +86,8 @@ vi.mock("../lib/api", () => ({
   sampleProjectMaterialize: srv.sampleProjectMaterialize,
   getDefaultProjectDir: srv.getDefaultProjectDir,
   checkPathExists: srv.checkPathExists,
+  lifecycleClaimFailedClose: srv.lifecycleClaimFailedClose,
+  lifecycleResolveFailedClose: srv.lifecycleResolveFailedClose,
   getTimeline: async () => srv.refreshSnapshot ?? ({
     timeline: srv.timeline,
     projectEpoch: 5,
@@ -109,6 +115,7 @@ vi.mock("../components/preview/nativePlaybackSession", () => ({
 vi.mock("../lib/dialog", () => ({
   saveDialog: srv.saveDialog,
   openDialog: srv.openDialog,
+  messageDialog: srv.messageDialog,
 }));
 
 import {
@@ -116,6 +123,7 @@ import {
   openProjectPath,
   openProjectViaDialog,
   openSampleProject,
+  resolveFailedClose,
   saveCurrentProject,
   saveCurrentProjectAs,
 } from "./projectActions";
@@ -131,6 +139,14 @@ import { useMotionStudioStore } from "./motionStudioStore";
 const defaultMotionFlushSave = useMotionStudioStore.getState().flushSave;
 
 beforeEach(() => {
+  srv.message.mockReset();
+  srv.message.mockResolvedValue("Cancel");
+  srv.messageDialog.mockReset();
+  srv.messageDialog.mockResolvedValue(srv.message);
+  srv.lifecycleClaimFailedClose.mockReset();
+  srv.lifecycleClaimFailedClose.mockResolvedValue(true);
+  srv.lifecycleResolveFailedClose.mockReset();
+  srv.lifecycleResolveFailedClose.mockResolvedValue(undefined);
   srv.save.mockReset();
   srv.save.mockResolvedValue("/tmp/fresh.opentake");
   srv.saveDialog.mockReset();
@@ -1202,6 +1218,69 @@ describe("project boundaries save the current project first", () => {
   );
 
   it.each(Object.keys(openers) as Array<keyof typeof openers>)(
+    "%s offers Save As, Don't Save and Cancel after a failed save",
+    async (name) => {
+      srv.projectSave.mockRejectedValueOnce(new Error("volume unplugged"));
+
+      await expect(openers[name]()).rejects.toThrow("当前工程的修改未能保存");
+
+      expect(srv.message).toHaveBeenCalledOnce();
+      const [, options] = srv.message.mock.calls[0] as [string, { buttons: unknown }];
+      expect(options.buttons).toEqual({ yes: "另存为…", no: "不保存", cancel: "取消" });
+      expect(replacement[name]).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(Object.keys(openers) as Array<keyof typeof openers>)(
+    "%s continues without saving or deleting after Don't Save",
+    async (name) => {
+      srv.projectSave.mockRejectedValue(new Error("bundle was deleted"));
+      srv.message.mockResolvedValueOnce("不保存");
+
+      await openers[name]();
+
+      // Asked once even though a sample open checks the boundary twice.
+      expect(srv.message).toHaveBeenCalledOnce();
+      expect(replacement[name]).toHaveBeenCalled();
+      // Only the failed in-place saves ran: no Save As, nothing else written.
+      for (const [path] of srv.projectSave.mock.calls) expect(path).toBeNull();
+    },
+  );
+
+  it("saves elsewhere with Save As and then switches", async () => {
+    srv.projectSave.mockRejectedValueOnce(new Error("disk full"));
+    srv.projectSave.mockResolvedValueOnce("/tmp/rescued.opentake");
+    srv.message.mockResolvedValueOnce("Yes");
+    srv.save.mockResolvedValueOnce("/tmp/rescued");
+
+    await openProjectPath("/tmp/other.opentake");
+
+    expect(srv.projectSave).toHaveBeenLastCalledWith(
+      "/tmp/rescued",
+      1,
+      "/tmp/current.opentake",
+    );
+    expect(useRecentStore.getState().recents.map(({ path }) => path)).toContain(
+      "/tmp/rescued.opentake",
+    );
+    expect(srv.projectOpen).toHaveBeenCalledWith("/tmp/other.opentake");
+  });
+
+  it("asks again when Save As is cancelled, and Cancel keeps the project", async () => {
+    srv.projectSave.mockRejectedValueOnce(new Error("disk full"));
+    srv.message.mockResolvedValueOnce("另存为…").mockResolvedValueOnce("取消");
+    srv.save.mockResolvedValueOnce(null);
+
+    await expect(openProjectPath("/tmp/other.opentake")).rejects.toThrow(
+      "当前工程的修改未能保存",
+    );
+
+    expect(srv.message).toHaveBeenCalledTimes(2);
+    expect(srv.projectOpen).not.toHaveBeenCalled();
+    expect(useProjectStore.getState().projectPath).toBe("/tmp/current.opentake");
+  });
+
+  it.each(Object.keys(openers) as Array<keyof typeof openers>)(
     "%s does not save a clean project",
     async (name) => {
       useProjectStore.setState({ lastSavedVersion: 7 });
@@ -1212,4 +1291,66 @@ describe("project boundaries save the current project first", () => {
       expect(replacement[name]).toHaveBeenCalled();
     },
   );
+});
+
+describe("resolveFailedClose", () => {
+  beforeEach(() => {
+    srv.projectSave.mockReset();
+    srv.projectSave.mockImplementation(async (path: string | null) => path ?? "/tmp/current.opentake");
+    useProjectStore.setState({
+      snapshotMutationRevision: 0,
+      projectEpoch: 1,
+      projectPath: "/tmp/current.opentake",
+      timelineVersion: 7,
+      lastSavedVersion: 7,
+      compatibilityReadOnly: false,
+    });
+    useI18nStore.setState({ locale: "en" });
+  });
+
+  afterEach(() => {
+    useProjectStore.setState({ projectEpoch: 0, projectPath: null, timelineVersion: 0, lastSavedVersion: 0 });
+  });
+
+  it.each([
+    ["Don't Save", "discard"],
+    ["No", "discard"],
+    ["Cancel", "cancel"],
+  ])("answers %s with %s", async (button, choice) => {
+    srv.message.mockResolvedValueOnce(button);
+
+    await resolveFailedClose({ id: 7, intent: "exit", message: "No space left on device" });
+
+    expect(srv.lifecycleClaimFailedClose).toHaveBeenCalledWith(7);
+    expect(srv.message.mock.calls[0]?.[0]).toContain("No space left on device");
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(7, choice);
+    expect(srv.projectSave).not.toHaveBeenCalled();
+  });
+
+  it("retries the close after a successful Save As", async () => {
+    srv.message.mockResolvedValueOnce("Save As…");
+    srv.save.mockResolvedValueOnce("/tmp/elsewhere.opentake");
+
+    await resolveFailedClose({ id: 3, intent: "hide", message: "bundle was deleted" });
+
+    expect(srv.projectSave).toHaveBeenCalledWith("/tmp/elsewhere.opentake", 1, "/tmp/current.opentake");
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(3, "retry");
+  });
+
+  it("hands the choice to the native prompt when the dialog cannot be shown", async () => {
+    srv.message.mockRejectedValueOnce(new Error("dialog.message not allowed"));
+
+    await resolveFailedClose({ id: 9, intent: "exit", message: "disk full" });
+
+    expect(srv.lifecycleResolveFailedClose).toHaveBeenCalledWith(9, "native");
+  });
+
+  it("does not prompt when the native fallback already owns the choice", async () => {
+    srv.lifecycleClaimFailedClose.mockResolvedValueOnce(false);
+
+    await resolveFailedClose({ id: 2, intent: "exit", message: "disk full" });
+
+    expect(srv.message).not.toHaveBeenCalled();
+    expect(srv.lifecycleResolveFailedClose).not.toHaveBeenCalled();
+  });
 });

@@ -48,6 +48,7 @@ impl From<CoreError> for CmdError {
             CoreError::Edit(_)
             | CoreError::Media(_)
             | CoreError::StaleProject
+            | CoreError::TargetTrackRemoved
             | CoreError::Project(opentake_project::ProjectError::CompatibilityReadOnly {
                 ..
             })

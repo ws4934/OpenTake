@@ -490,9 +490,16 @@ pub struct ChatSession {
     /// providers are rejected before any turn runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// The model id last used (display only).
+    /// The model id the last turn used (display only). It is never read back
+    /// to pick a model: sessions saved by older builds stored the provider
+    /// default here, and no build has offered a model choice, so a stored id
+    /// must not pin a past default after the default changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The model the user explicitly chose for this session's provider. Unset
+    /// means "follow the provider default", including after a default bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_model: Option<String>,
 }
 
 impl ChatSession {
@@ -504,6 +511,7 @@ impl ChatSession {
             is_open: true,
             provider: None,
             model: None,
+            chosen_model: None,
         }
     }
 }

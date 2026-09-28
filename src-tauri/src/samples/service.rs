@@ -1,8 +1,11 @@
 //! Remote sample-project materialization.
 //!
-//! Each open creates an independent project copy in durable application data.
-//! The complete bundle is validated before publication; failures remove only
-//! directories owned by that attempt, never an existing editable project.
+//! An open reuses an earlier copy of the same sample only while that copy's
+//! content identity still matches the one recorded when it was published, so
+//! a copy the user edited is never handed out again; otherwise it creates an
+//! independent project copy in durable application data. The complete bundle
+//! is validated before publication; failures remove only directories owned by
+//! that attempt, never an existing editable project.
 
 use std::collections::HashSet;
 use std::fs;
@@ -14,14 +17,43 @@ use opentake_domain::{Clip, ClipType, MediaManifest, TextStyle, Timeline, Track}
 use opentake_project::{layout, Project};
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const MAX_RESOLVE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Written next to each published copy's bundle (outside it) to identify the
+/// sample and the copy's content at publication.
+const COPY_RECORD_FILE: &str = "sample-copy.json";
+const MAX_COPY_RECORD_BYTES: u64 = 4 * 1024 * 1024;
+const COPY_RECORD_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleCopyRecord {
+    version: u32,
+    slug: String,
+    /// SHA-256 of the resolved sample the copy was built from.
+    source: String,
+    /// The bundle directory name inside the copy's directory.
+    bundle: String,
+    /// [`document_identity`] right after publication.
+    documents: String,
+    /// Every other file right after publication, sorted by path.
+    files: Vec<SampleCopyFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SampleCopyFile {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SampleDownload {
     id: String,
@@ -29,13 +61,13 @@ struct SampleDownload {
     url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SampleChatDownload {
     name: String,
     url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolvedSample {
     title: String,
@@ -81,10 +113,13 @@ impl SampleProjectService {
         })
     }
 
+    /// `in_use` names bundles that must not be reused, such as the open
+    /// project, whose unsaved edits the on-disk identity cannot see.
     pub(super) fn materialize(
         &self,
         backend_url: &str,
         slug: &str,
+        in_use: impl Fn(&Path) -> bool,
         on_progress: impl FnMut(f64),
     ) -> Result<PathBuf, String> {
         validate_slug(slug)?;
@@ -110,6 +145,7 @@ impl SampleProjectService {
                 }
                 self.download_file(download, target)
             },
+            in_use,
             on_progress,
         )
     }
@@ -117,12 +153,14 @@ impl SampleProjectService {
     pub(super) fn materialize_builtin(
         &self,
         slug: &str,
+        in_use: impl Fn(&Path) -> bool,
         on_progress: impl FnMut(f64),
     ) -> Result<PathBuf, String> {
         self.materialize_resolved(
             slug,
             builtin_sample(slug)?,
             |_, _| Err("built-in sample unexpectedly requested a download".into()),
+            in_use,
             on_progress,
         )
     }
@@ -132,11 +170,20 @@ impl SampleProjectService {
         slug: &str,
         resolved: ResolvedSample,
         mut download_file: impl FnMut(&SampleDownload, &Path) -> Result<(), String>,
+        in_use: impl Fn(&Path) -> bool,
         mut on_progress: impl FnMut(f64),
     ) -> Result<PathBuf, String> {
         validate_slug(slug)?;
         fs::create_dir_all(&self.storage_root)
             .map_err(|error| format!("create sample projects directory: {error}"))?;
+        let source = sample_source_identity(slug, &resolved)?;
+        // Checking a candidate copy can hash its media, so progress starts
+        // before the reuse scan.
+        on_progress(0.0);
+        if let Some(existing) = self.reusable_copy(slug, &source, &in_use) {
+            on_progress(1.0);
+            return Ok(existing);
+        }
         let stage_root = self
             .storage_root
             .join(format!(".{slug}.{}.tmp", uuid::Uuid::new_v4()));
@@ -171,7 +218,6 @@ impl SampleProjectService {
         }
         validate_downloads(&downloads)?;
         let total = downloads.len().max(1);
-        on_progress(0.0);
         if downloads.is_empty() {
             on_progress(1.0);
         }
@@ -200,7 +246,50 @@ impl SampleProjectService {
         fs::rename(&bundle, &destination)
             .map_err(|error| format!("publish sample project: {error}"))?;
         publication.armed = false;
+        // The record only enables reuse; a copy without one is still a
+        // complete project, and the next open creates a fresh copy.
+        if let Err(error) = write_copy_record(&publication.path, slug, &source, name) {
+            eprintln!("[samples] sample copy will not be reused: {error}");
+        }
         Ok(destination)
+    }
+
+    /// An earlier copy of this exact sample whose content is unchanged since
+    /// publication. Unreadable, mismatched or in-use candidates are skipped.
+    fn reusable_copy(
+        &self,
+        slug: &str,
+        source: &str,
+        in_use: &impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        let prefix = format!("{slug}-");
+        let mut candidates = fs::read_dir(&self.storage_root)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.into_iter().find_map(|directory| {
+            let record = read_copy_record(&directory)?;
+            if record.version != COPY_RECORD_VERSION
+                || record.slug != slug
+                || record.source != source
+            {
+                return None;
+            }
+            let bundle = directory.join(&record.bundle);
+            if in_use(&bundle) {
+                return None;
+            }
+            copy_is_unmodified(&bundle, &record).then_some(bundle)
+        })
     }
 
     fn download_file(&self, download: &SampleDownload, target: &Path) -> Result<(), String> {
@@ -292,6 +381,208 @@ fn builtin_sample(slug: &str) -> Result<ResolvedSample, String> {
         downloads: vec![],
         chat: vec![],
     })
+}
+
+fn sample_source_identity(slug: &str, resolved: &ResolvedSample) -> Result<String, String> {
+    let encoded =
+        serde_json::to_vec(resolved).map_err(|error| format!("encode sample identity: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(slug.as_bytes());
+    hasher.update([0]);
+    hasher.update(&encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Identity of the copy's documents as the model types read them, so a save
+/// that only re-encodes them keeps it. The files are parsed directly rather
+/// than through `Project::open`, which may repair or move files in the
+/// user's copy. A missing manifest or generation log reads as the project
+/// layer reads it: empty, or absent.
+fn document_identity(bundle: &Path) -> Result<String, String> {
+    fn read(bundle: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(bundle.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read sample copy {name}: {error}")),
+        }
+    }
+    fn parse<T: serde::de::DeserializeOwned>(name: &str, bytes: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(bytes).map_err(|error| format!("parse sample copy {name}: {error}"))
+    }
+    let timeline: Timeline = parse(
+        layout::TIMELINE_FILE,
+        &read(bundle, layout::TIMELINE_FILE)?.ok_or("sample copy has no timeline")?,
+    )?;
+    let manifest: MediaManifest = match read(bundle, layout::MANIFEST_FILE)? {
+        Some(bytes) => parse(layout::MANIFEST_FILE, &bytes)?,
+        None => MediaManifest::new(),
+    };
+    let generation_log: Option<opentake_project::GenerationLog> =
+        match read(bundle, layout::GENERATION_LOG_FILE)? {
+            Some(bytes) => Some(parse(layout::GENERATION_LOG_FILE, &bytes)?),
+            None => None,
+        };
+    let mut hasher = Sha256::new();
+    for (label, encoded) in [
+        ("timeline", serde_json::to_vec(&timeline)),
+        ("manifest", serde_json::to_vec(&manifest)),
+        ("generation-log", serde_json::to_vec(&generation_log)),
+    ] {
+        let encoded = encoded.map_err(|error| format!("encode sample {label}: {error}"))?;
+        hasher.update(label.as_bytes());
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(&encoded);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Every file of the copy except the documents and the cover thumbnail,
+/// which saving regenerates, with its size, sorted by path. A symlink or any
+/// other non-regular entry fails, so such a copy is never reused.
+fn bundle_files(bundle: &Path) -> Result<Vec<(String, u64)>, String> {
+    if !fs::symlink_metadata(bundle)
+        .map_err(|error| format!("inspect sample copy: {error}"))?
+        .file_type()
+        .is_dir()
+    {
+        return Err("sample copy is not a directory".into());
+    }
+    let mut files = Vec::new();
+    collect_bundle_files(bundle, "", &mut files)?;
+    files.retain(|(relative, _)| {
+        !matches!(
+            relative.as_str(),
+            layout::TIMELINE_FILE
+                | layout::MANIFEST_FILE
+                | layout::GENERATION_LOG_FILE
+                | layout::THUMBNAIL_FILE
+        )
+    });
+    files.sort();
+    Ok(files)
+}
+
+fn file_sha256(bundle: &Path, relative: &str) -> Result<String, String> {
+    let mut file = fs::File::open(bundle.join(relative))
+        .map_err(|error| format!("read sample copy {relative}: {error}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| format!("read sample copy {relative}: {error}"))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Whether the copy still matches its record. The cheap checks run first
+/// (documents, then the file list with sizes), so an edited copy is usually
+/// rejected without hashing its media.
+fn copy_is_unmodified(bundle: &Path, record: &SampleCopyRecord) -> bool {
+    if document_identity(bundle).ok().as_ref() != Some(&record.documents) {
+        return false;
+    }
+    let Ok(files) = bundle_files(bundle) else {
+        return false;
+    };
+    files.len() == record.files.len()
+        && files
+            .iter()
+            .zip(&record.files)
+            .all(|((path, size), recorded)| *path == recorded.path && *size == recorded.size)
+        && record.files.iter().all(|recorded| {
+            file_sha256(bundle, &recorded.path).is_ok_and(|hash| hash == recorded.sha256)
+        })
+}
+
+fn collect_bundle_files(
+    directory: &Path,
+    prefix: &str,
+    files: &mut Vec<(String, u64)>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| format!("list sample copy: {error}"))? {
+        let entry = entry.map_err(|error| format!("list sample copy: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "sample copy has a non-UTF-8 file name".to_string())?;
+        let relative = format!("{prefix}{name}");
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("inspect sample copy {relative}: {error}"))?;
+        if kind.is_dir() {
+            collect_bundle_files(&entry.path(), &format!("{relative}/"), files)?;
+        } else if kind.is_file() {
+            let size = entry
+                .metadata()
+                .map_err(|error| format!("inspect sample copy {relative}: {error}"))?
+                .len();
+            files.push((relative, size));
+        } else {
+            return Err(format!("sample copy holds a non-regular entry: {relative}"));
+        }
+    }
+    Ok(())
+}
+
+fn write_copy_record(
+    directory: &Path,
+    slug: &str,
+    source: &str,
+    bundle_name: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let bundle = bundle_name
+        .to_str()
+        .ok_or("sample bundle name is not UTF-8")?
+        .to_string();
+    let root = directory.join(&bundle);
+    let files = bundle_files(&root)?
+        .into_iter()
+        .map(|(path, size)| {
+            Ok(SampleCopyFile {
+                sha256: file_sha256(&root, &path)?,
+                path,
+                size,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let record = SampleCopyRecord {
+        version: COPY_RECORD_VERSION,
+        slug: slug.to_string(),
+        source: source.to_string(),
+        documents: document_identity(&root)?,
+        files,
+        bundle,
+    };
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("encode sample copy record: {error}"))?;
+    let temp = directory.join(format!(".{COPY_RECORD_FILE}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::File::create_new(&temp)
+            .map_err(|error| format!("create sample copy record: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write sample copy record: {error}"))?;
+        fs::rename(&temp, directory.join(COPY_RECORD_FILE))
+            .map_err(|error| format!("publish sample copy record: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn read_copy_record(directory: &Path) -> Option<SampleCopyRecord> {
+    let file = fs::File::open(directory.join(COPY_RECORD_FILE)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_COPY_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_COPY_RECORD_BYTES {
+        return None;
+    }
+    let record: SampleCopyRecord = serde_json::from_slice(&bytes).ok()?;
+    // The bundle must be one plain child of the copy's own directory.
+    let mut components = Path::new(&record.bundle).components();
+    let single =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    (single && record.bundle.ends_with(".opentake")).then_some(record)
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -494,7 +785,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let service = SampleProjectService::new(storage.path().to_path_buf()).unwrap();
         let current = service
-            .materialize_builtin("template-project", |_| {})
+            .materialize_builtin("template-project", |_| false, |_| {})
             .unwrap();
         let timeline_path = current.join(layout::TIMELINE_FILE);
         let mut timeline: Timeline =
@@ -503,12 +794,113 @@ mod tests {
         write_json(&timeline_path, &serde_json::to_value(timeline).unwrap()).unwrap();
         let saved = fs::read(&timeline_path).unwrap();
         let fresh = service
-            .materialize_builtin("template-project", |_| {})
+            .materialize_builtin("template-project", |_| false, |_| {})
             .unwrap();
         assert_ne!(current, fresh);
-        assert_eq!(fs::read(timeline_path).unwrap(), saved);
+        assert_eq!(fs::read(&timeline_path).unwrap(), saved);
         Project::open(&current).unwrap();
         Project::open(&fresh).unwrap();
+        // The unedited fresh copy is the one reused from now on.
+        let again = service
+            .materialize_builtin("template-project", |_| false, |_| {})
+            .unwrap();
+        assert_eq!(again, fresh);
+        assert_eq!(fs::read(&timeline_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn unmodified_copy_is_reused_after_an_open_and_save() {
+        let storage = tempfile::tempdir().unwrap();
+        let service = SampleProjectService::new(storage.path().to_path_buf()).unwrap();
+        let first = service
+            .materialize_builtin("quick-tutorial", |_| false, |_| {})
+            .unwrap();
+        // Opening and saving without an edit re-encodes the documents and
+        // writes the cover, which must not count as a user edit. (This module
+        // is also compiled into an opentake-project test, so it saves through
+        // the project layer that the core's save uses.)
+        let mut project = Project::open(&first).unwrap();
+        project.thumbnail = Some(b"regenerated cover".to_vec());
+        project.save().unwrap();
+        let mut progress = Vec::new();
+        let second = service
+            .materialize_builtin("quick-tutorial", |_| false, |value| progress.push(value))
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(progress, vec![0.0, 1.0]);
+        assert_eq!(fs::read_dir(storage.path()).unwrap().count(), 1);
+
+        // A different sample never reuses this copy, nor does the open project.
+        let other = service
+            .materialize_builtin("product-demo", |_| false, |_| {})
+            .unwrap();
+        assert_ne!(other, first);
+        let in_use = service
+            .materialize_builtin("quick-tutorial", |bundle| bundle == first, |_| {})
+            .unwrap();
+        assert_ne!(in_use, first);
+        assert_eq!(fs::read_dir(storage.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn copy_with_changed_media_or_record_is_not_reused() {
+        let storage = tempfile::tempdir().unwrap();
+        let service = SampleProjectService::new(storage.path().to_path_buf()).unwrap();
+        let sample = ResolvedSample {
+            title: "Media sample".into(),
+            project: serde_json::to_value(Timeline::new()).unwrap(),
+            manifest: serde_json::to_value(MediaManifest::new()).unwrap(),
+            generation_log: None,
+            poster_url: None,
+            downloads: vec![SampleDownload {
+                id: "clip".into(),
+                relative_path: "media/clip.bin".into(),
+                url: "https://samples.example/clip".into(),
+            }],
+            chat: vec![],
+        };
+        let materialize = |downloads: &mut usize| {
+            service
+                .materialize_resolved(
+                    "media-sample",
+                    sample.clone(),
+                    |_, target| {
+                        *downloads += 1;
+                        fs::write(target, b"sample bytes").map_err(|error| error.to_string())
+                    },
+                    |_| false,
+                    |_| {},
+                )
+                .unwrap()
+        };
+        let mut downloads = 0;
+        let first = materialize(&mut downloads);
+        assert_eq!(materialize(&mut downloads), first);
+        assert_eq!(downloads, 1, "a reused copy downloads nothing");
+
+        // Same size, same name, different bytes: a user edit, never reused.
+        let media = first.join("media/clip.bin");
+        fs::write(&media, b"edited bytes").unwrap();
+        let second = materialize(&mut downloads);
+        assert_ne!(second, first);
+        assert_eq!(fs::read(&media).unwrap(), b"edited bytes");
+
+        // A new file inside the bundle (a chat session, say) is an edit too.
+        fs::write(second.join("notes.txt"), b"mine").unwrap();
+        let third = materialize(&mut downloads);
+        assert_ne!(third, second);
+        assert!(second.join("notes.txt").is_file());
+
+        // A record naming a bundle outside its own directory is ignored.
+        let record_path = third.parent().unwrap().join(COPY_RECORD_FILE);
+        let mut record: SampleCopyRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record.bundle = "../elsewhere.opentake".into();
+        fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let fourth = materialize(&mut downloads);
+        assert_ne!(fourth, third);
+        assert_eq!(downloads, 4);
+        assert_eq!(materialize(&mut downloads), fourth);
     }
 
     fn serve_once(
@@ -602,7 +994,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let mut service = SampleProjectService::new(storage.path().into()).unwrap();
         service.client = local_client();
-        let result = service.materialize(&format!("http://{address}"), "remote", |_| {});
+        let result = service.materialize(&format!("http://{address}"), "remote", |_| false, |_| {});
         assert!(server.join().unwrap());
         Project::open(result.unwrap()).unwrap();
     }
@@ -639,7 +1031,12 @@ mod tests {
         let mut service = SampleProjectService::new(storage.path().into()).unwrap();
         service.client = local_client();
 
-        let result = service.materialize(&format!("http://{source_address}"), "unsafe", |_| {});
+        let result = service.materialize(
+            &format!("http://{source_address}"),
+            "unsafe",
+            |_| false,
+            |_| {},
+        );
 
         assert!(resolver.join().unwrap());
         let contacted_destination = destination.join().unwrap();
@@ -683,6 +1080,7 @@ mod tests {
                     }
                     fs::write(target, b"complete bytes").map_err(|error| error.to_string())
                 },
+                |_| false,
                 |_| {},
             )
             .unwrap_err();
@@ -712,6 +1110,7 @@ mod tests {
                 "starter",
                 sample,
                 |_, _| panic!("empty sample must not download"),
+                |_| false,
                 |value| progress.push(value),
             )
             .unwrap();
@@ -731,7 +1130,7 @@ mod tests {
         let service = SampleProjectService::new(cache.path().to_path_buf()).unwrap();
 
         let bundle = service
-            .materialize_builtin("quick-tutorial", |_| {})
+            .materialize_builtin("quick-tutorial", |_| false, |_| {})
             .unwrap();
         let project = Project::open(bundle).unwrap();
 

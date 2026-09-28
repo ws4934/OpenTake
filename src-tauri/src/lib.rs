@@ -394,6 +394,8 @@ pub fn run() {
             commands::check_path_exists,
             home::home_projects_sync,
             home::home_project_register,
+            lifecycle::lifecycle_claim_failed_close,
+            lifecycle::lifecycle_resolve_failed_close,
             home::home_project_remove,
             home::home_project_trash,
             home::home_project_reveal,

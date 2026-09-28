@@ -5742,14 +5742,17 @@ mod tests {
                     },
                 )
             });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             let save = scope.spawn(move || {
                 saved_tx
                     .send(core_ref.save_project(Some(destination)).is_ok())
                     .unwrap();
             });
             // A held identity lease would make this time out until copy resumes.
-            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));
+            // The copy stays paused until after this wait, so the ordering is
+            // proven by the pause; the generous bound only turns a deadlock
+            // into a failure instead of a hang on a loaded runner.
+            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_secs(5));
             resume_tx.send(()).unwrap();
             save.join().unwrap();
             let error = favorite
@@ -9147,7 +9150,7 @@ mod tests {
                 MediaCancelToken::new(),
                 move |request, _, _| {
                     stage_tx.send(request.output.to_path_buf()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
                     fs::write(request.output, b"completed proxy").unwrap();
                     Ok(ProxyResult {
                         path: request.output.to_path_buf(),
@@ -9162,7 +9165,7 @@ mod tests {
             )
         });
         let stage_output = stage_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("proxy reached its transcode stage");
         assert!(!stage_output.starts_with(&bundle));
 
@@ -9182,15 +9185,18 @@ mod tests {
             read_tx.send(started.elapsed()).unwrap();
         });
 
-        let saved = save_rx.recv_timeout(Duration::from_secs(1));
-        let read = read_rx.recv_timeout(Duration::from_secs(1));
+        // The transcode stays blocked until `release_tx` below, so receiving
+        // these results at all proves they did not wait for it; the generous
+        // bounds only turn a deadlock into a failure on a loaded runner.
+        let saved = save_rx.recv_timeout(Duration::from_secs(5));
+        let read = read_rx.recv_timeout(Duration::from_secs(5));
         let (transition_tx, transition_rx) = mpsc::channel();
         let transition_core = core.clone();
         let transition = std::thread::spawn(move || {
             transition_core.new_project();
             transition_tx.send(()).unwrap();
         });
-        let transitioned = transition_rx.recv_timeout(Duration::from_secs(1));
+        let transitioned = transition_rx.recv_timeout(Duration::from_secs(5));
         // Unblock the worker before asserting any deadline, so a regression
         // holding the read lease cannot deadlock the test itself.
         release_tx.send(()).unwrap();
@@ -9200,8 +9206,8 @@ mod tests {
         transition.join().unwrap();
         let (save_time, save_result) = saved.expect("in-place save must finish during transcode");
         save_result.expect("save must succeed");
-        assert!(save_time < Duration::from_secs(1));
-        assert!(read.expect("reader must finish during transcode") < Duration::from_millis(100));
+        assert!(save_time < Duration::from_secs(5));
+        assert!(read.expect("reader must finish during transcode") < Duration::from_secs(5));
         transitioned.expect("project transition must finish during transcode");
         let error = worker_result.err().expect("stale project rejects proxy");
         assert!(error.contains("project changed"), "{error}");
