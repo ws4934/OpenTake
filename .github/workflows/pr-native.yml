@@ -3,9 +3,9 @@ name: PR native checks
 # The lightweight gate in pr.yml builds only the core crates on Linux. When a
 # pull request changes Rust code, this workflow lints the whole workspace and
 # tests every affected crate (see scripts/pr_native_scope.py) on Linux, Windows
-# and macOS. Documentation- or web-only changes skip it. Tests that need a GPU,
-# an audio device or a real browser skip themselves on these runners; ci.yml
-# keeps the release-time qualification.
+# and macOS. Documentation- or web-only changes skip it. Tests that need a GPU
+# or an audio device skip themselves on hosted runners; ci.yml keeps the
+# release-time qualification.
 on:
   pull_request:
 
@@ -121,6 +121,19 @@ jobs:
         env:
           PACKAGES: ${{ needs.scope.outputs.packages }}
         run: |
-          $packages = $env:PACKAGES -split ' ' | Where-Object { $_ }
-          cargo test --locked @packages -- --test-threads=2
-          if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
+          # One cargo invocation per crate, exactly like a local `cargo test -p`.
+          # Testing crates together would unify their features: opentake-tauri
+          # enables opentake-motion's `chromium` feature, which turns on the
+          # live browser tests that ci.yml runs on a qualified runner.
+          $failed = @()
+          foreach ($package in ($env:PACKAGES -split ' ' | Where-Object { $_ })) {
+            Write-Output "::group::cargo test -p $package"
+            cargo test --locked --no-fail-fast -p $package -- --test-threads=2
+            $code = $LASTEXITCODE
+            Write-Output '::endgroup::'
+            if ($code -ne 0) {
+              Write-Output "::error::cargo test -p $package failed"
+              $failed += $package
+            }
+          }
+          if ($failed) { throw "tests failed: $($failed -join ', ')" }

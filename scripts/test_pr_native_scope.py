@@ -89,7 +89,7 @@ class MainTests(unittest.TestCase):
             output
         ), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(scope.main(["--files", "crates/core/src/lib.rs"]), 0)
-        self.assertEqual(output.getvalue(), "native=true\npackages=-p app -p core\n")
+        self.assertEqual(output.getvalue(), "native=true\npackages=app core\n")
 
         output = io.StringIO()
         with mock.patch.object(scope, "cargo_metadata", return_value=METADATA), contextlib.redirect_stdout(

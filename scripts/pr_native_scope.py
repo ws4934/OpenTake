@@ -10,8 +10,8 @@ Usage:
   python3 scripts/pr_native_scope.py --base <sha> --head <sha>
   python3 scripts/pr_native_scope.py --files crates/opentake-media/src/lib.rs
 
-Prints `native=true|false` and `packages=<-p flags>` lines, suitable for
-appending to "$GITHUB_OUTPUT".
+Prints `native=true|false` and `packages=<space-separated crate names>` lines,
+suitable for appending to "$GITHUB_OUTPUT".
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     files = args.files if args.files is not None else changed_files(args.base, args.head)
     packages = affected_packages(files, cargo_metadata())
     print(f"native={'true' if packages else 'false'}")
-    print(f"packages={' '.join(f'-p {name}' for name in packages)}")
+    print(f"packages={' '.join(packages)}")
     print(f"affected: {', '.join(packages) or 'none'}", file=sys.stderr)
     return 0
 
