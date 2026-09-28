@@ -2740,7 +2740,14 @@ fn render_lottie_frames(
                 (render_size.width, render_size.height),
                 "inspect-media-lottie",
             )
-            .map_err(|_| BridgeError::new("inspect_media: failed to render Lottie frame"))?;
+            .map_err(|_| {
+                // The document already parsed above, so this is a render
+                // failure. Vello reports GPU trouble only as a generic wgpu
+                // scope error, so retire the context rather than risk keeping
+                // a lost device; the next call rebuilds it.
+                *device_failed = true;
+                BridgeError::new("inspect_media: failed to render Lottie frame")
+            })?;
         let draw = LayerDraw {
             source: &source,
             source_frame,
