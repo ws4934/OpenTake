@@ -376,7 +376,7 @@ pub async fn search_index_start(
             let spec = search_config::embedder_spec();
             let source_identity = assets
                 .iter()
-                .map(|asset| asset_identity(asset))
+                .map(asset_identity)
                 .collect::<Vec<_>>()
                 .join("|");
             let request = opentake_media::ort_worker::JobRequest::new(
