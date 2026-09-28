@@ -1937,12 +1937,13 @@ fn edit_nested_sequence(
             "nested-sequence, media-library, and project-settings commands must target the root timeline".into(),
         ));
     }
-    let child = state
+    let (sequence_index, child) = state
         .timeline
         .nested_sequences
         .iter()
-        .find(|sequence| sequence.id == sequence_id)
-        .map(|sequence| sequence.timeline.clone())
+        .enumerate()
+        .find(|(_, sequence)| sequence.id == sequence_id)
+        .map(|(index, sequence)| (index, sequence.timeline.clone()))
         .ok_or_else(|| EditError::Invalid(format!("Nested sequence not found: {sequence_id}")))?;
     transact(
         state,
@@ -1965,7 +1966,16 @@ fn edit_nested_sequence(
                 .expect("sequence was resolved before transaction")
                 .timeline = Timeline::new();
             let mut child_state = EditorState::new(editable, st.manifest.clone());
-            let inner = apply(&mut child_state, command, ids)?;
+            // The inner command names clips by their child-timeline path;
+            // place that under the sequence so it does not read as a root path.
+            let inner = apply(&mut child_state, command, ids).map_err(|error| match error {
+                EditError::Invalid(message) if message.starts_with("timeline.") => {
+                    EditError::Invalid(format!(
+                        "timeline.nestedSequences[{sequence_index}].{message}"
+                    ))
+                }
+                other => other,
+            })?;
             child_state.timeline.nested_sequences.clear();
             let sequence = st
                 .timeline
@@ -2957,25 +2967,7 @@ fn validate_clip_frame_arithmetic(clip: &Clip, label: &str) -> Result<i32, EditE
 }
 
 fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Result<(), EditError> {
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
-        for (clip_index, clip) in track.clips.iter().enumerate() {
-            if validate_clip_frame_arithmetic(clip, "").is_err() {
-                validate_clip_frame_arithmetic(
-                    clip,
-                    &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
-                )?;
-            }
-        }
-    }
-    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        if validate_timeline_frame_arithmetic(&sequence.timeline, "").is_err() {
-            validate_timeline_frame_arithmetic(
-                &sequence.timeline,
-                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-            )?;
-        }
-    }
-    Ok(())
+    validate_frame_arithmetic_except(timeline, label, &|_| false, None)
 }
 
 /// [`validate_timeline_frame_arithmetic`] for everything except the child
@@ -2985,25 +2977,7 @@ fn validate_frame_arithmetic_outside_sequence(
     label: &str,
     sequence_id: &str,
 ) -> Result<(), EditError> {
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
-        for (clip_index, clip) in track.clips.iter().enumerate() {
-            if clip.frame_arithmetic().is_err() {
-                validate_clip_frame_arithmetic(
-                    clip,
-                    &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
-                )?;
-            }
-        }
-    }
-    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        if sequence.id != sequence_id {
-            validate_timeline_frame_arithmetic(
-                &sequence.timeline,
-                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-            )?;
-        }
-    }
-    Ok(())
+    validate_frame_arithmetic_except(timeline, label, &|_| false, Some(sequence_id))
 }
 
 /// [`validate_timeline_frame_arithmetic`] for every clip except the root clips
@@ -3013,9 +2987,22 @@ fn validate_kept_frame_arithmetic(
     label: &str,
     removed: &HashSet<String>,
 ) -> Result<(), EditError> {
+    validate_frame_arithmetic_except(timeline, label, &|clip| removed.contains(&clip.id), None)
+}
+
+/// Validate the frame arithmetic of every clip in `timeline` and its nested
+/// sequences, except the root clips `skip_clip` selects and the child timeline
+/// of `skip_sequence`. Errors name the clip by its path under `label`, which
+/// is only formatted once a clip fails.
+fn validate_frame_arithmetic_except(
+    timeline: &Timeline,
+    label: &str,
+    skip_clip: &dyn Fn(&Clip) -> bool,
+    skip_sequence: Option<&str>,
+) -> Result<(), EditError> {
     for (track_index, track) in timeline.tracks.iter().enumerate() {
         for (clip_index, clip) in track.clips.iter().enumerate() {
-            if removed.contains(&clip.id) || clip.frame_arithmetic().is_ok() {
+            if skip_clip(clip) || validate_clip_frame_arithmetic(clip, "").is_ok() {
                 continue;
             }
             validate_clip_frame_arithmetic(
@@ -3025,6 +3012,11 @@ fn validate_kept_frame_arithmetic(
         }
     }
     for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        if skip_sequence == Some(sequence.id.as_str())
+            || validate_timeline_frame_arithmetic(&sequence.timeline, "").is_ok()
+        {
+            continue;
+        }
         validate_timeline_frame_arithmetic(
             &sequence.timeline,
             &format!("{label}.nestedSequences[{sequence_index}].timeline"),
@@ -7754,7 +7746,8 @@ fn set_timeline_settings_cmd(
 /// A placed non-text clip must reference an asset in the project manifest;
 /// otherwise the timeline gains a clip that no preview or export can resolve.
 fn validate_entry_media(state: &EditorState, e: &ClipEntry, i: usize) -> Result<(), EditError> {
-    if e.media_type == ClipType::Text
+    // Only a clip that is text on both sides has no media, as for paste.
+    if (e.media_type == ClipType::Text && e.source_clip_type == ClipType::Text)
         || state
             .manifest
             .entries

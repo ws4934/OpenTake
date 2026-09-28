@@ -4921,6 +4921,30 @@ fn placement_commands_reject_media_missing_from_the_manifest() {
 }
 
 #[test]
+fn only_a_text_entry_on_both_sides_skips_the_manifest_check() {
+    let mut st = state(vec![video_track("v", true, vec![])]);
+    // A text lane whose source claims video still needs its media.
+    let disguised = ClipEntry {
+        media_ref: "does-not-exist".into(),
+        media_type: ClipType::Text,
+        source_clip_type: ClipType::Video,
+        ..entry(0, ClipType::Video, 0, 30)
+    };
+    assert_eq!(
+        apply(
+            &mut st,
+            EditCommand::AddClips {
+                entries: vec![disguised],
+            },
+            &SeqIdGen::default(),
+        )
+        .unwrap_err(),
+        EditError::Invalid("entries[0]: media asset not found: does-not-exist".into())
+    );
+    assert_eq!(st.undo_depth(), 0);
+}
+
+#[test]
 fn nested_placement_rejects_media_missing_from_the_shared_manifest() {
     let mut child = Timeline::new();
     child.tracks = vec![video_track("child-track", true, vec![])];
@@ -4992,12 +5016,13 @@ fn a_malformed_clip_inside_a_compound_clip_can_be_removed_from_inside_it() {
         }],
     };
 
-    // Other edits inside the compound clip are still refused, naming the clip
-    // relative to the child timeline; root edits name its registry path.
+    // Other edits, inside the compound clip or at the root, are still
+    // refused, naming the clip by its path under the sequence registry.
     assert_eq!(
         apply(&mut st, nested(move_ok()), &ids).unwrap_err(),
         EditError::Invalid(
-            "timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1".into()
+            "timeline.nestedSequences[0].timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1"
+                .into()
         )
     );
     let root_error = apply(
