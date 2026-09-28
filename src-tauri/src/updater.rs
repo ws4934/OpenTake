@@ -1773,9 +1773,12 @@ pub async fn install_update<R: Runtime>(
             let generation =
                 app.state::<std::sync::Arc<crate::generation::TauriGenerationBridge>>();
             if generation.has_active() {
-                let cancelled = generation.cancel_all_active();
+                // Paid jobs are kept, not cancelled: they resume when the
+                // project is next opened.
+                let detached = generation.detach_all_active();
                 return Err(format!(
-                    "cancelled {cancelled} active generation job(s); retry installation after they stop"
+                    "paused {detached} active generation job(s), which resume after the \
+                     update; retry installation after they stop"
                 ));
             }
             let motion = app.state::<crate::motion::MotionCommandState>();

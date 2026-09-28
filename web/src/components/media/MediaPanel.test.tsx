@@ -49,6 +49,8 @@ vi.mock("../../lib/api", () => ({
   motionDocumentPatch: vi.fn(),
   motionPreview: vi.fn(),
   motionPreviewCancel: vi.fn().mockResolvedValue(false),
+  generationRetryResumes: vi.fn().mockResolvedValue(false),
+  retryGeneration: vi.fn().mockResolvedValue({ jobId: "job", placeholderAssetIds: [], status: "queued" }),
 }));
 
 vi.mock("../../lib/asset", () => ({
@@ -698,6 +700,50 @@ describe("media grid interaction consistency", () => {
       await act(async () => root.unmount());
     },
   );
+
+  it("resumes an accepted job without a cost confirmation and confirms a resubmission", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirm);
+    vi.mocked(api.retryGeneration).mockClear();
+    const failed = (jobId: string): MediaItem => ({
+      ...mediaItem(jobId),
+      generationStatus: "failed",
+      generationErrorCode: "GENERATION_DOWNLOAD_FAILED",
+      generationInput: {
+        prompt: "mountains",
+        model: "test",
+        duration: 1,
+        aspectRatio: "16:9",
+        provider: "fal",
+        jobId,
+      },
+    });
+    const clickRetry = async () => {
+      const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "重试",
+      );
+      await act(async () => retry?.click());
+    };
+
+    vi.mocked(api.generationRetryResumes).mockResolvedValueOnce(true);
+    await act(async () => root.render(<MediaCard item={failed("job-resume")} />));
+    await clickRetry();
+    expect(api.generationRetryResumes).toHaveBeenLastCalledWith("job-resume");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(api.retryGeneration).toHaveBeenLastCalledWith("job-resume", false);
+
+    vi.mocked(api.generationRetryResumes).mockResolvedValueOnce(false);
+    await act(async () => root.render(<MediaCard item={failed("job-resubmit")} />));
+    await clickRetry();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(api.retryGeneration).toHaveBeenLastCalledWith("job-resubmit", true);
+
+    vi.unstubAllGlobals();
+    await act(async () => root.unmount());
+  });
 
   it("keeps extract audio keyboard-reachable from zero hover without adding idle visual noise", async () => {
     dialogMocks.saveDialog.mockResolvedValue(dialogMocks.save);
