@@ -14,6 +14,7 @@ export function MotionPreview({ store }: { store: MotionStudioStore }) {
   const pause = store((state) => state.pause);
   const replay = store((state) => state.replay);
   const setFrame = store((state) => state.setFrame);
+  const flushPreview = store((state) => state.flushPreview);
 
   return (
     <figure
@@ -68,6 +69,8 @@ export function MotionPreview({ store }: { store: MotionStudioStore }) {
           value={frame}
           aria-label={t("motionStudio.scrub")}
           onChange={(event) => setFrame(Number(event.currentTarget.value))}
+          onPointerUp={flushPreview}
+          onKeyUp={flushPreview}
         />
         <output aria-label={t("motionStudio.currentFrame")}>{frame}</output>
       </div>

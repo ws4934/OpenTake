@@ -33,6 +33,16 @@ import type {
 } from "../lib/api";
 
 export const MOTION_SAVE_DEBOUNCE_MS = 300;
+/**
+ * Scrubbing the frame slider or typing a parameter changes the previewed
+ * state many times per second, while every Chromium preview takes far longer.
+ * The first change after a quiet period previews at once; later changes
+ * collapse into one trailing request for the newest state, sent this long
+ * after the input settles and at most `MOTION_PREVIEW_MAX_WAIT_MS` after the
+ * first coalesced change while the input continues.
+ */
+export const MOTION_PREVIEW_DEBOUNCE_MS = 100;
+export const MOTION_PREVIEW_MAX_WAIT_MS = 400;
 const DEFAULT_PARAMETERS: MotionPublishParameters = {
   width: 1920,
   height: 1080,
@@ -116,6 +126,8 @@ export interface MotionStudioState {
   reapplyConflict: () => Promise<void>;
   requestPreview: (sourceFile?: MotionDocumentFile) => Promise<void>;
   setFrame: (frame: number) => void;
+  /** Send a coalesced preview request now, e.g. when the slider is released. */
+  flushPreview: () => void;
   setParameter: (name: keyof MotionPublishParameters, value: number) => void;
   setTransparent: (value: boolean) => void;
   play: () => void;
@@ -180,6 +192,9 @@ export function createMotionStudioStore(
 ): MotionStudioStore {
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let playbackTimer: ReturnType<typeof setInterval> | null = null;
+  let scheduledPreview: ReturnType<typeof setTimeout> | null = null;
+  let scheduledPreviewSince: number | null = null;
+  let lastImmediatePreviewAt = Number.NEGATIVE_INFINITY;
   let loadGeneration = 0;
   let previewGeneration = 0;
   let saveOperation = 0;
@@ -208,6 +223,11 @@ export function createMotionStudioStore(
     if (playbackTimer !== null) clearInterval(playbackTimer);
     playbackTimer = null;
   };
+  const clearScheduledPreview = () => {
+    if (scheduledPreview !== null) clearTimeout(scheduledPreview);
+    scheduledPreview = null;
+    scheduledPreviewSince = null;
+  };
   const cancelPreviews = async () => {
     if (previewCancellation) await previewCancellation;
     const current = backend.cancelPreview().then(() => undefined, () => undefined);
@@ -221,6 +241,29 @@ export function createMotionStudioStore(
       const pending = pendingExternalChange;
       pendingExternalChange = null;
       if (pending) void get().refreshExternalDocument(pending);
+    };
+
+    const flushScheduledPreview = () => {
+      clearScheduledPreview();
+      lastImmediatePreviewAt = Date.now();
+      void get().requestPreview();
+    };
+
+    /** Preview after a burst of input without one Chromium render per event. */
+    const schedulePreview = () => {
+      if (!get().document) return;
+      const now = Date.now();
+      if (scheduledPreview === null && now - lastImmediatePreviewAt >= MOTION_PREVIEW_DEBOUNCE_MS) {
+        flushScheduledPreview();
+        return;
+      }
+      scheduledPreviewSince ??= now;
+      if (scheduledPreview !== null) clearTimeout(scheduledPreview);
+      const wait = Math.min(
+        MOTION_PREVIEW_DEBOUNCE_MS,
+        Math.max(0, scheduledPreviewSince + MOTION_PREVIEW_MAX_WAIT_MS - now),
+      );
+      scheduledPreview = setTimeout(flushScheduledPreview, wait);
     };
 
     const scheduleSave = (delay = MOTION_SAVE_DEBOUNCE_MS) => {
@@ -305,6 +348,7 @@ export function createMotionStudioStore(
         saveOperation += 1;
         clearSaveTimer();
         clearPlaybackTimer();
+        clearScheduledPreview();
         set({ phase: "loading", error: null, errorFile: null, playing: false });
         if (previewCancellation) await previewCancellation;
         if (generation !== loadGeneration) return;
@@ -625,6 +669,8 @@ export function createMotionStudioStore(
       },
 
       requestPreview: async (sourceFile) => {
+        // Every request previews the current state, which covers a coalesced one.
+        clearScheduledPreview();
         if (disposing || suspended) return;
         const state = get();
         if (!state.document) return;
@@ -668,7 +714,11 @@ export function createMotionStudioStore(
       setFrame: (value) => {
         const frame = clampInteger(value, 0, get().parameters.durationFrames - 1);
         set({ frame });
-        void get().requestPreview();
+        schedulePreview();
+      },
+
+      flushPreview: () => {
+        if (scheduledPreview !== null) flushScheduledPreview();
       },
 
       setParameter: (name, value) => {
@@ -685,7 +735,7 @@ export function createMotionStudioStore(
           };
         });
         if (get().playing && name === "fps") beginPlayback();
-        void get().requestPreview();
+        schedulePreview();
       },
 
       setTransparent: (value) => set({ transparent: value }),
@@ -713,6 +763,7 @@ export function createMotionStudioStore(
         suspended = true;
         clearPlaybackTimer();
         clearSaveTimer();
+        clearScheduledPreview();
         previewGeneration += 1;
         set((state) => ({
           playing: false,
@@ -878,6 +929,7 @@ export function createMotionStudioStore(
       resetProject: () => {
         clearSaveTimer();
         clearPlaybackTimer();
+        clearScheduledPreview();
         loadGeneration += 1;
         previewGeneration += 1;
         saveOperation += 1;
@@ -925,6 +977,7 @@ export function createMotionStudioStore(
           suspended = true;
           clearSaveTimer();
           clearPlaybackTimer();
+          clearScheduledPreview();
           previewGeneration += 1;
           set({ playing: false, previewPhase: "idle", previewError: null });
           try {

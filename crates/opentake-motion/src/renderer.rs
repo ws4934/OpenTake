@@ -377,8 +377,9 @@ impl Crc32 {
 /// renderer-owned browser profile and process across renders and closes it
 /// after [`DEFAULT_BROWSER_IDLE_TIMEOUT`] without use. Each render gets a
 /// disposable browser context and target. The backend injects a strict CSP,
-/// intercepts every request with `Fetch`, and kills the browser on
-/// cancellation, timeout, or protocol failure. Without the feature, [`render`]
+/// intercepts every request with `Fetch`, and discards the browser on a
+/// timeout, sandbox violation or protocol failure; a cancelled render closes
+/// its target and leaves the browser reusable. Without the feature, [`render`]
 /// returns [`MotionError::RendererUnavailable`].
 ///
 /// [`DEFAULT_BROWSER_IDLE_TIMEOUT`]: HeadlessChromiumRenderer::DEFAULT_BROWSER_IDLE_TIMEOUT
@@ -578,18 +579,12 @@ impl HeadlessChromiumRenderer {
         cancellation: &MotionCancellationToken,
         progress: &dyn Fn(u32, u32),
     ) -> MotionResult<RenderedClip> {
-        let validated = (|| -> MotionResult<()> {
-            req.validate()?;
-            if let MotionSource::Code { html_css_js } = &req.source {
-                self.policy.check_document_size(html_css_js)?;
-            }
-            Ok(())
-        })();
-        #[cfg(feature = "chromium")]
-        if validated.is_err() {
-            self.browser_pool.invalidate_idle();
+        // A request that fails validation never reaches the browser, so it
+        // leaves the browser pool untouched.
+        req.validate()?;
+        if let MotionSource::Code { html_css_js } = &req.source {
+            self.policy.check_document_size(html_css_js)?;
         }
-        validated?;
 
         #[cfg(feature = "chromium")]
         {
@@ -642,6 +637,12 @@ mod chromium_backend {
     /// Largest CDP message accepted from Chromium. A guarded 4096x4096
     /// screencast frame, the largest legitimate message, stays well below it.
     const MAX_CDP_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+    /// A retained browser must answer a trivial command within this long
+    /// before it is reused; otherwise it is replaced.
+    const REUSED_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// A cancelled render gets this long to close its page and browser
+    /// context; if that fails the browser is discarded instead of reused.
+    const CANCELLED_RENDER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
     const PROFILE_PREFIX: &str = "opentake-chromium-";
 
     fn trace_enabled() -> bool {
@@ -802,13 +803,21 @@ mod chromium_backend {
             {
                 drop(slot.take());
             }
-            if let Some(browser) = slot.as_mut() {
-                if let Some(reason) = browser.unusable_reason() {
-                    drop(slot.take());
-                    return Err(MotionError::render_failed(format!(
-                        "reusable Chromium exited before the next render: {reason}"
-                    )));
-                }
+            let probe_timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REUSED_BROWSER_PROBE_TIMEOUT);
+            if let Some(reason) = slot
+                .as_mut()
+                .and_then(|browser| browser.unusable_reason(probe_timeout))
+            {
+                // A retained browser can crash or be killed while idle. That
+                // is not this render's failure: replace it silently.
+                trace(format!(
+                    "retained Chromium is unusable ({reason}); launching a replacement"
+                ));
+                drop(slot.take());
+            }
+            if slot.is_some() {
                 trace("reusing live Chromium process");
             } else {
                 let (process, pipe) =
@@ -919,17 +928,19 @@ mod chromium_backend {
 
     impl LiveBrowser {
         /// Why this retained browser cannot serve another render, if it can't:
-        /// it exited or its CDP pipe is gone.
-        fn unusable_reason(&mut self) -> Option<String> {
+        /// it exited, lost its pipe, or does not answer within `probe_timeout`.
+        fn unusable_reason(&mut self, probe_timeout: Duration) -> Option<String> {
             match self.process.try_wait() {
                 Ok(Some(status)) => return Some(format!("exited with {status}")),
                 Ok(None) => {}
                 Err(error) => return Some(format!("process status is unavailable: {error}")),
             }
-            match self.pipe.as_mut() {
-                Some(pipe) => pipe.discard_idle_messages().err(),
-                None => Some("its CDP pipe was not returned".to_owned()),
-            }
+            let Some(pipe) = self.pipe.as_mut() else {
+                return Some("its CDP pipe was not returned".to_owned());
+            };
+            pipe.discard_idle_messages()
+                .and_then(|()| pipe.probe(probe_timeout))
+                .err()
         }
     }
 
@@ -1065,20 +1076,12 @@ mod chromium_backend {
         }
     }
 
-    pub(super) fn render(
-        renderer: &HeadlessChromiumRenderer,
-        req: &MotionRenderRequest,
-        cancellation: &MotionCancellationToken,
-        progress: &dyn Fn(u32, u32),
-    ) -> MotionResult<RenderedClip> {
-        let result = render_inner(renderer, req, cancellation, progress);
-        if result.is_err() {
-            renderer.browser_pool.invalidate_idle();
-        }
-        result
+    /// An unrepresentable deadline fails closed, like an expired one.
+    fn deadline_after(start: Instant, budget: Duration) -> Instant {
+        start.checked_add(budget).unwrap_or(start)
     }
 
-    fn render_inner(
+    pub(super) fn render(
         renderer: &HeadlessChromiumRenderer,
         req: &MotionRenderRequest,
         cancellation: &MotionCancellationToken,
@@ -1124,35 +1127,126 @@ mod chromium_backend {
             return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
         }
 
-        let deadline = Instant::now()
-            .checked_add(renderer.policy.timeout)
-            .unwrap_or_else(Instant::now);
-        check_abort(cancellation, deadline, renderer.policy.timeout)?;
+        let deadline = deadline_after(Instant::now(), renderer.policy.timeout);
         let mut browser = renderer.browser_pool.acquire(
             &browser_path,
             deadline,
             renderer.policy.timeout,
             cancellation,
         )?;
-        check_abort(cancellation, deadline, renderer.policy.timeout)?;
-        if renderer.cache.is_cached(req) {
-            browser.commit_reuse();
-            progress(req.duration_frames, req.duration_frames);
-            return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
-        }
-
-        let dir = renderer.cache.begin_render(req)?;
-        remove_partial_frames(&dir)?;
+        // Nothing below has touched the browser yet: a cancellation or cache
+        // failure here leaves it reusable.
+        let prepared = (|| {
+            check_abort(cancellation, deadline, renderer.policy.timeout)?;
+            if renderer.cache.is_cached(req) {
+                return Ok(None);
+            }
+            let dir = renderer.cache.begin_render(req)?;
+            remove_partial_frames(&dir)?;
+            Ok(Some(dir))
+        })();
+        let dir = match prepared {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                browser.commit_reuse();
+                progress(req.duration_frames, req.duration_frames);
+                return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
+            }
+            Err(error) => {
+                browser.commit_reuse();
+                return Err(error);
+            }
+        };
         let mut partial = PartialFrames::new(dir.clone());
+
         let mut cdp = Cdp::new(
             browser.take_pipe()?,
             renderer.policy.clone(),
             cancellation.clone(),
             deadline,
         );
-        trace_gpu_backend_if_enabled(&mut cdp, trace_enabled())?;
+        let mut targets = RenderTargets::default();
+        let job = FrameJob {
+            req,
+            document: &document,
+            guarded_width,
+            guarded_height,
+            dir: &dir,
+        };
+        let rendered = (|| {
+            capture_frames(&mut cdp, &mut targets, &job, progress)?;
+            close_render_targets(&mut cdp, &mut targets)?;
+            cdp.check_abort()?;
+            publish_completed_render(
+                cancellation,
+                renderer.policy.timeout,
+                deadline,
+                &dir,
+                &mut partial,
+            )
+        })();
+
+        match rendered {
+            Ok(()) => {
+                browser.restore_pipe(cdp.into_pipe());
+                browser.commit_reuse();
+                Ok(RenderedClip {
+                    content_hash: hash,
+                    frames: (0..req.duration_frames as usize)
+                        .map(|index| MotionCache::frame_file(&dir, index))
+                        .collect(),
+                    fps: req.fps,
+                    width: req.width,
+                    height: req.height,
+                    transparent: req.transparent,
+                })
+            }
+            Err(error) => {
+                if matches!(error, MotionError::Cancelled) {
+                    // A superseded preview must not cost the next one a cold
+                    // start: close what this render opened and keep the
+                    // browser when that succeeds.
+                    match release_cancelled_render(&mut cdp, &mut targets) {
+                        Ok(()) => {
+                            browser.restore_pipe(cdp.into_pipe());
+                            browser.commit_reuse();
+                        }
+                        Err(cleanup) => trace(format!(
+                            "cancelled render cleanup failed; discarding Chromium: {cleanup}"
+                        )),
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The browser context and page one render opened.
+    #[derive(Default)]
+    struct RenderTargets {
+        browser_context_id: Option<String>,
+        target_id: Option<String>,
+    }
+
+    struct FrameJob<'a> {
+        req: &'a MotionRenderRequest,
+        document: &'a str,
+        guarded_width: u32,
+        guarded_height: u32,
+        dir: &'a Path,
+    }
+
+    fn capture_frames(
+        cdp: &mut Cdp,
+        targets: &mut RenderTargets,
+        job: &FrameJob<'_>,
+        progress: &dyn Fn(u32, u32),
+    ) -> MotionResult<()> {
+        let req = job.req;
+        trace_gpu_backend_if_enabled(cdp, trace_enabled())?;
 
         let browser_context_id = cdp.create_browser_context()?;
+        targets.browser_context_id = Some(browser_context_id.clone());
         let target = cdp.command(
             "Target.createTarget",
             json!({
@@ -1163,6 +1257,7 @@ mod chromium_backend {
             None,
         )?;
         let target_id = required_string(&target, "targetId")?;
+        targets.target_id = Some(target_id.clone());
         let attached = cdp.command(
             "Target.attachToTarget",
             json!({"targetId": target_id, "flatten": true}),
@@ -1182,14 +1277,14 @@ mod chromium_backend {
             json!({"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}),
             Some(&session),
         )?;
-        cdp.set_device_metrics(&session, guarded_width, guarded_height)?;
+        cdp.set_device_metrics(&session, job.guarded_width, job.guarded_height)?;
         let alpha = if req.transparent { 0.0 } else { 1.0 };
         cdp.command(
             "Emulation.setDefaultBackgroundColorOverride",
             json!({"color": {"r": 255, "g": 255, "b": 255, "a": alpha}}),
             Some(&session),
         )?;
-        let installed = install_host_document(&mut cdp, &session, &document)?;
+        let installed = install_host_document(cdp, &session, job.document)?;
         trace("inline motion document loaded");
         cdp.ensure_no_blocked_url()?;
         let InstalledHost {
@@ -1262,12 +1357,11 @@ mod chromium_backend {
         )?;
         cdp.ensure_no_blocked_url()?;
 
-        let mut frames = Vec::with_capacity(req.duration_frames as usize);
         for (index, seconds) in HeadlessChromiumRenderer::frame_time_grid(req)
             .into_iter()
             .enumerate()
         {
-            check_abort(cancellation, deadline, renderer.policy.timeout)?;
+            cdp.check_abort()?;
             trace(format!("frame {index}: seek start at {seconds:.17}s"));
             let expression = format!(
                 "(async () => {{ if (!window.OpenTake) throw new Error('OpenTake clock missing'); await window.OpenTake.seek({seconds:.17}); return window.OpenTake.currentTime(); }})()"
@@ -1311,39 +1405,36 @@ mod chromium_backend {
                     index,
                 },
             )?;
-            check_abort(cancellation, deadline, renderer.policy.timeout)?;
+            cdp.check_abort()?;
             cdp.ensure_no_blocked_url()?;
             trace(format!("frame {index}: compositor captured"));
-            let path = MotionCache::frame_file(&dir, index);
-            std::fs::write(&path, png)?;
-            frames.push(path);
+            std::fs::write(MotionCache::frame_file(job.dir, index), png)?;
             progress(
                 u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
                 req.duration_frames,
             );
         }
+        Ok(())
+    }
 
-        cdp.close_target(&target_id)?;
-        cdp.dispose_browser_context(&browser_context_id)?;
-        check_abort(cancellation, deadline, renderer.policy.timeout)?;
-        browser.restore_pipe(cdp.into_pipe());
-        publish_completed_render(
-            cancellation,
-            renderer.policy.timeout,
-            deadline,
-            &dir,
-            &mut partial,
-        )?;
-        browser.commit_reuse();
+    fn close_render_targets(cdp: &mut Cdp, targets: &mut RenderTargets) -> MotionResult<()> {
+        if let Some(target_id) = targets.target_id.take() {
+            cdp.close_target(&target_id)?;
+        }
+        if let Some(browser_context_id) = targets.browser_context_id.take() {
+            cdp.dispose_browser_context(&browser_context_id)?;
+        }
+        Ok(())
+    }
 
-        Ok(RenderedClip {
-            content_hash: hash,
-            frames,
-            fps: req.fps,
-            width: req.width,
-            height: req.height,
-            transparent: req.transparent,
-        })
+    /// Close what a cancelled render opened, bounded by its own short timeout
+    /// and independent of the already cancelled token. Any failure, including
+    /// a sandbox violation the document committed before it was cancelled,
+    /// makes the caller discard the browser.
+    fn release_cancelled_render(cdp: &mut Cdp, targets: &mut RenderTargets) -> MotionResult<()> {
+        cdp.begin_cleanup(CANCELLED_RENDER_CLEANUP_TIMEOUT);
+        close_render_targets(cdp, targets)?;
+        cdp.ensure_no_blocked_url()
     }
 
     fn clip_from_cache(
@@ -2575,6 +2666,27 @@ mod chromium_backend {
             }
         }
 
+        /// Round-trip a trivial command to prove the browser still serves CDP.
+        fn probe(&mut self, timeout: Duration) -> Result<(), String> {
+            let deadline = deadline_after(Instant::now(), timeout);
+            let id = self.next_id();
+            self.send(&json!({"id": id, "method": "Browser.getVersion", "params": {}}))
+                .map_err(|error| error.to_string())?;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("no CDP reply within {timeout:?}"));
+                }
+                match self.recv(remaining.min(CDP_POLL_INTERVAL)) {
+                    Ok(Some(reply)) if reply.get("id").and_then(Value::as_u64) == Some(id) => {
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+
         /// Drop whatever arrived while the browser was idle (late events of
         /// earlier renders) and report why the pipe is unusable, if it is.
         fn discard_idle_messages(&mut self) -> Result<(), String> {
@@ -2677,6 +2789,13 @@ mod chromium_backend {
                 next_capture_generation: 0,
                 next_author_marker_generation: 0,
             }
+        }
+
+        /// Continue on a fresh token after the render's own was cancelled, so
+        /// cleanup commands can still complete within `budget`.
+        fn begin_cleanup(&mut self, budget: Duration) {
+            self.cancellation = MotionCancellationToken::new();
+            self.deadline = deadline_after(Instant::now(), budget);
         }
 
         /// Hand the connection back for the next render of this browser.
@@ -4109,6 +4228,42 @@ mod chromium_backend {
             let _ = (browser_pid, elapsed);
         }
 
+        #[test]
+        fn killed_idle_browser_is_relaunched_on_the_next_render() {
+            let tmp = tempfile::tempdir().unwrap();
+            let Some(renderer) = live_renderer(tmp.path()) else {
+                return;
+            };
+            renderer
+                .render(&live_request("#102030"))
+                .expect("first render launches a browser");
+            let (killed_pid, killed_profile) = retained_browser(&renderer);
+            renderer
+                .browser_pool
+                .slot
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .process
+                .child
+                .as_mut()
+                .unwrap()
+                .kill()
+                .unwrap();
+
+            renderer
+                .render(&live_request("#405060"))
+                .expect("a browser that died while idle is replaced silently");
+            let (pid, profile) = retained_browser(&renderer);
+            assert_ne!(pid, killed_pid);
+            assert_ne!(profile, killed_profile);
+            assert!(
+                !killed_profile.exists(),
+                "the dead browser's profile is removed"
+            );
+        }
+
         fn fake_cdp_pair() -> (Cdp, FakeBrowser) {
             let (client, browser) = fake_cdp_transport();
             (
@@ -4321,6 +4476,66 @@ mod chromium_backend {
             let (delivered, reason) = read(b"abc");
             assert!(delivered.is_empty());
             assert!(reason.contains("inside a message"), "{reason}");
+        }
+
+        #[test]
+        fn cancelled_or_rejected_requests_leave_an_active_lease_reusable() {
+            let root = tempfile::tempdir().unwrap();
+            let renderer = HeadlessChromiumRenderer::new(
+                MotionCache::new(root.path()),
+                SandboxPolicy::default(),
+            )
+            .with_browser_path("browser-is-never-launched");
+            let pool = Arc::clone(&renderer.browser_pool);
+            // An active render holds the browser lease.
+            let active = pool.slot.lock().unwrap();
+
+            let invalid = MotionRenderRequest::new(MotionSource::code("<x/>"), 0, 1, 8, 8);
+            assert!(matches!(
+                renderer.render(&invalid),
+                Err(MotionError::InvalidRequest(_))
+            ));
+            let oversized = MotionRenderRequest::new(
+                MotionSource::code("x".repeat(crate::sandbox::DEFAULT_MAX_DOCUMENT_BYTES + 1)),
+                30,
+                1,
+                8,
+                8,
+            );
+            assert!(matches!(
+                renderer.render(&oversized),
+                Err(MotionError::Sandbox(_))
+            ));
+            let valid = MotionRenderRequest::new(MotionSource::code("<x/>"), 30, 1, 8, 8);
+            let cancelled = MotionCancellationToken::new();
+            cancelled.cancel();
+            assert!(matches!(
+                renderer.render_with_cancellation(&valid, &cancelled),
+                Err(MotionError::Cancelled)
+            ));
+            let queued = MotionCancellationToken::new();
+            let waiter = {
+                let renderer = renderer.clone();
+                let queued = queued.clone();
+                thread::spawn(move || renderer.render_with_cancellation(&valid, &queued))
+            };
+            thread::sleep(Duration::from_millis(100));
+            assert!(!waiter.is_finished(), "the request queues for the lease");
+            queued.cancel();
+            assert!(matches!(
+                waiter.join().unwrap(),
+                Err(MotionError::Cancelled)
+            ));
+
+            assert!(!pool.invalidation_pending.load(Ordering::Acquire));
+            let mut lease = BrowserLease {
+                pool: &pool,
+                slot: Some(active),
+                reusable: false,
+                observed_invalidation: false,
+            };
+            lease.commit_reuse();
+            assert!(lease.reusable, "the active render keeps its browser");
         }
 
         #[test]

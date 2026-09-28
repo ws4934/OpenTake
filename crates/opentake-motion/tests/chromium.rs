@@ -293,8 +293,9 @@ mod live {
             request(r#"<!doctype html><style>html,body{background:rgb(4,5,6)}</style>"#)
                 .with_transparent(false);
         renderer.render(&second_request).unwrap();
+        let relaunched = live_profiles();
         assert_eq!(
-            live_profiles().difference(&profiles_before).count(),
+            relaunched.difference(&profiles_before).count(),
             1,
             "a later explicit render may launch a new browser after invalidation"
         );
@@ -308,8 +309,21 @@ mod live {
             renderer.render_with_cancellation(&cancelled_request, &cancellation),
             Err(MotionError::Cancelled)
         ));
-        assert_eq!(live_profiles(), profiles_before);
+        assert_eq!(
+            live_profiles(),
+            relaunched,
+            "a cancelled request must not discard the idle browser"
+        );
         assert!(!renderer.cache().is_cached(&cancelled_request));
+
+        renderer.render(&cancelled_request).unwrap();
+        assert_eq!(
+            live_profiles(),
+            relaunched,
+            "the next render reuses the same browser without a cold start"
+        );
+        drop(renderer);
+        assert_eq!(live_profiles(), profiles_before);
     }
 
     pub(super) fn concurrent_browser_pool_invalidation_probe() {
@@ -377,23 +391,43 @@ mod live {
             "the first render must still own the browser lease when invalidation races it"
         );
 
+        let active_profiles = live_profiles();
         let cancelled_request =
             request(r#"<!doctype html><style>body{background:rgb(70,80,90)}</style>"#)
                 .with_transparent(false);
         let cancellation = MotionCancellationToken::new();
         cancellation.cancel();
         let cancelled = renderer.render_with_cancellation(&cancelled_request, &cancellation);
-        release_response_tx.send(()).unwrap();
         assert!(matches!(cancelled, Err(MotionError::Cancelled)));
         assert!(!renderer.cache().is_cached(&cancelled_request));
 
+        // A request cancelled while it queues for the busy browser.
+        let queued_renderer = renderer.clone();
+        let queued_request = cancelled_request.clone();
+        let queued_cancellation = MotionCancellationToken::new();
+        let queued_token = queued_cancellation.clone();
+        let queued = thread::spawn(move || {
+            queued_renderer.render_with_cancellation(&queued_request, &queued_token)
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !queued.is_finished(),
+            "the second render waits for the lease"
+        );
+        queued_cancellation.cancel();
+        assert!(matches!(
+            queued.join().unwrap(),
+            Err(MotionError::Cancelled)
+        ));
+
+        release_response_tx.send(()).unwrap();
         server.join().unwrap();
         active.join().unwrap().unwrap();
         assert!(renderer.cache().is_cached(&active_request));
         assert_eq!(
             live_profiles(),
-            profiles_before,
-            "a concurrent error must prevent the successful active lease from retaining Chromium"
+            active_profiles,
+            "cancelled neighbours must not stop the successful active lease from retaining Chromium"
         );
 
         let later_request =
@@ -401,9 +435,9 @@ mod live {
                 .with_transparent(false);
         renderer.render(&later_request).unwrap();
         assert_eq!(
-            live_profiles().difference(&profiles_before).count(),
-            1,
-            "a later explicit render may launch one new browser after invalidation"
+            live_profiles(),
+            active_profiles,
+            "a later render reuses the retained browser"
         );
         drop(renderer);
         assert_eq!(live_profiles(), profiles_before);
@@ -417,6 +451,48 @@ mod live {
           box.style.background = `rgb(${Math.round(t * 100) % 256}, 60, 90)`;
         });
       </script></body></html>"#;
+
+    pub(super) fn cancelled_render_keeps_its_browser_probe() {
+        let profiles_before = live_profiles();
+        let root = tempfile::tempdir().unwrap();
+        let renderer = renderer(root.path());
+        let request = MotionRenderRequest::new(MotionSource::code(STEPPED), 10, 6, 48, 32)
+            .with_transparent(false);
+
+        // Cancel once two frames are on disk, like a superseded publish.
+        let cancellation = MotionCancellationToken::new();
+        let cancel_after_two = cancellation.clone();
+        let cancelled = renderer.render_with_cancellation_and_progress(
+            &request,
+            &cancellation,
+            &move |done, _| {
+                if done == 2 {
+                    cancel_after_two.cancel();
+                }
+            },
+        );
+        assert!(
+            matches!(cancelled, Err(MotionError::Cancelled)),
+            "{cancelled:?}"
+        );
+        let retained = live_profiles();
+        assert_eq!(
+            retained.difference(&profiles_before).count(),
+            1,
+            "a render cancelled mid-clip must keep its browser"
+        );
+        assert!(!renderer.cache().is_cached(&request));
+
+        renderer.render(&request).unwrap();
+        assert_eq!(
+            live_profiles(),
+            retained,
+            "the next render reuses the browser without a cold start"
+        );
+        assert!(renderer.cache().is_cached(&request));
+        drop(renderer);
+        assert_eq!(live_profiles(), profiles_before);
+    }
 
     pub(super) fn idle_browser_probe() {
         let profiles_before = live_profiles();
@@ -1135,16 +1211,23 @@ fn preview_frame_is_deterministic_and_visibly_advances() {
 
 #[cfg(feature = "chromium")]
 #[test]
-fn browser_pool_invalidates_on_blocked_or_cancelled_render() {
+fn sandbox_violation_invalidates_the_browser_but_cancellation_keeps_it() {
     let _live_test_guard = live_test_guard();
     live::browser_pool_invalidation_probe();
 }
 
 #[cfg(feature = "chromium")]
 #[test]
-fn concurrent_error_invalidates_an_active_browser_lease() {
+fn cancelled_requests_leave_an_active_browser_lease_reusable() {
     let _live_test_guard = live_test_guard();
     live::concurrent_browser_pool_invalidation_probe();
+}
+
+#[cfg(feature = "chromium")]
+#[test]
+fn cancelled_render_keeps_its_browser() {
+    let _live_test_guard = live_test_guard();
+    live::cancelled_render_keeps_its_browser_probe();
 }
 
 #[cfg(feature = "chromium")]
