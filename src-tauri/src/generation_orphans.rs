@@ -56,6 +56,9 @@ pub(crate) struct HeldResult {
 pub(crate) struct OrphanedGenerationStore {
     list: DurableJsonList<OrphanedGeneration>,
     results_dir: PathBuf,
+    /// Makes [`Self::record`] fail, as a full disk would.
+    #[cfg(test)]
+    pub(crate) fail_records: std::sync::atomic::AtomicBool,
 }
 
 impl OrphanedGenerationStore {
@@ -69,6 +72,8 @@ impl OrphanedGenerationStore {
                 "orphaned generation jobs",
             ),
             results_dir: root.join("results"),
+            #[cfg(test)]
+            fail_records: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -83,6 +88,10 @@ impl OrphanedGenerationStore {
     /// Record a job, replacing an earlier record of the same job (whose held
     /// files are removed unless the new record keeps them).
     pub(crate) fn record(&self, entry: OrphanedGeneration) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_records.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("write orphaned generation jobs: no space left on device".to_string());
+        }
         let replaced = self.list.update(|entries| {
             let replaced = entries
                 .iter()

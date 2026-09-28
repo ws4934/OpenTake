@@ -908,23 +908,27 @@ impl TauriGenerationBridge {
         })
     }
 
-    /// The orphan record of `job_id`, durable or kept in memory.
+    /// The orphan record of `job_id`, kept in memory or durable. A record
+    /// is kept in memory only after its durable write failed, so it is newer
+    /// than the durable one, which may still be the pending submission.
     fn orphan_record(&self, job_id: &str) -> Option<OrphanedGeneration> {
-        let durable = match self.orphans.get(job_id) {
+        let kept = self
+            .runtime
+            .orphaned_submissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(job_id)
+            .cloned();
+        if kept.is_some() {
+            return kept;
+        }
+        match self.orphans.get(job_id) {
             Ok(record) => record,
             Err(error) => {
                 eprintln!("[generation] job {job_id}: orphaned jobs could not be read: {error}");
                 None
             }
-        };
-        durable.or_else(|| {
-            self.runtime
-                .orphaned_submissions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(job_id)
-                .cloned()
-        })
+        }
     }
 
     /// Forget an orphan record once the project records the job, or its
@@ -1387,6 +1391,28 @@ impl TauriGenerationBridge {
             resumed += 1;
         }
         resumed
+    }
+
+    /// Whether the open project records every placeholder as finished. The
+    /// core rolls back a failed write, so this is what the project holds.
+    fn outputs_terminal(&self, placeholder_ids: &[String]) -> bool {
+        let media = self.core.media();
+        placeholder_ids.iter().all(|asset_id| {
+            media
+                .entries
+                .iter()
+                .find(|entry| entry.id == *asset_id)
+                .and_then(|entry| entry.generation_input.as_ref())
+                .and_then(|input| input.status)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        GenerationJobStatus::Ready
+                            | GenerationJobStatus::Failed
+                            | GenerationJobStatus::Cancelled
+                    )
+                })
+        })
     }
 
     fn fail_nonterminal_outputs(
@@ -2638,10 +2664,12 @@ impl TauriGenerationBridge {
         let interrupted = matches!(result, Err(JobStop::Detached));
         self.settle_job(&binding, &local_job_id, &placeholder_ids, result, &cancel)
             .await;
-        // The held results are kept only while the job can still be
-        // finalized from them: it left its project or was interrupted.
-        // Finalized, failed or cancelled, they are removed.
-        if !interrupted && !binding.is_detached() {
+        // The held results are kept while the job can still be finalized
+        // from them: it left its project, was interrupted, or its end state
+        // was not saved, so its placeholders still wait for a result the
+        // provider cannot return again. Once the project records every
+        // output as finished, they are removed.
+        if !interrupted && !binding.is_detached() && self.outputs_terminal(&placeholder_ids) {
             self.forget_orphan_off_thread(&local_job_id).await;
         }
         self.finish_task(&local_job_id, task);
@@ -6467,6 +6495,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_id_kept_only_in_memory_is_resumed_over_its_pending_record() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let transport = GatedTransport::new(&mock, FLUX_SUBMIT);
+        let (cache, models) = runtime_dirs(&bundle);
+        let client = fixture_client_with_transport(&mock, transport.clone());
+        let bridge = build_bridge_with_timings(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients { client }),
+            crate::updater::InstallAdmissionGate::default(),
+            GenerationTimings {
+                resume_delay: Duration::from_millis(500),
+                ..GenerationTimings::default()
+            },
+        );
+        let submitted = submit_fixture_image(&bridge);
+        let asset_id = submitted.placeholder_asset_ids[0].clone();
+        wait_until("the submission to be sent", || transport.is_sent()).await;
+        // Neither the project nor the orphan store can record the accepted
+        // id: it is kept only in memory, behind the pending record.
+        bridge
+            .orphans
+            .fail_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::remove_file(bundle.join("media.json")).unwrap();
+        std::fs::create_dir_all(bundle.join("media.json/blocker")).unwrap();
+        transport.release();
+        wait_until("the accepted job to be kept in memory", || {
+            bridge
+                .runtime
+                .orphaned_submissions
+                .lock()
+                .unwrap()
+                .contains_key(&submitted.job_id)
+        })
+        .await;
+        let durable = bridge.orphans.get(&submitted.job_id).unwrap().unwrap();
+        assert_eq!(durable.provider_job_id, None, "the pending record remains");
+        assert_eq!(
+            bridge
+                .orphan_record(&submitted.job_id)
+                .and_then(|record| record.provider_job_id)
+                .as_deref(),
+            Some(MOVING_PROVIDER_JOB)
+        );
+        std::fs::remove_dir_all(bundle.join("media.json")).unwrap();
+
+        let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
+        assert_eq!(ready.id, asset_id);
+        let input = on_disk_input(&bundle, &asset_id);
+        assert_eq!(input.provider_job_id.as_deref(), Some(MOVING_PROVIDER_JOB));
+        assert_eq!(input.error_code, None);
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 1, "never resubmitted");
+        wait_until("the job to finish", || !bridge.has_active()).await;
+        assert_eq!(bridge.orphan_record(&submitted.job_id), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_finished_submission_leaves_no_pending_record() {
         let (_temp, bundle, core) = saved_core();
         let mock = MockTransport::new();
@@ -6631,6 +6725,39 @@ mod tests {
         assert_eq!(input.status, Some(GenerationJobStatus::Failed));
         assert_eq!(bridge.orphans.get(&job_id).unwrap(), None);
         assert!(!bridge.orphans.held_path(&held[0]).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_results_are_kept_until_their_job_end_is_saved() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, placeholders, held) = held_openai_job(&core, &bundle, &bridge, 1);
+        // Neither the result nor the failure can be saved.
+        std::fs::remove_file(bundle.join("media.json")).unwrap();
+        std::fs::create_dir_all(bundle.join("media.json/blocker")).unwrap();
+
+        assert_eq!(bridge.recover_current_project(), 1);
+        wait_until("the job to finish", || !bridge.has_active()).await;
+        let status = core
+            .media()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == placeholders[0])
+            .and_then(|entry| entry.generation_input)
+            .and_then(|input| input.status);
+        assert_eq!(status, Some(GenerationJobStatus::Generating));
+        assert!(bridge.orphans.get(&job_id).unwrap().is_some());
+        assert!(bridge.orphans.held_path(&held[0]).is_file());
+
+        std::fs::remove_dir_all(bundle.join("media.json")).unwrap();
+        assert_eq!(bridge.recover_current_project(), 1);
+        wait_until("the job to finish", || !bridge.has_active()).await;
+        let input = on_disk_input(&bundle, &placeholders[0]);
+        assert_eq!(input.status, Some(GenerationJobStatus::Ready), "{input:?}");
+        assert_eq!(bridge.orphans.get(&job_id).unwrap(), None);
+        assert!(!bridge.orphans.held_path(&held[0]).exists());
+        assert!(mock.calls().is_empty(), "nothing is paid again");
     }
 
     #[test]
