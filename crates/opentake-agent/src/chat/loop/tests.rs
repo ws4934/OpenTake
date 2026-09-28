@@ -528,26 +528,56 @@ async fn run_no_key_turn(loop_: &ChatLoop, session: &mut ChatSession, provider: 
 }
 
 #[tokio::test]
-async fn persisted_retired_model_is_replaced_and_chosen_model_is_kept() {
+async fn stored_models_follow_the_default_and_only_chosen_models_are_kept() {
     let loop_ = build_loop(talking_head_timeline(), Arc::new(MemoryKeyStore::new()));
-    let mut session = ChatSession::new("s1");
-    session.provider = Some("anthropic".into());
-    session.model = Some("claude-3-5-haiku-latest".into());
+    // Older builds stored the default of their day in `model`; no build has
+    // offered a choice, so it must not pin that past default.
+    let mut session: ChatSession = serde_json::from_value(serde_json::json!({
+        "id": "s1",
+        "messages": [],
+        "createdAt": 0,
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5-20250929",
+    }))
+    .unwrap();
+    assert_eq!(session.chosen_model, None);
     run_no_key_turn(&loop_, &mut session, "anthropic").await;
     assert_eq!(
         session.model.as_deref(),
         Some(LlmProvider::Anthropic.default_model())
     );
+    assert_eq!(session.chosen_model, None);
+    let saved = serde_json::to_value(&session).unwrap();
+    assert!(saved.get("chosenModel").is_none(), "{saved}");
 
-    session.model = Some("claude-sonnet-4-6".into());
+    session.chosen_model = Some("claude-3-5-haiku-latest".into());
+    run_no_key_turn(&loop_, &mut session, "anthropic").await;
+    assert_eq!(
+        session.model.as_deref(),
+        Some(LlmProvider::Anthropic.default_model()),
+        "a retired choice falls back to the default"
+    );
+
+    session.chosen_model = Some("claude-sonnet-4-6".into());
     run_no_key_turn(&loop_, &mut session, "anthropic").await;
     run_no_key_turn(&loop_, &mut session, "anthropic").await;
     assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-6"));
+    let saved = serde_json::to_value(&session).unwrap();
+    assert_eq!(saved["chosenModel"], "claude-sonnet-4-6");
 
     run_no_key_turn(&loop_, &mut session, "openai").await;
     assert_eq!(session.provider.as_deref(), Some("openai"));
     assert_eq!(
         session.model.as_deref(),
         Some(LlmProvider::OpenAi.default_model())
+    );
+    assert_eq!(
+        session.chosen_model, None,
+        "a choice belongs to its provider"
+    );
+    run_no_key_turn(&loop_, &mut session, "anthropic").await;
+    assert_eq!(
+        session.model.as_deref(),
+        Some(LlmProvider::Anthropic.default_model())
     );
 }

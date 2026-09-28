@@ -21,7 +21,7 @@ import { startLibrarySync, stopLibrarySync } from "./store/libraryStore";
 import { useEditorUiStore } from "./store/uiStore";
 import { initI18n } from "./i18n";
 import { initProxyPlayback, initWindowSize } from "./store/settingsStore";
-import { isTauri, onGoHome } from "./lib/api";
+import { isTauri, onCloseSaveFailed, onGoHome } from "./lib/api";
 import { stopNativePlaybackForProjectBoundary } from "./components/preview/nativePlaybackSession";
 import { useUpdateStore } from "./store/updateStore";
 import { startUpdateScheduler } from "./lib/updateScheduler";
@@ -128,6 +128,7 @@ export default function App() {
     let disposed = false;
     const retryTimers = new Set<ReturnType<typeof setTimeout>>();
     let unlisten: (() => void) | undefined;
+    let unlistenCloseSaveFailed: (() => void) | undefined;
 
     const reportLifecycleFailure = (label: string, error: unknown, retrying: boolean) => {
       const suffix = retrying
@@ -212,6 +213,25 @@ export default function App() {
       },
       (registeredUnlisten) => registeredUnlisten(),
     );
+    // A failed save before close or quit offers Save As / Don't Save / Cancel
+    // instead of trapping the user (the native fallback covers a dead listener).
+    launchWithRetry(
+      "窗口监听失败 / Window listener failed",
+      () =>
+        onCloseSaveFailed((event) => {
+          if (disposed) return;
+          void import("./store/projectActions")
+            .then(({ resolveFailedClose }) => resolveFailedClose(event))
+            .catch((error) => {
+              useEditorUiStore.getState().pushToast(errorMessage(error));
+            });
+        }),
+      (registeredUnlisten) => {
+        unlistenCloseSaveFailed?.();
+        unlistenCloseSaveFailed = registeredUnlisten;
+      },
+      (registeredUnlisten) => registeredUnlisten(),
+    );
     // Suppress the WebView's native context menu (the stray "Reload" item) so
     // app-native menus can own right-click; allow it in text fields.
     const onContextMenu = (e: MouseEvent) => {
@@ -232,6 +252,7 @@ export default function App() {
       retryTimers.clear();
       unsubscribeView();
       unlisten?.();
+      unlistenCloseSaveFailed?.();
       stopSync();
       stopMediaSync();
       stopLibrarySync();

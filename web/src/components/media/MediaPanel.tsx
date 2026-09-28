@@ -2431,6 +2431,12 @@ export function MediaCard({
     item.generationStatus === "generating" || item.generationStatus === "downloading";
   const generationFailed =
     item.generationStatus === "failed" || item.generationStatus === "cancelled";
+  // A submission that never answered, or that the app could not follow to
+  // its answer (it quit or switched projects first), may have been billed.
+  const submitOutcomeUnknown =
+    item.generationStatus === "failed" &&
+    (item.generationErrorCode === "GENERATION_SUBMIT_OUTCOME_UNKNOWN" ||
+      item.generationErrorCode === "GENERATION_RESTART_RETRY_REQUIRED");
   const thumbnailKey = mediaThumbnailKey(item);
   const [lazyThumbnail, setLazyThumbnail] = useState<string | null>(
     item.thumbnail ?? mediaThumbnailCache.get(thumbnailKey) ?? null,
@@ -2799,15 +2805,21 @@ export function MediaCard({
             <span style={{ fontSize: "var(--fs-micro)", fontWeight: "var(--fw-medium)" }}>
               {item.generationStatus === "cancelled"
                 ? "生成已取消"
-                : item.generationErrorCode ?? "GENERATION_FAILED"}
+                : submitOutcomeUnknown
+                  ? t("generation.outcomeUnknown")
+                  : item.generationErrorCode ?? "GENERATION_FAILED"}
             </span>
             {item.generationInput?.jobId && (
               <button
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
+                  // The provider may already have billed a submission
+                  // whose answer never arrived: retrying could pay twice.
                   const approved = window.confirm(
-                    "重试会再次调用生成服务并可能产生费用。是否继续？",
+                    submitOutcomeUnknown
+                      ? t("generation.outcomeUnknownRetryConfirm")
+                      : "重试会再次调用生成服务并可能产生费用。是否继续？",
                   );
                   if (approved) {
                     void retryGeneration(item.generationInput!.jobId!, true);

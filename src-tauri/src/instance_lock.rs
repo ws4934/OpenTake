@@ -99,6 +99,25 @@ mod tests {
         }
     }
 
+    /// Re-claims storage whose previous owner was just dropped. `flock` locks
+    /// belong to the open file description, and a child that another test
+    /// thread is forking holds a copy of every descriptor until its `exec`
+    /// closes the close-on-exec ones, so the released lock can stay held for
+    /// a moment after `drop`. Only that transient `Secondary` is retried; a
+    /// lock that is never released still fails after the deadline.
+    fn primary_after_release(path: &Path) -> InstanceLock {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match InstanceLock::claim(path).unwrap() {
+                InstanceClaim::Primary(instance) => return instance,
+                InstanceClaim::Secondary if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                InstanceClaim::Secondary => panic!("released storage was never reclaimed"),
+            }
+        }
+    }
+
     #[test]
     fn independent_handles_share_one_owner_and_activation_coalesces() {
         let storage = Storage::new();
@@ -113,7 +132,8 @@ mod tests {
         assert!(owner.take_activation().unwrap());
         assert!(!owner.take_activation().unwrap());
         drop(owner);
-        let next = primary(&storage.0);
+        let next = primary_after_release(&storage.0);
+        // A retried claim leaves a focus request, which the new owner clears.
         assert!(!next.take_activation().unwrap());
     }
 

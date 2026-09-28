@@ -968,3 +968,96 @@ fn durable_transition_with_large_media_stays_fast_and_does_not_block_readers() {
     assert!(slowest < Duration::from_millis(50), "{slowest:?}");
     assert!(worst_read < Duration::from_millis(50), "{worst_read:?}");
 }
+
+#[test]
+fn job_updates_leave_the_ready_outputs_of_a_partly_finalized_job_alone() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let runtime = core.runtime_snapshot();
+    let mut plan = upscale_plan();
+    plan.output_count = 2;
+    let committed = core
+        .begin_generation_job_for_project(runtime.project_epoch, &bundle, plan)
+        .unwrap();
+    let ready_id = committed.placeholder_asset_ids[0].clone();
+    let pending_id = committed.placeholder_asset_ids[1].clone();
+    for (status, progress) in [
+        (GenerationJobStatus::Generating, Some(0.2)),
+        (GenerationJobStatus::Downloading, Some(0.8)),
+    ] {
+        core.update_generation_job_for_project(
+            runtime.project_epoch,
+            &bundle,
+            &committed.job_id,
+            update(status, progress),
+        )
+        .unwrap();
+    }
+    let relative_path = format!("media/{ready_id}.png");
+    fs::write(bundle.join(&relative_path), b"ready-output").unwrap();
+    core.finalize_generation_output_for_project(
+        runtime.project_epoch,
+        &bundle,
+        PreparedGenerationOutput {
+            asset_id: ready_id.clone(),
+            relative_path: relative_path.clone(),
+            probe: history_image_probe(),
+            created_at: Some(800_000_002.0),
+        },
+    )
+    .unwrap();
+
+    // A job interrupted here is resumed from its provider job id, and
+    // finalization moves the job to Downloading again while output 0 is
+    // already Ready.
+    let mut resumed = update(GenerationJobStatus::Downloading, Some(0.85));
+    resumed.provider_job_id = Some("fal::resumed".to_string());
+    assert_eq!(
+        core.update_generation_job_for_project(
+            runtime.project_epoch,
+            &bundle,
+            &committed.job_id,
+            resumed,
+        )
+        .unwrap(),
+        1
+    );
+
+    let reopened = Project::open(&bundle).unwrap();
+    let input = |id: &str| {
+        reopened
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .generation_input
+            .clone()
+            .unwrap()
+    };
+    let ready = input(&ready_id);
+    assert_eq!(ready.status, Some(GenerationJobStatus::Ready));
+    assert_ne!(ready.provider_job_id.as_deref(), Some("fal::resumed"));
+    let pending = input(&pending_id);
+    assert_eq!(pending.status, Some(GenerationJobStatus::Downloading));
+    assert_eq!(pending.provider_job_id.as_deref(), Some("fal::resumed"));
+
+    // A job whose outputs are all terminal still refuses to restart.
+    core.fail_generation_output_for_project(
+        runtime.project_epoch,
+        &bundle,
+        &pending_id,
+        "GENERATION_DOWNLOAD_FAILED",
+        None,
+    )
+    .unwrap();
+    assert!(core
+        .update_generation_job_for_project(
+            runtime.project_epoch,
+            &bundle,
+            &committed.job_id,
+            update(GenerationJobStatus::Downloading, Some(0.8)),
+        )
+        .is_err());
+}

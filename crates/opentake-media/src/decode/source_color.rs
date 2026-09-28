@@ -163,7 +163,10 @@ pub(crate) fn resolve_path_color(
     if !metadata.is_file() {
         return Ok(None);
     }
-    let identity = SourceIdentity::Path(path.to_path_buf(), FileStamp::of(&metadata));
+    let Ok(stamp) = FileStamp::of_path(path) else {
+        return Ok(None);
+    };
+    let identity = SourceIdentity::Path(path.to_path_buf(), stamp);
     probe_color(identity, ProbeTarget::Path(path), cancel)
 }
 
@@ -180,7 +183,7 @@ pub(crate) fn resolve_file_color(
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    let stamp = FileStamp::of(&file.metadata()?);
+    let stamp = FileStamp::of_file(file)?;
     let file_id = crate::proxy::source_file_stamp_file(file)?.file_id;
     probe_color(
         SourceIdentity::Handle(stamp, file_id),
@@ -226,7 +229,8 @@ mod tests {
 
     #[test]
     fn cache_is_bounded_and_keeps_recently_used_entries() {
-        let stamp = FileStamp::of(&std::fs::metadata(std::env::temp_dir()).unwrap());
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let stamp = FileStamp::of_path(source.path()).unwrap();
         let key = |index: usize| {
             SourceIdentity::Path(PathBuf::from(format!("/cache-test/{index}")), stamp)
         };

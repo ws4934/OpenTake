@@ -4,10 +4,10 @@
 //! Succeeded, failed/canceled -> Failed. See gen-SPEC §2.2.2.
 
 use super::{normalize_output_urls, ModelRoute, ProviderAdapter};
-use crate::error::{map_http_error, GenError};
+use crate::error::{map_http_response, GenError};
 use crate::job::{GenerationJob, JobStatus};
 use crate::params::GenerationParams;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::transport::{file_upload_body, HttpRequest, HttpTransport};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -91,7 +91,18 @@ impl ReplicateAdapter {
                 }
                 input
             }
-            GenerationParams::Upscale(p) => json!({ "video": p.source_url }),
+            GenerationParams::Upscale(p) => {
+                // https://replicate.com/topazlabs/video-upscale/api/schema has
+                // no scale factor: without a target it renders 1080p at 30 fps.
+                let mut input = json!({ "video": p.source_url });
+                if let Some(resolution) = &p.target_resolution {
+                    input["target_resolution"] = json!(resolution);
+                }
+                if let Some(fps) = p.target_fps {
+                    input["target_fps"] = json!(fps);
+                }
+                input
+            }
         }
     }
 
@@ -168,11 +179,12 @@ impl ProviderAdapter for ReplicateAdapter {
             .send(HttpRequest::post(url).header(hk, hv).json(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         if v.get("id").and_then(|x| x.as_str()).is_none() {
-            return Err(GenError::Transport(
+            // Accepted, but without an id the job cannot be followed.
+            return Err(GenError::UnusableSuccess(
                 "replicate: missing prediction id".into(),
             ));
         }
@@ -182,38 +194,41 @@ impl ProviderAdapter for ReplicateAdapter {
     async fn poll(&self, job_id: &str) -> Result<GenerationJob, GenError> {
         let url = format!("{}/predictions/{}", self.api_base, job_id);
         let (hk, hv) = self.auth_header();
-        let resp = self.http.send(HttpRequest::get(url).header(hk, hv)).await?;
+        // A finished prediction can carry inline data URLs.
+        let resp = self
+            .http
+            .send(
+                HttpRequest::get(url)
+                    .header(hk, hv)
+                    .max_response_bytes(crate::transport::MEDIA_RESPONSE_BYTES_MAX),
+            )
+            .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         Ok(self.normalize(&v))
     }
 
     async fn upload(&self, path: &Path, content_type: &str) -> Result<String, GenError> {
-        // Replicate files API: POST /files -> urls.get
-        let data = tokio::fs::read(path)
-            .await
-            .map_err(|e| GenError::Transport(format!("read upload file: {e}")))?;
+        // Replicate files API: POST /files -> urls.get. The file is
+        // size-checked first and streamed from disk.
+        let body = file_upload_body(path, content_type).await?;
         let url = format!("{}/files", self.api_base);
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(
-                HttpRequest::post(url)
-                    .header(hk, hv)
-                    .bytes(content_type.to_string(), data),
-            )
+            .send(HttpRequest::post(url).header(hk, hv).file(body))
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let v: serde_json::Value = resp.json()?;
         v.get("urls")
             .and_then(|u| u.get("get"))
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| GenError::Transport("replicate: upload missing urls.get".into()))
+            .ok_or_else(|| GenError::Protocol("replicate: upload missing urls.get".into()))
     }
 }
 
@@ -226,6 +241,21 @@ mod tests {
 
     fn adapter(mock: &MockTransport) -> ReplicateAdapter {
         ReplicateAdapter::new(Arc::new(mock.clone()), "r8-token").with_base("https://mockrep/v1")
+    }
+
+    #[tokio::test]
+    async fn an_accepted_prediction_without_an_id_has_an_unknown_outcome() {
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockrep/v1/predictions",
+            201,
+            json!({"status": "starting"}),
+        );
+        let route = ModelRoute::parse("replicate:owner/model:v123").unwrap();
+        let params = GenerationParams::Image(ImageParams::new("x", "1:1", 1));
+        let error = adapter(&mock).submit(&route, &params).await.unwrap_err();
+        assert!(error.submission_outcome_unknown(), "{error:?}");
     }
 
     #[tokio::test]

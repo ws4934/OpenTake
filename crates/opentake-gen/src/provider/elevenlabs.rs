@@ -3,7 +3,7 @@
 //! cached result. Auth uses the `xi-api-key` header. See gen-SPEC §2.2.4.
 
 use super::{ModelRoute, ProviderAdapter};
-use crate::error::{map_http_error, GenError};
+use crate::error::{map_http_response, GenError};
 use crate::job::GenerationJob;
 use crate::params::{AudioParams, GenerationParams};
 use crate::transport::{HttpRequest, HttpTransport};
@@ -89,17 +89,22 @@ impl ElevenLabsAdapter {
         let voice = Self::voice_id(p)?;
         let mut url = url::Url::parse(&format!("{}/text-to-speech/", self.api_base))?;
         url.path_segments_mut()
-            .map_err(|_| GenError::Transport("invalid ElevenLabs API base".into()))?
+            .map_err(|_| GenError::Protocol("invalid ElevenLabs API base".into()))?
             .pop_if_empty()
             .push(&voice);
         let body = json!({ "text": p.prompt, "model_id": route.vendor_model });
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(HttpRequest::post(url.to_string()).header(hk, hv).json(body))
+            .send(
+                HttpRequest::post(url.to_string())
+                    .header(hk, hv)
+                    .json(body)
+                    .media_response(),
+            )
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let data_url =
             super::encode_data_url(&resp.body, resp.header("Content-Type"), "audio/mpeg");
@@ -124,10 +129,15 @@ impl ElevenLabsAdapter {
         let (hk, hv) = self.auth_header();
         let resp = self
             .http
-            .send(HttpRequest::post(url).header(hk, hv).json(body))
+            .send(
+                HttpRequest::post(url)
+                    .header(hk, hv)
+                    .json(body)
+                    .media_response(),
+            )
             .await?;
         if !resp.is_success() {
-            return Err(map_http_error(resp.status, &resp.body));
+            return Err(map_http_response(&resp));
         }
         let data_url =
             super::encode_data_url(&resp.body, resp.header("Content-Type"), "audio/mpeg");
@@ -168,7 +178,7 @@ impl ProviderAdapter for ElevenLabsAdapter {
             .unwrap()
             .get(job_id)
             .cloned()
-            .ok_or_else(|| GenError::Transport(format!("elevenlabs: unknown job id {job_id}")))
+            .ok_or_else(|| GenError::Protocol(format!("elevenlabs: unknown job id {job_id}")))
     }
 
     async fn upload(&self, _path: &Path, _content_type: &str) -> Result<String, GenError> {

@@ -168,7 +168,8 @@
     "uiCapabilities": {
       "speed": "Medium",
       "p75DurationSeconds": 60,
-      "supportedTypes": ["video"]
+      "supportedTypes": ["video"],
+      "targetResolutions": ["720p", "1080p", "4k"]
     }
   }
 ]

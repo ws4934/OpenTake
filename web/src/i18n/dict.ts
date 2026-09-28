@@ -50,6 +50,12 @@ const zh: Dict = {
   "projectOpen.nameSeparator": "、",
   "projectOpen.title": "打开项目时已处理的问题",
   "projectOpen.dismiss": "知道了",
+  "project.failedSave.title": "工程未能保存",
+  "project.failedSave.message":
+    "当前工程无法保存（例如工程已被删除、所在磁盘已断开或空间已满）。可以另存为到其他位置，或不保存继续（丢弃未保存的修改，不会删除磁盘上的任何文件）。",
+  "project.failedSave.saveAs": "另存为…",
+  "project.failedSave.dontSave": "不保存",
+  "project.failedSave.cancel": "取消",
   "projectSettingsMismatch.title": "素材与项目设置不一致",
   "projectSettingsMismatch.description":
     "时间线还没有内容。你可以保留当前项目设置，或改为匹配第一个视频素材。",
@@ -334,6 +340,9 @@ const zh: Dict = {
   "media.folderItemCount": "{count} 项",
   "media.folderEmpty": "此文件夹为空。",
   "media.importing": "正在导入…",
+  "generation.outcomeUnknown": "提交结果未知：服务商可能已接受并计费，重试前请先在服务商控制台确认",
+  "generation.outcomeUnknownRetryConfirm":
+    "此任务的提交没有收到应答，服务商可能已经生成并计费。请先在服务商控制台确认没有该任务，再重试。重试会再次调用生成服务并可能再次产生费用。是否继续？",
   "media.importFailed": "导入失败:{error}",
   "media.placeFailed": "放置到时间线失败：{error}",
   "media.dropToAdd": "松开以添加到时间线",
@@ -1013,6 +1022,12 @@ const zh: Dict = {
   "settings.byokSaved": "密钥已安全存储在系统钥匙串中。",
   "settings.byokDelete": "删除密钥",
   "settings.byokSaveFailed": "保存失败：{error}",
+  "settings.voiceRemovalTitle": "待移除的声音克隆",
+  "settings.voiceRemovalDesc":
+    "这些声音克隆的录入已取消或未能保存到工程，但从服务商账户移除时失败。请重试移除，或在服务商的声音库中手动删除。",
+  "settings.voiceRemovalRetry": "重试移除",
+  "settings.voiceRemovalRetrying": "正在移除…",
+  "settings.voiceRemovalFailed": "移除失败：{error}",
   "settings.codexDesc":
     "使用官方 Codex CLI 的 ChatGPT 登录直接驱动 OpenTake Agent。OpenTake 不读取、不复制也不保存你的 ChatGPT 凭据。",
   "settings.codexChecking": "正在检查官方 Codex 登录状态…",
@@ -1287,6 +1302,12 @@ const en: Dict = {
   "projectOpen.nameSeparator": ", ",
   "projectOpen.title": "Handled while opening this project",
   "projectOpen.dismiss": "Dismiss",
+  "project.failedSave.title": "The project could not be saved",
+  "project.failedSave.message":
+    "The current project cannot be saved (for example, it was deleted, its drive was disconnected or the disk is full). Save it somewhere else, or continue without saving: the unsaved changes are discarded and nothing on disk is deleted.",
+  "project.failedSave.saveAs": "Save As…",
+  "project.failedSave.dontSave": "Don't Save",
+  "project.failedSave.cancel": "Cancel",
   "projectSettingsMismatch.title": "Media and project settings differ",
   "projectSettingsMismatch.description":
     "The timeline is still empty. Keep the current project settings or match the first video asset.",
@@ -1565,6 +1586,10 @@ const en: Dict = {
   "media.folderItemCount": "{count} items",
   "media.folderEmpty": "This folder is empty.",
   "media.importing": "Importing…",
+  "generation.outcomeUnknown":
+    "Submission outcome unknown: the provider may have accepted and billed it. Check the provider console before retrying",
+  "generation.outcomeUnknownRetryConfirm":
+    "This submission got no answer, so the provider may already have generated and billed it. Check the provider console for the job before retrying. Retrying calls the provider again and may be billed again. Continue?",
   "media.importFailed": "Import failed: {error}",
   "media.placeFailed": "Failed to place on timeline: {error}",
   "media.dropToAdd": "Release to add to the timeline",
@@ -2238,6 +2263,12 @@ const en: Dict = {
   "settings.byokSaved": "Key stored securely in your system keychain.",
   "settings.byokDelete": "Remove key",
   "settings.byokSaveFailed": "Save failed: {error}",
+  "settings.voiceRemovalTitle": "Voice clones pending removal",
+  "settings.voiceRemovalDesc":
+    "The enrollment of these voice clones was cancelled or could not be saved to a project, but removing them from your provider account failed. Retry the removal, or delete them in the provider's voice library.",
+  "settings.voiceRemovalRetry": "Retry removal",
+  "settings.voiceRemovalRetrying": "Removing…",
+  "settings.voiceRemovalFailed": "Removal failed: {error}",
   "settings.codexDesc":
     "Use the official Codex CLI's ChatGPT sign-in to power the OpenTake Agent. OpenTake never reads, copies, or stores your ChatGPT credentials.",
   "settings.codexChecking": "Checking the official Codex login…",

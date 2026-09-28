@@ -213,7 +213,17 @@ pub enum MotionPlacement {
 pub enum GeneratedMediaExpectation {
     ExactVersion(u64),
     TimelineFps(i32),
-    ClipUnchanged { clip: Box<Clip>, track_id: String },
+    /// An Add placement onto an explicit track. Tracks can be inserted,
+    /// removed or moved while the job runs, so the target is the track id
+    /// captured with the request and is resolved to an index at commit.
+    TrackPlacement {
+        fps: i32,
+        track_id: String,
+    },
+    ClipUnchanged {
+        clip: Box<Clip>,
+        track_id: String,
+    },
 }
 
 impl From<u64> for GeneratedMediaExpectation {
@@ -228,7 +238,22 @@ impl GeneratedMediaExpectation {
         placement: &MotionPlacement,
     ) -> Result<Self> {
         let clip_id = match placement {
-            MotionPlacement::Add { .. } => return Ok(Self::TimelineFps(snapshot.timeline.fps)),
+            MotionPlacement::Add {
+                track_index: None, ..
+            } => return Ok(Self::TimelineFps(snapshot.timeline.fps)),
+            MotionPlacement::Add {
+                track_index: Some(index),
+                ..
+            } => {
+                let track =
+                    snapshot.timeline.tracks.get(*index).ok_or_else(|| {
+                        CoreError::Media(format!("target track not found: {index}"))
+                    })?;
+                return Ok(Self::TrackPlacement {
+                    fps: snapshot.timeline.fps,
+                    track_id: track.id.clone(),
+                });
+            }
             MotionPlacement::Replace { clip_id }
             | MotionPlacement::ReplaceAndClearMasks { clip_id } => clip_id,
         };
@@ -254,9 +279,13 @@ impl GeneratedMediaExpectation {
             Self::ExactVersion(expected) if *expected != version => Err(CoreError::Media(
                 "project changed while preparing a generated-media edit".into(),
             )),
-            Self::TimelineFps(expected) if *expected != timeline.fps => Err(CoreError::Media(
-                "timeline frame rate changed while generating media".into(),
-            )),
+            Self::TimelineFps(expected) | Self::TrackPlacement { fps: expected, .. }
+                if *expected != timeline.fps =>
+            {
+                Err(CoreError::Media(
+                    "timeline frame rate changed while generating media".into(),
+                ))
+            }
             Self::ClipUnchanged { clip, track_id } => {
                 let current = timeline
                     .tracks
@@ -281,6 +310,32 @@ impl GeneratedMediaExpectation {
                 }
             }
             _ => Ok(()),
+        }
+    }
+
+    /// The current index of an Add placement's explicit target track. Only an
+    /// unchanged document version keeps the requested index meaningful;
+    /// otherwise the track must have been recorded by id, and a removed track
+    /// fails instead of putting the result on whichever track took its index.
+    fn resolve_add_track(
+        &self,
+        track_index: Option<usize>,
+        timeline: &Timeline,
+    ) -> Result<Option<usize>> {
+        let Some(track_index) = track_index else {
+            return Ok(None);
+        };
+        match self {
+            Self::ExactVersion(_) => Ok(Some(track_index)),
+            Self::TrackPlacement { track_id, .. } => timeline
+                .tracks
+                .iter()
+                .position(|track| track.id == *track_id)
+                .map(Some)
+                .ok_or(CoreError::TargetTrackRemoved),
+            Self::TimelineFps(_) | Self::ClipUnchanged { .. } => Err(CoreError::Media(
+                "an explicit track placement must record its target track id".into(),
+            )),
         }
     }
 }
@@ -1783,9 +1838,20 @@ impl AppCore {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let timeline = session.editor.timeline();
-            expected_version
-                .into()
-                .check(session.editor.version(), &timeline)?;
+            let expectation = expected_version.into();
+            expectation.check(session.editor.version(), &timeline)?;
+            let placement = match placement {
+                MotionPlacement::Add {
+                    start_frame,
+                    duration_frames,
+                    track_index,
+                } => MotionPlacement::Add {
+                    start_frame,
+                    duration_frames,
+                    track_index: expectation.resolve_add_track(track_index, &timeline)?,
+                },
+                other => other,
+            };
             if provenance.provider.as_deref() == Some("elevenlabs") {
                 if let Some(voice_id) = provenance.voice.as_deref() {
                     if !timeline.voice_models.iter().any(|record| {
@@ -2812,6 +2878,124 @@ mod tests {
         assert_eq!(after_commit.timeline, before_commit.timeline);
         assert_eq!(after_commit.media, before_commit.media);
         assert_eq!(after_commit.version, before_commit.version);
+
+        let _ = std::fs::remove_dir_all(bundle);
+    }
+
+    #[test]
+    fn add_placement_follows_its_track_id_and_fails_when_the_track_is_removed() {
+        let bundle = project_bundle("add-track-identity");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let media_dir = opentake_project::layout::media_dir(&bundle);
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let moved_output = media_dir.join("moved-track.mp4");
+        let removed_output = media_dir.join("removed-track.mp4");
+        for output in [&moved_output, &removed_output] {
+            std::fs::write(output, b"completed-render").unwrap();
+        }
+        let probe = ProbedMedia {
+            duration_secs: 1.0,
+            width: Some(64),
+            height: Some(36),
+            fps: Some(30.0),
+            has_audio: false,
+            color: None,
+        };
+        let placement = MotionPlacement::Add {
+            start_frame: 0,
+            duration_frames: 30,
+            track_index: Some(0),
+        };
+
+        let requested = core.runtime_snapshot();
+        let target_id = requested.timeline.tracks[0].id.clone();
+        let expectation = GeneratedMediaExpectation::for_placement(&requested, &placement).unwrap();
+        // A track inserted above the target while the job runs moves it.
+        core.apply(EditCommand::InsertTrack {
+            kind: ClipType::Video,
+            at: Some(0),
+        })
+        .unwrap();
+        assert_eq!(core.get_timeline().timeline.tracks[1].id, target_id);
+        let added = core
+            .commit_motion_media_for_project(
+                requested.project_epoch,
+                expectation,
+                &bundle,
+                &moved_output,
+                "Moved track",
+                &probe,
+                GenerationInput::default(),
+                placement.clone(),
+            )
+            .unwrap();
+        // Placement may prune the inserted empty track; the clip must still
+        // land on the recorded track and on no other.
+        let timeline = core.get_timeline().timeline;
+        for track in &timeline.tracks {
+            let clips: Vec<_> = track.clips.iter().map(|clip| clip.id.clone()).collect();
+            if track.id == target_id {
+                assert_eq!(clips, added.edit.affected_clip_ids);
+            } else {
+                assert!(clips.is_empty(), "result placed on another track");
+            }
+        }
+
+        // A removed target fails with a typed error and changes nothing, even
+        // though another track now has the recorded index.
+        let requested = core.runtime_snapshot();
+        let placement = MotionPlacement::Add {
+            start_frame: 60,
+            duration_frames: 30,
+            track_index: Some(0),
+        };
+        let expectation = GeneratedMediaExpectation::for_placement(&requested, &placement).unwrap();
+        core.apply(EditCommand::RemoveTracks {
+            track_indexes: vec![0],
+        })
+        .unwrap();
+        let before = core.runtime_snapshot();
+        let error = core
+            .commit_motion_media_for_project(
+                requested.project_epoch,
+                expectation,
+                &bundle,
+                &removed_output,
+                "Removed track",
+                &probe,
+                GenerationInput::default(),
+                placement.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, CoreError::TargetTrackRemoved), "{error}");
+        let after = core.runtime_snapshot();
+        assert_eq!(after.timeline, before.timeline);
+        assert_eq!(after.media, before.media);
+        assert_eq!(after.version, before.version);
+
+        // The index must name a track when the job starts, and an explicit
+        // index cannot be committed against a merely fps-checked timeline.
+        let missing = MotionPlacement::Add {
+            start_frame: 0,
+            duration_frames: 30,
+            track_index: Some(after.timeline.tracks.len()),
+        };
+        assert!(GeneratedMediaExpectation::for_placement(&after, &missing).is_err());
+        let error = core
+            .commit_motion_media_for_project(
+                after.project_epoch,
+                GeneratedMediaExpectation::TimelineFps(after.timeline.fps),
+                &bundle,
+                &removed_output,
+                "Unrecorded track",
+                &probe,
+                GenerationInput::default(),
+                placement,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("record its target track id"));
+        assert_eq!(core.runtime_snapshot().version, after.version);
 
         let _ = std::fs::remove_dir_all(bundle);
     }

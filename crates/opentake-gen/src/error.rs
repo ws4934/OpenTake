@@ -19,9 +19,38 @@ pub enum GenError {
     #[error("{0}")]
     InsufficientCredits(String),
 
-    /// Transport-level failure (DNS, TCP, non-HTTP response, body read).
+    /// Transport-level failure after the connection was established (reset,
+    /// timeout, non-HTTP response, body read). The request may have reached
+    /// the server.
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// The connection could not be established (DNS, TCP connect, TLS), so
+    /// the request never reached the server.
+    #[error("connection failed: {0}")]
+    Connect(String),
+
+    /// The provider answered with a response or job identity this client
+    /// cannot use (missing ids, foreign URLs, a synchronous job that is no
+    /// longer cached). Repeating the same request cannot fix it.
+    #[error("unusable provider response: {0}")]
+    Protocol(String),
+
+    /// A 2xx answer whose body this client cannot use: undecodable JSON (a
+    /// proxy page or a truncated body), or a missing or foreign job id. The
+    /// server handled the request, so a submission may have been accepted
+    /// and billed, while a status poll may succeed when repeated.
+    #[error("unusable success response: {0}")]
+    UnusableSuccess(String),
+
+    /// A 2xx response body larger than the request allows. Repeating the
+    /// request returns the same body, so this is final.
+    #[error("response body exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: u64 },
+
+    /// A reference file is larger than the upload limit; nothing was read.
+    #[error("upload file is {len} bytes, above the {limit}-byte limit")]
+    UploadTooLarge { len: u64, limit: u64 },
 
     /// Structured API error parsed from the `{"error":{code,message}}` envelope,
     /// or synthesized from an HTTP status when no envelope is present.
@@ -30,6 +59,8 @@ pub enum GenError {
         status: u16,
         code: String,
         message: String,
+        /// The server's `Retry-After` delay, when it sent one in seconds.
+        retry_after: Option<std::time::Duration>,
     },
 
     /// Any other internal error (serde, IO, keyring, logic).
@@ -51,7 +82,69 @@ impl From<keyring::Error> for GenError {
 
 impl From<url::ParseError> for GenError {
     fn from(e: url::ParseError) -> Self {
-        GenError::Transport(e.to_string())
+        GenError::Protocol(e.to_string())
+    }
+}
+
+impl GenError {
+    /// Whether the same request may succeed when repeated later: network
+    /// failures, undecodable 2xx bodies and HTTP 408, 429 and 5xx.
+    /// Authentication, credits, other 4xx, oversized bodies and unusable job
+    /// identities are final.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            GenError::Transport(_) | GenError::Connect(_) | GenError::UnusableSuccess(_) => true,
+            GenError::Api { status, .. } => matches!(status, 408 | 429 | 500..=599),
+            _ => false,
+        }
+    }
+
+    /// The server-requested delay before retrying, if any.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            GenError::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Whether a submission that failed this way may still have been
+    /// accepted (and billed) by the provider: the request may have arrived
+    /// (a reset or timed-out connection, a gateway error from a proxy in
+    /// front of the provider) or it was answered with a 2xx body this client
+    /// cannot use.
+    pub fn submission_outcome_unknown(&self) -> bool {
+        match self {
+            GenError::Transport(_)
+            | GenError::UnusableSuccess(_)
+            | GenError::ResponseTooLarge { .. } => true,
+            GenError::Api { status, .. } => matches!(status, 502 | 504),
+            _ => false,
+        }
+    }
+
+    /// Treat any failure to use a 2xx answer as [`GenError::UnusableSuccess`].
+    pub(crate) fn after_success(self) -> GenError {
+        match self {
+            GenError::UnusableSuccess(_) | GenError::ResponseTooLarge { .. } => self,
+            other => GenError::UnusableSuccess(other.to_string()),
+        }
+    }
+
+    /// A short, credential- and URL-free label for logs.
+    pub fn kind_label(&self) -> String {
+        match self {
+            GenError::NotConfigured => "not configured".to_string(),
+            GenError::Unauthenticated => "unauthenticated".to_string(),
+            GenError::InsufficientCredits(_) => "insufficient credits".to_string(),
+            GenError::Transport(_) => "transport".to_string(),
+            GenError::Connect(_) => "connect".to_string(),
+            GenError::Protocol(_) => "protocol".to_string(),
+            GenError::UnusableSuccess(_) => "unusable success response".to_string(),
+            GenError::ResponseTooLarge { .. } => "response too large".to_string(),
+            GenError::UploadTooLarge { .. } => "upload too large".to_string(),
+            GenError::Api { status, .. } => format!("http {status}"),
+            GenError::Other(_) => "other".to_string(),
+        }
     }
 }
 
@@ -101,7 +194,21 @@ pub(crate) fn map_http_error(status: u16, body: &[u8]) -> GenError {
         status,
         code,
         message,
+        retry_after: None,
     }
+}
+
+/// [`map_http_error`] for a whole response, keeping a `Retry-After` delay
+/// given in seconds (an HTTP-date is ignored; the caller's backoff applies).
+pub(crate) fn map_http_response(response: &crate::transport::HttpResponse) -> GenError {
+    let mut error = map_http_error(response.status, &response.body);
+    if let GenError::Api { retry_after, .. } = &mut error {
+        *retry_after = response
+            .header("Retry-After")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+    }
+    error
 }
 
 #[cfg(test)]
@@ -158,6 +265,7 @@ mod tests {
                 status,
                 code,
                 message,
+                ..
             } => {
                 assert_eq!(status, 500);
                 assert_eq!(code, "server_error");
@@ -174,6 +282,7 @@ mod tests {
                 status,
                 code,
                 message,
+                ..
             } => {
                 assert_eq!(status, 418);
                 assert_eq!(code, "");
@@ -181,6 +290,70 @@ mod tests {
             }
             other => panic!("expected Api, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transient_errors_are_network_failures_and_retryable_statuses() {
+        assert!(GenError::Transport("reset".into()).is_transient());
+        assert!(GenError::Connect("refused".into()).is_transient());
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(map_http_error(status, b"").is_transient(), "{status}");
+        }
+        for final_error in [
+            map_http_error(400, b""),
+            map_http_error(401, b""),
+            map_http_error(402, b""),
+            map_http_error(404, b""),
+            map_http_error(422, b""),
+            GenError::NotConfigured,
+            GenError::Protocol("bad id".into()),
+            GenError::UploadTooLarge { len: 2, limit: 1 },
+            GenError::ResponseTooLarge { limit: 1 },
+        ] {
+            assert!(!final_error.is_transient(), "{final_error:?}");
+        }
+        assert!(GenError::UnusableSuccess("truncated".into()).is_transient());
+    }
+
+    #[test]
+    fn a_submission_may_have_been_accepted_unless_it_was_refused() {
+        for unknown in [
+            GenError::Transport("reset".into()),
+            GenError::UnusableSuccess("no id".into()),
+            GenError::ResponseTooLarge { limit: 1 },
+            map_http_error(502, b""),
+            map_http_error(504, b""),
+        ] {
+            assert!(unknown.submission_outcome_unknown(), "{unknown:?}");
+        }
+        for refused in [
+            GenError::Connect("refused".into()),
+            map_http_error(400, b""),
+            map_http_error(401, b""),
+            map_http_error(429, b""),
+            map_http_error(500, b""),
+            map_http_error(503, b""),
+            GenError::Protocol("bad id".into()),
+        ] {
+            assert!(!refused.submission_outcome_unknown(), "{refused:?}");
+        }
+        assert!(matches!(
+            GenError::Protocol("foreign url".into()).after_success(),
+            GenError::UnusableSuccess(message) if message.contains("foreign url")
+        ));
+    }
+
+    #[test]
+    fn retry_after_seconds_are_kept_from_the_response() {
+        let mut response = crate::transport::HttpResponse::new(429, b"{}".to_vec());
+        response.headers.push(("retry-after".into(), " 7 ".into()));
+        let error = map_http_response(&response);
+        assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(7)));
+        let mut dated = crate::transport::HttpResponse::new(503, Vec::new());
+        dated
+            .headers
+            .push(("Retry-After".into(), "Wed, 21 Oct 2015 07:28:00 GMT".into()));
+        assert_eq!(map_http_response(&dated).retry_after(), None);
     }
 
     #[test]

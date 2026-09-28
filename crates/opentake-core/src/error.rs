@@ -54,6 +54,13 @@ pub enum CoreError {
     /// same stale mutation against a replacement project.
     #[error("project changed while preparing a deferred edit")]
     StaleProject,
+
+    /// The explicit target track of a long-running Add placement was removed
+    /// before its result committed. Nothing was placed or registered, so the
+    /// caller owns (and should discard) the generated output. Maps to the
+    /// `validation` error class.
+    #[error("target track was removed while generating media")]
+    TargetTrackRemoved,
 }
 
 /// Convenience alias for fallible assembly-layer operations.
@@ -74,7 +81,9 @@ impl CoreError {
     /// on (see [`project_error_code`]), and `"internal"` for everything else.
     pub fn code(&self) -> &'static str {
         match self {
-            CoreError::Edit(_) | CoreError::Media(_) => "validation",
+            CoreError::Edit(_) | CoreError::Media(_) | CoreError::TargetTrackRemoved => {
+                "validation"
+            }
             CoreError::StaleProject => "staleProject",
             CoreError::Project(error) => project_error_code(error),
             CoreError::NoProjectOpen | CoreError::Unsupported(_) => "internal",

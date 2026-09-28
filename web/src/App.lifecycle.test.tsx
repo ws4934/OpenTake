@@ -22,6 +22,7 @@ const srv = vi.hoisted(() => ({
   startLibrarySync: vi.fn(async () => {}),
   stopLibrarySync: vi.fn(),
   onGoHome: vi.fn(),
+  onCloseSaveFailed: vi.fn(),
   stopNativePlayback: vi.fn(async () => {}),
 }));
 
@@ -37,6 +38,7 @@ vi.mock("./store/libraryStore", () => ({
 vi.mock("./lib/api", () => ({
   isTauri: false,
   onGoHome: srv.onGoHome,
+  onCloseSaveFailed: srv.onCloseSaveFailed,
   checkForAppUpdate: vi.fn().mockResolvedValue(null),
   closeAppUpdate: vi.fn().mockResolvedValue(undefined),
   installAppUpdate: vi.fn().mockResolvedValue(undefined),
@@ -151,6 +153,7 @@ describe("App lifecycle listeners", () => {
     srv.startLibrarySync.mockReset().mockResolvedValue(undefined);
     srv.stopLibrarySync.mockReset();
     srv.onGoHome.mockReset().mockResolvedValue(vi.fn());
+    srv.onCloseSaveFailed.mockReset().mockResolvedValue(vi.fn());
     srv.stopNativePlayback.mockReset().mockResolvedValue(undefined);
     settings.initProxyPlayback.mockReset();
     settings.initWindowSize.mockReset();

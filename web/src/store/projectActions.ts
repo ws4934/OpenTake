@@ -13,7 +13,8 @@ import { useEditorUiStore } from "./uiStore";
 import { useProjectStore } from "./projectStore";
 import { useRecentStore } from "./recentStore";
 import { refreshMedia, resetProjectMediaState, useMediaStore } from "./mediaStore";
-import { openDialog, saveDialog } from "../lib/dialog";
+import { messageDialog, openDialog, saveDialog } from "../lib/dialog";
+import type { CloseSaveFailedEvent, FailedCloseChoice } from "../lib/types";
 import { t } from "../i18n";
 import { projectErrorMessage } from "../lib/projectMessages";
 import { stopNativePlaybackForProjectBoundary } from "../components/preview/nativePlaybackSession";
@@ -169,15 +170,100 @@ function currentProjectNeedsSave(): boolean {
   return Boolean(current.projectPath) && current.timelineVersion !== current.lastSavedVersion;
 }
 
+/** One project boundary's Don't Save answer: the exact document the user
+ *  chose to leave, so a boundary that checks twice (a sample open) asks once. */
+interface BoundaryDecision {
+  discarded: SaveSnapshot | null;
+}
+
 /** Persist the open project before another session replaces it. The core only
  *  swaps sessions, and autosave's debounce (or an earlier failed save it never
  *  retries) would otherwise drop the latest edits silently. The coordinator
  *  reports failures without rejecting, so the dirty state is re-checked: if the
- *  save did not land, the boundary is refused and the current project stays. */
-async function saveCurrentProjectBeforeBoundary(): Promise<void> {
+ *  save did not land, the user chooses Save As, Don't Save (the edits are left
+ *  behind; nothing on disk is deleted) or Cancel, which refuses the boundary
+ *  and keeps the current project. */
+async function saveCurrentProjectBeforeBoundary(
+  decision: BoundaryDecision = { discarded: null },
+): Promise<void> {
   if (!currentProjectNeedsSave()) return;
+  const current = captureSaveSnapshot();
+  if (current && decision.discarded && sameSnapshot(current, decision.discarded)) return;
   await saveCurrentProject();
-  if (currentProjectNeedsSave()) throw new Error(t("project.unsavedBlocksSwitch"));
+  if (!currentProjectNeedsSave()) return;
+  const choice = await chooseAfterFailedSave();
+  if (choice === "discard") {
+    decision.discarded = captureSaveSnapshot();
+    return;
+  }
+  if (choice === "saved" && !currentProjectNeedsSave()) return;
+  throw new Error(t("project.unsavedBlocksSwitch"));
+}
+
+export type FailedSaveChoice = "saved" | "discard" | "cancel";
+
+let failedSaveChoice: Promise<FailedSaveChoice> | null = null;
+
+/** Ask how to continue after the project could not be saved (a deleted
+ *  bundle, an unplugged volume, a full disk): Save As, Don't Save or Cancel.
+ *  Save As loops back to the question when it is cancelled or fails, so the
+ *  only ways out are a successful save, an explicit Don't Save, or Cancel.
+ *  Concurrent callers share one prompt. Outside Tauri the answer is Cancel. */
+export function chooseAfterFailedSave(detail?: string): Promise<FailedSaveChoice> {
+  if (failedSaveChoice) return failedSaveChoice;
+  const run = runFailedSaveChoice(detail);
+  const tracked = run.finally(() => {
+    if (failedSaveChoice === tracked) failedSaveChoice = null;
+  });
+  failedSaveChoice = tracked;
+  return tracked;
+}
+
+async function runFailedSaveChoice(detail?: string): Promise<FailedSaveChoice> {
+  const message = await messageDialog();
+  if (!message) return "cancel";
+  const buttons = {
+    yes: t("project.failedSave.saveAs"),
+    no: t("project.failedSave.dontSave"),
+    cancel: t("project.failedSave.cancel"),
+  };
+  const body = detail
+    ? `${t("project.failedSave.message")}\n\n${detail}`
+    : t("project.failedSave.message");
+  while (true) {
+    const result = await message(body, {
+      title: t("project.failedSave.title"),
+      kind: "warning",
+      buttons,
+    });
+    // Platforms report custom buttons by label or as the default Yes/No.
+    if (result === "No" || result === buttons.no) return "discard";
+    if (result !== "Yes" && result !== buttons.yes) return "cancel";
+    try {
+      if (await saveCurrentProjectAs()) return "saved";
+    } catch {
+      // Save As already reported the failure; ask again.
+    }
+  }
+}
+
+/** The save before a window close or quit failed (see `lifecycle.rs`). Claim
+ *  the prompt (the native fallback may already own it), ask, and answer. If
+ *  the dialog itself fails, the native prompt takes over instead of the close
+ *  being silently cancelled. */
+export async function resolveFailedClose(event: CloseSaveFailedEvent): Promise<void> {
+  if (!(await api.lifecycleClaimFailedClose(event.id))) return;
+  let answer: FailedCloseChoice;
+  try {
+    const choice = await chooseAfterFailedSave(event.message);
+    answer = choice === "saved" ? "retry" : choice;
+  } catch (error) {
+    console.error("Failed-save prompt could not be shown:", error);
+    answer = "native";
+  }
+  await api.lifecycleResolveFailedClose(event.id, answer).catch((error: unknown) => {
+    useEditorUiStore.getState().pushToast(projectLifecycleErrorMessage(error));
+  });
 }
 
 async function runSaveCoordinator(): Promise<void> {
@@ -260,9 +346,9 @@ export function saveCurrentProject(): Promise<void> {
  *  succeeds; the front-end mirrors the returned canonical path afterwards.
  *  Overlapping gestures share one operation so two native publications cannot
  *  race the front-end's path ownership. */
-let saveAsInFlight: Promise<void> | null = null;
+let saveAsInFlight: Promise<boolean> | null = null;
 
-export function saveCurrentProjectAs(): Promise<void> {
+export function saveCurrentProjectAs(): Promise<boolean> {
   if (saveAsInFlight) return saveAsInFlight;
   const run = runSaveCurrentProjectAs();
   const tracked = run.finally(() => {
@@ -272,10 +358,11 @@ export function saveCurrentProjectAs(): Promise<void> {
   return tracked;
 }
 
-async function runSaveCurrentProjectAs(): Promise<void> {
+/** Resolves `true` once the project was published at the chosen path. */
+async function runSaveCurrentProjectAs(): Promise<boolean> {
   const project = useProjectStore.getState();
   const request = captureSaveSnapshot();
-  if (!request || project.compatibilityReadOnly) return;
+  if (!request || project.compatibilityReadOnly) return false;
   const requestIsExactCurrent = () => {
     const current = captureSaveSnapshot();
     return Boolean(current && sameSnapshot(request, current));
@@ -289,21 +376,21 @@ async function runSaveCurrentProjectAs(): Promise<void> {
   };
   try {
     const save = await saveDialog("project");
-    if (!save || !requestIsExactCurrent()) return;
+    if (!save || !requestIsExactCurrent()) return false;
     const selected = await save({
       title: t("menu.saveAs"),
       defaultPath: request.projectPath,
       filters: [{ name: "OpenTake", extensions: [PROJECT_EXT] }],
     });
-    if (typeof selected !== "string" || !requestIsExactCurrent()) return;
+    if (typeof selected !== "string" || !requestIsExactCurrent()) return false;
     await flushMotionStudioBeforeProjectBoundary();
-    if (!requestIsExactCurrent()) return;
+    if (!requestIsExactCurrent()) return false;
     const committedPath = await api.projectSave(
       selected,
       request.projectEpoch,
       request.projectPath,
     );
-    if (!requestProjectIsCurrent(committedPath)) return;
+    if (!requestProjectIsCurrent(committedPath)) return false;
     const savedSnapshotIsCurrent = requestIsExactCurrent();
     const current = useProjectStore.getState();
     if (current.projectPath !== committedPath) current.setProjectPath(committedPath);
@@ -311,6 +398,7 @@ async function runSaveCurrentProjectAs(): Promise<void> {
       useProjectStore.getState().markSaved(request.timelineVersion);
     }
     useRecentStore.getState().add(committedPath);
+    return true;
   } catch (error) {
     if (requestProjectIsCurrent()) {
       useEditorUiStore.getState().pushToast(
@@ -396,10 +484,11 @@ export async function openProjectViaDialog(): Promise<void> {
  * request the guided variant only after the project has opened successfully. */
 export async function openSampleProject(slug: string, startTutorial: boolean): Promise<void> {
   try {
-    await saveCurrentProjectBeforeBoundary();
+    const decision: BoundaryDecision = { discarded: null };
+    await saveCurrentProjectBeforeBoundary(decision);
     const path = await api.sampleProjectMaterialize(slug);
     await flushMotionStudioBeforeProjectBoundary();
-    await saveCurrentProjectBeforeBoundary();
+    await saveCurrentProjectBeforeBoundary(decision);
     await stopNativePlaybackForProjectBoundary();
     const snapshot = await api.projectOpen(path);
     useProjectStore.getState().replaceProjectSnapshot(snapshot);

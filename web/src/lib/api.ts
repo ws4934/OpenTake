@@ -28,6 +28,8 @@ import type {
   ChatMessage,
   ChatSession,
   ChatToolCall,
+  CloseSaveFailedEvent,
+  FailedCloseChoice,
   ClipType,
   EditRequest,
   EditResult,
@@ -58,6 +60,7 @@ import type {
   LoudnessNormalization,
   DenoiseMode,
   ModelStatus,
+  PendingVoiceRevocation,
   PlaybackCommandError,
   PlaybackErrorEvent,
   PlaybackFrameEvent,
@@ -2149,6 +2152,29 @@ export async function secretDelete(provider: string): Promise<SecretStatus> {
   return NO_SECRET;
 }
 
+/** Voice clones whose provider removal failed after the user abandoned them.
+ *  Outside Tauri there is no provider account, so the list is empty. */
+export async function voiceRevocationsPending(): Promise<PendingVoiceRevocation[]> {
+  await ensureTauri();
+  if (invokeImpl) {
+    return invokeImpl<PendingVoiceRevocation[]>("voice_revocations_pending");
+  }
+  return [];
+}
+
+/** Retry removing one queued voice clone; resolves with the remaining queue. */
+export async function voiceRevocationRetry(
+  providerVoiceId: string,
+): Promise<PendingVoiceRevocation[]> {
+  await ensureTauri();
+  if (invokeImpl) {
+    return invokeImpl<PendingVoiceRevocation[]>("voice_revocation_retry", {
+      providerVoiceId,
+    });
+  }
+  throw new Error("Voice clone removal is available only in the desktop app");
+}
+
 // MARK: - Official Codex / ChatGPT authentication
 //
 // OpenTake never receives a ChatGPT token. These commands only ask the
@@ -2580,6 +2606,44 @@ export async function onProjectSaved(
       handler(p.path, p.projectEpoch);
     }
   });
+}
+
+/** Subscribe to `close_save_failed`: the save before a close or quit failed.
+ *  The handler claims the prompt with {@link lifecycleClaimFailedClose} and
+ *  answers with {@link lifecycleResolveFailedClose}. No-op outside Tauri. */
+export async function onCloseSaveFailed(
+  handler: (event: CloseSaveFailedEvent) => void,
+): Promise<() => void> {
+  await ensureTauri();
+  if (!listenImpl) return () => {};
+  return listenImpl("close_save_failed", (e) => {
+    const p = e.payload as Partial<CloseSaveFailedEvent> | undefined;
+    if (
+      p &&
+      typeof p.id === "number" &&
+      (p.intent === "hide" || p.intent === "exit") &&
+      typeof p.message === "string"
+    ) {
+      handler({ id: p.id, intent: p.intent, message: p.message });
+    }
+  });
+}
+
+/** Claim failed-close prompt `id`. `false` when the native fallback already
+ *  showed it or it is no longer waiting. */
+export async function lifecycleClaimFailedClose(id: number): Promise<boolean> {
+  await ensureTauri();
+  if (!invokeImpl) return false;
+  return invokeImpl<boolean>("lifecycle_claim_failed_close", { id });
+}
+
+/** Answer failed close or quit save `id`. */
+export async function lifecycleResolveFailedClose(
+  id: number,
+  choice: FailedCloseChoice,
+): Promise<void> {
+  await ensureTauri();
+  if (invokeImpl) await invokeImpl<void>("lifecycle_resolve_failed_close", { id, choice });
 }
 
 /** Subscribe to `go_home` after macOS window close saves and hides the window.

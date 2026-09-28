@@ -23,6 +23,7 @@ pub mod params;
 pub mod provider;
 pub mod stems;
 pub mod transport;
+pub mod upscale;
 
 // Public API surface.
 pub use build_params::{
@@ -34,7 +35,8 @@ pub use catalog::{
     ResponseShape, UiCapabilities, UpscaleCaps, VideoCaps,
 };
 pub use client::{
-    can_generate, filter_by_kind, AuthMode, GenClient, StaticToken, TokenProvider, UploadTicket,
+    can_generate, filter_by_kind, AuthMode, GenClient, PollPolicy, StaticToken, TokenProvider,
+    UploadTicket, WatchEvent, WatchInterruption,
 };
 pub use error::GenError;
 pub use job::{GenerationJob, JobStatus};
@@ -46,7 +48,12 @@ pub use provider::{
 };
 pub use stems::{resolve_stem_execution, StemExecutionPlan, StemProviderSelection};
 pub use transport::{
-    Body, HttpRequest, HttpResponse, HttpTransport, Method, MockTransport, ReqwestTransport,
+    file_upload_body, Body, HttpRequest, HttpResponse, HttpTransport, Method, MockTransport,
+    ReqwestTransport, TransportLimits,
+};
+pub use upscale::{
+    expected_upscale_size, plan_video_upscale, upscale_result_matches, video_upscale_resolution,
+    UpscaleResolution, VideoUpscaleError, VideoUpscalePlan,
 };
 
 // Re-export the domain input type assembled by `build_params` for downstream use.

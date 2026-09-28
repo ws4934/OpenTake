@@ -1225,6 +1225,19 @@ export interface SecretStatus {
   masked: string;
 }
 
+/** A voice clone the user abandoned (the enrollment was cancelled or could not
+ *  be saved to a project) whose removal from the provider failed. Mirror of
+ *  the Rust `PendingVoiceRevocation`; it lives in application data because no
+ *  project record is left to revoke it from. */
+export interface PendingVoiceRevocation {
+  provider: string;
+  providerVoiceId: string;
+  voiceName: string;
+  /** Unix seconds when the removal was first queued. */
+  recordedAt: number;
+  lastError: string;
+}
+
 // MARK: - Optional account backend (mirror of src-tauri account.rs)
 
 /** Identity returned by a configured backend's `/api/auth/verify` endpoint. */
@@ -1309,7 +1322,10 @@ export interface ChatSession {
   createdAt: number;
   isOpen: boolean;
   provider?: string;
+  /** The model the last turn used (display only). */
   model?: string;
+  /** The model the user chose; unset follows the provider default. */
+  chosenModel?: string;
 }
 
 function hasOwn(value: object, property: string): boolean {
@@ -1823,3 +1839,18 @@ export interface GenerationLog {
   version: number;
   entries: GenerationLogEntry[];
 }
+
+/** `close_save_failed`: the save before a window close ("hide", macOS) or a
+ *  quit ("exit") failed, and the user chooses how to continue. */
+export interface CloseSaveFailedEvent {
+  /** Identifies this failure; answers for an older one are ignored. */
+  id: number;
+  intent: "hide" | "exit";
+  message: string;
+}
+
+/** The answer to a failed close or quit save: `retry` after a successful
+ *  Save As, `discard` to close without saving (the unsaved edits are dropped
+ *  and nothing is deleted), `cancel` to keep the project open, or `native`
+ *  when the WebView could not ask and the native prompt should. */
+export type FailedCloseChoice = "retry" | "discard" | "cancel" | "native";

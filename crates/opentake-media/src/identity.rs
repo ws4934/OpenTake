@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, Metadata};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -16,25 +17,66 @@ use crate::cancel::MediaCancelToken;
 use crate::error::Result;
 use crate::proxy::{file_sha256_file_cancellable, open_retained_regular_file};
 
-/// Cheap file identity: size + modification time, plus device/inode and
-/// status-change time on Unix. Any rewrite, replacement, or truncation changes
-/// at least one field except a same-size rewrite within the filesystem's
-/// timestamp granularity, which on Unix still bumps `ctime`. On Windows,
-/// [`FileStamp::of_file`] adds the volume serial, file index and change time
-/// of an open handle for the same guarantee.
+/// Cheap file identity: size + modification time, plus the file's identity
+/// and change time (device, inode and `ctime` on Unix; volume serial number,
+/// file index and `ChangeTime` on Windows). Any rewrite, replacement, or
+/// truncation changes at least one field: a replacement is a different file
+/// identity even when it preserves the size and modification time, and a
+/// same-size in-place rewrite with a restored modification time still bumps
+/// the change time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
     #[cfg(unix)]
     unix: (u64, u64, i64, i64),
-    /// `(volume serial, file index, change time)`, from [`FileStamp::of_file`].
+    /// `(volume serial, file index, change time)` of the open handle.
     #[cfg(windows)]
-    windows: Option<(u32, u64, i64)>,
+    windows: (u32, u64, i64),
 }
 
 impl FileStamp {
-    pub fn of(metadata: &Metadata) -> Self {
+    /// Stamp an open file. The identity describes the handle, so it stays
+    /// stable across reopening the same file.
+    pub fn of_file(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        #[cfg(windows)]
+        {
+            Ok(Self::with_windows_identity(
+                &metadata,
+                windows_file_identity(file)?,
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self::of_metadata(&metadata))
+        }
+    }
+
+    /// Stamp the file at `path` (following symlinks, like `fs::metadata`).
+    /// On Windows the file identity needs a handle, so the path is opened the
+    /// way `fs::metadata` opens it: without read access and with backup
+    /// semantics, so directories and read-locked files stamp too.
+    pub fn of_path(path: &Path) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+            let file = File::options()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?;
+            Self::of_file(&file)
+        }
+        #[cfg(not(windows))]
+        {
+            // Never open: a FIFO would block. `stat` carries the identity.
+            Ok(Self::of_metadata(&std::fs::metadata(path)?))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn of_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         FileStamp {
@@ -47,26 +89,20 @@ impl FileStamp {
                 metadata.ctime(),
                 metadata.ctime_nsec(),
             ),
-            #[cfg(windows)]
-            windows: None,
         }
     }
 
-    /// The stamp of an open file. On Windows it also carries the handle's
-    /// volume serial, file index and change time, which `Metadata` does not
-    /// expose on stable Rust, so a same-size replacement or rewrite with an
-    /// unchanged modification time is still detected.
-    pub fn of_file(file: &File) -> std::io::Result<Self> {
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut stamp = Self::of(&file.metadata()?);
-        #[cfg(windows)]
-        {
-            stamp.windows = Some(windows_file_identity(file)?);
+    #[cfg(windows)]
+    fn with_windows_identity(metadata: &Metadata, identity: (u32, u64, i64)) -> Self {
+        FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            windows: identity,
         }
-        Ok(stamp)
     }
 }
 
+/// Volume serial number, file index and change time of an open handle.
 #[cfg(windows)]
 fn windows_file_identity(file: &File) -> std::io::Result<(u32, u64, i64)> {
     use std::os::windows::io::AsRawHandle;
@@ -209,6 +245,58 @@ mod tests {
         let second = cache.sha256(&path).unwrap();
         assert_ne!(first, second);
         assert_eq!(second, crate::file_sha256(&path).unwrap());
+        assert_eq!(cache.hashes(), 2);
+    }
+
+    #[test]
+    fn stamp_is_stable_across_reopen_and_changes_on_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.png");
+        std::fs::write(&path, b"first").unwrap();
+        let first = FileStamp::of_path(&path).unwrap();
+        let handle = File::open(&path).unwrap();
+        assert_eq!(FileStamp::of_file(&handle).unwrap(), first);
+        assert_eq!(
+            FileStamp::of_file(&File::open(&path).unwrap()).unwrap(),
+            first
+        );
+        assert_eq!(FileStamp::of_path(&path).unwrap(), first);
+
+        // A same-size replacement that restores the modification time is
+        // still a different file.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = dir.path().join("replacement.png");
+        std::fs::write(&replacement, b"other").unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        drop(handle);
+        std::fs::rename(&replacement, &path).unwrap();
+        let replaced = FileStamp::of_path(&path).unwrap();
+        assert_ne!(replaced, first);
+
+        let mut cache = ContentHashCache::new();
+        std::fs::write(&replacement, b"first").unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let before = cache.sha256(&path).unwrap();
+        std::fs::write(&replacement, b"other").unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(cache.sha256(&path).unwrap(), before, "stale hash reused");
         assert_eq!(cache.hashes(), 2);
     }
 

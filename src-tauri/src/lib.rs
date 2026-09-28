@@ -18,6 +18,7 @@ mod dialog_output;
 // `pub` so the ffmpeg-gated integration test (`tests/export_integration.rs`) can
 // drive the export orchestrator (`export::run_export`) against the library
 // target. The Tauri command itself is registered below like the other modules.
+mod durable_list;
 pub mod export;
 #[cfg(not(feature = "external-mcp-integration"))]
 mod external_mcp;
@@ -26,6 +27,7 @@ pub mod external_mcp;
 pub mod feedback;
 mod fs_availability;
 mod generation;
+mod generation_orphans;
 mod haptic;
 mod home;
 mod instance_lock;
@@ -39,6 +41,7 @@ mod media_pressure;
 mod media_tools;
 pub mod motion;
 mod motion_documents;
+mod public_net;
 // Public for the same reason as `export`: integration acceptance drives the
 // standalone compositing path against a generated project snapshot.
 pub mod render;
@@ -50,6 +53,7 @@ mod storage;
 pub mod telemetry;
 mod transcribe;
 mod updater;
+mod voice_revocations;
 
 // Streaming playback engine (#53). Feature-gated (`playback-engine`, now a DEFAULT
 // feature) and `pub` so the gated GPU+ffmpeg integration test can drive the render
@@ -208,21 +212,35 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("workflows");
             let install_admission = updater::InstallAdmissionGate::default();
+            // Paid jobs and abandoned voice clones recorded outside any
+            // project must survive restarts, so they need the real
+            // application data directory: never fall back to a temporary one.
+            let app_data_dir = durable_app_data_dir(app.path().app_data_dir())?;
             let generation_bridge = generation::build_bridge(
                 core.clone(),
                 cache_root.clone(),
                 models_dir.clone(),
+                app_data_dir.join("generation-orphans"),
                 install_admission.clone(),
             );
+            // Save As rebinds running generation jobs to the new bundle;
+            // replacing the project detaches them for recovery on reopen.
+            generation_bridge.follow_project_identity();
             let motion_bridge = Arc::new(motion::TauriMotionBridge::new(
                 core.clone(),
                 cache_root.clone(),
             ));
             motion::spawn_startup_cache_maintenance(&cache_root);
+            // Abandoned voice clones whose provider removal failed. They have
+            // no project record, so the queue lives in application data.
+            let voice_revocations = Arc::new(voice_revocations::VoiceRevocationStore::new(
+                app_data_dir.join("voice-revocations.json"),
+            ));
             let advanced_bridge = Arc::new(advanced::TauriAdvancedWorkflowBridge::new(
                 core.clone(),
                 cache_root.clone(),
                 models_dir.clone(),
+                voice_revocations,
             ));
             let motion_document_app = app.handle().clone();
             let motion_document_notify: mcp::MotionDocumentNotifier = Arc::new(move |change| {
@@ -395,6 +413,8 @@ pub fn run() {
             commands::check_path_exists,
             home::home_projects_sync,
             home::home_project_register,
+            lifecycle::lifecycle_claim_failed_close,
+            lifecycle::lifecycle_resolve_failed_close,
             home::home_project_remove,
             home::home_project_trash,
             home::home_project_reveal,
@@ -461,6 +481,8 @@ pub fn run() {
             advanced::advanced_generate_avatar,
             advanced::advanced_clone_voice,
             advanced::cancel_advanced_workflow,
+            advanced::voice_revocations_pending,
+            advanced::voice_revocation_retry,
             secret::secret_save,
             secret::secret_load,
             secret::secret_delete,
@@ -562,6 +584,30 @@ pub fn run_safe_asset_helper_if_requested() -> bool {
     safe_asset_protocol::run_helper_if_requested()
 }
 
+/// The application data directory that paid generation jobs and abandoned
+/// voice clones are recorded in. They must survive restarts, so startup
+/// fails when it cannot be resolved or created instead of falling back to a
+/// temporary directory.
+fn durable_app_data_dir(
+    resolved: tauri::Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = resolved
+        .map_err(|error| format!("the application data directory is unavailable: {error}"))?;
+    if !dir.is_absolute() {
+        return Err(format!(
+            "the application data directory is not absolute: {}",
+            dir.display()
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "the application data directory {} cannot be created: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
 /// Map a [`CoreEvent`] onto a front-end Tauri event. The event name matches the
 /// `kind` tag the front end listens for; the payload is the event itself
 /// (serialized with its `kind`-tagged shape).
@@ -569,11 +615,6 @@ fn forward_event(app: &tauri::AppHandle, event: &CoreEvent) {
     if let CoreEvent::ProjectOpened { project_epoch, .. } = event {
         if let Some(prewarm) = app.try_state::<PrewarmScheduler>() {
             prewarm.activate_project(*project_epoch);
-        }
-        if let Some(generation) =
-            app.try_state::<std::sync::Arc<generation::TauriGenerationBridge>>()
-        {
-            generation.recover_current_project();
         }
     }
     #[cfg(feature = "playback-engine")]
@@ -621,6 +662,19 @@ mod id_tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn startup_requires_a_usable_application_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(durable_app_data_dir(Err(tauri::Error::UnknownPath)).is_err());
+        assert!(durable_app_data_dir(Ok("relative/app-data".into())).is_err());
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"a file").unwrap();
+        assert!(durable_app_data_dir(Ok(blocked.join("app-data"))).is_err());
+        let usable = root.path().join("app-data");
+        assert_eq!(durable_app_data_dir(Ok(usable.clone())).unwrap(), usable);
+        assert!(usable.is_dir());
+    }
 
     #[test]
     fn production_ids_are_unique_and_uuid_shaped() {

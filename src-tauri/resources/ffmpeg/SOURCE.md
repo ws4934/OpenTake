@@ -5,6 +5,37 @@ per-platform download URL, archive member (when applicable), archive SHA-256,
 extracted-binary SHA-256, and reported version are recorded in
 `scripts/ffmpeg-sidecars.lock.json`.
 
+## Download locations
+
+The primary download location is the
+[`ffmpeg-sidecars-v1` prerelease](https://github.com/ws4934/OpenTake/releases/tag/ffmpeg-sidecars-v1)
+of this repository. It holds byte-identical copies of the pinned upstream
+files (the original archive or raw binary, unchanged, named
+`<tool>-<target>-<sha256[:16]>` plus the upstream extension, where the hash
+prefix is the pinned SHA-256 of that file) and is listed as the
+`mirror_urls` of each lock record. The upstream `url` of each record remains
+the provenance of the file and the fallback: `scripts/provision_ffmpeg_sidecars.py`
+tries the mirror first and moves to the upstream URL on a network error, an
+HTTP error or a checksum mismatch. Every source is held to the same archive and
+binary SHA-256 pins, so a mirror can never change what is packaged.
+
+The `Mirror FFmpeg sidecars` workflow
+(`.github/workflows/mirror-ffmpeg-sidecars.yml`, run manually from `main`)
+fills the release with `scripts/mirror_ffmpeg_sidecars.py`: it downloads every
+file from its upstream URL, verifies its pins (the archive and the extracted
+binary SHA-256 for a zip, the binary SHA-256 for a raw binary) and uploads the
+missing assets. The script only appends: an existing asset with the same
+SHA-256 is kept, one with different bytes fails the run, and it never deletes
+or replaces an asset. GitHub does not enforce this; anyone with write access
+to the repository can replace or delete a release asset. That is harmless
+only because every download, from the mirror or upstream, is checked against
+the pins in the lock, so a replaced asset fails verification and the
+provisioner falls back to the next source. Changing a pin changes the asset
+name, so the new `mirror_urls` must be updated with it (the unit tests and the
+mirror workflow reject a mismatch) and the workflow run again.
+
+## Builds and licences
+
 The Apple Silicon pair is the FFmpeg 7.0 arm64 build published by
 [OSXExperts](https://www.osxexperts.net/). Its reported configure line enables
 GPL components such as x264/x265 but does **not** enable FFmpeg's `nonfree`
