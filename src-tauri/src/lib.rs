@@ -214,6 +214,9 @@ pub fn run() {
                 models_dir.clone(),
                 install_admission.clone(),
             );
+            // Save As rebinds running generation jobs to the new bundle;
+            // replacing the project detaches them for recovery on reopen.
+            generation_bridge.follow_project_identity();
             let motion_bridge = Arc::new(motion::TauriMotionBridge::new(
                 core.clone(),
                 cache_root.clone(),
