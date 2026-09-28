@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime};
 
 use opentake_domain::{AudioDenoise, Clip};
 use opentake_media::analysis::{
-    denoise_stream_start, DenoiseError, DenoiseProfile, DenoiseProfileBuilder, DenoiseStream,
+    denoise_stream_start, denoise_warmup_frames, DenoiseError, DenoiseProfile,
+    DenoiseProfileBuilder, DenoiseStream,
 };
 use opentake_media::{MediaCancelToken, MediaError, PcmFormat, PcmSpec, PcmStream};
 
@@ -61,8 +62,9 @@ pub(crate) fn keep_clip_reader(kept: usize) -> bool {
 /// frame. A decode that starts at a seek point differs from a continuous one
 /// for its first few milliseconds (codec priming such as AAC's overlapped
 /// first frame, and the resampler's filter start); the pre-roll moves that
-/// difference out of the frames the reader returns. A denoised reader's
-/// warm-up is longer and covers it.
+/// difference out of the frames the reader returns. A denoised reader starts
+/// at least this far back too (its warm-up is shorter below 32 kHz), aligned
+/// down to the denoiser's hop grid.
 const DECODE_PREROLL_FRAMES: usize = 4_096;
 
 /// Timeline mix frame at the start of timeline frame `frame` (rounded, as the
@@ -226,7 +228,11 @@ impl ClipAudioReader {
             )));
         }
         let start = if denoise.is_some() {
-            denoise_stream_start(layout.rate, from).min(from.saturating_sub(preroll))
+            // The denoiser must start on its hop grid. Below 32 kHz its
+            // warm-up is shorter than the pre-roll, so reach back by the
+            // longer of the two and align down to the grid from there.
+            let extra = preroll.saturating_sub(denoise_warmup_frames(layout.rate));
+            denoise_stream_start(layout.rate, from.saturating_sub(extra))
         } else {
             from.saturating_sub(preroll)
         };
@@ -1322,6 +1328,64 @@ mod tests {
                 assert!(
                     difference(0) > 10.0 * pre_rolled,
                     "{name} from {from}: the pre-roll is what makes the difference"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn denoised_reader_opened_mid_clip_matches_at_every_mix_rate() {
+        if !ffmpeg_ready() {
+            eprintln!("skip: ffmpeg/ffprobe not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("speech.wav");
+        write_wav(&path, &noisy_tone(5.0, 310.0, 13));
+        let config = AudioDenoise {
+            mode: DenoiseMode::Voice,
+            strength: 0.7,
+            preview_enabled: true,
+        };
+        let cancel = MediaCancelToken::new();
+        // Below 32 kHz the denoiser's hop is 128 and its warm-up (2,560
+        // frames) is shorter than the reader's pre-roll; every start must
+        // still land on the hop grid.
+        for rate in [8_000_u32, 16_000, 22_050, 24_000, 48_000] {
+            let layout = ClipAudioLayout::new(&clip(0, 120), 30, rate).unwrap();
+            let profile = clip_denoise_profile(&layout, &path, 1, &cancel, None).unwrap();
+            let denoised = |from, steps: &[usize]| {
+                read_all(
+                    layout,
+                    &path,
+                    from,
+                    steps,
+                    Some((DenoiseProfile::clone(&profile), config)),
+                )
+            };
+            let reference = denoised(0, &[layout.len]);
+            for from in [
+                1,
+                777,
+                DECODE_PREROLL_FRAMES + 1,
+                5_003,
+                layout.len / 2 + 37,
+            ] {
+                assert_ne!(from % 128, 0);
+                // Opening off the hop grid used to fail here below 32 kHz.
+                let restarted = denoised(from, &[3_001]);
+                let max_difference = restarted
+                    .iter()
+                    .zip(&reference[from..])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                // Rates that divide the 48 kHz source decode exactly after a
+                // seek; 22.05 kHz restarts FFmpeg's resampler at another
+                // phase, which undenoised readers show just the same.
+                let tolerance = if 48_000 % rate == 0 { 1.0e-6 } else { 0.05 };
+                assert!(
+                    max_difference < tolerance,
+                    "{rate} Hz reader from {from} differs by {max_difference}"
                 );
             }
         }

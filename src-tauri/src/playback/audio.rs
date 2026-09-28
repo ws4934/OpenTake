@@ -3568,52 +3568,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (timeline, paths) = denoised_timeline(dir.path());
         let media = media_for(&paths);
-        let rate = 48_000_u32;
-        let total = timeline_audio_frames(&timeline, rate).unwrap();
-        assert_eq!(total, 8 * 48_000);
-        let window = rate as usize * STREAM_WINDOW_SECONDS;
-        let cancel = MediaCancelToken::new();
-        // Stream the whole timeline in two-second windows from `start`, as the
-        // audio producer does after a play or seek at that position.
-        let stream_from = |start: u64| {
-            let mut sources = PreviewAudioSources::default();
-            let mut out = Vec::new();
-            let mut position = start;
-            while position < total {
-                let len = (total - position).min(window as u64) as usize;
-                out.extend(
-                    mix_timeline_window_channels(
-                        &timeline,
-                        &media,
-                        rate,
-                        MIX_CHANNELS,
-                        position,
-                        len,
-                        &mut sources,
-                        ProfileWait::Block,
-                        &cancel,
-                    )
-                    .unwrap(),
+        // Seeks inside the plain clip (0.7 s), inside the denoised clip
+        // (2.08 s), and in the middle of an STFT hop (3.96 s), at the usual
+        // device rate and at a Bluetooth hands-free rate, where the denoiser's
+        // hop (128) and warm-up (2,560 frames) are shorter than the reader's
+        // pre-roll.
+        for (rate, starts) in [
+            (48_000_u32, [33_600_u64, 100_000, 190_003]),
+            (16_000, [11_200, 33_333, 63_335]),
+        ] {
+            let total = timeline_audio_frames(&timeline, rate).unwrap();
+            assert_eq!(total, 8 * u64::from(rate));
+            let window = rate as usize * STREAM_WINDOW_SECONDS;
+            let cancel = MediaCancelToken::new();
+            // Stream the whole timeline in two-second windows from `start`,
+            // as the audio producer does after a play or seek there.
+            let stream_from = |start: u64| {
+                let mut sources = PreviewAudioSources::default();
+                let mut out = Vec::new();
+                let mut position = start;
+                while position < total {
+                    let len = (total - position).min(window as u64) as usize;
+                    out.extend(
+                        mix_timeline_window_channels(
+                            &timeline,
+                            &media,
+                            rate,
+                            MIX_CHANNELS,
+                            position,
+                            len,
+                            &mut sources,
+                            ProfileWait::Block,
+                            &cancel,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{rate} Hz window at {position} failed: {error}")
+                        }),
+                    );
+                    position += len as u64;
+                }
+                out
+            };
+            let from_zero = stream_from(0);
+            for start in starts {
+                let seeked = stream_from(start);
+                let offset = start as usize * MIX_CHANNELS;
+                let max_difference = seeked
+                    .iter()
+                    .zip(&from_zero[offset..])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_difference < 1.0e-4,
+                    "{rate} Hz playback from {start} differs by {max_difference}"
                 );
-                position += len as u64;
             }
-            out
-        };
-        let from_zero = stream_from(0);
-        // Seeks inside the plain clip, inside the denoised clip, and in the
-        // middle of an STFT hop.
-        for start in [33_600_u64, 100_000, 190_003] {
-            let seeked = stream_from(start);
-            let offset = start as usize * MIX_CHANNELS;
-            let max_difference = seeked
-                .iter()
-                .zip(&from_zero[offset..])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f32, f32::max);
-            assert!(
-                max_difference < 1.0e-4,
-                "playback from {start} differs by {max_difference}"
-            );
         }
     }
 
