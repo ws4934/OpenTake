@@ -101,6 +101,14 @@ pub enum ExportCodec {
     Prores4444,
 }
 
+impl ExportCodec {
+    /// Whether the delivery keeps an alpha plane (composited over a
+    /// transparent canvas and encoded with straight alpha).
+    fn preserves_alpha(self) -> bool {
+        self == ExportCodec::Prores4444
+    }
+}
+
 /// Requested output short-edge resolution, projected from the front-end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -490,11 +498,25 @@ fn resolve_preset(
 }
 
 fn export_clear_rgba(codec: ExportCodec) -> [f64; 4] {
-    if codec == ExportCodec::Prores4444 {
+    if codec.preserves_alpha() {
         [0.0, 0.0, 0.0, 0.0]
     } else {
         [0.0, 0.0, 0.0, 1.0]
     }
+}
+
+/// The encoder input for one composited frame. The compositor blends and reads
+/// back premultiplied RGBA, while the encoder's `-pix_fmt rgba` input (and
+/// ProRes 4444's alpha) is straight, so an alpha-preserving delivery converts
+/// at this boundary (#21). Opaque deliveries pass the compositor bytes through
+/// untouched: their alpha is 255 everywhere, where both conventions agree.
+fn encoder_frame(codec: ExportCodec, composite: DecodedFrame) -> RgbaFrame {
+    let frame = if codec.preserves_alpha() {
+        composite.into_straight_alpha()
+    } else {
+        composite
+    };
+    RgbaFrame::new(frame.width, frame.height, frame.rgba)
 }
 
 /// Resolvable info for one media asset, projected from the manifest.
@@ -2211,11 +2233,7 @@ pub(crate) fn run_export_with_control(
             ));
         }
         encoder
-            .push_frame(&RgbaFrame::new(
-                composite.width,
-                composite.height,
-                composite.rgba,
-            ))
+            .push_frame(&encoder_frame(req.codec, composite))
             .map_err(|e| format!("encode frame {f} failed: {e}"))?;
 
         if let Some(emit) = &on_progress {
@@ -4450,6 +4468,35 @@ mod tests {
             [0.0, 0.0, 0.0, 0.0]
         );
         assert_eq!(export_clear_rgba(ExportCodec::Prores), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn prores_4444_encodes_straight_alpha_while_opaque_codecs_keep_composite_bytes() {
+        // Premultiplied compositor output: 50% white, transparent, opaque red,
+        // 25% (255, 0, 128).
+        let composite = DecodedFrame::new(
+            4,
+            1,
+            vec![
+                128, 128, 128, 128, 0, 0, 0, 0, 255, 0, 0, 255, 64, 0, 32, 64,
+            ],
+            true,
+        );
+        for codec in [ExportCodec::H264, ExportCodec::H265, ExportCodec::Prores] {
+            assert!(!codec.preserves_alpha());
+            let frame = encoder_frame(codec, composite.clone());
+            assert_eq!(
+                frame.rgba, composite.rgba,
+                "{codec:?} must receive the compositor bytes unchanged"
+            );
+            assert_eq!((frame.width, frame.height), (4, 1));
+        }
+        assert!(ExportCodec::Prores4444.preserves_alpha());
+        let straight = encoder_frame(ExportCodec::Prores4444, composite);
+        assert_eq!(
+            straight.rgba,
+            vec![255, 255, 255, 128, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 128, 64]
+        );
     }
 
     #[test]

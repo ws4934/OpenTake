@@ -870,3 +870,109 @@ fn export_prores_4444_preserves_transparent_text_alpha() {
     assert_eq!(minimum, 0, "transparent canvas should retain zero alpha");
     assert!(maximum > 0, "text glyph should contribute non-zero alpha");
 }
+
+/// First decoded frame of `path` as straight RGBA8 (FFmpeg's `rgba`).
+fn decoded_rgba_first_frame(path: &Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        .output()
+        .expect("decode the first exported frame");
+    assert!(output.status.success(), "decode {}", path.display());
+    output.stdout
+}
+
+/// ProRes 4444 carries straight alpha: a 50%-opaque pure white layer must
+/// decode as white with alpha near 128 instead of the compositor's
+/// premultiplied gray, while the uncovered canvas stays fully transparent
+/// (#21).
+#[test]
+fn export_prores_4444_delivers_straight_alpha_for_translucent_white() {
+    if !ffmpeg_ready() {
+        eprintln!("skip: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let white = dir.path().join("white.png");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:s=64x64",
+            "-frames:v",
+            "1",
+            "-y",
+        ])
+        .arg(&white)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !generated {
+        eprintln!("skip: could not generate the white image fixture");
+        return;
+    }
+
+    let frames = 3;
+    let mut timeline = Timeline::new();
+    timeline.fps = 10;
+    timeline.width = 320;
+    timeline.height = 240;
+    let mut track = Track::new("t-white", ClipType::Video);
+    let mut layer = Clip::new("clip-white", "white-image", 0, frames);
+    layer.media_type = ClipType::Image;
+    layer.source_clip_type = ClipType::Image;
+    layer.opacity = 0.5;
+    layer.transform.width = 0.5;
+    layer.transform.height = 0.5;
+    track.clips.push(layer);
+    timeline.tracks.push(track);
+    let mut manifest = build_manifest(&white, 64, 64, 10.0);
+    manifest.entries[0].id = "white-image".into();
+    manifest.entries[0].name = "white.png".into();
+    manifest.entries[0].kind = ClipType::Image;
+    manifest.entries[0].source_fps = None;
+
+    let out = dir.path().join("translucent-white.mov");
+    let req = ExportRequest {
+        out_path: out.to_string_lossy().into_owned(),
+        codec: opentake_tauri_lib::export::ExportCodec::Prores4444,
+        quality: ExportQuality::P720,
+    };
+    match run_export(&timeline, &manifest, &None, &req) {
+        Ok(summary) => assert_eq!(summary.frame_count, frames),
+        Err(error) if error.contains("no GPU device") => {
+            eprintln!("skip: {error}");
+            return;
+        }
+        Err(error) => panic!("translucent ProRes 4444 export failed: {error}"),
+    }
+
+    let (minimum, maximum) = decoded_alpha_range(&out).expect("decode alpha plane");
+    assert_eq!(minimum, 0, "the uncovered canvas stays transparent");
+    assert!(maximum > 0, "the white layer contributes alpha");
+    let rgba = decoded_rgba_first_frame(&out);
+    let translucent = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| (126..=130).contains(&pixel[3]))
+        .collect::<Vec<_>>();
+    assert!(
+        !translucent.is_empty(),
+        "the 50% white layer must decode with alpha near 128"
+    );
+    let darkest = translucent
+        .iter()
+        .map(|pixel| pixel[0].min(pixel[1]).min(pixel[2]))
+        .min()
+        .unwrap();
+    assert!(
+        darkest >= 250,
+        "straight-alpha white must stay white (darkest channel {darkest})"
+    );
+}
