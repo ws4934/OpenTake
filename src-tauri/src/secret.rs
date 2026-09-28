@@ -141,9 +141,9 @@ pub fn secret_save(
     if trimmed.is_empty() {
         return Err("API key is empty".to_string());
     }
-    KeyringStore::new()
-        .save(account, trimmed)
-        .map_err(|e| e.to_string())?;
+    let saved = KeyringStore::new().save(account, trimmed);
+    crate::generation_availability::invalidate();
+    saved.map_err(|e| e.to_string())?;
     status_for(account)
 }
 
@@ -162,9 +162,9 @@ pub fn secret_delete(
 ) -> Result<SecretStatus, String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
     let account = account_for(&provider)?;
-    KeyringStore::new()
-        .delete(account)
-        .map_err(|e| e.to_string())?;
+    let deleted = KeyringStore::new().delete(account);
+    crate::generation_availability::invalidate();
+    deleted.map_err(|e| e.to_string())?;
     status_for(account)
 }
 

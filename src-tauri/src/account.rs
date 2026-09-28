@@ -420,7 +420,9 @@ pub fn account_set_backend_url(
     url: Option<String>,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    set_backend_url(&keyring_store(), &state, url)
+    let result = set_backend_url(&keyring_store(), &state, url);
+    crate::generation_availability::invalidate();
+    result
 }
 
 #[tauri::command]
@@ -443,10 +445,12 @@ pub async fn account_login(
 
     let store = keyring_store();
     let attempt = begin_login(&store, &state)?;
-    match verify_token(&attempt.backend_url, &token).await {
+    let result = match verify_token(&attempt.backend_url, &token).await {
         Ok(info) => finish_login_success(&store, &state, attempt, &token, info),
         Err(message) => Err(finish_login_failure(&state, attempt, message)),
-    }
+    };
+    crate::generation_availability::invalidate();
+    result
 }
 
 fn logout(store: &dyn KeyStore, state: &AccountState) -> Result<(), String> {
@@ -468,7 +472,9 @@ pub fn account_logout(
     admission: State<'_, crate::updater::InstallAdmissionGate>,
 ) -> Result<(), String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    logout(&keyring_store(), &state)
+    let result = logout(&keyring_store(), &state);
+    crate::generation_availability::invalidate();
+    result
 }
 
 #[tauri::command]
