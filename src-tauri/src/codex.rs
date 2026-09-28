@@ -1782,7 +1782,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn captured_endpoint_and_cwd(capture: &str) -> (std::net::SocketAddr, PathBuf) {
+    struct CapturedEndpoint {
+        url: String,
+        token: String,
+    }
+
+    #[cfg(unix)]
+    fn captured_endpoint_and_cwd(capture: &str) -> (CapturedEndpoint, PathBuf) {
         let cwd = capture
             .lines()
             .find_map(|line| line.strip_prefix("cwd="))
@@ -1793,13 +1799,84 @@ mod tests {
             .find(|line| line.contains("mcp_servers.opentake.url="))
             .and_then(|line| line.split('"').nth(1))
             .expect("captured dynamic endpoint");
-        let addr = url
-            .strip_prefix("http://")
-            .and_then(|value| value.strip_suffix("/mcp"))
-            .expect("loopback MCP URL")
-            .parse()
-            .expect("socket address");
-        (addr, cwd)
+        assert!(
+            url.starts_with("http://127.0.0.1:") && url.ends_with("/mcp"),
+            "{url}"
+        );
+        let token = capture
+            .lines()
+            .find_map(|line| line.strip_prefix("token="))
+            .expect("captured bearer token");
+        assert_eq!(token.len(), 64);
+        (
+            CapturedEndpoint {
+                url: url.to_string(),
+                token: token.to_string(),
+            },
+            cwd,
+        )
+    }
+
+    /// Whether an MCP endpoint at `endpoint.url` accepts `endpoint.token`.
+    /// A released ephemeral port can be bound again at once by a parallel
+    /// test, so a refused connection cannot be required after cleanup;
+    /// instead nothing there may accept the turn's bearer token, which only
+    /// the turn's own endpoint ever held.
+    #[cfg(unix)]
+    async fn endpoint_accepts_token(endpoint: &CapturedEndpoint) -> bool {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "closed-endpoint-check", "version": "0" }
+            }
+        });
+        client
+            .post(&endpoint.url)
+            .bearer_auth(&endpoint.token)
+            .header("accept", "application/json, text/event-stream")
+            .json(&initialize)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+    }
+
+    #[cfg(unix)]
+    async fn assert_endpoint_closed(endpoint: &CapturedEndpoint) {
+        assert!(
+            !endpoint_accepts_token(endpoint).await,
+            "the turn's MCP endpoint still accepts its token at {}",
+            endpoint.url
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_endpoint_check_detects_a_live_endpoint() {
+        let context = turn_context(Arc::new(AtomicBool::new(false)));
+        let live = crate::mcp::spawn(context.dispatcher, context.registry, context.gate)
+            .await
+            .unwrap();
+        let endpoint = CapturedEndpoint {
+            url: live.url().to_string(),
+            token: live.bearer_token().to_string(),
+        };
+        assert!(endpoint_accepts_token(&endpoint).await);
+        let wrong_token = CapturedEndpoint {
+            url: endpoint.url.clone(),
+            token: "0".repeat(64),
+        };
+        assert!(!endpoint_accepts_token(&wrong_token).await);
+        live.close().await.unwrap();
+        assert_endpoint_closed(&endpoint).await;
     }
 
     #[test]
@@ -2549,6 +2626,7 @@ capture="$(dirname "$0")/capture"
   sleep 60 &
   descendant="$!"
   printf 'cwd=%s\n' "$PWD"
+  printf 'token=%s\n' "${OPENTAKE_CODEX_MCP_BEARER_TOKEN:-}"
   printf 'token_length=%s\n' "${#OPENTAKE_CODEX_MCP_BEARER_TOKEN}"
   printf 'descendant=%s\n' "$descendant"
   printf 'arg=%s\n' "$@"
@@ -2572,7 +2650,7 @@ printf '%s\n' 'child-waited' > "$(dirname "$0")/finished"
         assert!(root.path().join("finished").exists());
 
         let capture = std::fs::read_to_string(root.path().join("capture")).unwrap();
-        let (addr, cwd) = captured_endpoint_and_cwd(&capture);
+        let (endpoint, cwd) = captured_endpoint_and_cwd(&capture);
         let descendant = capture
             .lines()
             .find_map(|line| line.strip_prefix("descendant="))
@@ -2584,7 +2662,7 @@ printf '%s\n' 'child-waited' > "$(dirname "$0")/finished"
             "successful turn must kill descendants that retain JSONL pipes"
         );
         assert!(!cwd.exists(), "isolated cwd removed only after cleanup");
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        assert_endpoint_closed(&endpoint).await;
     }
 
     #[cfg(unix)]
@@ -2599,6 +2677,7 @@ hold="$(dirname "$0")/hold"
 mkfifo "$hold"
 {
   printf 'cwd=%s\n' "$PWD"
+  printf 'token=%s\n' "${OPENTAKE_CODEX_MCP_BEARER_TOKEN:-}"
   printf 'pid=%s\n' "$$"
   printf 'arg=%s\n' "$@"
 } > "$capture"
@@ -2631,7 +2710,7 @@ IFS= read -r ignored <&3
             .find_map(|line| line.strip_prefix("pid="))
             .expect("captured child pid")
             .to_string();
-        let (addr, cwd) = captured_endpoint_and_cwd(&capture);
+        let (endpoint, cwd) = captured_endpoint_and_cwd(&capture);
         cancel.store(true, Ordering::Release);
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -2639,7 +2718,7 @@ IFS= read -r ignored <&3
             .expect("runner task joined");
         assert_eq!(result.unwrap_err(), CodexTurnError::Cancelled);
         assert!(!cwd.exists());
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        assert_endpoint_closed(&endpoint).await;
         assert!(
             !Command::new("kill")
                 .args(["-0", &pid])
@@ -2707,6 +2786,7 @@ sleep 60
 capture="$(dirname "$0")/capture"
 {
   printf 'cwd=%s\n' "$PWD"
+  printf 'token=%s\n' "${OPENTAKE_CODEX_MCP_BEARER_TOKEN:-}"
   printf 'arg=%s\n' "$@"
   IFS= read -r prompt || true
 } > "$capture"
@@ -2727,9 +2807,9 @@ exit 2
         );
 
         let capture = std::fs::read_to_string(root.path().join("capture")).unwrap();
-        let (addr, cwd) = captured_endpoint_and_cwd(&capture);
+        let (endpoint, cwd) = captured_endpoint_and_cwd(&capture);
         assert!(!cwd.exists());
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        assert_endpoint_closed(&endpoint).await;
         assert!(!format!("{result:?}").contains("private/path/token"));
     }
 }
