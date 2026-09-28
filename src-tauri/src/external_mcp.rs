@@ -2843,6 +2843,16 @@ mod tests {
         state.set_enabled(true).await.expect("enable endpoint");
         let receipt = state.pair("Cursor").await.expect("pair client");
         let writes_before = state.catalog_publish_count_for_test();
+        let (flushed_tx, mut flushed_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_status_sink(Arc::new(move |status: ExternalMcpStatus| {
+            if status
+                .clients
+                .first()
+                .is_some_and(|client| client.last_used_at.is_some())
+            {
+                let _ = flushed_tx.send(());
+            }
+        }));
         let client = reqwest::Client::new();
 
         for name in ["first", "second", "third"] {
@@ -2855,6 +2865,12 @@ mod tests {
             .await;
         }
 
+        // The last-use worker writes the catalog in the background and then
+        // publishes a status that carries the persisted timestamp.
+        tokio::time::timeout(Duration::from_secs(30), flushed_rx.recv())
+            .await
+            .expect("last-use worker persisted the first use")
+            .expect("status sink stays installed");
         assert!(state.status().await.clients[0].last_used_at.is_some());
         assert_eq!(state.catalog_publish_count_for_test(), writes_before + 1);
         let reloaded = load_catalog(&root, secrets);
