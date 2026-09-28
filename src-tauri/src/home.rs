@@ -546,14 +546,14 @@ fn probe_project_entries_with(
         .collect::<Vec<_>>()
 }
 
+/// Grant exactly the requested cover and the path its retained handle resolves
+/// to. The two differ when an ancestor directory is a symlink, junction or
+/// `subst` drive; the cover itself is opened no-follow through its bundle.
 fn authorize_home_thumbnail(scope: &tauri::scope::fs::Scope, thumbnail: &Path) -> bool {
-    let Ok(final_path) = crate::safe_asset_protocol::validate_resident_regular_file(thumbnail)
+    let Ok(final_path) = crate::safe_asset_protocol::validate_resident_home_thumbnail(thumbnail)
     else {
         return false;
     };
-    if !same_path(thumbnail, &final_path) {
-        return false;
-    }
     scope.allow_file(thumbnail).is_ok() && scope.allow_file(final_path).is_ok()
 }
 
@@ -1749,6 +1749,47 @@ mod tests {
             &scope,
             &project_data
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_thumbnail_behind_a_symlinked_ancestor_is_authorized_exactly() {
+        use crate::safe_asset_protocol::scope_allows_lexical_path;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let real_project = real.join("Linked.opentake");
+        fs::create_dir_all(&real_project).unwrap();
+        let link = directory.path().join("link");
+        symlink(&real, &link).unwrap();
+        let project = link.join("Linked.opentake");
+        let thumbnail = project.join("thumbnail.jpg");
+        write_test_jpeg(&thumbnail, [10, 20, 30]);
+        fs::write(project.join("project.json"), b"{}").unwrap();
+        let alias = directory.path().join("Alias.opentake");
+        symlink(&real_project, &alias).unwrap();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+
+        assert!(authorize_home_thumbnail(&scope, &thumbnail));
+        assert!(scope_allows_lexical_path(&scope, &thumbnail));
+        assert!(scope_allows_lexical_path(
+            &scope,
+            &real_project.join("thumbnail.jpg")
+        ));
+        assert!(!scope_allows_lexical_path(
+            &scope,
+            &project.join("project.json")
+        ));
+        assert!(!scope_allows_lexical_path(
+            &scope,
+            &real_project.join("project.json")
+        ));
+        assert!(
+            !authorize_home_thumbnail(&scope, &alias.join("thumbnail.jpg")),
+            "a symlinked bundle is not a Home cover"
+        );
     }
 
     #[test]
