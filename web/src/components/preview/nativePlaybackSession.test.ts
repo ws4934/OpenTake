@@ -131,6 +131,85 @@ describe("native playback identity", () => {
     expect(controller.acceptError(failure)).toBe(false);
   });
 
+  it("delivers an error raised while a paused session is resuming once the resume commits", async () => {
+    let finishStart!: () => void;
+    let blockStart = false;
+    const api = {
+      playbackStart: vi.fn(async () => {
+        if (!blockStart) return;
+        await new Promise<void>((resolve) => {
+          finishStart = resolve;
+        });
+      }),
+      playbackPause: vi.fn(async () => {}),
+      playbackSeek: vi.fn(async () => {}),
+      playbackStop: vi.fn(async () => {}),
+    };
+    const controller = createNativePlaybackController(api, () => "resume-error");
+    const identity = await controller.start(revision(1, 4), 0);
+    await controller.pause(identity, 20);
+
+    blockStart = true;
+    const deferred: unknown[] = [];
+    const resuming = controller.start(revision(1, 4), 20, {
+      onDeferredError: (event) => deferred.push(event),
+    });
+    await Promise.resolve();
+    const failure = {
+      ...identity,
+      frame: 20,
+      code: "videoDecode" as const,
+      message: "clip-1 decode failed",
+      fatal: true,
+    };
+    // The backend fails the first frame before `playback_start` returns.
+    expect(controller.acceptError(failure)).toBe(false);
+    expect(controller.acceptError({ ...failure, sessionId: "other" })).toBe(false);
+    expect(deferred).toEqual([]);
+
+    finishStart();
+    await resuming;
+    expect(deferred).toEqual([failure]);
+    expect(controller.acceptError(failure)).toBe(true);
+  });
+
+  it("drops errors held for a resume that a pause superseded", async () => {
+    let finishStart!: () => void;
+    let blockStart = false;
+    const api = {
+      playbackStart: vi.fn(async () => {
+        if (!blockStart) return;
+        await new Promise<void>((resolve) => {
+          finishStart = resolve;
+        });
+      }),
+      playbackPause: vi.fn(async () => {}),
+      playbackSeek: vi.fn(async () => {}),
+      playbackStop: vi.fn(async () => {}),
+    };
+    const controller = createNativePlaybackController(api, () => "resume-paused");
+    const identity = await controller.start(revision(1, 4), 0);
+    await controller.pause(identity, 20);
+
+    blockStart = true;
+    const deferred: unknown[] = [];
+    const resuming = controller.start(revision(1, 4), 20, {
+      onDeferredError: (event) => deferred.push(event),
+    });
+    await Promise.resolve();
+    controller.acceptError({
+      ...identity,
+      frame: 20,
+      code: "videoDecode",
+      message: "clip-1 decode failed",
+      fatal: true,
+    });
+    await controller.pause(identity, 20);
+    finishStart();
+    await expect(resuming).rejects.toMatchObject({ code: "superseded" });
+    expect(deferred).toEqual([]);
+  });
+
   it("does not let a late pause completion re-freeze a resumed session", async () => {
     let finishPause!: () => void;
     const api = {

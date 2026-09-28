@@ -153,9 +153,9 @@ impl FrameQuery {
 #[derive(Default)]
 struct GateState {
     open: bool,
-    /// Bumped by every close. Work captured while the gate was open under an
-    /// older epoch (a frame queued before a pause) can never publish after a
-    /// later reopen.
+    /// Bumped by every close and every invalidation. Work captured under an
+    /// older epoch (a frame queued before a pause or a seek) can never publish
+    /// after a later reopen.
     epoch: u64,
 }
 
@@ -183,6 +183,14 @@ impl PublicationGate {
 
     pub fn reopen(&self) {
         self.lock().open = true;
+    }
+
+    /// Retire every frame captured so far without closing publication: the
+    /// playhead moved, so queued and in-flight frames are stale while the
+    /// frames rendered after this call publish normally.
+    pub fn invalidate(&self) {
+        let mut state = self.lock();
+        state.epoch = state.epoch.wrapping_add(1);
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -606,6 +614,13 @@ impl FrameSink for MjpegSink {
     fn push_terminal(&self, frame: i32) {
         self.enqueue(EncodeJob::Terminal { frame });
     }
+
+    fn invalidate(&self) {
+        // Called on the render thread, so it is ordered before that thread's
+        // next push: the frame in the mailbox and the one being encoded fail
+        // their epoch check at commit, the next pushed frame passes.
+        self.publisher.publication.gate.invalidate();
+    }
 }
 
 /// Playhead frame number broadcast to the front end, so it can move the
@@ -681,25 +696,42 @@ impl PlaybackErrorEvent {
     }
 }
 
-/// A [`PlaybackErrorSink`] that emits a Tauri `playback_error` event.
+/// A [`PlaybackErrorSink`] that emits a Tauri `playback_error` event while
+/// the session's publication gate is open. A paused, stopped or replaced
+/// session reports nothing: its failures (for example a decode cancelled by
+/// the teardown itself) are not the running transport's to show.
 pub struct TauriPlaybackErrorEmitter {
     app: AppHandle,
     identity: PlaybackIdentity,
+    gate: PublicationGate,
 }
 
 impl TauriPlaybackErrorEmitter {
-    pub fn new(app: AppHandle, identity: PlaybackIdentity) -> Self {
-        Self { app, identity }
+    pub fn new(app: AppHandle, identity: PlaybackIdentity, gate: PublicationGate) -> Self {
+        Self {
+            app,
+            identity,
+            gate,
+        }
     }
 }
 
 impl PlaybackErrorSink for TauriPlaybackErrorEmitter {
     fn report(&self, failure: PlaybackFailure) {
-        let _ = self.app.emit(
-            "playback_error",
-            PlaybackErrorEvent::new(&self.identity, failure),
-        );
+        if let Some(event) = gated_error_event(&self.gate, &self.identity, failure) {
+            let _ = self.app.emit("playback_error", event);
+        }
     }
+}
+
+/// The event for `failure`, or `None` once the session's gate is closed.
+fn gated_error_event(
+    gate: &PublicationGate,
+    identity: &PlaybackIdentity,
+    failure: PlaybackFailure,
+) -> Option<PlaybackErrorEvent> {
+    gate.is_open()
+        .then(|| PlaybackErrorEvent::new(identity, failure))
 }
 
 #[cfg(test)]
@@ -1050,6 +1082,60 @@ mod tests {
             seen.push(publication.frame());
         }
         assert_eq!(seen, vec![30], "pre-pause frames must not publish");
+    }
+
+    #[test]
+    fn frames_queued_before_a_seek_never_publish_after_it() {
+        let latest = LatestFrameStore::default();
+        let (on_publish, published) = recording_publisher();
+        let gate = PublicationGate::open();
+        let sink = test_sink(
+            &latest,
+            identity(2, 3, "seek-epoch"),
+            gate.clone(),
+            1_000,
+            on_publish,
+            slow_encode,
+        );
+        // Frame 100 occupies the encoder; frame 101 waits in the mailbox.
+        sink.push_frame(100, solid(4, 4));
+        std::thread::sleep(Duration::from_millis(20));
+        sink.push_frame(101, solid(4, 4));
+        // The render thread consumes a seek to 500 while playing.
+        sink.invalidate();
+        assert!(gate.is_open(), "a seek keeps publication open");
+        sink.push_frame(500, solid(4, 4));
+        sink.push_frame(501, solid(4, 4));
+
+        let mut seen = Vec::new();
+        while let Ok(publication) = published.recv_timeout(Duration::from_millis(600)) {
+            seen.push(publication.frame());
+        }
+        assert!(
+            seen.iter().all(|frame| *frame >= 500),
+            "pre-seek frames must not publish after the seek: {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&501));
+    }
+
+    #[test]
+    fn playback_errors_are_dropped_once_the_session_gate_closes() {
+        let gate = PublicationGate::open();
+        let session = identity(4, 9, "error-gate");
+        let failure = PlaybackFailure {
+            frame: 12,
+            code: PlaybackFailureCode::VideoDecode,
+            message: "clip-1 cancelled".to_string(),
+            fatal: true,
+        };
+        assert!(gated_error_event(&gate, &session, failure.clone()).is_some());
+        gate.close();
+        assert!(
+            gated_error_event(&gate, &session, failure.clone()).is_none(),
+            "a paused or torn-down session reports nothing"
+        );
+        gate.reopen();
+        assert!(gated_error_event(&gate, &session, failure).is_some());
     }
 
     #[test]

@@ -1036,6 +1036,7 @@ pub async fn playback_start(
         let errors: Arc<dyn PlaybackErrorSink> = Arc::new(TauriPlaybackErrorEmitter::new(
             app.clone(),
             identity.clone(),
+            publication.clone(),
         ));
         (
             timeline,

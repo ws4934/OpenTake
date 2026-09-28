@@ -52,10 +52,16 @@ const STREAM_SEND_POLL: Duration = Duration::from_millis(5);
 const CALLBACK_START_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const AUDIO_CLOCK_STALL_TIMEOUT: Duration = Duration::from_millis(150);
+/// How far (in video frames) recovered audio may trail the wall-clock
+/// fallback and still take over as is. Video holds for at most this many
+/// frames instead of discarding decoded audio, and a device whose callback
+/// period is close to the stall timeout cannot loop stall → re-align → seek.
+const REALIGN_TOLERANCE_FRAMES: i32 = 2;
 const CALLBACKS_REQUIRED_FOR_LIVENESS: u64 = 2;
 pub(super) const AUDIO_PREPARE_BUSY: &str = "audio_prepare_busy";
 
-type AudioRateReply = SyncSender<Option<u32>>;
+/// One CPAL device query, run on the `opentake-audio-device` thread.
+type DeviceJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Serializes CPAL device discovery on one process-lifetime thread.
 ///
@@ -66,8 +72,12 @@ type AudioRateReply = SyncSender<Option<u32>>;
 /// cached COM object with no live originating apartment and the next query can
 /// terminate the process with `STATUS_ACCESS_VIOLATION`. Keeping discovery on a
 /// dedicated thread both preserves that COM lifetime and prevents concurrent
-/// default-device queries from racing.
-static AUDIO_RATE_PROBE: OnceLock<Option<SyncSender<AudioRateReply>>> = OnceLock::new();
+/// default-device queries from racing. The default rate probe and the
+/// default-device check on resume both run there. Opening a stream cannot:
+/// `cpal::Stream` is `!Send`, so it is built on (and never leaves) the
+/// session's own `opentake-audio` thread, as it was before device checks
+/// existed.
+static AUDIO_DEVICE_THREAD: OnceLock<Option<SyncSender<DeviceJob>>> = OnceLock::new();
 
 struct AudioPrepareJob<T> {
     build: Box<dyn FnOnce() -> T + Send + 'static>,
@@ -223,10 +233,17 @@ struct AudioStreamControl {
     stopped: AtomicBool,
     underruns: AtomicU64,
     active_decode: Mutex<Option<MediaCancelToken>>,
-    /// The first window failure of the current generation, awaiting report.
+    /// The first window failure since the last explicit seek, awaiting report.
     pending_error: Mutex<Option<String>>,
-    /// Generation whose failure was already recorded (reported once per seek).
-    reported_generation: AtomicU64,
+    /// Counts explicit (transport) seeks. A clock re-alignment also restarts
+    /// the producer but is not a user action, so a clip that is known to be
+    /// broken is not reported again for it.
+    seek_epoch: AtomicU64,
+    /// Seek epoch whose failure was already recorded (reported once per seek).
+    reported_epoch: AtomicU64,
+    /// `(generation, end)`: the producer has queued every window of that
+    /// generation up to output frame `end`.
+    buffered: Mutex<(u64, u64)>,
 }
 
 impl AudioStreamControl {
@@ -238,14 +255,18 @@ impl AudioStreamControl {
             underruns: AtomicU64::new(0),
             active_decode: Mutex::new(None),
             pending_error: Mutex::new(None),
-            reported_generation: AtomicU64::new(u64::MAX),
+            seek_epoch: AtomicU64::new(0),
+            reported_epoch: AtomicU64::new(u64::MAX),
+            buffered: Mutex::new((0, start_frame)),
         }
     }
 
-    /// Record a window failure. Only the first failure of each generation is
-    /// kept, so a broken clip is reported once rather than every window.
-    fn record_error(&self, generation: u64, message: String) {
-        if self.reported_generation.swap(generation, Ordering::AcqRel) == generation {
+    /// Record a window failure. Only the first failure after each explicit
+    /// seek is kept, so a broken clip is reported once rather than every
+    /// window or every clock re-alignment.
+    fn record_error(&self, message: String) {
+        let epoch = self.seek_epoch.load(Ordering::Acquire);
+        if self.reported_epoch.swap(epoch, Ordering::AcqRel) == epoch {
             return;
         }
         *self
@@ -261,9 +282,46 @@ impl AudioStreamControl {
             .take()
     }
 
+    /// A transport seek: restart the producer at `start_frame` and forget a
+    /// failure reported for the previous position.
     fn request_seek(&self, start_frame: u64) {
+        self.seek_epoch.fetch_add(1, Ordering::AcqRel);
+        self.pending_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.restart_at(start_frame);
+    }
+
+    /// Whether output frame `frame` of the current generation is already
+    /// queued, so the consumer reaches it by skipping forward.
+    fn is_buffered(&self, frame: u64) -> bool {
+        let generation = self.generation.load(Ordering::Acquire);
+        let (buffered_generation, end) = *self
+            .buffered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buffered_generation == generation && frame < end
+    }
+
+    fn mark_buffered(&self, generation: u64, end: u64) {
+        let mut buffered = self
+            .buffered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.generation.load(Ordering::Acquire) == generation {
+            *buffered = (generation, end);
+        }
+    }
+
+    /// Restart the producer at `start_frame` under a new generation.
+    fn restart_at(&self, start_frame: u64) {
         self.requested_start.store(start_frame, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *self
+            .buffered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (generation, start_frame);
         if let Some(cancel) = self
             .active_decode
             .lock()
@@ -338,21 +396,27 @@ impl AudioStreamConsumer {
 
     fn ready_at(&mut self, frame: u64) -> bool {
         let generation = self.control.generation.load(Ordering::Acquire);
-        if self.current.as_ref().is_none_or(|chunk| {
-            let frames = chunk.samples.len() / MIX_CHANNELS;
-            chunk.generation != generation
-                || frame < chunk.start_frame
-                || frame >= chunk.start_frame.saturating_add(frames as u64)
-        }) {
-            self.current = None;
-            self.discard_stale();
-        }
-        self.current.as_ref().is_some_and(|chunk| {
+        let covers = |chunk: &AudioStreamChunk| {
             let frames = chunk.samples.len() / MIX_CHANNELS;
             chunk.generation == generation
                 && frame >= chunk.start_frame
                 && frame < chunk.start_frame.saturating_add(frames as u64)
-        })
+        };
+        // Skip every queued window that ends at or before `frame` (the clock
+        // re-aligned forward within the buffer). Bounded by the channel
+        // capacity and never blocks.
+        loop {
+            if self.current.as_ref().is_some_and(covers) {
+                return true;
+            }
+            self.current = None;
+            self.discard_stale();
+            match self.current.as_ref() {
+                Some(chunk) if !covers(chunk) && frame < chunk.start_frame => return false,
+                Some(_) => {}
+                None => return false,
+            }
+        }
     }
 
     fn sample_frame(&mut self, frame: u64) -> (f32, f32) {
@@ -388,6 +452,8 @@ pub struct AudioClock {
     stream: Option<Arc<AudioStreamControl>>,
     progress: Mutex<AudioClockProgress>,
     now: ClockNow,
+    /// The output muted by [`PlaybackClock::halt`].
+    mute: Option<OutputMute>,
 }
 
 struct AudioClockProgress {
@@ -434,7 +500,14 @@ impl AudioClock {
                 last_frame: initial_frame,
             }),
             now,
+            mute: None,
         }
+    }
+
+    /// Let [`PlaybackClock::halt`] mute the output that drives this clock.
+    fn muting(mut self, mute: OutputMute) -> Self {
+        self.mute = Some(mute);
+        self
     }
 }
 
@@ -481,15 +554,21 @@ impl PlaybackClock for AudioClock {
                 let target_frame = wall_frame(origin, base_frame).max(progress.last_frame);
                 progress.observed_underruns = underruns;
                 progress.observed_at = now;
-                if audio_frame >= target_frame {
+                if audio_frame.saturating_add(REALIGN_TOLERANCE_FRAMES) >= target_frame {
+                    // Close enough: audio takes over and video holds (never
+                    // rewinds) until it catches up.
                     progress.observed_pos = pos;
-                    progress.last_frame = audio_frame;
-                    return audio_frame;
+                    progress.last_frame = progress.last_frame.max(audio_frame);
+                    return progress.last_frame;
                 }
                 let target_pos = frame_audio_position(target_frame, self.rate, fps);
                 self.pos.store(target_pos, Ordering::Release);
                 if let Some(stream) = &self.stream {
-                    stream.request_seek(target_pos);
+                    // Windows already queued up to the target are skipped by
+                    // the consumer; only restart decoding past the buffer.
+                    if !stream.is_buffered(target_pos) {
+                        stream.restart_at(target_pos);
+                    }
                 }
                 progress.observed_pos = target_pos;
                 progress.last_frame = target_frame;
@@ -554,6 +633,29 @@ impl PlaybackClock for AudioClock {
             .as_ref()
             .and_then(|control| control.take_error())
     }
+
+    fn halt(&self) {
+        if let Some(mute) = &self.mute {
+            mute.halt();
+        }
+    }
+}
+
+/// The logical mute of one output, as the render loop's clock sees it.
+#[derive(Clone)]
+struct OutputMute {
+    paused: Arc<AtomicBool>,
+    /// Set when the render loop paused itself on a fatal failure; keeps a
+    /// resume that is committing concurrently from unmuting. Cleared by the
+    /// next `prepare_resume`, which precedes the render thread's resume.
+    halted: Arc<AtomicBool>,
+}
+
+impl OutputMute {
+    fn halt(&self) {
+        self.halted.store(true, Ordering::Release);
+        self.paused.store(true, Ordering::Release);
+    }
 }
 
 /// A cloneable transport endpoint of one audio output thread. `pause` and
@@ -563,9 +665,18 @@ impl PlaybackClock for AudioClock {
 pub struct AudioControl {
     control_tx: Sender<AudioCmd>,
     paused: Arc<AtomicBool>,
+    halted: Arc<AtomicBool>,
 }
 
 impl AudioControl {
+    fn new(control_tx: Sender<AudioCmd>, paused: Arc<AtomicBool>) -> Self {
+        Self {
+            control_tx,
+            paused,
+            halted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Mute output immediately. The hardware stream keeps running silently so
     /// a later resume can prove callback liveness without trusting an
     /// asynchronous backend play/pause acknowledgement.
@@ -583,6 +694,7 @@ impl AudioControl {
     /// clock before committing audible output.
     pub fn prepare_resume(&self) -> Result<(), String> {
         self.paused.store(true, Ordering::Release);
+        self.halted.store(false, Ordering::Release);
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control_tx
             .send(AudioCmd::Resume(reply_tx))
@@ -594,9 +706,19 @@ impl AudioControl {
 
     /// Commit a successfully prepared resume after the render clock has been
     /// positioned. The already-running callback begins consuming at `pos` on
-    /// its next block.
+    /// its next block. Stays muted when the render thread failed (and halted
+    /// the output) after `prepare_resume`.
     pub fn commit_resume(&self) {
-        self.paused.store(false, Ordering::Release);
+        if !self.halted.load(Ordering::Acquire) {
+            self.paused.store(false, Ordering::Release);
+        }
+    }
+
+    fn output_mute(&self) -> OutputMute {
+        OutputMute {
+            paused: Arc::clone(&self.paused),
+            halted: Arc::clone(&self.halted),
+        }
     }
 
     pub fn mute(&self) {
@@ -655,7 +777,7 @@ impl OutputBackend for CpalBackend {
     type Stream = cpal::Stream;
 
     fn default_device_id(&self) -> Option<String> {
-        cpal::default_host().default_output_device()?.name().ok()
+        on_audio_device_thread(query_default_output_device_name)
     }
 
     fn open(&self, shared: &OutputShared) -> Result<(cpal::Stream, Option<String>), String> {
@@ -682,7 +804,7 @@ impl AudioPlayback {
             &paused,
         )?;
         Ok(AudioPlayback {
-            control: AudioControl { control_tx, paused },
+            control: AudioControl::new(control_tx, paused),
             handle: Some(handle),
             stream_control: None,
             stream_producer: None,
@@ -705,7 +827,7 @@ impl AudioPlayback {
             &paused,
         ) {
             Ok((control_tx, handle)) => Ok(Self {
-                control: AudioControl { control_tx, paused },
+                control: AudioControl::new(control_tx, paused),
                 handle: Some(handle),
                 stream_control: Some(stream_control),
                 stream_producer: Some(stream_producer),
@@ -790,10 +912,7 @@ impl AudioPlayback {
         handle: JoinHandle<()>,
     ) -> Self {
         Self {
-            control: AudioControl {
-                control_tx,
-                paused: Arc::clone(paused),
-            },
+            control: AudioControl::new(control_tx, Arc::clone(paused)),
             handle: Some(handle),
             stream_control: None,
             stream_producer: None,
@@ -1039,6 +1158,12 @@ fn build_and_play(shared: &OutputShared) -> Result<(cpal::Stream, Option<String>
 /// The device's default output config, or — when the device (for example one
 /// the user just switched to) defaults to another rate — a supported config at
 /// the rate the session's audio was mixed at.
+///
+/// On macOS, CPAL 0.15 opens a stream at a non-default rate by setting the
+/// device's nominal sample rate (`kAudioDevicePropertyNominalSampleRate`),
+/// which applies system-wide until something changes it back. Other apps on
+/// that device then run at the session's rate; restarting playback after the
+/// switch mixes at the device's new default and needs no change.
 fn output_config_at_rate(
     device: &cpal::Device,
     rate: u32,
@@ -1247,29 +1372,53 @@ fn claim_ready_audio_block(
 
 /// Query the default output device's sample rate (Hz), or `None` if unavailable.
 fn default_output_rate() -> Option<u32> {
-    let probe = AUDIO_RATE_PROBE
+    on_audio_device_thread(query_default_output_rate)
+}
+
+/// Run `query` on the process-lifetime device thread and wait for its result.
+/// A panicking query yields `None` and leaves the thread serving later ones.
+fn on_audio_device_thread<T: Send + 'static>(
+    query: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let worker = AUDIO_DEVICE_THREAD
         .get_or_init(|| {
-            let (request_tx, request_rx) = mpsc::sync_channel::<AudioRateReply>(1);
+            let (job_tx, job_rx) = mpsc::sync_channel::<DeviceJob>(1);
             thread::Builder::new()
                 .name("opentake-audio-device".to_string())
-                .spawn(move || run_audio_rate_probe(request_rx, query_default_output_rate))
+                .spawn(move || run_device_jobs(job_rx))
                 .ok()
-                .map(|_| request_tx)
+                .map(|_| job_tx)
         })
         .as_ref()?;
+    submit_device_query(worker, query)
+}
+
+fn submit_device_query<T: Send + 'static>(
+    worker: &SyncSender<DeviceJob>,
+    query: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    probe.send(reply_tx).ok()?;
+    worker
+        .send(Box::new(move || {
+            let result = catch_unwind(AssertUnwindSafe(query)).unwrap_or(None);
+            let _ = reply_tx.send(result);
+        }))
+        .ok()?;
     reply_rx.recv().ok().flatten()
 }
 
-fn run_audio_rate_probe(
-    request_rx: Receiver<AudioRateReply>,
-    mut query: impl FnMut() -> Option<u32>,
-) {
-    while let Ok(reply) = request_rx.recv() {
-        let rate = catch_unwind(AssertUnwindSafe(&mut query)).unwrap_or(None);
-        let _ = reply.send(rate);
+fn run_device_jobs(job_rx: Receiver<DeviceJob>) {
+    while let Ok(job) = job_rx.recv() {
+        job();
     }
+}
+
+/// Name of the current default output device. CPAL 0.15 exposes no stable
+/// device id, so two identical devices (two headsets of one model) share a
+/// name and a switch between them is not detected until the stream reports
+/// an error.
+fn query_default_output_device_name() -> Option<String> {
+    cpal::default_host().default_output_device()?.name().ok()
 }
 
 fn query_default_output_rate() -> Option<u32> {
@@ -1724,13 +1873,10 @@ fn run_audio_producer(
             Ok(samples) => samples,
             Err(MediaError::Cancelled) => continue,
             Err(error) => {
-                control.record_error(
-                    generation,
-                    format!(
-                        "audio at {:.1} s could not be decoded and plays as silence: {error}",
-                        next_frame as f64 / rate.max(1) as f64
-                    ),
-                );
+                control.record_error(format!(
+                    "audio at {:.1} s could not be decoded and plays as silence: {error}",
+                    next_frame as f64 / rate.max(1) as f64
+                ));
                 vec![0.0; len * MIX_CHANNELS]
             }
         };
@@ -1745,6 +1891,7 @@ fn run_audio_producer(
             generation,
         ) {
             next_frame = next_frame.saturating_add(len as u64);
+            control.mark_buffered(generation, next_frame);
         }
     }
 }
@@ -1794,6 +1941,7 @@ fn mix_timeline_stereo(
         }))
         .map_err(|_| MediaError::Decode("audio stream queue closed during prefill".to_string()))?;
     let control = Arc::new(AudioStreamControl::new(start_frame));
+    control.mark_buffered(0, start_frame.saturating_add(first_len as u64));
     let producer_control = Arc::clone(&control);
     let producer_timeline = timeline.clone();
     let producer_media = media.clone();
@@ -1910,7 +2058,10 @@ fn build_clock_with_state(
         pos,
         paused,
     ) {
-        Ok(audio) => Ok((Arc::new(clock), Some(audio))),
+        Ok(audio) => {
+            let clock = clock.muting(audio.control.output_mute());
+            Ok((Arc::new(clock), Some(audio)))
+        }
         Err(error) => {
             eprintln!("[audio] {error}; falling back to wall clock");
             Ok((Arc::new(InstantClock::new(start_frame)), None))
@@ -1936,7 +2087,10 @@ where
     clock.seek(start_frame); // begin playback at the current playhead
 
     match start(buffer, pos, paused) {
-        Ok(audio) => (Arc::new(clock), Some(audio)),
+        Ok(audio) => {
+            let clock = clock.muting(audio.control.output_mute());
+            (Arc::new(clock), Some(audio))
+        }
         Err(e) => {
             eprintln!("[audio] {e}; falling back to wall clock");
             (Arc::new(InstantClock::new(start_frame)), None)
@@ -2371,29 +2525,24 @@ mod tests {
     }
 
     #[test]
-    fn audio_rate_probe_survives_a_query_panic() {
-        let (request_tx, request_rx) = mpsc::sync_channel::<AudioRateReply>(1);
-        let mut attempts = 0;
-        let worker = std::thread::spawn(move || {
-            run_audio_rate_probe(request_rx, move || {
-                attempts += 1;
-                if attempts == 1 {
-                    panic!("simulated CPAL query panic");
-                }
-                Some(44_100)
-            });
-        });
+    fn audio_device_thread_survives_a_query_panic() {
+        let (job_tx, job_rx) = mpsc::sync_channel::<DeviceJob>(1);
+        let worker = std::thread::spawn(move || run_device_jobs(job_rx));
 
-        let request = |sender: &SyncSender<AudioRateReply>| {
-            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-            sender.send(reply_tx).expect("submit rate query");
-            reply_rx.recv().expect("receive rate query result")
-        };
-        assert_eq!(request(&request_tx), None);
-        assert_eq!(request(&request_tx), Some(44_100));
+        assert_eq!(
+            submit_device_query(&job_tx, || -> Option<u32> {
+                panic!("simulated CPAL query panic")
+            }),
+            None
+        );
+        assert_eq!(submit_device_query(&job_tx, || Some(44_100)), Some(44_100));
+        assert_eq!(
+            submit_device_query(&job_tx, || Some("speakers".to_string())),
+            Some("speakers".to_string())
+        );
 
-        drop(request_tx);
-        worker.join().expect("join audio rate probe");
+        drop(job_tx);
+        worker.join().expect("join audio device thread");
     }
 
     #[test]
@@ -2659,6 +2808,139 @@ mod tests {
         assert!(
             frames.windows(2).all(|pair| pair[0] <= pair[1]),
             "the playhead never moves backwards: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_render_failure_during_a_resume_handshake_keeps_audio_muted() {
+        let (audio, paused, _stopped) = AudioPlayback::test_stub();
+        let clock = AudioClock::new(Arc::new(AtomicU64::new(0)), 48_000, 30, None)
+            .muting(audio.control().output_mute());
+
+        audio.prepare_resume().expect("prepare");
+        // The render thread, already resumed, fails before the commit.
+        clock.halt();
+        audio.commit_resume();
+        assert!(
+            paused.load(Ordering::Acquire),
+            "a failed render keeps sound off"
+        );
+
+        // The next resume is a retry and unmutes normally.
+        audio.prepare_resume().expect("prepare again");
+        audio.commit_resume();
+        assert!(!paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_large_callback_block_after_a_stall_takes_over_without_a_seek() {
+        // A device with a ~160 ms callback period: the clock falls back to
+        // wall time between blocks, and each block catches audio up in one go.
+        let time = TestTime::new();
+        let pos = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(AudioStreamControl::new(0));
+        let clock = AudioClock::with_time_source(
+            Arc::clone(&pos),
+            48_000,
+            30,
+            Some(Arc::clone(&control)),
+            time.source(),
+        );
+        let mut frames = Vec::new();
+        play_linear(&clock, &time, &pos, 48_000, 1_000, &mut frames);
+        for _ in 0..5 {
+            stall(&clock, &time, 160, &mut frames);
+            pos.fetch_add(48_000 * 160 / 1_000, Ordering::AcqRel);
+            frames.push(clock.frame(30));
+        }
+        assert_eq!(
+            control.generation.load(Ordering::Acquire),
+            0,
+            "audio within the tolerance must not be re-seeked: {frames:?}"
+        );
+        assert!(
+            frames.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{frames:?}"
+        );
+        let audio_frame = audio_position_frame(pos.load(Ordering::Acquire), 48_000, 30);
+        assert!(
+            (*frames.last().unwrap() - audio_frame).abs() <= REALIGN_TOLERANCE_FRAMES,
+            "{frames:?} vs audio {audio_frame}"
+        );
+    }
+
+    #[test]
+    fn realignment_within_the_queued_audio_skips_forward_without_restarting() {
+        let time = TestTime::new();
+        let pos = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(AudioStreamControl::new(0));
+        // Eight seconds are already queued for generation 0.
+        control.mark_buffered(0, 8 * 48_000);
+        let clock = AudioClock::with_time_source(
+            Arc::clone(&pos),
+            48_000,
+            30,
+            Some(Arc::clone(&control)),
+            time.source(),
+        );
+        let mut frames = Vec::new();
+        play_linear(&clock, &time, &pos, 48_000, 1_000, &mut frames);
+        stall(&clock, &time, 300, &mut frames);
+        play_linear(&clock, &time, &pos, 48_000, 10, &mut frames);
+
+        let audio_frame = audio_position_frame(pos.load(Ordering::Acquire), 48_000, 30);
+        assert!((*frames.last().unwrap() - audio_frame).abs() <= 1);
+        assert_eq!(
+            control.generation.load(Ordering::Acquire),
+            0,
+            "the queued windows are kept; the consumer skips to the new position"
+        );
+    }
+
+    #[test]
+    fn consumer_skips_queued_windows_before_a_forward_position() {
+        let control = Arc::new(AudioStreamControl::new(0));
+        let (sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        for window in 0..3_u64 {
+            sender
+                .send(Ok(AudioStreamChunk {
+                    generation: 0,
+                    start_frame: window * 100,
+                    samples: vec![window as f32; 100 * MIX_CHANNELS],
+                }))
+                .unwrap();
+        }
+        let mut consumer = AudioStreamConsumer {
+            receiver,
+            control: Arc::clone(&control),
+            current: None,
+            terminated: false,
+        };
+        assert_eq!(consumer.sample_frame(10), (0.0, 0.0));
+        assert_eq!(consumer.sample_frame(250), (2.0, 2.0));
+        assert_eq!(control.underruns.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_seek_forgets_an_unreported_failure_but_realignment_does_not_repeat_it() {
+        let control = AudioStreamControl::new(0);
+        control.record_error("clip-2 failed at 1.0 s".to_string());
+        control.request_seek(500);
+        assert_eq!(
+            control.take_error(),
+            None,
+            "the error belonged to the old position"
+        );
+
+        control.record_error("clip-2 failed at 6.0 s".to_string());
+        assert!(control.take_error().is_some());
+        // A clock re-alignment restarts the producer, which hits the same clip.
+        control.restart_at(700);
+        control.record_error("clip-2 failed at 7.0 s".to_string());
+        assert_eq!(
+            control.take_error(),
+            None,
+            "reported once until the next seek"
         );
     }
 

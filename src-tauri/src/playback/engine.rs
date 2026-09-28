@@ -139,6 +139,10 @@ pub trait PlaybackClock: Send + Sync {
     fn take_error(&self) -> Option<String> {
         None
     }
+    /// The render loop paused itself after a fatal failure: silence the
+    /// clock's audio output until the next resume commits. A no-op for clocks
+    /// without sound.
+    fn halt(&self) {}
 }
 
 /// Receives each composited frame. Production: [`super::transport::MjpegSink`],
@@ -150,6 +154,10 @@ pub trait FrameSink: Send + Sync {
     /// The final timeline frame failed to render: announce the terminal tick
     /// without new pixels so the front end can end its transport.
     fn push_terminal(&self, frame: i32);
+    /// The render thread moved the playhead (a seek): drop frames handed off
+    /// before this call, keeping publication open for the ones that follow.
+    /// Test doubles that do not queue frames can keep the no-op.
+    fn invalidate(&self) {}
 }
 
 /// Why playback stopped producing frames or sound (`playback_error.code`).
@@ -805,6 +813,7 @@ impl PlaybackEngine {
             rx,
             seek_mailbox: Arc::clone(&control.seek_mailbox),
             pause_requested: Arc::clone(&control.pause_requested),
+            cancel: cancel.clone(),
         };
         let handle = thread::Builder::new()
             .name("opentake-playback-render".to_string())
@@ -1033,6 +1042,9 @@ struct LoopControl {
     rx: mpsc::Receiver<PlaybackCmd>,
     seek_mailbox: Arc<SeekMailbox>,
     pause_requested: Arc<AtomicBool>,
+    /// The session's media cancellation. Once it fires the session is being
+    /// torn down: a render it interrupted is a stop, never a failure.
+    cancel: MediaCancelToken,
 }
 
 /// The render thread body: render frames paced at the project fps until the
@@ -1055,6 +1067,7 @@ fn run_render_loop<R: FrameRenderer>(
         rx,
         seek_mailbox,
         pause_requested,
+        cancel,
     } = control;
     let total = renderer.total_frames();
     let fps = renderer.fps();
@@ -1071,6 +1084,9 @@ fn run_render_loop<R: FrameRenderer>(
     let mut paused = false;
     let mut paused_frame = initial_frame;
     let mut buffered_first: Option<(i32, DecodedFrame)> = None;
+    // Set when a render failure paused the loop: the next resume restarts
+    // decoding (clearing the renderer's negative cache) even at the same frame.
+    let mut retry_on_resume = false;
 
     loop {
         if paused {
@@ -1086,7 +1102,11 @@ fn run_render_loop<R: FrameRenderer>(
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     clock.seek(frame);
-                    resume_decode_streams(paused_frame, frame, || renderer.seek());
+                    if std::mem::take(&mut retry_on_resume) {
+                        renderer.seek();
+                    } else {
+                        resume_decode_streams(paused_frame, frame, || renderer.seek());
+                    }
                     if let Some((buffered_frame, image)) = buffered_first.take() {
                         sink.push_frame(buffered_frame, image);
                     }
@@ -1096,6 +1116,7 @@ fn run_render_loop<R: FrameRenderer>(
                 }
                 Ok(PlaybackCmd::Seek) => {
                     if let Some(request) = seek_mailbox.take() {
+                        sink.invalidate();
                         clock.seek(request.frame);
                         renderer.seek();
                         paused_frame = Some(request.frame);
@@ -1120,6 +1141,9 @@ fn run_render_loop<R: FrameRenderer>(
                 }
                 Ok(PlaybackCmd::Resume(frame, reply)) => {
                     let current_frame = clock.frame(fps);
+                    if current_frame != frame {
+                        sink.invalidate();
+                    }
                     clock.seek(frame);
                     resume_decode_streams(Some(current_frame), frame, || renderer.seek());
                     pause_requested.store(false, Ordering::Release);
@@ -1127,6 +1151,9 @@ fn run_render_loop<R: FrameRenderer>(
                 }
                 Ok(PlaybackCmd::Seek) => {
                     if let Some(request) = seek_mailbox.take() {
+                        // Frames rendered before the seek may still be queued
+                        // or encoding; they must not move the playhead back.
+                        sink.invalidate();
                         clock.seek(request.frame);
                         renderer.seek();
                     }
@@ -1152,6 +1179,13 @@ fn run_render_loop<R: FrameRenderer>(
         }
         let render_generation = seek_mailbox.generation();
         let rendered = renderer.render(clamped);
+        if startup.is_none() && cancel.is_cancelled() {
+            // Teardown cancelled the session's decodes (an edit, a project
+            // switch or a stop); a `Stop` follows. Whatever the render
+            // returned, it is not the user's failure to hear about. (During
+            // startup the typed cause still goes to the waiting caller.)
+            return;
+        }
         if pause_requested.load(Ordering::Acquire) || !seek_mailbox.is_current(render_generation) {
             continue;
         }
@@ -1174,9 +1208,12 @@ fn run_render_loop<R: FrameRenderer>(
                     return;
                 }
                 // Hold the last published frame instead of retrying (and
-                // respawning decoders) every tick. A resume or seek retries.
+                // respawning decoders) every tick, and silence audio: the
+                // transport is stopped until a resume or seek retries.
                 paused = true;
                 paused_frame = Some(clamped);
+                retry_on_resume = true;
+                clock.halt();
                 if done {
                     eprintln!("[playback] final frame {clamped}: {}", failure.message);
                     sink.push_terminal(clamped);
@@ -1217,10 +1254,13 @@ mod tests {
 
     use std::sync::atomic::AtomicI32;
 
+    use opentake_media::MediaError;
+
     /// Advances one frame per read, like a clock running at the render rate.
     struct SteppingClock {
         next: AtomicI32,
         audio_errors: Mutex<Vec<String>>,
+        halts: AtomicI32,
     }
 
     impl SteppingClock {
@@ -1228,6 +1268,7 @@ mod tests {
             Self {
                 next: AtomicI32::new(0),
                 audio_errors: Mutex::new(Vec::new()),
+                halts: AtomicI32::new(0),
             }
         }
     }
@@ -1244,12 +1285,26 @@ mod tests {
         fn take_error(&self) -> Option<String> {
             self.audio_errors.lock().unwrap().pop()
         }
+
+        fn halt(&self) {
+            self.halts.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A render at `frame` that blocks until `cancel` fires, then fails the
+    /// way an interrupted decode does.
+    struct BlockAt {
+        frame: i32,
+        cancel: MediaCancelToken,
+        entered: mpsc::Sender<()>,
     }
 
     struct StubRenderer {
         total: i32,
         fail_at: Option<i32>,
         renders: Arc<Mutex<Vec<i32>>>,
+        seeks: Arc<AtomicI32>,
+        block_at: Option<BlockAt>,
     }
 
     impl FrameRenderer for StubRenderer {
@@ -1263,6 +1318,16 @@ mod tests {
 
         fn render(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure> {
             self.renders.lock().unwrap().push(target);
+            if let Some(block) = self.block_at.as_ref().filter(|block| block.frame == target) {
+                let _ = block.entered.send(());
+                while !block.cancel.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                return Err(RenderFailure::new(
+                    PlaybackFailureCode::VideoDecode,
+                    format!("clip-1 at frame {target}: {}", MediaError::Cancelled),
+                ));
+            }
             if self.fail_at == Some(target) {
                 return Err(RenderFailure::new(
                     PlaybackFailureCode::VideoDecode,
@@ -1272,22 +1337,31 @@ mod tests {
             Ok(DecodedFrame::new(1, 1, vec![0, 0, 0, 255], false))
         }
 
-        fn seek(&mut self) {}
+        fn seek(&mut self) {
+            self.seeks.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     #[derive(Default)]
     struct RecordingSink {
         frames: Mutex<Vec<i32>>,
         terminals: Mutex<Vec<i32>>,
+        /// Every push and invalidation in order: `Some(frame)` or `None`.
+        events: Mutex<Vec<Option<i32>>>,
     }
 
     impl FrameSink for RecordingSink {
         fn push_frame(&self, frame: i32, _image: DecodedFrame) {
             self.frames.lock().unwrap().push(frame);
+            self.events.lock().unwrap().push(Some(frame));
         }
 
         fn push_terminal(&self, frame: i32) {
             self.terminals.lock().unwrap().push(frame);
+        }
+
+        fn invalidate(&self) {
+            self.events.lock().unwrap().push(None);
         }
     }
 
@@ -1303,13 +1377,24 @@ mod tests {
     struct StubRun {
         engine: PlaybackEngine,
         renders: Arc<Mutex<Vec<i32>>>,
+        seeks: Arc<AtomicI32>,
         sink: Arc<RecordingSink>,
         errors: Arc<RecordingErrors>,
         clock: Arc<SteppingClock>,
     }
 
     fn run_stub(total: i32, fail_at: Option<i32>) -> StubRun {
+        run_stub_with(total, fail_at, None, MediaCancelToken::new())
+    }
+
+    fn run_stub_with(
+        total: i32,
+        fail_at: Option<i32>,
+        block_at: Option<BlockAt>,
+        cancel: MediaCancelToken,
+    ) -> StubRun {
         let renders = Arc::new(Mutex::new(Vec::new()));
+        let seeks = Arc::new(AtomicI32::new(0));
         let sink = Arc::new(RecordingSink::default());
         let errors = Arc::new(RecordingErrors::default());
         let clock = Arc::new(SteppingClock::new());
@@ -1317,6 +1402,8 @@ mod tests {
             total,
             fail_at,
             renders: Arc::clone(&renders),
+            seeks: Arc::clone(&seeks),
+            block_at,
         };
         let engine = PlaybackEngine::spawn_with(
             move || Ok(renderer),
@@ -1327,12 +1414,13 @@ mod tests {
             },
             None,
             None,
-            MediaCancelToken::new(),
+            cancel,
         )
         .expect("spawn stub render loop");
         StubRun {
             engine,
             renders,
+            seeks,
             sink,
             errors,
             clock,
@@ -1372,6 +1460,94 @@ mod tests {
             run.errors.0.lock().unwrap().len() == 2
         });
         run.engine.stop();
+    }
+
+    #[test]
+    fn a_fatal_failure_silences_audio_and_resume_retries_with_fresh_decoders() {
+        let run = run_stub(100, Some(5));
+        wait_until("the failing render", || {
+            run.errors.0.lock().unwrap().len() == 1
+        });
+        assert_eq!(run.clock.halts.load(Ordering::Acquire), 1);
+        let seeks_before = run.seeks.load(Ordering::Acquire);
+
+        // Resuming at the very frame that failed must not be served from the
+        // renderer's negative cache: it restarts decoding first.
+        run.engine.resume(5).expect("retry resume");
+        wait_until("the retried render", || {
+            run.errors.0.lock().unwrap().len() == 2
+        });
+        assert_eq!(run.seeks.load(Ordering::Acquire), seeks_before + 1);
+        assert_eq!(run.clock.halts.load(Ordering::Acquire), 2);
+        run.engine.stop();
+    }
+
+    #[test]
+    fn a_render_interrupted_by_session_teardown_reports_nothing() {
+        let cancel = MediaCancelToken::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let run = run_stub_with(
+            100,
+            None,
+            Some(BlockAt {
+                frame: 3,
+                cancel: cancel.clone(),
+                entered: entered_tx,
+            }),
+            cancel,
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the render reaches the blocking decode");
+
+        // Teardown cancels the session's decodes before the loop sees `Stop`.
+        run.engine.stop();
+
+        assert!(
+            run.errors.0.lock().unwrap().is_empty(),
+            "a cancelled session must not report a failure: {:?}",
+            run.errors.0.lock().unwrap()
+        );
+        assert_eq!(run.clock.halts.load(Ordering::Acquire), 0);
+        assert!(run.sink.terminals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_seek_while_playing_invalidates_frames_pushed_before_it() {
+        let run = run_stub(1_000_000, None);
+        wait_until("playback to run", || {
+            run.sink.frames.lock().unwrap().len() > 3
+        });
+        run.engine.seek(500_000);
+        wait_until("a frame after the seek", || {
+            run.sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| *frame >= 500_000)
+        });
+        run.engine.stop();
+
+        let events = run.sink.events.lock().unwrap().clone();
+        let invalidated = events
+            .iter()
+            .position(Option::is_none)
+            .expect("the seek invalidates queued frames");
+        assert!(
+            events[..invalidated]
+                .iter()
+                .flatten()
+                .all(|frame| *frame < 500_000),
+            "{events:?}"
+        );
+        assert!(
+            events[invalidated + 1..]
+                .iter()
+                .flatten()
+                .all(|frame| *frame >= 500_000),
+            "every frame after the invalidation follows the seek: {events:?}"
+        );
     }
 
     #[test]

@@ -610,7 +610,9 @@ export function useTimelinePlaybackEngine(): void {
       });
 
       let unlistenError: (() => void) | null = null;
-      void onPlaybackError((event) => handleNativePlaybackError(event)).then(
+      // Start only once the error listener is registered too: a failure right
+      // after the resume must not be emitted before anyone listens.
+      const errorListenerReady = onPlaybackError((event) => handleNativePlaybackError(event)).then(
         (unlisten) => {
           if (disposed) unlisten();
           else unlistenError = unlisten;
@@ -626,14 +628,19 @@ export function useTimelinePlaybackEngine(): void {
         setEngineFailed(true);
         return;
       }
-      const start = startNativePlaybackAfterListener(listenerReady, () =>
-        nativePlaybackController.start({ projectEpoch, timelineVersion }, startFrame, {
-          onIdentity: (started) => {
-            identity = started;
-            activeNativeIdentityRef.current = started;
-            lastEngineFrameRef.current = null;
-          },
-        }),
+      const start = startNativePlaybackAfterListener(
+        Promise.all([listenerReady, errorListenerReady]),
+        () =>
+          nativePlaybackController.start({ projectEpoch, timelineVersion }, startFrame, {
+            onIdentity: (started) => {
+              identity = started;
+              activeNativeIdentityRef.current = started;
+              lastEngineFrameRef.current = null;
+            },
+            onDeferredError: (event) => {
+              if (!disposed) handleNativePlaybackError(event);
+            },
+          }),
       );
       void start
         .then((started) => {

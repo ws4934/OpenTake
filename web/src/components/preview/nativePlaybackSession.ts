@@ -98,6 +98,9 @@ export interface NativePlaybackController {
       forceNewSession?: boolean;
       mediaId?: string;
       onIdentity?: (identity: PlaybackIdentity) => void;
+      /** Receives `playback_error`s of this session that arrived while the
+       *  start was in flight, once it has committed. */
+      onDeferredError?: (event: PlaybackErrorEvent) => void;
     },
   ): Promise<PlaybackIdentity>;
   pause(identity: PlaybackIdentity, frame: number): Promise<void>;
@@ -107,7 +110,10 @@ export interface NativePlaybackController {
   stopCurrent(): Promise<void>;
   currentIdentity(): PlaybackIdentity | null;
   acceptFrame(event: PlaybackFrameEvent): void;
-  /** Whether a `playback_error` concerns the running (not paused) session. */
+  /** Whether a `playback_error` concerns the running (not paused) session.
+   *  An error of a paused session whose resume is in flight is held back and
+   *  handed to that start's `onDeferredError` once the resume commits: the
+   *  backend already runs the render thread before `playbackStart` returns. */
   acceptError(event: PlaybackErrorEvent): boolean;
   shouldFallback(error: unknown): boolean;
 }
@@ -121,6 +127,9 @@ export function createNativePlaybackController(
   let paused = false;
   let lastSequence = -1;
   let lifecycleGeneration = 0;
+  // The session a `start` is resuming, and errors it reported meanwhile.
+  let starting: PlaybackIdentity | null = null;
+  let deferredErrors: PlaybackErrorEvent[] = [];
 
   const stopIdentity = async (
     identity: PlaybackIdentity,
@@ -181,11 +190,19 @@ export function createNativePlaybackController(
           message: "native playback start was superseded",
         } satisfies PlaybackCommandError;
       }
-      await playbackApi.playbackStart(
-        Math.max(0, Math.floor(frame)),
-        identity,
-        requestedMediaId ?? undefined,
-      );
+      starting = identity;
+      deferredErrors = [];
+      try {
+        await playbackApi.playbackStart(
+          Math.max(0, Math.floor(frame)),
+          identity,
+          requestedMediaId ?? undefined,
+        );
+      } finally {
+        if (starting === identity) starting = null;
+      }
+      const deferred = deferredErrors;
+      deferredErrors = [];
       if (
         startGeneration !== lifecycleGeneration ||
         !samePlaybackIdentity(current, identity)
@@ -196,6 +213,7 @@ export function createNativePlaybackController(
         } satisfies PlaybackCommandError;
       }
       paused = false;
+      for (const event of deferred) options?.onDeferredError?.(event);
       return identity;
     },
     async pause(identity, frame) {
@@ -262,7 +280,10 @@ export function createNativePlaybackController(
       publishNativePlaybackFrame(event);
     },
     acceptError(event) {
-      return !paused && samePlaybackIdentity(current, event);
+      if (!samePlaybackIdentity(current, event)) return false;
+      if (!paused) return true;
+      if (samePlaybackIdentity(starting, event)) deferredErrors.push(event);
+      return false;
     },
     shouldFallback(error) {
       return (
