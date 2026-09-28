@@ -502,9 +502,8 @@ impl LottieMaterializer {
     fn ensure_document(&mut self, path: &std::path::Path) -> Result<(), String> {
         // Stat before reading: a write racing the read changes the stamp, so
         // the next frame re-reads instead of trusting a torn document.
-        let metadata = std::fs::metadata(path)
+        let stamp = FileStamp::of_path(path)
             .map_err(|error| format!("read Lottie document {}: {error}", path.display()))?;
-        let stamp = FileStamp::of(&metadata);
         if self.is_current(path, stamp) {
             return Ok(());
         }
@@ -514,10 +513,8 @@ impl LottieMaterializer {
     }
 
     fn ensure_document_file(&mut self, path: &std::path::Path, file: &File) -> Result<(), String> {
-        let metadata = file
-            .metadata()
+        let stamp = FileStamp::of_file(file)
             .map_err(|error| format!("stat retained Lottie document: {error}"))?;
-        let stamp = FileStamp::of(&metadata);
         if self.is_current(path, stamp) {
             return Ok(());
         }
