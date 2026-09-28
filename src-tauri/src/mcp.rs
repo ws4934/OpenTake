@@ -579,17 +579,15 @@ pub(crate) fn build_media_bridge(
     Arc::new(TauriMediaBridge::new(core, cache_root, models_dir))
 }
 
+/// `motion` is the editor's shared bridge in production, so the Agent's
+/// document previews and publishes reuse its renderer and browser.
 pub(crate) fn build_motion_document_bridge(
     core: AppCore,
-    cache_root: PathBuf,
+    motion: Arc<crate::motion::TauriMotionBridge>,
     notify: Option<MotionDocumentNotifier>,
 ) -> Arc<dyn MotionDocumentBridge> {
     let documents = Arc::new(crate::motion_documents::MotionDocumentStore::new(
         core.clone(),
-    ));
-    let motion = Arc::new(crate::motion::TauriMotionBridge::new(
-        core.clone(),
-        cache_root,
     ));
     let active = Arc::new(Mutex::new(
         HashMap::<u64, opentake_media::MediaCancelToken>::new(),
@@ -3205,7 +3203,10 @@ mod tests {
         let captured = notifications.clone();
         let bridge = build_motion_document_bridge(
             core.clone(),
-            fixture.path().join("motion-cache"),
+            Arc::new(crate::motion::TauriMotionBridge::new(
+                core.clone(),
+                fixture.path().join("motion-cache"),
+            )),
             Some(Arc::new(move |summary| {
                 captured
                     .lock()

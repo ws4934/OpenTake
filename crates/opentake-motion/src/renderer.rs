@@ -187,6 +187,7 @@ impl MotionRenderer for StubRenderer {
         }
 
         let hash = content_hash(req);
+        let _render_dir = self.cache.lock_render_dir(req, &|| Ok(()))?;
         if self.cache.is_cached(req) {
             let dir = self.cache.dir_for(req);
             MotionCache::touch(&dir);
@@ -636,6 +637,7 @@ impl MotionRenderer for HeadlessChromiumRenderer {
 #[cfg(feature = "chromium")]
 mod chromium_backend {
     use std::collections::hash_map::RandomState;
+    use std::collections::VecDeque;
     use std::hash::BuildHasher;
     use std::io::{BufRead, BufReader, Cursor, PipeReader, PipeWriter, Read, Write};
     use std::process::{Child, Command, Stdio};
@@ -679,6 +681,23 @@ mod chromium_backend {
     /// beyond this, unless the policy timeout itself is longer.
     const MAX_FRAME_WATCHDOG: Duration = Duration::from_secs(10 * 60);
     const PROFILE_PREFIX: &str = "opentake-chromium-";
+    /// Bounds on CDP events read while waiting for something else. Screencast
+    /// frames carry base64 PNGs, so the queue is bounded by bytes as well as
+    /// by count.
+    const MAX_PENDING_EVENTS: usize = 256;
+    const MAX_PENDING_EVENT_BYTES: usize = 256 * 1024 * 1024;
+    /// Event methods some render step waits for. Any other queued event is
+    /// never consumed and may be evicted when the queue is full.
+    const AWAITED_EVENT_METHODS: &[&str] = &[
+        "Emulation.virtualTimeBudgetExpired",
+        "Page.frameDetached",
+        "Page.frameNavigated",
+        "Page.frameStoppedLoading",
+        "Page.loadEventFired",
+        "Page.screencastFrame",
+        "Runtime.executionContextCreated",
+        "Target.attachedToTarget",
+    ];
 
     fn trace_enabled() -> bool {
         std::env::var_os("OPENTAKE_MOTION_TRACE").is_some()
@@ -1235,6 +1254,22 @@ mod chromium_backend {
             budget.acquire,
             cancellation,
         )?;
+        let acquired_at = Instant::now();
+        // Held until the frames are published or cleaned up (dropped after
+        // `partial`), so another renderer instance on the same cache root can
+        // neither clear nor resume this render's frames, nor race its
+        // completion marker. Waiting for it is bounded like waiting for the
+        // shared browser.
+        let claim_deadline = deadline_after(acquired_at, budget.acquire);
+        let _render_dir = match renderer.cache.lock_render_dir(req, &|| {
+            check_abort(cancellation, claim_deadline, budget.acquire)
+        }) {
+            Ok(claim) => claim,
+            Err(error) => {
+                browser.commit_reuse();
+                return Err(error);
+            }
+        };
         let acquired_at = Instant::now();
         // Nothing below has touched the browser yet: a cancellation or cache
         // failure here leaves it reusable.
@@ -2924,6 +2959,130 @@ mod chromium_backend {
         }
     }
 
+    struct PendingEvent {
+        value: Value,
+        bytes: usize,
+    }
+
+    /// CDP events received while the renderer waited for another reply or
+    /// event, oldest first, bounded by count and approximate bytes. When full
+    /// it evicts events no render step waits for; it never silently drops an
+    /// awaited kind and instead fails the render with an explicit error.
+    struct PendingEvents {
+        events: VecDeque<PendingEvent>,
+        bytes: usize,
+        max_events: usize,
+        max_bytes: usize,
+    }
+
+    impl PendingEvents {
+        fn new(max_events: usize, max_bytes: usize) -> Self {
+            Self {
+                events: VecDeque::new(),
+                bytes: 0,
+                max_events,
+                max_bytes,
+            }
+        }
+
+        #[cfg(test)]
+        fn len(&self) -> usize {
+            self.events.len()
+        }
+
+        #[cfg(test)]
+        fn is_empty(&self) -> bool {
+            self.events.is_empty()
+        }
+
+        #[cfg(test)]
+        fn iter(&self) -> impl Iterator<Item = &Value> {
+            self.events.iter().map(|event| &event.value)
+        }
+
+        fn position(&self, mut predicate: impl FnMut(&Value) -> bool) -> Option<usize> {
+            self.events.iter().position(|event| predicate(&event.value))
+        }
+
+        fn remove(&mut self, index: usize) -> Value {
+            let event = self
+                .events
+                .remove(index)
+                .expect("pending CDP event index comes from a search of the queue");
+            self.bytes -= event.bytes;
+            event.value
+        }
+
+        fn retain(&mut self, mut keep: impl FnMut(&Value) -> bool) {
+            let bytes = &mut self.bytes;
+            self.events.retain(|event| {
+                let kept = keep(&event.value);
+                if !kept {
+                    *bytes -= event.bytes;
+                }
+                kept
+            });
+        }
+
+        fn push(&mut self, value: Value) -> MotionResult<()> {
+            let bytes = approximate_json_bytes(&value);
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.events.push_back(PendingEvent { value, bytes });
+            while self.events.len() > self.max_events || self.bytes > self.max_bytes {
+                let Some(index) = self
+                    .events
+                    .iter()
+                    .position(|event| !is_awaited_event_kind(&event.value))
+                else {
+                    return Err(MotionError::render_failed(format!(
+                        "Chromium sent more CDP events than the renderer can hold while \
+                         waiting ({} events, about {} bytes; limits {} events, {} bytes)",
+                        self.events.len(),
+                        self.bytes,
+                        self.max_events,
+                        self.max_bytes
+                    )));
+                };
+                self.remove(index);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    impl std::ops::Index<usize> for PendingEvents {
+        type Output = Value;
+
+        fn index(&self, index: usize) -> &Value {
+            &self.events[index].value
+        }
+    }
+
+    fn is_awaited_event_kind(event: &Value) -> bool {
+        event
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| AWAITED_EVENT_METHODS.contains(&method))
+    }
+
+    /// Approximate in-memory payload of a parsed CDP message: string and key
+    /// bytes plus a small constant per value. Dominated by screencast data.
+    fn approximate_json_bytes(value: &Value) -> usize {
+        const NODE: usize = 16;
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => NODE,
+            Value::String(text) => NODE + text.len(),
+            Value::Array(items) => items.iter().fold(NODE, |total, item| {
+                total.saturating_add(approximate_json_bytes(item))
+            }),
+            Value::Object(fields) => fields.iter().fold(NODE, |total, (key, item)| {
+                total
+                    .saturating_add(key.len())
+                    .saturating_add(approximate_json_bytes(item))
+            }),
+        }
+    }
+
     struct Cdp {
         pipe: CdpPipe,
         policy: SandboxPolicy,
@@ -2933,7 +3092,7 @@ mod chromium_backend {
         deadline: Instant,
         timeout: Duration,
         blocked_url: Option<String>,
-        pending_events: Vec<Value>,
+        pending_events: PendingEvents,
         next_capture_generation: u32,
         next_author_marker_generation: u64,
     }
@@ -2952,7 +3111,7 @@ mod chromium_backend {
                 cancellation,
                 deadline,
                 blocked_url: None,
-                pending_events: Vec::new(),
+                pending_events: PendingEvents::new(MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES),
                 next_capture_generation: 0,
                 next_author_marker_generation: 0,
             }
@@ -3029,7 +3188,7 @@ mod chromium_backend {
         }
 
         fn wait_for_event(&mut self, method: &str, session: Option<&str>) -> MotionResult<Value> {
-            if let Some(index) = self.pending_events.iter().position(|event| {
+            if let Some(index) = self.pending_events.position(|event| {
                 event.get("method").and_then(Value::as_str) == Some(method)
                     && session.is_none_or(|expected| {
                         event.get("sessionId").and_then(Value::as_str) == Some(expected)
@@ -3056,7 +3215,7 @@ mod chromium_backend {
             session: Option<&str>,
             mut predicate: impl FnMut(&Value) -> bool,
         ) -> MotionResult<Value> {
-            if let Some(index) = self.pending_events.iter().position(|event| {
+            if let Some(index) = self.pending_events.position(|event| {
                 event.get("method").and_then(Value::as_str) == Some(method)
                     && session.is_none_or(|expected| {
                         event.get("sessionId").and_then(Value::as_str) == Some(expected)
@@ -3089,7 +3248,6 @@ mod chromium_backend {
             loop {
                 if let Some(index) = self
                     .pending_events
-                    .iter()
                     .position(|event| is_frame_detached_event(event, session, author_frame_id))
                 {
                     self.pending_events.remove(index);
@@ -3097,7 +3255,7 @@ mod chromium_backend {
                         "Chromium author frame detached before loading completed",
                     ));
                 }
-                if let Some(index) = self.pending_events.iter().position(|event| {
+                if let Some(index) = self.pending_events.position(|event| {
                     event.get("method").and_then(Value::as_str) == Some(method)
                         && event.get("sessionId").and_then(Value::as_str) == Some(session)
                         && predicate(event)
@@ -3337,8 +3495,12 @@ mod chromium_backend {
                     None,
                 )
                 .and_then(|_| self.ensure_no_blocked_url());
+            // Nothing waits on a detached capture session again, so none of its
+            // events may occupy the bounded queue for the rest of the render.
             self.pending_events.retain(|event| {
                 event.get("method").and_then(Value::as_str) != Some("Page.screencastFrame")
+                    && event.get("sessionId").and_then(Value::as_str)
+                        != Some(capture_session.as_str())
             });
 
             match captured {
@@ -3448,7 +3610,6 @@ mod chromium_backend {
         fn next_screencast_event(&mut self, session: &str) -> MotionResult<Value> {
             if let Some(index) = self
                 .pending_events
-                .iter()
                 .position(|event| is_screencast_event_for_session(event, session))
             {
                 return Ok(self.pending_events.remove(index));
@@ -3465,7 +3626,6 @@ mod chromium_backend {
         fn ack_pending_screencast_frames(&mut self, session: &str) -> MotionResult<()> {
             while let Some(index) = self
                 .pending_events
-                .iter()
                 .position(|event| is_screencast_event_for_session(event, session))
             {
                 let event = self.pending_events.remove(index);
@@ -3744,13 +3904,7 @@ mod chromium_backend {
                 Some("Inspector.targetCrashed" | "Target.targetCrashed") => {
                     Err(MotionError::render_failed("Chromium render target crashed"))
                 }
-                Some(_) => {
-                    if self.pending_events.len() >= 256 {
-                        self.pending_events.remove(0);
-                    }
-                    self.pending_events.push(value);
-                    Ok(())
-                }
+                Some(_) => self.pending_events.push(value),
                 None => Ok(()),
             }
         }
@@ -4283,6 +4437,81 @@ mod chromium_backend {
                 status.is_none(),
                 "browser died with its launching thread: {status:?}"
             );
+        }
+
+        #[test]
+        fn pending_events_evict_only_unawaited_kinds_and_fail_instead_of_dropping() {
+            let event = |method: &str, session: &str| json!({"method": method, "sessionId": session, "params": {}});
+            let mut queue = PendingEvents::new(3, usize::MAX);
+            queue.push(event("Page.lifecycleEvent", "a")).unwrap();
+            queue.push(event("Page.loadEventFired", "a")).unwrap();
+            queue.push(event("Page.frameNavigated", "a")).unwrap();
+            // Full: the unawaited lifecycle event is evicted, awaited ones stay.
+            queue
+                .push(event("Emulation.virtualTimeBudgetExpired", "a"))
+                .unwrap();
+            let methods = queue
+                .iter()
+                .map(|event| event["method"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                [
+                    "Page.loadEventFired",
+                    "Page.frameNavigated",
+                    "Emulation.virtualTimeBudgetExpired"
+                ]
+            );
+            // Only awaited kinds remain: overflowing is an explicit render error
+            // and the awaited events already queued are not dropped.
+            let error = queue
+                .push(event("Page.screencastFrame", "a"))
+                .expect_err("an awaited event must never be dropped silently");
+            assert!(
+                matches!(&error, MotionError::RenderFailed(message) if message.contains("CDP events")),
+                "{error:?}"
+            );
+            assert_eq!(
+                queue.iter().next().unwrap()["method"],
+                "Page.loadEventFired"
+            );
+
+            let removed = queue.remove(0);
+            assert_eq!(removed["method"], "Page.loadEventFired");
+            queue.retain(|event| event["method"] != "Page.frameNavigated");
+            assert_eq!(queue.len(), 2);
+        }
+
+        #[test]
+        fn pending_events_are_bounded_by_bytes() {
+            let frame = |size: usize| {
+                json!({
+                    "method": "Page.screencastFrame",
+                    "sessionId": "capture",
+                    "params": {"data": "A".repeat(size), "sessionId": 1}
+                })
+            };
+            let mut queue = PendingEvents::new(256, 4096);
+            queue.push(frame(1024)).unwrap();
+            queue.push(frame(1024)).unwrap();
+            queue
+                .push(json!({"method": "Log.other", "params": {"text": "x".repeat(1024)}}))
+                .unwrap();
+            // The unawaited payload is evicted first to make room.
+            queue.push(frame(1024)).unwrap();
+            assert_eq!(queue.len(), 3);
+            assert!(queue
+                .iter()
+                .all(|event| event["method"] == "Page.screencastFrame"));
+            let error = queue
+                .push(frame(2048))
+                .expect_err("screencast bytes beyond the bound fail the render");
+            assert!(matches!(error, MotionError::RenderFailed(_)), "{error:?}");
+            assert!(queue.bytes > 4096);
+            while !queue.is_empty() {
+                queue.remove(0);
+            }
+            assert_eq!(queue.bytes, 0, "byte accounting follows removals");
         }
 
         #[test]

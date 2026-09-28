@@ -66,7 +66,7 @@ pub use renderer::{
     deterministic_clock_script, HeadlessChromiumRenderer, MotionCancellationToken, MotionRenderer,
     StubRenderer,
 };
-pub use sandbox::{AllowedOrigin, SandboxPolicy, OFFLINE_DOCUMENT_CSP};
+pub use sandbox::{AllowedOrigin, SandboxPolicy, DEFAULT_MAX_DOCUMENT_BYTES, OFFLINE_DOCUMENT_CSP};
 pub use source::{
     limits, MotionDocumentSource, MotionRenderRequest, MotionSource, MotionSourceDiagnostic,
     ParamValue, RenderedClip,
