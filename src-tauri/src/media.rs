@@ -5041,10 +5041,13 @@ fn create_media_proxy_blocking_with<R: Runtime>(
         .map_err(|error| error.to_string())?;
     let proxy_dir = project_proxy_directory(&project_dir, true)?;
     let output = proxy_dir.join(leaf);
-    // Hard-linking from the private sibling stage is atomic, same-volume, and
-    // refuses to clobber a destination that unexpectedly already exists.
-    std::fs::hard_link(&stage_output, &output)
-        .map_err(|error| format!("media_proxy_publish_failed:{error}"))?;
+    // Move the file out of the private sibling stage with a same-volume rename
+    // that refuses to clobber a destination that unexpectedly already exists.
+    // Unlike a hard link, this also works on FAT and exFAT volumes.
+    tempfile::TempPath::try_from_path(&stage_output)
+        .map_err(|error| format!("media_proxy_publish_failed:{error}"))?
+        .persist_noclobber(&output)
+        .map_err(|error| format!("media_proxy_publish_failed:{}", error.error))?;
     let proxy = MediaProxy {
         relative_path: relative_path.clone(),
         source_sha256: created.source_sha256.clone(),
@@ -8561,6 +8564,55 @@ mod tests {
         assert!(!stage_output.exists());
         assert!(core.media().entries[0].proxy.is_none());
         assert!(!bundle.join("media/proxies").exists());
+    }
+
+    #[test]
+    fn completed_proxy_moves_from_private_stage_into_the_bundle() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let created = create_media_proxy_blocking_with(
+            app.handle().clone(),
+            asset_id,
+            None,
+            None,
+            MediaCancelToken::new(),
+            move |request, _, _| {
+                fs::write(request.output, b"completed proxy").unwrap();
+                stage_tx.send(request.output.to_path_buf()).unwrap();
+                Ok(ProxyResult {
+                    path: request.output.to_path_buf(),
+                    source_sha256: opentake_media::file_sha256(request.source).unwrap(),
+                    source_stamp: Some(opentake_media::source_file_stamp(request.source).unwrap()),
+                    width: 320,
+                    height: 180,
+                })
+            },
+        )
+        .expect("completed proxy is published");
+
+        let stage_output = stage_rx.recv().unwrap();
+        assert!(
+            !stage_output.parent().unwrap().exists(),
+            "private stage is removed after publication"
+        );
+        let published = PathBuf::from(&created.path);
+        assert_eq!(fs::read(&published).unwrap(), b"completed proxy");
+        assert!(app.handle().asset_protocol_scope().is_allowed(&published));
+        let proxy = core.media().entries[0]
+            .proxy
+            .clone()
+            .expect("proxy recorded");
+        assert!(proxy.relative_path.starts_with("media/proxies/"));
+        assert_eq!(
+            fs::read(bundle.join(&proxy.relative_path)).unwrap(),
+            b"completed proxy"
+        );
+        assert!(proxy.source_stamp.is_some());
     }
 
     #[test]
