@@ -49,6 +49,17 @@ pub mod test_hooks {
             assert!(!fail.replace(true), "previous test left the failure armed");
         });
     }
+
+    /// Let `successes` more directory flushes on this thread succeed, then
+    /// fail the next one after its rename has already committed.
+    pub fn fail_directory_sync_after(successes: usize) {
+        crate::project_root::sync_hooks::fail_directory_sync_after(successes);
+    }
+
+    /// Directory flushes attempted on this thread so far.
+    pub fn directory_syncs() -> usize {
+        crate::project_root::sync_hooks::directory_syncs()
+    }
 }
 
 /// Persisted schema details this build cannot safely write back.
@@ -330,7 +341,7 @@ impl Project {
             encoded.write_to(&root)
         } else {
             let publisher = ProjectRoot::begin_replace(&self.bundle_path)?;
-            encoded.write_to(publisher.stage())?;
+            encoded.write_to(publisher.stage()).map_err(unpublished)?;
             publisher.publish().map(|_| ())
         }
     }
@@ -369,11 +380,17 @@ impl Project {
     pub fn save_manifest_and_generation_log_to_root(&self, root: &ProjectRoot) -> Result<()> {
         self.compatibility.ensure_writable()?;
         let manifest = encode_component(layout::MANIFEST_FILE, &self.manifest)?;
-        if let Some(log) = &self.generation_log {
-            let log = encode_component(layout::GENERATION_LOG_FILE, log)?;
-            root.write_atomic(layout::GENERATION_LOG_FILE, &log)?;
+        let log = self
+            .generation_log
+            .as_ref()
+            .map(|log| encode_component(layout::GENERATION_LOG_FILE, log))
+            .transpose()?;
+        let mut writes = ComponentWrites::default();
+        if let Some(log) = &log {
+            writes.write(root, layout::GENERATION_LOG_FILE, log)?;
         }
-        root.write_atomic(layout::MANIFEST_FILE, &manifest)
+        writes.write(root, layout::MANIFEST_FILE, &manifest)?;
+        writes.finish()
     }
 
     /// Like [`Self::save`] but targets an explicit `bundle` directory (used by
@@ -381,7 +398,7 @@ impl Project {
     pub fn save_to(&self, bundle: impl AsRef<Path>) -> Result<()> {
         let encoded = EncodedProject::prepare(self)?;
         let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
+        encoded.write_to(publisher.stage()).map_err(unpublished)?;
         publisher.publish().map(|_| ())
     }
 
@@ -430,16 +447,53 @@ impl Project {
         let preserve_thumbnail = matches!(thumbnail, ThumbnailUpdate::Preserve);
         let encoded = EncodedProject::prepare_with_thumbnail_update(self, thumbnail)?;
         let publisher = ProjectRoot::begin_replace(bundle.as_ref())?;
-        encoded.write_to(publisher.stage())?;
+        encoded.write_to(publisher.stage()).map_err(unpublished)?;
         if let Some(source) = media_source {
             source.copy_media_to(publisher.stage())?;
             source.copy_chat_sessions_to(publisher.stage())?;
             source.copy_motion_documents_to(publisher.stage())?;
             if preserve_thumbnail {
-                source.copy_thumbnail_to(publisher.stage())?;
+                source
+                    .copy_thumbnail_to(publisher.stage())
+                    .map_err(unpublished)?;
             }
         }
         publisher.publish()
+    }
+}
+
+/// A write into an unpublished stage commits nothing: only the stage's
+/// publication rename does. An unconfirmed flush there is an ordinary failure
+/// that aborts publication and discards the stage.
+fn unpublished(error: ProjectError) -> ProjectError {
+    match error {
+        ProjectError::DurabilityUnconfirmed { path, source } => ProjectError::io(path, source),
+        error => error,
+    }
+}
+
+/// The component replacements of one logical save. A replacement whose
+/// directory flush failed has still committed, so the save carries on to its
+/// commit point and reports the unconfirmed flush only after the remaining
+/// components are written; any other failure stops the save immediately.
+#[derive(Default)]
+struct ComponentWrites {
+    unconfirmed: Option<ProjectError>,
+}
+
+impl ComponentWrites {
+    fn write(&mut self, root: &ProjectRoot, name: &str, bytes: &[u8]) -> Result<()> {
+        match root.write_atomic(name, bytes) {
+            Err(error @ ProjectError::DurabilityUnconfirmed { .. }) => {
+                self.unconfirmed.get_or_insert(error);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        self.unconfirmed.map_or(Ok(()), Err)
     }
 }
 
@@ -513,12 +567,14 @@ impl EncodedProject {
             .collect();
         let adds_assets = next_ids.iter().any(|id| !current_ids.contains(id));
         let removes_assets = current_ids.iter().any(|id| !next_ids.contains(id));
+        let mut writes = ComponentWrites::default();
 
         if removes_assets && !adds_assets {
-            self.write_non_manifest_components(root)?;
-            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
-            return write_final_manifest(root, &self.manifest)
-                .map_err(ProjectError::partial_commit);
+            self.write_non_manifest_components(root, &mut writes)?;
+            writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+            write_final_manifest(root, &mut writes, &self.manifest)
+                .map_err(ProjectError::partial_commit)?;
+            return writes.finish();
         }
 
         if adds_assets && removes_assets {
@@ -540,28 +596,34 @@ impl EncodedProject {
             }
             validate_manifest_paths(&transition_manifest)?;
             let transition_bytes = encode_component(layout::MANIFEST_FILE, &transition_manifest)?;
-            root.write_atomic(layout::MANIFEST_FILE, &transition_bytes)?;
-            self.write_non_manifest_components(root)?;
-            root.write_atomic(layout::TIMELINE_FILE, &self.timeline)?;
-            return write_final_manifest(root, &self.manifest)
-                .map_err(ProjectError::partial_commit);
+            writes.write(root, layout::MANIFEST_FILE, &transition_bytes)?;
+            self.write_non_manifest_components(root, &mut writes)?;
+            writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+            write_final_manifest(root, &mut writes, &self.manifest)
+                .map_err(ProjectError::partial_commit)?;
+            return writes.finish();
         }
 
-        root.write_atomic(layout::MANIFEST_FILE, &self.manifest)?;
-        self.write_non_manifest_components(root)?;
+        writes.write(root, layout::MANIFEST_FILE, &self.manifest)?;
+        self.write_non_manifest_components(root, &mut writes)?;
         // New clip references become visible only after their manifest entries.
         // A failed timeline replacement can leave extra, unreferenced entries.
-        root.write_atomic(layout::TIMELINE_FILE, &self.timeline)
+        writes.write(root, layout::TIMELINE_FILE, &self.timeline)?;
+        writes.finish()
     }
 
-    fn write_non_manifest_components(&self, root: &ProjectRoot) -> Result<()> {
+    fn write_non_manifest_components(
+        &self,
+        root: &ProjectRoot,
+        writes: &mut ComponentWrites,
+    ) -> Result<()> {
         if let Some(log) = &self.generation_log {
-            root.write_atomic(layout::GENERATION_LOG_FILE, log)?;
+            writes.write(root, layout::GENERATION_LOG_FILE, log)?;
         }
         match &self.thumbnail {
             ThumbnailUpdate::Preserve => {}
             ThumbnailUpdate::Replace(thumbnail) => {
-                root.write_atomic(layout::THUMBNAIL_FILE, thumbnail)?;
+                writes.write(root, layout::THUMBNAIL_FILE, thumbnail)?;
             }
             ThumbnailUpdate::Remove => root.remove_optional_component(layout::THUMBNAIL_FILE)?,
         }
@@ -569,7 +631,11 @@ impl EncodedProject {
     }
 }
 
-fn write_final_manifest(root: &ProjectRoot, manifest: &[u8]) -> Result<()> {
+fn write_final_manifest(
+    root: &ProjectRoot,
+    writes: &mut ComponentWrites,
+    manifest: &[u8],
+) -> Result<()> {
     #[cfg(any(test, feature = "test-hooks"))]
     if FAIL_FINAL_MANIFEST_WRITE.with(|fail| fail.replace(false)) {
         return Err(ProjectError::io(
@@ -577,7 +643,7 @@ fn write_final_manifest(root: &ProjectRoot, manifest: &[u8]) -> Result<()> {
             std::io::Error::other("injected final manifest failure"),
         ));
     }
-    root.write_atomic(layout::MANIFEST_FILE, manifest)
+    writes.write(root, layout::MANIFEST_FILE, manifest)
 }
 
 fn encode_component<T: Serialize>(file_name: &str, value: &T) -> Result<Vec<u8>> {
@@ -745,6 +811,88 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.id == "asset-1"));
+    }
+
+    fn video_entry(id: &str, relative_path: &str) -> MediaManifestEntry {
+        MediaManifestEntry {
+            id: id.into(),
+            name: format!("{id}.mp4"),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: relative_path.into(),
+            },
+            duration: 1.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn unflushed_component_does_not_stop_the_save_before_its_commit_point() {
+        let tmp = TmpDir::new("deferred-durability");
+        let bundle = tmp.path().join("Deferred.opentake");
+        let mut project = Project::new(&bundle);
+        project.save().unwrap();
+        let root = ProjectRoot::open(&bundle).unwrap();
+        project.timeline.fps = 48;
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/asset-1.mp4"));
+
+        // The manifest (written before the timeline commit) is not flushed.
+        crate::project_root::sync_hooks::fail_directory_sync_after(0);
+        let error = project
+            .save_to_root(&root)
+            .expect_err("the unconfirmed manifest flush must be reported");
+
+        assert!(
+            matches!(error, ProjectError::DurabilityUnconfirmed { .. }),
+            "{error:?}"
+        );
+        assert!(error.is_partial_commit());
+        let reopened = Project::open(&bundle).unwrap();
+        assert_eq!(
+            reopened.timeline.fps, 48,
+            "the save reached its commit point"
+        );
+        assert_eq!(reopened.manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn unflushed_stage_component_aborts_publication_without_a_commit() {
+        let tmp = TmpDir::new("stage-durability");
+        let source = tmp.path().join("Source.opentake");
+        let destination = tmp.path().join("Copy.opentake");
+        let mut project = Project::new(&source);
+        project
+            .manifest
+            .entries
+            .push(video_entry("asset-1", "media/asset-1.mp4"));
+
+        // Journal and stage marker flushes succeed; the staged manifest does not.
+        crate::project_root::sync_hooks::fail_directory_sync_after(2);
+        let error = project
+            .save_to(&destination)
+            .expect_err("an unflushed stage must not be published");
+
+        assert!(!error.is_partial_commit(), "{error:?}");
+        assert!(!destination.exists());
+        // Only the persistent transaction lock remains: no stage or journal.
+        let artifacts = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".Copy.opentake.opentake-"))
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts, [".Copy.opentake.opentake-lock"]);
     }
 
     fn tree_receipt(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {

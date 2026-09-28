@@ -80,12 +80,32 @@ pub enum ProjectError {
         publish: String,
         restore: String,
     },
+
+    /// A replacement took effect — its rename is visible and the new bytes are
+    /// live — but the containing directory could not be synced, so a power
+    /// loss or kernel crash might still revert it. The change is committed:
+    /// callers keep their in-memory state, and saving again re-syncs the
+    /// directory.
+    #[error("{path} was replaced, but its directory could not be flushed to disk: {source}")]
+    DurabilityUnconfirmed {
+        /// The component whose replacement is not yet known to be durable.
+        path: PathBuf,
+        /// The failed directory sync.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl ProjectError {
-    /// Whether the save crossed its timeline commit point before failing.
+    /// Whether the save crossed its commit point before failing: the new state
+    /// is already visible on disk (a trailing manifest cleanup failed, or the
+    /// final flush could not be confirmed), so callers must keep the in-memory
+    /// state that produced it instead of rolling back.
     pub fn is_partial_commit(&self) -> bool {
-        matches!(self, ProjectError::PartialCommit { .. })
+        matches!(
+            self,
+            ProjectError::PartialCommit { .. } | ProjectError::DurabilityUnconfirmed { .. }
+        )
     }
 
     pub(crate) fn partial_commit(source: ProjectError) -> Self {

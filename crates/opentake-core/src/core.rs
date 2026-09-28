@@ -51,11 +51,24 @@ use crate::session::{
 type ProjectIdentityTransitionListener = Arc<dyn Fn(bool) + Send + Sync + 'static>;
 
 /// A generation mutation committed under the session lock, with the events
-/// still owed to observers once every lock is released.
+/// still owed to observers once every lock is released. `written` carries a
+/// committed persistence error when the write crossed its commit point.
 struct GenerationCommit<T> {
     value: T,
     media_count: Option<usize>,
-    written: Option<PathBuf>,
+    written: Option<Result<PathBuf>>,
+}
+
+/// Split a persistence result at its commit point. The outer error never
+/// committed and must roll the in-memory mutation back. The inner error
+/// already committed (see [`CoreError::is_committed`]): the mutation stays
+/// live, its change events are still owed, and the error is reported after
+/// them.
+fn split_at_commit<T>(result: Result<T>) -> Result<Result<T>> {
+    match result {
+        Err(error) if error.is_committed() => Ok(Err(error)),
+        result => result.map(Ok),
+    }
 }
 
 /// Thread-safe id generator used as the core's default.
@@ -1443,8 +1456,10 @@ impl AppCore {
     }
 
     /// Run one generation mutation under the session lock and persist it only
-    /// when it is a durable lifecycle change. Any mutation or persistence
-    /// failure restores the exact pre-call manifest and log.
+    /// when it is a durable lifecycle change. Any mutation or uncommitted
+    /// persistence failure restores the exact pre-call manifest and log; a
+    /// failure after the commit point keeps them, because disk already holds
+    /// the new state.
     fn commit_generation_mutation<T>(
         &self,
         _publication: &MutexGuard<'_, ()>,
@@ -1459,7 +1474,7 @@ impl AppCore {
         let result = (|| {
             let (value, change) = mutate(&mut session.editor, self.ids.as_ref())?;
             let written = match change {
-                GenerationChange::Durable => Some(persist(&mut session.editor)?),
+                GenerationChange::Durable => Some(split_at_commit(persist(&mut session.editor))?),
                 GenerationChange::Progress | GenerationChange::Unchanged => None,
             };
             Ok((value, change, written))
@@ -1495,7 +1510,7 @@ impl AppCore {
         }
         if let Some(written) = committed.written {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: written.to_string_lossy().into_owned(),
+                path: written?.to_string_lossy().into_owned(),
                 project_epoch,
             });
         }
@@ -1713,10 +1728,12 @@ impl AppCore {
             placement,
             action_name,
             &mut events,
-        )?;
+        );
         drop(publication);
+        // Events are queued only once the edit is committed, so this also
+        // announces an edit whose save committed but reported an error.
         self.emit_deferred(events);
-        Ok(commit)
+        commit
     }
 
     /// Deferred-event form of [`Self::commit_generated_media_for_project`].
@@ -1869,14 +1886,14 @@ impl AppCore {
                 let mut edit = session.editor.apply(command, self.ids.as_ref())?;
                 edit.action_name = action_name.to_string();
                 edit.summary = format!("{} generated media clip(s)", edit.affected_clip_ids.len());
-                let written = session.editor.save_project(None)?;
-                Ok((MotionMediaCommit { media, edit }, written))
+                let saved = split_at_commit(session.editor.save_project(None))?;
+                Ok((MotionMediaCommit { media, edit }, saved))
             })();
 
             match result {
-                Ok((commit, written)) => {
+                Ok((commit, saved)) => {
                     let count = session.editor.media_count();
-                    (commit, count, written)
+                    (commit, count, saved)
                 }
                 Err(error) => {
                     session.editor.restore_editor_state(before);
@@ -1894,7 +1911,7 @@ impl AppCore {
             count,
         });
         events.push(CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: written?.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
         });
         Ok(commit)
@@ -1960,12 +1977,12 @@ impl AppCore {
                 let imports = session
                     .editor
                     .import_prepared_media(plan, self.ids.as_ref())?;
-                let written = persist(&mut session.editor)?;
-                Ok((imports, written))
+                let saved = split_at_commit(persist(&mut session.editor))?;
+                Ok((imports, saved))
             })();
 
             match result {
-                Ok((imports, written)) => (imports, session.editor.media_count(), written),
+                Ok((imports, saved)) => (imports, session.editor.media_count(), saved),
                 Err(error) => {
                     session.editor.restore_editor_state(before);
                     return Err(error);
@@ -1978,7 +1995,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: written?.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
         });
         Ok(imports)
@@ -2005,9 +2022,11 @@ impl AppCore {
             probe,
             library_id,
             &mut events,
-        )?;
+        );
+        // Events are queued only after the import committed, including one
+        // whose save committed but reported an error.
         self.emit_deferred(events);
-        Ok(entry)
+        entry
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2022,7 +2041,7 @@ impl AppCore {
         events: &mut DeferredCoreEvents,
     ) -> Result<MediaManifestEntry> {
         let id = self.ids.next_id();
-        let (entry, count) = {
+        let (entry, count, saved) = {
             let mut session = self.lock();
             ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
             let before = session.editor.media();
@@ -2031,13 +2050,13 @@ impl AppCore {
                 session
                     .editor
                     .set_media_global_favorite(&entry.id, Some(library_id.to_string()))?;
-                session.editor.save_media_manifest()?;
-                Ok(entry)
+                let saved = split_at_commit(session.editor.save_media_manifest())?;
+                Ok((entry, saved))
             })();
             match result {
-                Ok(entry) => {
+                Ok((entry, saved)) => {
                     let count = session.editor.media_count();
-                    (entry, count)
+                    (entry, count, saved)
                 }
                 Err(error) => {
                     session.editor.restore_media(before);
@@ -2049,6 +2068,7 @@ impl AppCore {
             project_epoch: expected_project_epoch,
             count,
         });
+        saved?;
         events.push(CoreEvent::ProjectSaved {
             path: expected_project_dir.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
@@ -2283,8 +2303,8 @@ impl AppCore {
             let before = session.editor.media();
             let entry = session.editor.set_media_proxy(asset_id, proxy)?;
             let count = session.editor.media_count();
-            match session.editor.save_media_manifest() {
-                Ok(written) => (entry, count, written),
+            match split_at_commit(session.editor.save_media_manifest()) {
+                Ok(saved) => (entry, count, saved),
                 Err(error) => {
                     session.editor.restore_media(before);
                     return Err(error);
@@ -2296,7 +2316,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: written?.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
         });
         Ok(entry)
@@ -2327,8 +2347,8 @@ impl AppCore {
             let before = session.editor.media();
             let entry = session.editor.set_media_proxy(&expected_entry.id, proxy)?;
             let count = session.editor.media_count();
-            match session.editor.save_media_manifest() {
-                Ok(written) => (entry, count, written),
+            match split_at_commit(session.editor.save_media_manifest()) {
+                Ok(saved) => (entry, count, saved),
                 Err(error) => {
                     session.editor.restore_media(before);
                     return Err(error);
@@ -2340,7 +2360,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: written?.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
         });
         Ok(Some(entry))
@@ -2374,8 +2394,8 @@ impl AppCore {
             let before = session.editor.media();
             session.editor.set_media_proxy(asset_id, updated)?;
             let count = session.editor.media_count();
-            match session.editor.save_media_manifest() {
-                Ok(written) => (count, written),
+            match split_at_commit(session.editor.save_media_manifest()) {
+                Ok(saved) => (count, saved),
                 Err(error) => {
                     session.editor.restore_media(before);
                     return Err(error);
@@ -2387,7 +2407,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: written?.to_string_lossy().into_owned(),
             project_epoch: expected_project_epoch,
         });
         Ok(true)
@@ -2567,9 +2587,9 @@ impl AppCore {
         let mut session = self.lock();
         ensure_project_identity(&session, expected_project_epoch, expected_project_dir)?;
         session.editor.restore_media(manifest);
-        session.editor.save_media_manifest()?;
+        let saved = split_at_commit(session.editor.save_media_manifest())?;
         events.clear();
-        Ok(())
+        saved.map(|_| ())
     }
 
     /// Restore and persist a manifest through caller-supplied retained
@@ -2616,8 +2636,8 @@ impl AppCore {
             let entry = session.editor.relink_media_file(asset_id, path, probe)?;
             let count = session.editor.media_count();
             let saved = if session.editor.project_dir().is_some() {
-                match session.editor.save_media_manifest() {
-                    Ok(path) => Some(path),
+                match split_at_commit(session.editor.save_media_manifest()) {
+                    Ok(saved) => Some(saved),
                     Err(error) => {
                         session.editor.restore_media(before);
                         return Err(error);
@@ -2632,9 +2652,9 @@ impl AppCore {
             project_epoch,
             count,
         });
-        if let Some(path) = saved {
+        if let Some(saved) = saved {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: path.to_string_lossy().into_owned(),
+                path: saved?.to_string_lossy().into_owned(),
                 project_epoch,
             });
         }
@@ -3173,6 +3193,82 @@ mod tests {
         assert!(recovered.manifest.entries.is_empty());
 
         drop(recovered);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn unflushed_persisted_edit_stays_live_and_reports_unconfirmed_durability() {
+        let bundle = project_bundle("unflushed-persisted-edit");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let before = core.runtime_snapshot();
+
+        // media.json is replaced first; its flush fails after the rename.
+        opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
+        let error = core
+            .apply_at_revision_persisted(core.project_revision(), add_one_clip())
+            .expect_err("the unconfirmed flush must be reported");
+
+        assert!(error.is_committed(), "{error:?}");
+        assert!(matches!(
+            error,
+            CoreError::Project(opentake_project::ProjectError::DurabilityUnconfirmed { .. })
+        ));
+        let after = core.runtime_snapshot();
+        assert!(
+            after.version > before.version,
+            "the edit must not roll back"
+        );
+        let persisted = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(persisted.timeline, after.timeline);
+
+        drop(persisted);
+        drop(core);
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn unflushed_proxy_manifest_keeps_the_committed_proxy_live() {
+        let bundle = project_bundle("unflushed-proxy");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        let snapshot = core.runtime_snapshot();
+        let asset_id = snapshot.media.entries[0].id.clone();
+        let proxy = MediaProxy {
+            relative_path: "media/proxies/proxy.mp4".into(),
+            source_sha256: "a".repeat(64),
+            source_stamp: None,
+            width: 320,
+            height: 180,
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        core.subscribe(move |event| recorded.lock().unwrap().push(event.clone()));
+
+        opentake_project::bundle::test_hooks::fail_directory_sync_after(0);
+        let error = core
+            .set_media_proxy_for_project(
+                snapshot.project_epoch,
+                &bundle,
+                &asset_id,
+                Some(proxy.clone()),
+            )
+            .expect_err("the unconfirmed flush must be reported");
+
+        assert!(error.is_committed(), "{error:?}");
+        assert_eq!(core.media().entries[0].proxy, Some(proxy.clone()));
+        let persisted = opentake_project::Project::open(&bundle).unwrap();
+        assert_eq!(persisted.manifest.entries[0].proxy, Some(proxy));
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MediaChanged { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::ProjectSaved { .. })));
+
+        drop(persisted);
         drop(core);
         std::fs::remove_dir_all(bundle).unwrap();
     }

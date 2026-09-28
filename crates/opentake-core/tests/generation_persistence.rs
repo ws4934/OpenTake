@@ -759,6 +759,72 @@ fn failed_manifest_commit_rolls_back_the_published_media_leaf() {
     assert_eq!(core.generation_log().entries.len(), rows);
 }
 
+#[test]
+fn unflushed_manifest_commit_keeps_the_finalized_output_and_its_media_leaf() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let job = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    for status in [
+        GenerationJobStatus::Generating,
+        GenerationJobStatus::Downloading,
+    ] {
+        core.update_generation_job_for_project(epoch, &bundle, &job.job_id, update(status, None))
+            .unwrap();
+    }
+    let rows = core.generation_log().entries.len();
+    let asset_id = &job.placeholder_asset_ids[0];
+    let leaf = format!("{asset_id}.png");
+
+    // The media leaf and log flushes succeed; the manifest's commit flush
+    // fails after its rename.
+    opentake_project::bundle::test_hooks::fail_directory_sync_after(2);
+    let error = core
+        .finalize_generation_output_with_media_for_project(
+            epoch,
+            &bundle,
+            PreparedGenerationOutput {
+                asset_id: asset_id.clone(),
+                relative_path: format!("media/{leaf}"),
+                probe: history_image_probe(),
+                created_at: None,
+            },
+            &leaf,
+            6,
+            &mut std::io::Cursor::new(b"result"),
+        )
+        .expect_err("the unconfirmed manifest flush must be reported");
+
+    assert!(error.is_committed(), "{error:?}");
+    assert_eq!(
+        fs::read(bundle.join("media").join(&leaf)).unwrap(),
+        b"result"
+    );
+    let live = core
+        .media()
+        .entries
+        .into_iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(
+        live.generation_input.as_ref().unwrap().status,
+        Some(GenerationJobStatus::Ready)
+    );
+    assert_eq!(core.generation_log().entries.len(), rows + 1);
+    let persisted = Project::open(&bundle).unwrap();
+    let persisted_entry = persisted
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.id == asset_id)
+        .unwrap();
+    assert_eq!(persisted_entry, &live);
+    assert_eq!(persisted.generation_log.unwrap(), core.generation_log());
+}
+
 /// Acceptance timing for issue #76: with 256 MiB under `media/`, one durable
 /// transition and every concurrent session read stay under 50 ms because no
 /// media byte is copied. Ignored by default because fsync latency on shared

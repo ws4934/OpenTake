@@ -42,7 +42,7 @@ use opentake_domain::{
 use opentake_ops::command::{self, EditCommand, EditResult};
 use opentake_ops::{EditorState, IdGen};
 use opentake_project::{
-    GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectRoot,
+    GenerationLog, GenerationLogEntry, Project, ProjectCompatibility, ProjectError, ProjectRoot,
     ProjectRootIdentity, StagedMediaLeaf, ThumbnailUpdate,
 };
 use same_file::Handle;
@@ -1247,9 +1247,16 @@ impl EditorSession {
         self.ensure_mutable()?;
         let target = self.project_dir.clone().ok_or(CoreError::NoProjectOpen)?;
         let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
-        self.generation_state_project(&target)
-            .save_manifest_and_generation_log_to_root(root)?;
-        self.generation_log_component_present = true;
+        let saved = self
+            .generation_state_project(&target)
+            .save_manifest_and_generation_log_to_root(root);
+        if saved
+            .as_ref()
+            .map_or_else(ProjectError::is_partial_commit, |()| true)
+        {
+            self.generation_log_component_present = true;
+        }
+        saved?;
         Ok(target)
     }
 
@@ -1270,9 +1277,18 @@ impl EditorSession {
         }
         let project = self.generation_state_project(&target);
         let published = media.publish()?;
-        project.save_manifest_and_generation_log_to_root(root)?;
-        published.commit();
-        self.generation_log_component_present = true;
+        let saved = project.save_manifest_and_generation_log_to_root(root);
+        if saved
+            .as_ref()
+            .map_or_else(ProjectError::is_partial_commit, |()| true)
+        {
+            // The manifest naming the leaf committed, even if its flush was
+            // not confirmed: the leaf must stay. Otherwise dropping the guard
+            // rolls the uncommitted leaf back.
+            published.commit();
+            self.generation_log_component_present = true;
+        }
+        saved?;
         Ok(target)
     }
 

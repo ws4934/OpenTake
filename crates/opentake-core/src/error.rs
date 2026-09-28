@@ -60,6 +60,14 @@ pub enum CoreError {
 pub type Result<T> = std::result::Result<T, CoreError>;
 
 impl CoreError {
+    /// Whether a persistence failure happened after its commit point (see
+    /// [`ProjectError::is_partial_commit`]): the new state is already on disk,
+    /// so the in-memory mutation that produced it must stay live rather than
+    /// being rolled back.
+    pub fn is_committed(&self) -> bool {
+        matches!(self, CoreError::Project(error) if error.is_partial_commit())
+    }
+
     /// Machine-readable error class for the Tauri boundary (`core-SPEC.md` §6.3):
     /// `"validation"` for rejected input, `"internal"` for everything else.
     pub fn code(&self) -> &'static str {
