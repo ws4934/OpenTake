@@ -1328,6 +1328,7 @@ fn validation_error(message: String) -> CmdError {
     CmdError {
         code: "validation".to_string(),
         message,
+        params: Default::default(),
     }
 }
 
@@ -1335,6 +1336,7 @@ fn internal_error(message: impl Into<String>) -> CmdError {
     CmdError {
         code: "internal".to_string(),
         message: message.into(),
+        params: Default::default(),
     }
 }
 

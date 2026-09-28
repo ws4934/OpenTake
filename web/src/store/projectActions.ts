@@ -7,13 +7,15 @@
  */
 
 import * as api from "../lib/api";
+import type { RuntimeTimelineSnapshot } from "../lib/types";
 import { forceRefresh } from "./sync";
 import { useEditorUiStore } from "./uiStore";
 import { useProjectStore } from "./projectStore";
 import { useRecentStore } from "./recentStore";
-import { refreshMedia, resetProjectMediaState } from "./mediaStore";
+import { refreshMedia, resetProjectMediaState, useMediaStore } from "./mediaStore";
 import { openDialog, saveDialog } from "../lib/dialog";
 import { t } from "../i18n";
+import { projectErrorMessage, projectOpenNotices } from "../lib/projectMessages";
 import { stopNativePlaybackForProjectBoundary } from "../components/preview/nativePlaybackSession";
 import { useMotionStudioStore } from "./motionStudioStore";
 
@@ -203,8 +205,9 @@ async function runSaveCoordinator(): Promise<void> {
       const afterFailure = captureSaveSnapshot();
       const failureIsCurrent = Boolean(afterFailure && sameSnapshot(snapshot, afterFailure));
       if (failureIsCurrent) {
-        const message = error instanceof Error ? error.message : String(error);
-        useEditorUiStore.getState().pushToast(t("project.saveFailed", { error: message }));
+        useEditorUiStore
+          .getState()
+          .pushToast(t("project.saveFailed", { error: projectErrorMessage(error) }));
       }
       if (queuedExplicitSave) continue;
       if (failureIsCurrent) return;
@@ -323,12 +326,18 @@ async function runSaveCurrentProjectAs(): Promise<void> {
 /** Open `path` (a `.opentake` bundle), refresh the mirror, record it, and enter
  *  the editor. Used by both the dialog flow and the recents list. */
 function projectLifecycleErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "object" && error !== null && "message" in error) {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string") return message;
-  }
-  return String(error);
+  return projectErrorMessage(error);
+}
+
+/** Tell the user, once per opened project, about the recoverable problems the
+ *  core handled while opening it. Later refreshes of the same project carry
+ *  the same warnings but never come through here. */
+function showProjectOpenNotices(snapshot: RuntimeTimelineSnapshot): void {
+  const warnings = snapshot.compatibilityWarnings ?? [];
+  if (warnings.length === 0) return;
+  const names = new Map(useMediaStore.getState().items.map((item) => [item.id, item.name]));
+  const notices = projectOpenNotices(warnings, names);
+  if (notices.length > 0) useEditorUiStore.getState().pushToast(notices.join("\n"));
 }
 
 export async function openProjectPath(path: string): Promise<void> {
@@ -350,6 +359,7 @@ export async function openProjectPath(path: string): Promise<void> {
   await refreshMedia();
   useEditorUiStore.getState().resetProjectRuntimeState();
   useEditorUiStore.getState().setView("editor");
+  showProjectOpenNotices(snap);
 }
 
 /** Pick a project bundle with the native dialog, then open it. `.opentake`

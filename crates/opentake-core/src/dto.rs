@@ -13,6 +13,8 @@
 //! domain schema (= `project.json`), so the read-only mirror and the persisted
 //! file share one shape (`core-SPEC.md` §4.4).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use opentake_domain::Timeline;
@@ -33,6 +35,10 @@ pub struct CmdError {
     pub code: String,
     /// Human-readable message (carries precise validation paths when available).
     pub message: String,
+    /// Values a front end needs to rebuild `message` in its own language, such
+    /// as `file`, `sizeMib` and `limitMib` for `projectComponentTooLarge`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 }
 
 impl From<CoreError> for CmdError {
@@ -55,10 +61,35 @@ impl From<CoreError> for CmdError {
                     .unwrap_or_else(|| "Project operation failed".to_string())
             }
         };
+        let params = match &err {
+            CoreError::Project(project) => project_error_params(project),
+            _ => BTreeMap::new(),
+        };
         CmdError {
             code: code.to_string(),
             message,
+            params,
         }
+    }
+}
+
+const MIB: f64 = 1024.0 * 1024.0;
+
+/// The values behind [`project_error_message`] for errors whose message
+/// carries them, so a front end can translate the message.
+fn project_error_params(error: &opentake_project::ProjectError) -> BTreeMap<String, String> {
+    match error {
+        opentake_project::ProjectError::ComponentTooLarge { file, size, limit } => {
+            BTreeMap::from([
+                ("file".to_string(), file.clone()),
+                ("sizeMib".to_string(), format!("{:.1}", *size as f64 / MIB)),
+                (
+                    "limitMib".to_string(),
+                    format!("{:.0}", *limit as f64 / MIB),
+                ),
+            ])
+        }
+        _ => BTreeMap::new(),
     }
 }
 
@@ -69,7 +100,6 @@ fn project_error_message(error: &opentake_project::ProjectError) -> Option<Strin
     use opentake_project::ProjectError;
     use std::io::ErrorKind;
 
-    const MIB: f64 = 1024.0 * 1024.0;
     let message = match error {
         ProjectError::Io { source, .. } => match source.kind() {
             ErrorKind::StorageFull | ErrorKind::QuotaExceeded => {
@@ -129,12 +159,18 @@ pub struct TimelineSnapshotDto {
     /// Sorted persisted-schema paths this build does not understand.
     #[serde(rename = "compatibilityBlockers")]
     pub compatibility_blockers: Vec<String>,
+    /// Sorted, file-qualified notices about recoverable problems handled when
+    /// the project was opened (`media.json:offline-media:<id>`,
+    /// `media.json:ignored-proxy:<id>`, `generation-log.json:moved-aside:<file>`).
+    #[serde(rename = "compatibilityWarnings")]
+    pub compatibility_warnings: Vec<String>,
 }
 
 impl From<TimelineSnapshot> for TimelineSnapshotDto {
     fn from(s: TimelineSnapshot) -> Self {
         let compatibility_read_only = s.compatibility.is_read_only();
         let compatibility_blockers = s.compatibility.blockers().to_vec();
+        let compatibility_warnings = s.compatibility.warnings().to_vec();
         TimelineSnapshotDto {
             timeline: s.timeline,
             project_epoch: s.project_epoch,
@@ -142,6 +178,7 @@ impl From<TimelineSnapshot> for TimelineSnapshotDto {
             project_path: s.project_path,
             compatibility_read_only,
             compatibility_blockers,
+            compatibility_warnings,
         }
     }
 }
@@ -484,6 +521,23 @@ mod tests {
             "{}",
             too_large.message
         );
+        // The values behind the message travel as params so the front end
+        // can translate it; other errors carry none.
+        assert_eq!(
+            too_large.params,
+            BTreeMap::from([
+                ("file".to_string(), "generation-log.json".to_string()),
+                ("limitMib".to_string(), "16".to_string()),
+                ("sizeMib".to_string(), "17.0".to_string()),
+            ])
+        );
+        let json = serde_json::to_value(&too_large).unwrap();
+        assert_eq!(json["params"]["sizeMib"], "17.0");
+        assert!(storage_full.params.is_empty());
+        assert!(serde_json::to_value(&storage_full)
+            .unwrap()
+            .get("params")
+            .is_none());
         let recovery = CmdError::from(CoreError::Project(ProjectError::RecoveryRequired {
             backup: "/private/customer/.secret.opentake.opentake-backup".into(),
             publish: "publish failed".into(),
@@ -525,6 +579,40 @@ mod tests {
         assert_eq!(dto.version, 0);
         assert_eq!(dto.project_epoch, 2);
         assert!(dto.timeline.tracks.is_empty());
+    }
+
+    #[test]
+    fn snapshot_carries_the_open_warnings() {
+        let dir = std::env::temp_dir().join(format!(
+            "opentake-core-dto-warnings-{}.opentake",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = opentake_project::Project::new(dir.clone());
+        project.save().unwrap();
+        // An older build wrote an unsafe `.project` path.
+        let manifest_path = dir.join(opentake_project::layout::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut entry =
+            serde_json::to_value(crate::session::test_media_entry("unsafe-asset")).unwrap();
+        entry["source"] = serde_json::json!({ "project": { "relativePath": "../outside.mp4" } });
+        manifest["entries"] = serde_json::json!([entry]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let core = AppCore::new();
+        let dto = TimelineSnapshotDto::from(core.open_project(dir.clone()).unwrap());
+        assert_eq!(
+            dto.compatibility_warnings,
+            ["media.json:offline-media:unsafe-asset"]
+        );
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            json["compatibilityWarnings"],
+            serde_json::json!(["media.json:offline-media:unsafe-asset"])
+        );
+        assert!(handle_project_new(&core).compatibility_warnings.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
