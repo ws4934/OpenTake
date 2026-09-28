@@ -1429,56 +1429,21 @@ impl Dispatcher {
 
         // Transcribe each UNIQUE source once (cached), via the bridge. Skip —
         // don't fail — on per-source errors, collecting `{file, reason}`.
-        let unique_sources = unique_transcript_sources(&frags);
         let Some(bridge) = self.bridge.as_ref() else {
             return Ok(ToolResult::error(
                 "get_transcript: transcription is not available in this build",
             ));
         };
-        let source_results = bridge
-            .transcribe_sources(&unique_sources)
-            .map_err(|e| ToolError::new(e.message))?;
+        let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
 
-        // Index transcripts + collect skips by media_ref.
-        let mut transcripts: BTreeMap<String, opentake_media::TranscriptionResult> =
-            BTreeMap::new();
-        let mut skipped: Vec<serde_json::Value> = Vec::new();
-        for r in source_results {
-            if let Some(t) = r.transcript {
-                transcripts.insert(r.media_ref, t);
-            } else if let Some(reason) = r.error {
-                let file = manifest
-                    .entries
-                    .iter()
-                    .find(|e| e.id == r.media_ref)
-                    .map(|e| e.name.clone())
-                    .unwrap_or_else(|| r.media_ref.clone());
-                tracing::warn!(
-                    target: "opentake::agent::private",
-                    media_ref = %r.media_ref,
-                    detail = %reason,
-                    "transcript source was skipped"
-                );
-                skipped.push(serde_json::json!({
-                    "file": file,
-                    "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
-                    "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
-                }));
-            }
-        }
-
-        // Assemble via the pure mapper: attach each frag's transcript by media_ref.
-        let mapper_frags: Vec<opentake_media::ClipFragment<'_>> = frags
-            .iter()
-            .map(|f| opentake_media::ClipFragment {
-                clip_id: f.clip.id.clone(),
-                track_index: f.track_index,
-                clip: f.clip,
-                transcript: transcripts.get(&f.clip.media_ref),
-            })
-            .collect();
-        let assembled =
-            opentake_media::timeline_transcript(mapper_frags, fps, a.start_frame, a.end_frame);
+        // Assemble via the pure mapper, capped for the model-facing response.
+        let assembled = assemble_fragment_transcript(
+            &frags,
+            &sources,
+            fps,
+            (a.start_frame, a.end_frame),
+            opentake_media::TIMELINE_MAX_WORDS,
+        );
 
         // Serialize the upstream envelope: clips with nested compact word rows.
         let clips_json: Vec<serde_json::Value> = assembled
@@ -1517,8 +1482,8 @@ impl Dispatcher {
                 ));
             }
         }
-        if !skipped.is_empty() {
-            out["skipped"] = serde_json::json!(skipped);
+        if !sources.skipped.is_empty() {
+            out["skipped"] = serde_json::json!(sources.skipped);
         }
         Ok(ToolResult::ok(out.to_string()))
     }
@@ -2292,15 +2257,10 @@ impl Dispatcher {
             ));
         }
 
-        let transcript = self.get_transcript(&serde_json::json!({}), before, manifest)?;
-        if transcript.is_error {
-            return Ok(transcript);
-        }
-        let transcript_json: Value = serde_json::from_str(&transcript.text_joined())
-            .map_err(|_| ToolError::new("remove_filler_words: transcript response is invalid"))?;
-        let clips = transcript_json["clips"]
-            .as_array()
-            .ok_or_else(|| ToolError::new("remove_filler_words: transcript clips are missing"))?;
+        // Resolve the scope before transcribing: the requested clips (or every
+        // clip on trackIndex) plus their link-group partners. Only those clips'
+        // sources are transcribed, and every word is kept — get_transcript's
+        // model-facing word cap would silently drop later clips here.
         let requested_ids = a
             .clip_ids
             .as_ref()
@@ -2335,6 +2295,32 @@ impl Dispatcher {
             }
             expanded
         });
+        let frags: Vec<TranscriptFrag<'_>> = caption_target_fragments(before, manifest)
+            .into_iter()
+            .filter(|f| {
+                selected_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(f.clip.id.as_str()))
+            })
+            .collect();
+        let (clips, skipped) = if frags.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let Some(bridge) = self.bridge.as_ref() else {
+                return Ok(ToolResult::error(
+                    "remove_filler_words: transcription is not available in this build",
+                ));
+            };
+            let sources = transcribe_fragment_sources(bridge.as_ref(), &frags, manifest)?;
+            let transcript = assemble_fragment_transcript(
+                &frags,
+                &sources,
+                before.fps,
+                (None, None),
+                usize::MAX,
+            );
+            (transcript.clips, sources.skipped)
+        };
         let padding = a.padding_frames.unwrap_or(1).max(0) as i64;
         let mut cuts = Vec::new();
         let mut ranges_by_track: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
@@ -2342,34 +2328,20 @@ impl Dispatcher {
         // member's cuts go to the first member's track as one set of ranges.
         let mut link_group_tracks: BTreeMap<&str, usize> = BTreeMap::new();
 
-        for clip in clips {
-            let Some(clip_id) = clip["clipId"].as_str() else {
-                continue;
-            };
-            let Some(track_index) = clip["trackIndex"].as_u64() else {
-                continue;
-            };
+        for clip in &clips {
+            let clip_id = clip.clip_id.as_str();
+            let track_index = clip.track_index;
             let command_track =
                 match find_clip(before, clip_id).and_then(|clip| clip.link_group_id.as_deref()) {
-                    Some(group) => *link_group_tracks
-                        .entry(group)
-                        .or_insert(track_index as usize),
-                    None => track_index as usize,
+                    Some(group) => *link_group_tracks.entry(group).or_insert(track_index),
+                    None => track_index,
                 };
-            if selected_ids
-                .as_ref()
-                .is_some_and(|ids| !ids.contains(clip_id))
-            {
-                continue;
-            }
-            let clip_start = clip["startFrame"].as_i64().unwrap_or(0);
-            let clip_end = clip["endFrame"].as_i64().unwrap_or(clip_start);
-            let Some(rows) = clip["words"].as_array() else {
-                continue;
-            };
+            let clip_start = i64::from(clip.start_frame);
+            let clip_end = i64::from(clip.end_frame);
+            let rows = &clip.words;
             let normalized = rows
                 .iter()
-                .map(|row| normalize_spoken_token(row[0].as_str().unwrap_or_default()))
+                .map(|row| normalize_spoken_token(&row.text))
                 .collect::<Vec<_>>();
             let mut word_index = 0;
             while word_index < rows.len() {
@@ -2381,14 +2353,14 @@ impl Dispatcher {
                     continue;
                 };
                 let last_index = word_index + phrase.len() - 1;
-                let start = (rows[word_index][1].as_i64().unwrap_or(clip_start) + padding)
-                    .clamp(clip_start, clip_end);
-                let end = (rows[last_index][2].as_i64().unwrap_or(start) - padding)
-                    .clamp(clip_start, clip_end);
+                let start =
+                    (i64::from(rows[word_index].start_frame) + padding).clamp(clip_start, clip_end);
+                let end =
+                    (i64::from(rows[last_index].end_frame) - padding).clamp(clip_start, clip_end);
                 if end > start {
                     let text = rows[word_index..=last_index]
                         .iter()
-                        .filter_map(|row| row[0].as_str())
+                        .map(|row| row.text.as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
                     let cut_id = format!("filler-{clip_id}-{word_index}");
@@ -2420,15 +2392,17 @@ impl Dispatcher {
             )
         });
         let commands = ordered_ripple_commands(&ranges_by_track);
-        Ok(ToolResult::ok(
-            serde_json::json!({
-                "applied": false,
-                "cuts": cuts,
-                "commands": commands,
-                "note": "Review cuts and remove rejected ranges, then call the returned ripple_delete_ranges commands in the listed order; do not reorder them. Each command applies as one undoable edit.",
-            })
-            .to_string(),
-        ))
+        let mut out = serde_json::json!({
+            "applied": false,
+            "cuts": cuts,
+            "commands": commands,
+            "note": "Review cuts and remove rejected ranges, then call the returned ripple_delete_ranges commands in the listed order; do not reorder them. Each command applies as one undoable edit.",
+        });
+        // Sources that could not be transcribed were not searched for fillers.
+        if !skipped.is_empty() {
+            out["skipped"] = serde_json::json!(skipped);
+        }
+        Ok(ToolResult::ok(out.to_string()))
     }
 
     fn detect_beat_hints(
@@ -3609,6 +3583,83 @@ fn scoped_caption_target_fragments<'a>(
         .into_iter()
         .filter(|f| selected.contains(f.clip.id.as_str()))
         .collect()
+}
+
+/// Per-source transcripts for a set of caption fragments, keyed by media ref,
+/// plus model-safe `skipped` entries for sources that could not be transcribed.
+struct FragmentTranscripts {
+    by_media_ref: BTreeMap<String, opentake_media::TranscriptionResult>,
+    skipped: Vec<Value>,
+}
+
+/// Transcribe each distinct source of `frags` once (cached) through the
+/// bridge. A per-source failure is skipped — not fatal — and reported as a
+/// `{file, code, reason}` entry without the private diagnostic; a backend
+/// failure (e.g. no model) is a tool error.
+fn transcribe_fragment_sources(
+    bridge: &dyn MediaBridge,
+    frags: &[TranscriptFrag<'_>],
+    manifest: &MediaManifest,
+) -> Result<FragmentTranscripts, ToolError> {
+    let source_results = bridge
+        .transcribe_sources(&unique_transcript_sources(frags))
+        .map_err(|e| ToolError::new(e.message))?;
+    let mut by_media_ref = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for r in source_results {
+        if let Some(t) = r.transcript {
+            by_media_ref.insert(r.media_ref, t);
+        } else if let Some(reason) = r.error {
+            let file = manifest
+                .entries
+                .iter()
+                .find(|e| e.id == r.media_ref)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| r.media_ref.clone());
+            tracing::warn!(
+                target: "opentake::agent::private",
+                media_ref = %r.media_ref,
+                detail = %reason,
+                "transcript source was skipped"
+            );
+            skipped.push(serde_json::json!({
+                "file": file,
+                "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
+                "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
+            }));
+        }
+    }
+    Ok(FragmentTranscripts {
+        by_media_ref,
+        skipped,
+    })
+}
+
+/// Map every fragment's words into project frames with the pure timeline
+/// assembler, keeping at most `max_words` words across all fragments.
+fn assemble_fragment_transcript(
+    frags: &[TranscriptFrag<'_>],
+    sources: &FragmentTranscripts,
+    fps: i32,
+    (window_start, window_end): (Option<i32>, Option<i32>),
+    max_words: usize,
+) -> opentake_media::TimelineTranscript {
+    let mapper_frags = frags
+        .iter()
+        .map(|f| opentake_media::ClipFragment {
+            clip_id: f.clip.id.clone(),
+            track_index: f.track_index,
+            clip: f.clip,
+            transcript: sources.by_media_ref.get(&f.clip.media_ref),
+        })
+        .collect();
+    opentake_media::timeline_transcript_with_limit(
+        mapper_frags,
+        fps,
+        window_start,
+        window_end,
+        max_words,
+    )
 }
 
 /// Caption style/placement defaults, 1:1 with upstream `AppTheme.Caption`
@@ -10456,5 +10507,176 @@ mod tests {
         let expected = vec![(0, 6, 0), (6, 48, 12)];
         assert_eq!(track_layout(&after, 0), expected);
         assert_eq!(track_layout(&after, 1), expected);
+    }
+
+    /// One audio track at 30 fps: `clip-long` (media `long`, 10_005 words with
+    /// an "um" at word 10_002, past the get_transcript cap) followed by
+    /// `clip-b` (media `short`, "Well um go").
+    fn long_interview_dispatcher() -> (Dispatcher, Arc<FakeBridge>) {
+        let mut timeline = Timeline::new();
+        timeline.fps = 30;
+        let mut track = Track::new("track-a", ClipType::Audio);
+        track.clips.push(audio_clip("clip-long", "long", 0, 30_100));
+        track.clips.push(audio_clip("clip-b", "short", 30_100, 60));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("long", "Interview"));
+        manifest.entries.push(audio_entry("short", "Outro"));
+        let long_words = (0..10_005)
+            .map(|index| {
+                let start = index as f64 * 0.1;
+                word(
+                    if index == 10_002 { "um" } else { "so" },
+                    start,
+                    start + 0.05,
+                )
+            })
+            .collect();
+        let bridge = Arc::new(
+            FakeBridge::default()
+                .with_transcript("long", transcript(long_words))
+                .with_transcript(
+                    "short",
+                    transcript(vec![
+                        word("Well", 0.0, 0.2),
+                        word("um", 0.2, 0.4),
+                        word("go", 0.5, 0.7),
+                    ]),
+                ),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+        (d, bridge)
+    }
+
+    /// `(clipId, text)` of every cut in a remove_filler_words preview.
+    fn filler_cuts(result: &ToolResult) -> Vec<(String, String)> {
+        assert!(!result.is_error, "{}", result.text_joined());
+        first_json(result)["cuts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cut| {
+                (
+                    cut["clipId"].as_str().unwrap().to_string(),
+                    cut["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn filler_cut(clip_id: &str) -> (String, String) {
+        (clip_id.to_string(), "um".to_string())
+    }
+
+    #[test]
+    fn remove_filler_words_finds_fillers_past_the_transcript_word_cap() {
+        let (d, bridge) = long_interview_dispatcher();
+        let args = |scope: Value| {
+            let mut args = serde_json::json!({"fillerWords": ["um"], "paddingFrames": 0});
+            args.as_object_mut()
+                .unwrap()
+                .extend(scope.as_object().unwrap().clone());
+            args
+        };
+
+        let scoped = d.dispatch(
+            "remove_filler_words",
+            args(serde_json::json!({"clipIds": ["clip-b"]})),
+        );
+        assert_eq!(filler_cuts(&scoped), [filler_cut("clip-b")]);
+        assert_eq!(
+            first_json(&scoped)["cuts"][0]["range"],
+            serde_json::json!([30_106, 30_112])
+        );
+
+        let long = d.dispatch(
+            "remove_filler_words",
+            args(serde_json::json!({"clipIds": ["clip-long"]})),
+        );
+        assert_eq!(filler_cuts(&long), [filler_cut("clip-long")]);
+
+        let whole_timeline = d.dispatch("remove_filler_words", args(serde_json::json!({})));
+        assert_eq!(
+            filler_cuts(&whole_timeline),
+            [filler_cut("clip-long"), filler_cut("clip-b")]
+        );
+
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![
+                vec!["short".to_string()],
+                vec!["long".to_string()],
+                vec!["long".to_string(), "short".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_filler_words_transcribes_only_the_requested_scope() {
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![
+            word("Well", 0.0, 0.2),
+            word("um", 0.2, 0.4),
+        ]));
+        let mut timeline = d.handle.timeline();
+        let mut other = Track::new("track-b", ClipType::Audio);
+        other.clips.push(audio_clip("clip-b", "aud-b", 0, 60));
+        timeline.tracks.push(other);
+        let mut manifest = d.handle.media();
+        manifest.entries.push(audio_entry("aud-b", "Room tone"));
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+
+        for scope in [
+            serde_json::json!({"clipIds": ["clip-v"]}),
+            serde_json::json!({"trackIndex": 2}),
+            // The video track resolves to the linked audio it carries.
+            serde_json::json!({"trackIndex": 0}),
+        ] {
+            let result = d.dispatch("remove_filler_words", scope.clone());
+            assert!(!result.is_error, "{scope}: {}", result.text_joined());
+        }
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![
+                vec!["aud".to_string()],
+                vec!["aud-b".to_string()],
+                vec!["aud".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_filler_words_reports_skipped_sources() {
+        const PRIVATE_DIAGNOSTIC: &str = "decode failed at /Users/private/voice.wav";
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![word("um", 0.2, 0.4)]));
+        bridge
+            .transcribe_errors
+            .lock()
+            .unwrap()
+            .insert("aud".into(), PRIVATE_DIAGNOSTIC.into());
+
+        let result = d.dispatch(
+            "remove_filler_words",
+            serde_json::json!({"clipIds": ["clip-v"], "fillerWords": ["um"]}),
+        );
+
+        assert!(filler_cuts(&result).is_empty());
+        assert!(!result.text_joined().contains("/Users/private"));
+        let json = first_json(&result);
+        assert_eq!(
+            json["skipped"],
+            serde_json::json!([{
+                "file": "Voice",
+                "code": "TRANSCRIPTION_SOURCE_UNAVAILABLE",
+                "reason": "Source unavailable for transcription. Relink or replace the media, then retry."
+            }])
+        );
     }
 }

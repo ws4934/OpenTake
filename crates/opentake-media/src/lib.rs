@@ -200,8 +200,8 @@ pub use transcribe::{
     model::{self as whisper_model, WhisperModel, DEFAULT_MODEL as DEFAULT_WHISPER_MODEL},
     search::{search as search_spoken, SpokenHit},
     timeline::{
-        span_frames, timeline_transcript, ClipFragment, ClipTranscript, TimelineTranscript,
-        WordRow, TIMELINE_MAX_WORDS,
+        span_frames, timeline_transcript, timeline_transcript_with_limit, ClipFragment,
+        ClipTranscript, TimelineTranscript, WordRow, TIMELINE_MAX_WORDS,
     },
     TranscribeOptions, Transcriber, TranscriptionResult, TranscriptionSegment, TranscriptionWord,
 };

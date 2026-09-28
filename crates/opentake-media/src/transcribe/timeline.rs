@@ -23,7 +23,9 @@ use super::TranscriptionResult;
 
 /// Total-word cap across all clips in one `get_transcript` response (upstream
 /// `inspectMaxWords`). Rows past the cap are dropped and the caller pages with
-/// `startFrame`/`endFrame` using the returned `next_start_frame`.
+/// `startFrame`/`endFrame` using the returned `next_start_frame`. The cap bounds
+/// model-facing responses only; in-process consumers that need every word use
+/// [`timeline_transcript_with_limit`].
 pub const TIMELINE_MAX_WORDS: usize = 10_000;
 
 /// One `[text, startFrame, endFrame]` row: a single word mapped to project
@@ -52,7 +54,8 @@ pub struct ClipTranscript {
     /// Clip end on the timeline (`start_frame + duration_frames`).
     pub end_frame: i32,
     /// The word rows attributed to this clip, in `(start, end)` order. Truncated
-    /// to keep the whole response at [`TIMELINE_MAX_WORDS`].
+    /// to keep the whole response within the word cap ([`TIMELINE_MAX_WORDS`]
+    /// by default).
     pub words: Vec<WordRow>,
 }
 
@@ -132,17 +135,31 @@ pub fn span_frames(start: f64, end: f64, clip: &Clip, fps: i32) -> Option<(i32, 
 /// starting at/after it (both project frames). Paging: when `total_words`
 /// exceeds the cap, `next_start_frame` is the last emitted word's end frame.
 pub fn timeline_transcript(
+    frags: Vec<ClipFragment<'_>>,
+    fps: i32,
+    window_start: Option<i32>,
+    window_end: Option<i32>,
+) -> TimelineTranscript {
+    timeline_transcript_with_limit(frags, fps, window_start, window_end, TIMELINE_MAX_WORDS)
+}
+
+/// [`timeline_transcript`] with an explicit total-word cap in place of
+/// [`TIMELINE_MAX_WORDS`]. An in-process consumer that must see every word
+/// (e.g. filler-word detection) passes `usize::MAX`: nothing is dropped and
+/// `next_start_frame` stays `None`.
+pub fn timeline_transcript_with_limit(
     mut frags: Vec<ClipFragment<'_>>,
     fps: i32,
     window_start: Option<i32>,
     window_end: Option<i32>,
+    max_words: usize,
 ) -> TimelineTranscript {
     // Timeline order (upstream `frags.sorted(by: startFrame)`).
     frags.sort_by_key(|f| f.clip.start_frame);
 
     let mut clips_out: Vec<ClipTranscript> = Vec::new();
     let mut total_words = 0usize;
-    let mut remaining = TIMELINE_MAX_WORDS;
+    let mut remaining = max_words;
     let mut last_end: Option<i32> = None;
 
     for frag in &frags {
@@ -199,7 +216,7 @@ pub fn timeline_transcript(
         });
     }
 
-    let next_start_frame = if total_words > TIMELINE_MAX_WORDS {
+    let next_start_frame = if total_words > max_words {
         last_end
     } else {
         None
@@ -500,6 +517,49 @@ mod tests {
         // next_start_frame is the last emitted word's end frame.
         let last = out.clips[0].words.last().unwrap();
         assert_eq!(out.next_start_frame, Some(last.end_frame));
+    }
+
+    #[test]
+    fn explicit_limit_keeps_every_word_past_the_response_cap() {
+        let c = clip("c1", 0, 10_000_000, 0, 1.0);
+        let n = TIMELINE_MAX_WORDS + 5;
+        let words = (0..n)
+            .map(|i| {
+                let s = i as f64 * 0.1;
+                word("w", s, s + 0.05)
+            })
+            .collect();
+        let t = result(words);
+        let frags = vec![ClipFragment {
+            clip_id: "c1".into(),
+            track_index: 0,
+            clip: &c,
+            transcript: Some(&t),
+        }];
+        let out = timeline_transcript_with_limit(frags, 30, None, None, usize::MAX);
+        assert_eq!(out.clips[0].words.len(), n);
+        assert_eq!(out.total_words, n);
+        assert_eq!(out.next_start_frame, None);
+    }
+
+    #[test]
+    fn explicit_limit_truncates_like_the_response_cap() {
+        let c = clip("c1", 0, 300, 0, 1.0);
+        let t = result(vec![
+            word("a", 0.0, 0.5),
+            word("b", 1.0, 1.5),
+            word("c", 2.0, 2.5),
+        ]);
+        let frags = vec![ClipFragment {
+            clip_id: "c1".into(),
+            track_index: 0,
+            clip: &c,
+            transcript: Some(&t),
+        }];
+        let out = timeline_transcript_with_limit(frags, 30, None, None, 2);
+        assert_eq!(out.clips[0].words.len(), 2);
+        assert_eq!(out.total_words, 3);
+        assert_eq!(out.next_start_frame, Some(45));
     }
 
     #[test]
