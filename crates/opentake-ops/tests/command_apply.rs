@@ -1062,6 +1062,74 @@ fn add_clips_auto_track_places_visual_media_on_a_fresh_top_track() {
     assert_eq!(st.timeline.tracks[2].id, "existing-audio");
 }
 
+/// The audio part of a video asset: an audio clip that still resolves its
+/// sound from the video source.
+fn audio_of_video(start: i32, dur: i32) -> ClipEntry {
+    ClipEntry {
+        source_clip_type: ClipType::Video,
+        ..entry(0, ClipType::Audio, start, dur)
+    }
+}
+
+#[test]
+fn add_clips_auto_track_routes_by_the_placed_clip_type() {
+    // Routing used `source_clip_type`: this entry went to a new video track
+    // that cannot hold an audio clip, was dropped, and an empty track and an
+    // undo step were committed as "Added 0 clip(s)".
+    let mut st = state(vec![]);
+    let g = SeqIdGen::new("n-");
+    let res = apply(
+        &mut st,
+        EditCommand::AddClipsAutoTrack {
+            entries: vec![entry(0, ClipType::Video, 0, 30), audio_of_video(0, 30)],
+        },
+        &g,
+    )
+    .unwrap();
+
+    assert_eq!(res.affected_clip_ids.len(), 2);
+    let kinds: Vec<(ClipType, Vec<(ClipType, ClipType)>)> = st
+        .timeline
+        .tracks
+        .iter()
+        .map(|track| {
+            let clips = track
+                .clips
+                .iter()
+                .map(|clip| (clip.media_type, clip.source_clip_type))
+                .collect();
+            (track.kind, clips)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (ClipType::Video, vec![(ClipType::Video, ClipType::Video)]),
+            (ClipType::Audio, vec![(ClipType::Audio, ClipType::Video)]),
+        ]
+    );
+    assert_eq!(st.undo_depth(), 1);
+}
+
+#[test]
+fn add_clips_to_separate_auto_tracks_routes_by_the_placed_clip_type() {
+    let mut st = state(vec![]);
+    let res = apply(
+        &mut st,
+        EditCommand::AddClipsToSeparateAutoTracks {
+            entries: vec![audio_of_video(10, 40)],
+        },
+        &SeqIdGen::new("n-"),
+    )
+    .unwrap();
+
+    assert_eq!(res.affected_clip_ids.len(), 1);
+    assert_eq!(st.timeline.tracks.len(), 1);
+    assert_eq!(st.timeline.tracks[0].kind, ClipType::Audio);
+    assert_eq!(st.timeline.tracks[0].clips[0].id, res.affected_clip_ids[0]);
+    assert_eq!(st.undo_depth(), 1);
+}
+
 // ---- split + keyframes ----------------------------------------------------
 
 #[test]
@@ -2325,6 +2393,170 @@ fn create_folder_and_move_asset_into_it() {
     apply(&mut st, EditCommand::Undo, &g).unwrap();
     assert!(st.manifest.entries[0].folder_id.is_none());
     assert_eq!(st.manifest.folders.len(), 1);
+}
+
+#[test]
+fn single_folder_commands_reject_missing_references_like_their_batches() {
+    // An asset in, or a folder under, a folder that does not exist is shown
+    // in no folder of the default folder view.
+    let mut st = EditorState::new(Timeline::new(), MediaManifest::new());
+    st.manifest
+        .entries
+        .push(media_entry("asset", ClipType::Video, 1.0));
+    let g = SeqIdGen::new("f-");
+    let folder = apply(
+        &mut st,
+        EditCommand::CreateFolder {
+            name: "Existing".into(),
+            parent_folder_id: None,
+        },
+        &g,
+    )
+    .unwrap()
+    .affected_clip_ids[0]
+        .clone();
+    let before = st.manifest.clone();
+    let (version, depth, minted) = (st.version(), st.undo_depth(), g.count());
+
+    for (command, message) in [
+        (
+            EditCommand::CreateFolder {
+                name: "Orphan".into(),
+                parent_folder_id: Some("missing".into()),
+            },
+            "parentFolderId not found: missing",
+        ),
+        (
+            EditCommand::MoveToFolder {
+                asset_ids: vec!["asset".into()],
+                folder_id: Some("missing".into()),
+            },
+            "folderId not found: missing",
+        ),
+        (
+            EditCommand::MoveToFolder {
+                asset_ids: vec!["missing".into()],
+                folder_id: Some(folder.clone()),
+            },
+            "media asset not found: missing",
+        ),
+    ] {
+        let error = apply(&mut st, command, &g).unwrap_err();
+        assert_eq!(error, EditError::Invalid(message.into()));
+        assert_eq!(st.manifest, before);
+        assert_eq!(
+            (st.version(), st.undo_depth(), g.count()),
+            (version, depth, minted)
+        );
+    }
+
+    apply(
+        &mut st,
+        EditCommand::MoveToFolder {
+            asset_ids: vec!["asset".into()],
+            folder_id: Some(folder.clone()),
+        },
+        &g,
+    )
+    .unwrap();
+    assert_eq!(st.manifest.entries[0].folder_id, Some(folder));
+}
+
+// ---- malformed clips -------------------------------------------------------
+
+/// A persisted clip no edit could create: zero frames long.
+fn malformed_timeline_state() -> EditorState {
+    state(vec![video_track(
+        "v",
+        true,
+        vec![clip("ok", 0, 30), clip("bad", 40, 0)],
+    )])
+}
+
+const BAD_CLIP: &str =
+    "timeline.tracks[0].clips[1]: startFrame must be >= 0 and durationFrames >= 1";
+
+#[test]
+fn a_malformed_clip_can_be_removed_and_editing_resumes() {
+    let mut st = malformed_timeline_state();
+    let ids = SeqIdGen::default();
+    let move_ok = || EditCommand::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "ok".into(),
+            to_track: 0,
+            to_frame: 60,
+        }],
+    };
+    // Every other edit is still refused while the clip is there, naming it.
+    assert_eq!(
+        apply(&mut st, move_ok(), &ids).unwrap_err(),
+        EditError::Invalid(BAD_CLIP.into())
+    );
+
+    let removed = apply(
+        &mut st,
+        EditCommand::RemoveClips {
+            clip_ids: vec!["bad".into()],
+        },
+        &ids,
+    )
+    .unwrap();
+
+    assert!(removed.changed);
+    let spans: Vec<(&str, i32)> = st.timeline.tracks[0]
+        .clips
+        .iter()
+        .map(|clip| (clip.id.as_str(), clip.start_frame))
+        .collect();
+    assert_eq!(spans, [("ok", 0)]);
+    apply(&mut st, move_ok(), &ids).unwrap();
+    assert_eq!(st.timeline.tracks[0].clips[0].start_frame, 60);
+}
+
+#[test]
+fn removing_a_valid_clip_still_names_the_malformed_one() {
+    let mut st = malformed_timeline_state();
+    let before = st.timeline.clone();
+    let error = apply(
+        &mut st,
+        EditCommand::RemoveClips {
+            clip_ids: vec!["ok".into()],
+        },
+        &SeqIdGen::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error, EditError::Invalid(BAD_CLIP.into()));
+    assert_eq!(st.timeline, before);
+    assert_eq!(st.undo_depth(), 0);
+}
+
+#[test]
+fn undo_and_redo_restore_valid_history_over_a_malformed_document() {
+    let ids = SeqIdGen::default();
+    let move_a = EditCommand::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "a".into(),
+            to_track: 0,
+            to_frame: 50,
+        }],
+    };
+
+    // Undo: the live document went bad after the last edit.
+    let mut st = state(vec![video_track("v", true, vec![clip("a", 0, 30)])]);
+    let original = st.timeline.clone();
+    apply(&mut st, move_a.clone(), &ids).unwrap();
+    st.timeline.tracks[0].clips.push(clip("bad", 100, 0));
+    assert!(apply(&mut st, EditCommand::Undo, &ids).unwrap().changed);
+    assert_eq!(st.timeline, original);
+
+    // Redo: the live document went bad after an undo.
+    let mut st = state(vec![video_track("v", true, vec![clip("a", 0, 30)])]);
+    apply(&mut st, move_a, &ids).unwrap();
+    let moved = st.timeline.clone();
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    st.timeline.tracks[0].clips.push(clip("bad", 100, 0));
+    assert!(apply(&mut st, EditCommand::Redo, &ids).unwrap().changed);
+    assert_eq!(st.timeline, moved);
 }
 
 // ---- remove tracks --------------------------------------------------------
@@ -3942,6 +4174,133 @@ fn place_media_settings_new_track_and_linked_audio_are_one_undo_step() {
     let undone = apply(&mut st, EditCommand::Undo, &ids).unwrap();
     assert!(undone.changed);
     assert_eq!(document_snapshot(&st), before);
+}
+
+#[test]
+fn project_settings_repair_a_timeline_without_a_frame_rate() {
+    // fps 0 gives no timebase to rescale from, so the new rate is written and
+    // clip frames are kept, as upstream applyTimelineSettings does. The
+    // command used to report success while leaving everything unchanged.
+    let mut child = Timeline::new();
+    child.fps = 0;
+    child.tracks = vec![video_track("child", true, vec![clip("inner", 4, 8)])];
+    let mut timeline = Timeline::new();
+    timeline.fps = 0;
+    timeline.tracks = vec![video_track("v", true, vec![clip("a", 10, 40)])];
+    timeline
+        .nested_sequences
+        .push(NestedSequence::new("sequence", "Scene", child));
+    let mut st = EditorState::new(timeline, MediaManifest::new());
+    let before = st.timeline.clone();
+    let ids = SeqIdGen::default();
+
+    let result = apply(
+        &mut st,
+        EditCommand::SetTimelineSettings {
+            fps: 30,
+            width: 1280,
+            height: 720,
+        },
+        &ids,
+    )
+    .unwrap();
+
+    assert!(result.changed);
+    assert_eq!(result.summary, "Set timeline to 1280×720 @ 30 fps");
+    assert_eq!(
+        (st.timeline.fps, st.timeline.width, st.timeline.height),
+        (30, 1280, 720)
+    );
+    let a = &st.timeline.tracks[0].clips[0];
+    assert_eq!((a.start_frame, a.duration_frames), (10, 40));
+    let child = &st.timeline.nested_sequences[0].timeline;
+    assert_eq!(child.fps, 30);
+    let inner = &child.tracks[0].clips[0];
+    assert_eq!((inner.start_frame, inner.duration_frames), (4, 8));
+
+    apply(&mut st, EditCommand::Undo, &ids).unwrap();
+    assert_eq!(st.timeline, before);
+}
+
+#[test]
+fn a_nested_timeline_without_a_frame_rate_does_not_block_project_settings() {
+    let mut child = Timeline::new();
+    child.fps = 0;
+    child.tracks = vec![video_track("child", true, vec![clip("inner", 4, 8)])];
+    let mut timeline = Timeline::new();
+    timeline.tracks = vec![video_track("v", true, vec![clip("a", 10, 40)])];
+    timeline
+        .nested_sequences
+        .push(NestedSequence::new("sequence", "Scene", child));
+    let mut st = EditorState::new(timeline, MediaManifest::new());
+
+    let result = apply(
+        &mut st,
+        EditCommand::SetTimelineSettings {
+            fps: 60,
+            width: 1920,
+            height: 1080,
+        },
+        &SeqIdGen::default(),
+    )
+    .unwrap();
+
+    assert!(result.changed);
+    let a = &st.timeline.tracks[0].clips[0];
+    assert_eq!((a.start_frame, a.duration_frames), (20, 80));
+    let child = &st.timeline.nested_sequences[0].timeline;
+    assert_eq!(child.fps, 60);
+    let inner = &child.tracks[0].clips[0];
+    assert_eq!((inner.start_frame, inner.duration_frames), (4, 8));
+}
+
+#[test]
+fn place_media_applies_its_settings_to_a_timeline_without_a_frame_rate() {
+    let mut st = state_with_media(vec![], vec![media_entry("m", ClipType::Video, 2.0)]);
+    st.timeline.fps = 0;
+
+    let result = apply(
+        &mut st,
+        EditCommand::PlaceMedia {
+            sequence_id: None,
+            settings: Some(ProjectTimelineSettings {
+                fps: 30,
+                width: 1280,
+                height: 720,
+            }),
+            target: PlaceMediaTarget::NewTrack {
+                kind: ClipType::Video,
+                at: Some(0),
+            },
+            entry: unplaced_media("m", ClipType::Video, 0, 30),
+        },
+        &SeqIdGen::new("place-"),
+    )
+    .unwrap();
+
+    assert_eq!(result.affected_clip_ids.len(), 1);
+    assert_eq!(
+        (st.timeline.fps, st.timeline.width, st.timeline.height),
+        (30, 1280, 720)
+    );
+    assert!(st.timeline.settings_configured);
+}
+
+#[test]
+fn unchanged_project_settings_do_not_claim_to_set_the_timeline() {
+    let mut st = state(vec![]);
+    let ids = SeqIdGen::default();
+    let settings = EditCommand::SetTimelineSettings {
+        fps: 30,
+        width: 1920,
+        height: 1080,
+    };
+    assert!(apply(&mut st, settings.clone(), &ids).unwrap().changed);
+
+    let again = apply(&mut st, settings, &ids).unwrap();
+
+    assert!(!again.changed);
+    assert_eq!(again.summary, "Timeline is already 1920×1080 @ 30 fps");
 }
 
 #[test]

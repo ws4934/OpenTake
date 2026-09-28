@@ -1041,12 +1041,16 @@ pub enum EditCommand {
         entries: Vec<ClipEntry>,
     },
     /// Move clips (expanded to linked partners by the caller) to new tracks/frames.
+    /// A batch reaching before frame 0 is clamped as one group; moved clips
+    /// overwrite the clips they land on but must not overlap each other.
     MoveClips { moves: Vec<ClipMove> },
     /// Deep-copy clips (Option/Alt-drag duplicate) to new positions. Each clip
     /// is cloned with all its fields (keyframe tracks / grade / chroma / masks /
     /// effects / text / transform / crop / fades), gets a fresh id, is shifted
-    /// by `offset_frames`, lands on `target_track_indexes[i]`, and has its
+    /// by `offset_frames` (clamped for the whole batch so no copy starts before
+    /// frame 0), lands on `target_track_indexes[i]`, and has its
     /// `link_group_id` cleared (a copy is not linked to the original's group).
+    /// Copies overwrite the clips they land on but must not overlap each other.
     DuplicateClips {
         clip_ids: Vec<String>,
         offset_frames: i32,
@@ -1063,6 +1067,7 @@ pub enum EditCommand {
         mode: NewTrackClipMode,
     },
     /// Deep-paste complete clip snapshots with fresh clip/link/caption ids.
+    /// Entries overwrite the clips they land on but must not overlap each other.
     PasteClips { entries: Vec<PasteClipEntry> },
     /// Remove clips (expanded to linked partners), pruning emptied tracks.
     RemoveClips { clip_ids: Vec<String> },
@@ -1284,7 +1289,8 @@ pub enum EditCommand {
     /// Swap the positions — track + start frame — of two clips, so a cross-track
     /// drag exchanges them instead of overwriting (swallowing) the destination.
     /// Lossless: refused with no change if a clip would overlap a third clip at
-    /// its new slot. OpenTake-only extension.
+    /// its new slot, or, on one track, the other swapped clip. OpenTake-only
+    /// extension.
     SwapClips { a: String, b: String },
     /// Insert a new empty track of `kind` (clamped into its zone). Lets the drop
     /// flow create a track on demand when the timeline has no compatible one
@@ -1367,9 +1373,15 @@ pub fn apply(
     ids: &dyn IdGen,
 ) -> Result<EditResult, EditError> {
     // Commands inspect clip ends while deriving their transaction plan. Guard
-    // the complete persisted graph before even that read; undo/redo additionally
-    // validate their candidate history snapshot before replacing live state.
-    validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // the complete persisted graph before even that read. Undo/redo only
+    // validate the history snapshot they would restore, and a removal only the
+    // clips it keeps, so a malformed clip can always be undone or removed.
+    if !matches!(
+        command,
+        EditCommand::Undo | EditCommand::Redo | EditCommand::RemoveClips { .. }
+    ) {
+        validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    }
     match command {
         EditCommand::Undo => {
             // History is immutable/shared, so this candidate clones only the
@@ -2238,7 +2250,9 @@ fn transact(
     summarize: impl FnOnce(&[String]) -> String,
     work: impl FnOnce(&mut EditorState) -> Result<Vec<String>, EditError>,
 ) -> Result<EditResult, EditError> {
-    // `apply` validated the complete root/nested graph before dispatch.
+    // `apply` rejected malformed persisted arithmetic before any command work
+    // could mutate a track or consume an id (RemoveClips checks every clip it
+    // keeps); `finish_edited_timeline` validates the result.
     let before = state.snapshot();
     let affected = match work(state) {
         Ok(affected) => affected,
@@ -2273,10 +2287,98 @@ fn transact(
 fn finish_edited_timeline(before: &Timeline, timeline: &mut Timeline) -> Result<(), EditError> {
     rebase_stabilization_after_edit(before, timeline);
     validate_timeline_frame_arithmetic(timeline, "timeline")?;
+    reject_new_overlaps(before, timeline)?;
     prune_invalid_transitions(timeline);
     timeline
         .validate_nested_sequences()
         .map_err(EditError::Invalid)
+}
+
+/// Refuse an edit that leaves two non-text clips overlapping on a track that
+/// had no such overlap before it. The render plan draws only the first of two
+/// overlapping clips, so every edit resolves its overlaps itself (overwrite,
+/// ripple or refusal); this is the backstop for all of them. A track that was
+/// already overlapping, e.g. saved by an older build, stays editable.
+fn reject_new_overlaps(before: &Timeline, after: &Timeline) -> Result<(), EditError> {
+    for track in &after.tracks {
+        let Some((earlier, later)) = first_clip_overlap(track) else {
+            continue;
+        };
+        let already_overlapping = before
+            .tracks
+            .iter()
+            .any(|old| old.id == track.id && first_clip_overlap(old).is_some());
+        if !already_overlapping {
+            return Err(EditError::Invalid(format!(
+                "edit would leave clips {} and {} overlapping on track {}",
+                earlier.id, later.id, track.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first two non-text clips of `track` that overlap. Text clips may
+/// overlap anything, as in the render plan.
+fn first_clip_overlap(track: &Track) -> Option<(&Clip, &Clip)> {
+    let mut clips: Vec<&Clip> = track
+        .clips
+        .iter()
+        .filter(|clip| clip.media_type != ClipType::Text)
+        .collect();
+    if clips
+        .windows(2)
+        .any(|pair| pair[0].start_frame > pair[1].start_frame)
+    {
+        clips.sort_by_key(|clip| clip.start_frame);
+    }
+    let end = |clip: &Clip| clip.start_frame.saturating_add(clip.duration_frames);
+    let mut furthest: Option<&Clip> = None;
+    for clip in clips {
+        match furthest {
+            Some(previous) if clip.start_frame < end(previous) => return Some((previous, clip)),
+            Some(previous) if end(clip) <= end(previous) => {}
+            _ => furthest = Some(clip),
+        }
+    }
+    None
+}
+
+/// One destination range of a batch edit, at `index` in the request.
+struct BatchSlot<'a> {
+    index: usize,
+    track_id: &'a str,
+    start: i32,
+    end: i32,
+    media_type: ClipType,
+}
+
+/// The first two non-text destination ranges of one batch that overlap on a
+/// track, as `(lower index, higher index, track id)`.
+fn first_batch_overlap<'a>(
+    slots: impl IntoIterator<Item = BatchSlot<'a>>,
+) -> Option<(usize, usize, &'a str)> {
+    let mut slots: Vec<BatchSlot<'a>> = slots
+        .into_iter()
+        .filter(|slot| slot.media_type != ClipType::Text)
+        .collect();
+    slots.sort_by(|a, b| (a.track_id, a.start, a.index).cmp(&(b.track_id, b.start, b.index)));
+    let mut furthest: Option<&BatchSlot<'a>> = None;
+    for slot in &slots {
+        match furthest {
+            Some(previous) if previous.track_id == slot.track_id && slot.start < previous.end => {
+                let (first, second) = if previous.index < slot.index {
+                    (previous.index, slot.index)
+                } else {
+                    (slot.index, previous.index)
+                };
+                return Some((first, second, slot.track_id));
+            }
+            Some(previous) if previous.track_id == slot.track_id && slot.end <= previous.end => {}
+            _ => furthest = Some(slot),
+        }
+    }
+    None
 }
 
 /// Keep every surviving clip's stabilization on the source frames it was
@@ -2520,6 +2622,254 @@ mod transaction_tests {
     }
 }
 
+#[cfg(test)]
+mod frame_arithmetic_tests {
+    use super::*;
+
+    // The command layer's own checks before they moved to the domain rule
+    // shared with the ops and the project loader, kept as the reference for
+    // every error message they produce.
+    fn previous_checked_frame_arithmetic(
+        start_frame: i32,
+        duration_frames: i32,
+        trim_start_frame: i32,
+        trim_end_frame: i32,
+        speed: f64,
+        label: &str,
+    ) -> Result<i32, EditError> {
+        if start_frame < 0 || duration_frames < 1 {
+            return Err(EditError::Invalid(format!(
+                "{label}: startFrame must be >= 0 and durationFrames >= 1"
+            )));
+        }
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(EditError::Invalid(format!(
+                "{label}: speed must be finite and > 0"
+            )));
+        }
+        let end_frame = start_frame.checked_add(duration_frames).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: startFrame + durationFrames overflows"))
+        })?;
+        duration_frames
+            .checked_add(trim_start_frame)
+            .and_then(|value| value.checked_add(trim_end_frame))
+            .ok_or_else(|| {
+                EditError::Invalid(format!("{label}: durationFrames + trim frames overflows"))
+            })?;
+        let consumed = (duration_frames as f64 * speed).round();
+        if !(0.0..=i32::MAX as f64).contains(&consumed) {
+            return Err(EditError::Invalid(format!(
+                "{label}: visible source-frame extent is out of range"
+            )));
+        }
+        let consumed = consumed as i32;
+        trim_start_frame.checked_add(consumed).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: trimStart source-frame extent overflows"))
+        })?;
+        trim_end_frame.checked_add(consumed).ok_or_else(|| {
+            EditError::Invalid(format!("{label}: trimEnd source-frame extent overflows"))
+        })?;
+        trim_start_frame
+            .checked_add(consumed)
+            .and_then(|value| value.checked_add(trim_end_frame))
+            .ok_or_else(|| EditError::Invalid(format!("{label}: source-frame extent overflows")))?;
+        Ok(end_frame)
+    }
+
+    fn previous_checked_clip_frame_arithmetic(
+        start_frame: i32,
+        duration_frames: i32,
+        trim_start_frame: i32,
+        trim_end_frame: i32,
+        speed: f64,
+        media_type: ClipType,
+        label: &str,
+    ) -> Result<i32, EditError> {
+        if !matches!(media_type, ClipType::Image | ClipType::Text)
+            && (trim_start_frame < 0 || trim_end_frame < 0)
+        {
+            return Err(EditError::Invalid(format!(
+                "{label}: trim frames must be >= 0 for audio/video clips"
+            )));
+        }
+        previous_checked_frame_arithmetic(
+            start_frame,
+            duration_frames,
+            trim_start_frame,
+            trim_end_frame,
+            speed,
+            label,
+        )
+    }
+
+    fn previous_validate_settings_frame_projection(
+        timeline: &Timeline,
+        fps: i32,
+        label: &str,
+    ) -> Result<(), EditError> {
+        for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+            previous_validate_settings_frame_projection(
+                &sequence.timeline,
+                fps,
+                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+            )?;
+        }
+        if timeline.fps <= 0 || timeline.fps == fps {
+            return Ok(());
+        }
+        let scale = fps as f64 / timeline.fps as f64;
+        for (track_index, track) in timeline.tracks.iter().enumerate() {
+            let mut order: Vec<usize> = (0..track.clips.len()).collect();
+            order.sort_by_key(|&index| track.clips[index].start_frame);
+            let mut previous_end = None;
+            for clip_index in order {
+                let clip = &track.clips[clip_index];
+                let source_end = clip
+                    .start_frame
+                    .checked_add(clip.duration_frames)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!(
+                            "{label}.tracks[{track_index}].clips[{clip_index}]: source end overflows"
+                        ))
+                    })?;
+                let scaled_start = (clip.start_frame as f64 * scale).round() as i32;
+                let scaled_end = (source_end as f64 * scale).round() as i32;
+                let start_frame = scaled_start.max(previous_end.unwrap_or(scaled_start));
+                let duration_frames = scaled_end
+                    .checked_sub(start_frame)
+                    .ok_or_else(|| {
+                        EditError::Invalid(format!(
+                            "{label}.tracks[{track_index}].clips[{clip_index}]: projected duration overflows"
+                        ))
+                    })?
+                    .max(1);
+                let trim_start_frame = (clip.trim_start_frame as f64 * scale).round() as i32;
+                let trim_end_frame = (clip.trim_end_frame as f64 * scale).round() as i32;
+                previous_end = Some(previous_checked_clip_frame_arithmetic(
+                    start_frame,
+                    duration_frames,
+                    trim_start_frame,
+                    trim_end_frame,
+                    clip.speed,
+                    clip.media_type,
+                    &format!("{label}.tracks[{track_index}].clips[{clip_index}] projected"),
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_settings_projection_keeps_every_command_error_message() {
+        let clip = |id: &str, start: i32, duration: i32, trim: i32, speed: f64| {
+            let mut clip = Clip::new(id, "m", start, duration);
+            clip.trim_start_frame = trim;
+            clip.trim_end_frame = trim / 2;
+            clip.speed = speed;
+            clip
+        };
+        let clip_sets = [
+            vec![clip("a", 0, 10, 0, 1.0), clip("b", 3, 4, 2, 1.0)],
+            vec![clip("a", 10, 7, 5, 2.0), clip("b", 17, 1, 0, 0.5)],
+            vec![clip("a", i32::MAX - 10, 5, 0, 1.0)],
+            vec![clip("a", 1 << 29, 1 << 29, 0, 1.0)],
+            vec![clip("a", 0, 1 << 20, i32::MAX / 2, 3.0)],
+            vec![clip("a", 5, 3, 0, 1e9)],
+        ];
+        for root_fps in [-5, 0, 1, 24, 30, 60] {
+            for child_fps in [0, 30, 1000] {
+                for (index, clips) in clip_sets.iter().enumerate() {
+                    let mut child = Timeline::new();
+                    child.fps = child_fps;
+                    child.tracks = vec![Track::new("child", ClipType::Video)];
+                    child.tracks[0].clips = clips_with_prefix(clips, "child-");
+                    let mut root = Timeline::new();
+                    root.fps = root_fps;
+                    root.tracks = vec![Track::new("root", ClipType::Video)];
+                    root.tracks[0].clips = clips.clone();
+                    root.nested_sequences
+                        .push(NestedSequence::new("sequence", "Scene", child));
+                    for fps in [1, 25, 30, 120, i32::MAX] {
+                        let case = (root_fps, child_fps, index, fps);
+                        let previous =
+                            previous_validate_settings_frame_projection(&root, fps, "timeline");
+                        assert_eq!(
+                            validate_settings_frame_projection(&root, fps, "timeline"),
+                            previous,
+                            "{case:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn clips_with_prefix(clips: &[Clip], prefix: &str) -> Vec<Clip> {
+        clips
+            .iter()
+            .map(|clip| Clip {
+                id: format!("{prefix}{}", clip.id),
+                ..clip.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_rule_keeps_every_command_error_message() {
+        let starts = [-1, 0, 7, i32::MAX - 3, i32::MAX];
+        let durations = [-2, 0, 1, 9, i32::MAX - 1, i32::MAX];
+        let trims = [i32::MIN, -4, 0, 5, i32::MAX - 8, i32::MAX];
+        let speeds = [
+            f64::NAN,
+            -1.0,
+            0.0,
+            1e-300,
+            0.5,
+            1.0,
+            2.5,
+            1e12,
+            f64::INFINITY,
+        ];
+        let kinds = [
+            ClipType::Video,
+            ClipType::Audio,
+            ClipType::Image,
+            ClipType::Text,
+        ];
+        for start in starts {
+            for duration in durations {
+                for trim_start in trims {
+                    for trim_end in trims {
+                        for speed in speeds {
+                            let args = (start, duration, trim_start, trim_end, speed);
+                            assert_eq!(
+                                checked_frame_arithmetic(
+                                    start, duration, trim_start, trim_end, speed, "x"
+                                ),
+                                previous_checked_frame_arithmetic(
+                                    start, duration, trim_start, trim_end, speed, "x"
+                                ),
+                                "{args:?}"
+                            );
+                            for kind in kinds {
+                                assert_eq!(
+                                    checked_clip_frame_arithmetic(
+                                        start, duration, trim_start, trim_end, speed, kind, "x"
+                                    ),
+                                    previous_checked_clip_frame_arithmetic(
+                                        start, duration, trim_start, trim_end, speed, kind, "x"
+                                    ),
+                                    "{args:?} {kind:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Command implementations
 
 fn checked_frame_arithmetic(
@@ -2530,43 +2880,14 @@ fn checked_frame_arithmetic(
     speed: f64,
     label: &str,
 ) -> Result<i32, EditError> {
-    if start_frame < 0 || duration_frames < 1 {
-        return Err(EditError::Invalid(format!(
-            "{label}: startFrame must be >= 0 and durationFrames >= 1"
-        )));
-    }
-    if !speed.is_finite() || speed <= 0.0 {
-        return Err(EditError::Invalid(format!(
-            "{label}: speed must be finite and > 0"
-        )));
-    }
-    let end_frame = start_frame.checked_add(duration_frames).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: startFrame + durationFrames overflows"))
-    })?;
-    duration_frames
-        .checked_add(trim_start_frame)
-        .and_then(|value| value.checked_add(trim_end_frame))
-        .ok_or_else(|| {
-            EditError::Invalid(format!("{label}: durationFrames + trim frames overflows"))
-        })?;
-    let consumed = (duration_frames as f64 * speed).round();
-    if !(0.0..=i32::MAX as f64).contains(&consumed) {
-        return Err(EditError::Invalid(format!(
-            "{label}: visible source-frame extent is out of range"
-        )));
-    }
-    let consumed = consumed as i32;
-    trim_start_frame.checked_add(consumed).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: trimStart source-frame extent overflows"))
-    })?;
-    trim_end_frame.checked_add(consumed).ok_or_else(|| {
-        EditError::Invalid(format!("{label}: trimEnd source-frame extent overflows"))
-    })?;
-    trim_start_frame
-        .checked_add(consumed)
-        .and_then(|value| value.checked_add(trim_end_frame))
-        .ok_or_else(|| EditError::Invalid(format!("{label}: source-frame extent overflows")))?;
-    Ok(end_frame)
+    opentake_domain::frame_arithmetic(
+        start_frame,
+        duration_frames,
+        trim_start_frame,
+        trim_end_frame,
+        speed,
+    )
+    .map_err(|error| EditError::Invalid(format!("{label}: {error}")))
 }
 
 fn checked_clip_frame_arithmetic(
@@ -2578,21 +2899,15 @@ fn checked_clip_frame_arithmetic(
     media_type: ClipType,
     label: &str,
 ) -> Result<i32, EditError> {
-    if !matches!(media_type, ClipType::Image | ClipType::Text)
-        && (trim_start_frame < 0 || trim_end_frame < 0)
-    {
-        return Err(EditError::Invalid(format!(
-            "{label}: trim frames must be >= 0 for audio/video clips"
-        )));
-    }
-    checked_frame_arithmetic(
+    opentake_domain::clip_frame_arithmetic(
         start_frame,
         duration_frames,
         trim_start_frame,
         trim_end_frame,
         speed,
-        label,
+        media_type,
     )
+    .map_err(|error| EditError::Invalid(format!("{label}: {error}")))
 }
 
 fn validate_clip_frame_arithmetic_at(
@@ -2637,61 +2952,40 @@ fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Resul
     Ok(())
 }
 
+/// [`validate_timeline_frame_arithmetic`] for every clip except the root clips
+/// whose ids are in `removed`.
+fn validate_kept_frame_arithmetic(
+    timeline: &Timeline,
+    label: &str,
+    removed: &HashSet<String>,
+) -> Result<(), EditError> {
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            if removed.contains(&clip.id) || clip.frame_arithmetic().is_ok() {
+                continue;
+            }
+            validate_clip_frame_arithmetic(
+                clip,
+                &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
+            )?;
+        }
+    }
+    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        validate_timeline_frame_arithmetic(
+            &sequence.timeline,
+            &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_settings_frame_projection(
     timeline: &Timeline,
     fps: i32,
     label: &str,
 ) -> Result<(), EditError> {
-    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        validate_settings_frame_projection(
-            &sequence.timeline,
-            fps,
-            &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-        )?;
-    }
-    if timeline.fps <= 0 || timeline.fps == fps {
-        return Ok(());
-    }
-    let scale = fps as f64 / timeline.fps as f64;
-    for (track_index, track) in timeline.tracks.iter().enumerate() {
-        let mut order: Vec<usize> = (0..track.clips.len()).collect();
-        order.sort_by_key(|&index| track.clips[index].start_frame);
-        let mut previous_end = None;
-        for clip_index in order {
-            let clip = &track.clips[clip_index];
-            let source_end = clip
-                .start_frame
-                .checked_add(clip.duration_frames)
-                .ok_or_else(|| {
-                    EditError::Invalid(format!(
-                        "{label}.tracks[{track_index}].clips[{clip_index}]: source end overflows"
-                    ))
-                })?;
-            let scaled_start = (clip.start_frame as f64 * scale).round() as i32;
-            let scaled_end = (source_end as f64 * scale).round() as i32;
-            let start_frame = scaled_start.max(previous_end.unwrap_or(scaled_start));
-            let duration_frames = scaled_end
-                .checked_sub(start_frame)
-                .ok_or_else(|| {
-                    EditError::Invalid(format!(
-                        "{label}.tracks[{track_index}].clips[{clip_index}]: projected duration overflows"
-                    ))
-                })?
-                .max(1);
-            let trim_start_frame = (clip.trim_start_frame as f64 * scale).round() as i32;
-            let trim_end_frame = (clip.trim_end_frame as f64 * scale).round() as i32;
-            previous_end = Some(checked_clip_frame_arithmetic(
-                start_frame,
-                duration_frames,
-                trim_start_frame,
-                trim_end_frame,
-                clip.speed,
-                clip.media_type,
-                &format!("{label}.tracks[{track_index}].clips[{clip_index}] projected"),
-            )?);
-        }
-    }
-    Ok(())
+    ops::settings::settings_projection(timeline, fps)
+        .map_err(|fault| EditError::Invalid(fault.describe(label)))
 }
 
 fn validate_unplaced_entry(entry: &UnplacedClipEntry, label: &str) -> Result<(), EditError> {
@@ -2841,12 +3135,13 @@ fn place_media(
         |affected| format!("Placed media as {} clip(s)", affected.len()),
         move |current| {
             if let Some(settings) = settings {
-                ops::set_timeline_settings(
+                ops::settings::apply_timeline_settings(
                     &mut current.timeline,
                     settings.fps,
                     settings.width,
                     settings.height,
-                );
+                )
+                .map_err(EditError::Invalid)?;
             }
             let target_timeline =
                 timeline_for_sequence_mut(&mut current.timeline, sequence_id.as_deref())?;
@@ -2959,12 +3254,15 @@ fn add_clips_auto_track(
         .enumerate()
         .map(|(index, entry)| validate_auto_track_entry(entry, index))
         .collect::<Result<_, _>>()?;
+    // Route by the placed clip's own type, as validation and track
+    // compatibility do: the audio part of a video asset (`media_type` audio,
+    // `source_clip_type` video) belongs on the audio track.
     let has_visual = entries
         .iter()
-        .any(|entry| entry.source_clip_type != ClipType::Audio);
+        .any(|entry| entry.media_type != ClipType::Audio);
     let has_audio = entries
         .iter()
-        .any(|entry| entry.source_clip_type == ClipType::Audio);
+        .any(|entry| entry.media_type == ClipType::Audio);
     let action_name = if entries.len() == 1 {
         "Add Clip"
     } else {
@@ -2985,8 +3283,8 @@ fn add_clips_auto_track(
                 ops::insert_track(&mut st.timeline, at, ClipType::Audio, ids)
             });
             let mut placed = Vec::new();
-            for (entry, end_frame) in entries.iter().zip(&entry_ends) {
-                let track_index = if entry.source_clip_type == ClipType::Audio {
+            for (index, (entry, end_frame)) in entries.iter().zip(&entry_ends).enumerate() {
+                let track_index = if entry.media_type == ClipType::Audio {
                     audio_track_index
                 } else {
                     visual_track_index
@@ -3005,15 +3303,13 @@ fn add_clips_auto_track(
                         ids,
                     );
                 }
-                if let Some(ti) = st.track_index(&track_id) {
-                    placed.extend(ops::place_clip_validated(
-                        &mut st.timeline,
-                        &entry.to_spec(),
-                        ti,
-                        None,
-                        ids,
-                    ));
-                }
+                let clip_ids = st
+                    .track_index(&track_id)
+                    .map(|ti| {
+                        ops::place_clip_validated(&mut st.timeline, &entry.to_spec(), ti, None, ids)
+                    })
+                    .unwrap_or_default();
+                placed.extend(placed_or_refused(clip_ids, index)?);
             }
             Ok(placed)
         },
@@ -3045,8 +3341,8 @@ fn add_clips_to_separate_auto_tracks(
         },
         |current| {
             let mut placed = Vec::with_capacity(entries.len());
-            for entry in &entries {
-                let kind = if entry.source_clip_type == ClipType::Audio {
+            for (index, entry) in entries.iter().enumerate() {
+                let kind = if entry.media_type == ClipType::Audio {
                     ClipType::Audio
                 } else {
                     ClipType::Video
@@ -3055,17 +3351,30 @@ fn add_clips_to_separate_auto_tracks(
                 let track_index = ops::insert_track(&mut current.timeline, at, kind, ids);
                 let mut entry = entry.clone();
                 entry.track_index = track_index;
-                placed.extend(ops::place_clip_validated(
+                let clip_ids = ops::place_clip_validated(
                     &mut current.timeline,
                     &entry.to_spec(),
                     track_index,
                     None,
                     ids,
-                ));
+                );
+                placed.extend(placed_or_refused(clip_ids, index)?);
             }
             Ok(placed)
         },
     )
+}
+
+/// An auto-placed entry must land: an empty placement fails the whole
+/// transaction instead of committing an empty track (upstream `add_clips`
+/// throws when `placeClip` returns no clip).
+fn placed_or_refused(clip_ids: Vec<String>, index: usize) -> Result<Vec<String>, EditError> {
+    if clip_ids.is_empty() {
+        return Err(EditError::Invalid(format!(
+            "entries[{index}]: clip could not be placed on its new track"
+        )));
+    }
+    Ok(clip_ids)
 }
 
 fn insert_track_cmd(
@@ -3403,6 +3712,15 @@ fn move_clips(
         return Err(EditError::Invalid("Missing or empty 'moves' array".into()));
     }
     validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // A batch that would start before frame 0 is clamped as one group, so the
+    // clips keep their spacing. (Upstream clamps each clip on its own, which
+    // stacks every clip moved past the start on frame 0.)
+    let lift = match moves.iter().map(|movement| movement.to_frame).min() {
+        Some(earliest) if earliest < 0 => earliest
+            .checked_neg()
+            .ok_or_else(|| EditError::Invalid("moves: destination start is out of range".into()))?,
+        _ => 0,
+    };
     let mut unique = HashSet::with_capacity(moves.len());
     let mut plans = Vec::with_capacity(moves.len());
     for (index, movement) in moves.iter().enumerate() {
@@ -3430,7 +3748,9 @@ fn move_clips(
                 "moves[{index}]: clip is incompatible with destination track"
             )));
         }
-        let to_frame = movement.to_frame.max(0);
+        let to_frame = movement.to_frame.checked_add(lift).ok_or_else(|| {
+            EditError::Invalid(format!("moves[{index}]: destination start overflows"))
+        })?;
         let to_end_frame = to_frame.checked_add(clip.duration_frames).ok_or_else(|| {
             EditError::Invalid(format!("moves[{index}]: destination end overflows"))
         })?;
@@ -3440,6 +3760,21 @@ fn move_clips(
             to_frame,
             to_end_frame,
         });
+    }
+    // Moved clips only overwrite clips that stay put, so two of them must not
+    // land on each other.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(plans.iter().enumerate().map(|(index, plan)| BatchSlot {
+            index,
+            track_id: &plan.to_track_id,
+            start: plan.to_frame,
+            end: plan.to_end_frame,
+            media_type: plan.clip.media_type,
+        }))
+    {
+        return Err(EditError::Invalid(format!(
+            "moves[{first}] and moves[{second}] would overlap on track {track_id}"
+        )));
     }
     let action_name = if moves.len() == 1 {
         "Move Clip"
@@ -3482,7 +3817,7 @@ fn duplicate_clips_cmd(
     }
     validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
     let mut unique = HashSet::with_capacity(clip_ids.len());
-    let mut plans = Vec::with_capacity(clip_ids.len());
+    let mut sources = Vec::with_capacity(clip_ids.len());
     for (index, (id, &target_track_index)) in clip_ids.iter().zip(&target_track_indexes).enumerate()
     {
         if !unique.insert(id.as_str()) {
@@ -3510,16 +3845,47 @@ fn duplicate_clips_cmd(
             .start_frame
             .checked_add(offset_frames)
             .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination start overflows")))?;
-        let to_frame = shifted.max(0);
+        sources.push((clip, target.id.clone(), shifted));
+    }
+    // The copies keep their spacing: an offset reaching past frame 0 is
+    // clamped for the whole batch. (Upstream clamps each copy on its own,
+    // which stacks every copy shifted past the start on frame 0.)
+    let lift = match sources.iter().map(|(_, _, shifted)| *shifted).min() {
+        Some(earliest) if earliest < 0 => earliest.checked_neg().ok_or_else(|| {
+            EditError::Invalid("offsetFrames: destination start is out of range".into())
+        })?,
+        _ => 0,
+    };
+    let mut plans = Vec::with_capacity(sources.len());
+    for (clip, to_track_id, shifted) in sources {
+        let id = &clip.id;
+        let to_frame = shifted
+            .checked_add(lift)
+            .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination start overflows")))?;
         let to_end_frame = to_frame
             .checked_add(clip.duration_frames)
             .ok_or_else(|| EditError::Invalid(format!("clip {id}: destination end overflows")))?;
         plans.push(DuplicateClipPlan {
             clip,
-            to_track_id: target.id.clone(),
+            to_track_id,
             to_frame,
             to_end_frame,
         });
+    }
+    // Copies overwrite existing clips, not each other.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(plans.iter().enumerate().map(|(index, plan)| BatchSlot {
+            index,
+            track_id: &plan.to_track_id,
+            start: plan.to_frame,
+            end: plan.to_end_frame,
+            media_type: plan.clip.media_type,
+        }))
+    {
+        return Err(EditError::Invalid(format!(
+            "copies of clip {} and clip {} would overlap on track {track_id}",
+            plans[first].clip.id, plans[second].clip.id
+        )));
     }
     let action_name = if clip_ids.len() == 1 {
         "Duplicate Clip"
@@ -3864,6 +4230,23 @@ fn paste_clips(
         }
         validate_paste_media(state, &entry.clip)?;
     }
+    // Every destination is cleared before any copy lands, so entries of one
+    // batch cannot overwrite each other and must not overlap.
+    if let Some((first, second, track_id)) =
+        first_batch_overlap(entries.iter().zip(&destination_ends).enumerate().map(
+            |(index, (entry, &end))| BatchSlot {
+                index,
+                track_id: &entry.target_track_id,
+                start: entry.start_frame,
+                end,
+                media_type: entry.clip.media_type,
+            },
+        ))
+    {
+        return Err(EditError::Invalid(format!(
+            "entries[{first}] and entries[{second}] would overlap on track {track_id}"
+        )));
+    }
 
     transact(
         state,
@@ -3961,6 +4344,9 @@ fn remove_clips(state: &mut EditorState, clip_ids: Vec<String>) -> Result<EditRe
         }
     }
     let expanded = ops::expand_to_link_group(&state.timeline, &clip_ids.iter().cloned().collect());
+    // Removing a malformed clip is how it gets repaired, so only the clips
+    // this edit keeps must be well-formed; the result is validated as usual.
+    validate_kept_frame_arithmetic(&state.timeline, "timeline", &expanded)?;
     let count = expanded.len();
     transact(
         state,
@@ -6712,6 +7098,7 @@ fn create_folder(
     if name.is_empty() {
         return Err(EditError::Invalid("folder name is required".into()));
     }
+    validate_folder_parent(state, parent_folder_id.as_deref())?;
     transact(
         state,
         "New Folder",
@@ -6746,18 +7133,7 @@ fn create_folders(
         return Err(EditError::Invalid("folder name is required".into()));
     }
     for entry in &entries {
-        if let Some(parent) = entry.parent_folder_id.as_deref() {
-            if !state
-                .manifest
-                .folders
-                .iter()
-                .any(|folder| folder.id == parent)
-            {
-                return Err(EditError::Invalid(format!(
-                    "parentFolderId not found: {parent}"
-                )));
-            }
-        }
+        validate_folder_parent(state, entry.parent_folder_id.as_deref())?;
     }
     let count = entries.len();
     transact(
@@ -6788,6 +7164,7 @@ fn move_to_folder(
     if asset_ids.is_empty() {
         return Err(EditError::Invalid("assetIds is required".into()));
     }
+    validate_folder_move(state, &asset_ids, folder_id.as_deref())?;
     let n = asset_ids.len();
     transact(
         state,
@@ -6819,30 +7196,7 @@ fn move_to_folders(
         ));
     }
     for entry in &entries {
-        for asset_id in &entry.asset_ids {
-            if !state
-                .manifest
-                .entries
-                .iter()
-                .any(|asset| asset.id == *asset_id)
-            {
-                return Err(EditError::Invalid(format!(
-                    "media asset not found: {asset_id}"
-                )));
-            }
-        }
-        if let Some(folder_id) = entry.folder_id.as_deref() {
-            if !state
-                .manifest
-                .folders
-                .iter()
-                .any(|folder| folder.id == folder_id)
-            {
-                return Err(EditError::Invalid(format!(
-                    "folderId not found: {folder_id}"
-                )));
-            }
-        }
+        validate_folder_move(state, &entry.asset_ids, entry.folder_id.as_deref())?;
     }
     let asset_count = entries
         .iter()
@@ -6866,6 +7220,57 @@ fn move_to_folders(
             Ok(Vec::new())
         },
     )
+}
+
+/// A new folder's parent must exist, or the folder view shows it nowhere.
+fn validate_folder_parent(state: &EditorState, parent: Option<&str>) -> Result<(), EditError> {
+    if let Some(parent) = parent {
+        if !state
+            .manifest
+            .folders
+            .iter()
+            .any(|folder| folder.id == parent)
+        {
+            return Err(EditError::Invalid(format!(
+                "parentFolderId not found: {parent}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Moved assets and their destination folder must exist, or the folder view
+/// shows the assets nowhere.
+fn validate_folder_move(
+    state: &EditorState,
+    asset_ids: &[String],
+    folder_id: Option<&str>,
+) -> Result<(), EditError> {
+    for asset_id in asset_ids {
+        if !state
+            .manifest
+            .entries
+            .iter()
+            .any(|asset| asset.id == *asset_id)
+        {
+            return Err(EditError::Invalid(format!(
+                "media asset not found: {asset_id}"
+            )));
+        }
+    }
+    if let Some(folder_id) = folder_id {
+        if !state
+            .manifest
+            .folders
+            .iter()
+            .any(|folder| folder.id == folder_id)
+        {
+            return Err(EditError::Invalid(format!(
+                "folderId not found: {folder_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn rename_media(
@@ -7268,12 +7673,22 @@ fn set_timeline_settings_cmd(
         )));
     }
     validate_settings_frame_projection(&state.timeline, fps, "timeline")?;
+    let changed = std::cell::Cell::new(false);
     transact(
         state,
         "Change Project Settings",
-        move |_| format!("Set timeline to {width}×{height} @ {fps} fps"),
+        |_| {
+            if changed.get() {
+                format!("Set timeline to {width}×{height} @ {fps} fps")
+            } else {
+                format!("Timeline is already {width}×{height} @ {fps} fps")
+            }
+        },
         |st| {
-            ops::set_timeline_settings(&mut st.timeline, fps, width, height);
+            changed.set(
+                ops::settings::apply_timeline_settings(&mut st.timeline, fps, width, height)
+                    .map_err(EditError::Invalid)?,
+            );
             Ok(Vec::new())
         },
     )

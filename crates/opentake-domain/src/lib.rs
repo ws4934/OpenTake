@@ -25,6 +25,7 @@ pub mod caption_sync;
 pub mod clip;
 pub mod clip_type;
 mod clip_wire;
+pub mod frame_arithmetic;
 pub mod grade;
 pub mod inpaint;
 pub mod keyframe;
@@ -49,6 +50,7 @@ pub use clip::{
     VolumeScale,
 };
 pub use clip_type::ClipType;
+pub use frame_arithmetic::{clip_frame_arithmetic, frame_arithmetic, FrameArithmeticError};
 pub use grade::{
     chroma_cb_cr, effect_registry, luma709, smoothstep01, validate_effect_chain, ChromaKey,
     ColorGrade, ColorGradeValidationError, ColorMatchInput, Effect, EffectDescriptor,

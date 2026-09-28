@@ -129,7 +129,9 @@ impl<'a> Builder<'a> {
         Builder {
             timeline,
             resolver,
-            fps: timeline.fps,
+            // A timeline without a positive rate exports at 1 fps, as the EDL,
+            // OTIO and FCPXML exporters do; the fade cutPointTicks divide by it.
+            fps: timeline.fps.max(1),
             seq_width: timeline.width,
             seq_height: timeline.height,
             emitted_files: HashSet::new(),
@@ -1413,6 +1415,35 @@ mod tests {
         assert!(xml.contains(&format!("<cutPointTicks>{expected_ticks}</cutPointTicks>")));
         // 音频淡入 Cross Fade。
         assert!(xml.contains("<name>Cross Fade ( 0dB)</name>"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_survives_a_zero_frame_rate_and_an_extreme_source_rate() {
+        // fps 0 divided by zero in the fade's cutPointTicks; a huge source
+        // rate must not overflow the file timecode either.
+        let dir = std::env::temp_dir().join(format!("opentake-xmeml-rate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let vpath = touch(&dir, "clip.mp4");
+        let mut manifest = MediaManifest::new();
+        let mut entry = ext_entry("v1", "clip.mp4", ClipType::Video, &vpath, 4.0);
+        entry.source_fps = Some(268_435_456.0);
+        manifest.entries.push(entry);
+        let mut tl = Timeline::new();
+        tl.fps = 0;
+        let mut vtrack = Track::new("vt", ClipType::Video);
+        let mut vclip = Clip::new("cv", "v1", 0, 60);
+        vclip.fade_out_frames = 10;
+        vtrack.clips.push(vclip);
+        tl.tracks.push(vtrack);
+
+        let xml = export_xmeml(&tl, &manifest, None);
+
+        // Like the EDL and OTIO exporters, a missing rate exports as 1 fps.
+        assert!(xml.contains("<timebase>1</timebase>"));
+        let ticks = 10i64 * 254_016_000_000;
+        assert!(xml.contains(&format!("<cutPointTicks>{ticks}</cutPointTicks>")));
+        assert!(xml.contains("<timebase>268435456</timebase>"));
         fs::remove_dir_all(&dir).ok();
     }
 

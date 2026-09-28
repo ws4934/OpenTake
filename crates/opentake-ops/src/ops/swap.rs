@@ -29,9 +29,11 @@ pub fn swap_tracks(timeline: &mut Timeline, a: usize, b: usize) -> bool {
 ///
 /// Lossless by construction: if either clip, placed at the other's slot, would
 /// overlap a *different* clip on its destination track (e.g. the two clips have
-/// different durations and a neighbour sits in the way), the swap is refused and
-/// the timeline is left untouched. Cross-kind requests (a video clip onto an
-/// audio track, or vice versa), a missing clip, or `id_a == id_b` are all no-ops.
+/// different durations and a neighbour sits in the way), or two clips on one
+/// track would overlap each other at their exchanged starts, the swap is
+/// refused and the timeline is left untouched. Cross-kind requests (a video clip
+/// onto an audio track, or vice versa), a missing clip, or `id_a == id_b` are
+/// all no-ops.
 pub fn swap_clip_positions(timeline: &mut Timeline, id_a: &str, id_b: &str) -> bool {
     if id_a == id_b {
         return false;
@@ -61,7 +63,12 @@ pub fn swap_clip_positions(timeline: &mut Timeline, id_a: &str, id_b: &str) -> b
     let Some(b_destination_end) = a_start.checked_add(clip_b.duration_frames) else {
         return false;
     };
-    if !range_free(&timeline.tracks[tb], b_start, a_destination_end, &exclude)
+    // On one track the exchanged ranges `[b_start, a_destination_end)` and
+    // `[a_start, b_destination_end)` share the lane, so they must not overlap
+    // each other either (clips of different lengths usually would).
+    let same_track_overlap = ta == tb && b_start < b_destination_end && a_start < a_destination_end;
+    if same_track_overlap
+        || !range_free(&timeline.tracks[tb], b_start, a_destination_end, &exclude)
         || !range_free(&timeline.tracks[ta], a_start, b_destination_end, &exclude)
     {
         return false;
@@ -278,6 +285,39 @@ mod tests {
         // x (dur 100) at v2@0 would cover [0,100), overlapping z [30,80) -> refuse.
         assert!(!swap_clip_positions(&mut tl, "x", "y"));
         assert_eq!(tl, before);
+    }
+
+    #[test]
+    fn same_track_swap_refused_when_the_exchanged_ranges_overlap() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(track(
+            "v",
+            ClipType::Video,
+            vec![clip("x", "m-x", 0, 10), clip("y", "m-y", 10, 30)],
+        ));
+        let before = tl.clone();
+
+        // y would take [0,30) and x [10,20): the two swapped clips collide.
+        assert!(!swap_clip_positions(&mut tl, "x", "y"));
+        assert_eq!(tl, before);
+    }
+
+    #[test]
+    fn same_track_swap_of_equal_lengths_exchanges_neighbours() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(track(
+            "v",
+            ClipType::Video,
+            vec![clip("x", "m-x", 0, 20), clip("y", "m-y", 20, 20)],
+        ));
+
+        assert!(swap_clip_positions(&mut tl, "x", "y"));
+        let order: Vec<_> = tl.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.id.as_str(), c.start_frame))
+            .collect();
+        assert_eq!(order, [("y", 0), ("x", 20)]);
     }
 
     #[test]

@@ -9,6 +9,9 @@
 //!    start-order with upstream's `previousEnd` no-overlap guard, then the
 //!    keyframe/fade clamps re-run.
 //!  - `fps`, `width`, `height`, `settings_configured = true` are set last.
+//!  - A timeline whose FPS is not positive has no timebase to rescale from:
+//!    its frames are kept and the new FPS is written (upstream rescales only
+//!    when `prevFPS > 0`).
 //!
 //! Deliberately NOT ported here (both need state the ops layer doesn't hold):
 //!  - `currentFrame` / `sourcePlayheadFrame` rescale — those are UI-owned in
@@ -22,26 +25,59 @@
 //!    it is safe: clips simply keep their explicit transform across a
 //!    resolution change (they are not silently re-fitted).
 
-use opentake_domain::{Clip, ClipType, Timeline};
+use opentake_domain::{clip_frame_arithmetic, FrameArithmeticError, Timeline};
+
+use crate::ops::clip_arithmetic_is_safe;
 
 /// Apply new project settings to `timeline`. Returns `true` when anything
 /// changed (the command layer's snapshot/commit also re-checks, so a no-op call
-/// produces no undo entry). Invalid (`<= 0`) `fps`/`width`/`height` are rejected
-/// as a no-op to keep the timeline well-formed.
+/// produces no undo entry). Invalid (`<= 0`) `fps`/`width`/`height`, and a
+/// rescale that would break a clip's frame arithmetic, are rejected as a no-op
+/// to keep the timeline well-formed; [`apply_timeline_settings`] reports why.
 pub fn set_timeline_settings(timeline: &mut Timeline, fps: i32, width: i32, height: i32) -> bool {
-    if fps <= 0 || width <= 0 || height <= 0 {
-        return false;
-    }
-    if !settings_frame_projection_is_safe(timeline, fps) {
-        return false;
-    }
+    apply_timeline_settings(timeline, fps, width, height).unwrap_or(false)
+}
 
+/// [`set_timeline_settings`] for the command layer: a refusal is an error,
+/// never an unchanged timeline reported as applied.
+pub(crate) fn apply_timeline_settings(
+    timeline: &mut Timeline,
+    fps: i32,
+    width: i32,
+    height: i32,
+) -> Result<bool, String> {
+    if fps <= 0 || width <= 0 || height <= 0 {
+        return Err(format!(
+            "timeline settings must be positive (got fps={fps}, width={width}, height={height})"
+        ));
+    }
+    if !timeline_clips_are_safe(timeline) {
+        return Err("timeline contains a clip with invalid frame arithmetic".into());
+    }
+    settings_projection(timeline, fps).map_err(|fault| fault.describe("timeline"))?;
+    Ok(write_timeline_settings(timeline, fps, width, height))
+}
+
+fn timeline_clips_are_safe(timeline: &Timeline) -> bool {
+    timeline
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .all(clip_arithmetic_is_safe)
+        && timeline
+            .nested_sequences
+            .iter()
+            .all(|sequence| timeline_clips_are_safe(&sequence.timeline))
+}
+
+/// Write validated settings to `timeline` and every nested sequence.
+fn write_timeline_settings(timeline: &mut Timeline, fps: i32, width: i32, height: i32) -> bool {
     // Nested timelines share one project timebase and output canvas. Keep every
     // stored child synchronized (including frame/keyframe rescaling) so entering
     // a compound never exposes stale settings after the root changes.
     let mut nested_changed = false;
     for sequence in &mut timeline.nested_sequences {
-        nested_changed |= set_timeline_settings(&mut sequence.timeline, fps, width, height);
+        nested_changed |= write_timeline_settings(&mut sequence.timeline, fps, width, height);
     }
 
     let prev_fps = timeline.fps;
@@ -97,83 +133,98 @@ fn round_scale(value: i32, scale: f64) -> i32 {
     (value as f64 * scale).round() as i32
 }
 
-fn settings_frame_projection_is_safe(timeline: &Timeline, fps: i32) -> bool {
-    if timeline.fps <= 0
-        || timeline
-            .nested_sequences
-            .iter()
-            .any(|sequence| !settings_frame_projection_is_safe(&sequence.timeline, fps))
-        || timeline
-            .tracks
-            .iter()
-            .flat_map(|track| &track.clips)
-            .any(|clip| !clip_arithmetic_is_safe(clip))
-    {
-        return false;
+/// Where rescaling to a new frame rate would break a clip's frame arithmetic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionFault {
+    /// Nested-sequence indexes from the root timeline, outermost first.
+    pub(crate) sequence_path: Vec<usize>,
+    pub(crate) track_index: usize,
+    pub(crate) clip_index: usize,
+    pub(crate) kind: ProjectionFaultKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionFaultKind {
+    /// The clip's current end frame overflows.
+    SourceEnd,
+    /// The rescaled duration overflows.
+    Duration,
+    /// The rescaled clip breaks this rule.
+    Arithmetic(FrameArithmeticError),
+}
+
+impl ProjectionFault {
+    /// The command layer's error text; `label` names the root timeline.
+    pub(crate) fn describe(&self, label: &str) -> String {
+        let mut clip = label.to_string();
+        for index in &self.sequence_path {
+            clip.push_str(&format!(".nestedSequences[{index}].timeline"));
+        }
+        clip.push_str(&format!(
+            ".tracks[{}].clips[{}]",
+            self.track_index, self.clip_index
+        ));
+        match self.kind {
+            ProjectionFaultKind::SourceEnd => format!("{clip}: source end overflows"),
+            ProjectionFaultKind::Duration => format!("{clip}: projected duration overflows"),
+            ProjectionFaultKind::Arithmetic(error) => format!("{clip} projected: {error}"),
+        }
     }
-    if timeline.fps == fps {
-        return true;
+}
+
+/// Check that rescaling every clip of `timeline` and of its nested sequences
+/// to `fps`, the way [`set_timeline_settings`] does, keeps each clip's frame
+/// arithmetic valid. The one check behind both this op and the command
+/// layer's preflight. A timeline whose frame rate is not positive keeps its
+/// frames (see the module docs), so it projects unchanged.
+pub(crate) fn settings_projection(timeline: &Timeline, fps: i32) -> Result<(), ProjectionFault> {
+    for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
+        settings_projection(&sequence.timeline, fps).map_err(|mut fault| {
+            fault.sequence_path.insert(0, sequence_index);
+            fault
+        })?;
+    }
+    if timeline.fps <= 0 || timeline.fps == fps {
+        return Ok(());
     }
     let scale = fps as f64 / timeline.fps as f64;
-    for track in &timeline.tracks {
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
         let mut order: Vec<usize> = (0..track.clips.len()).collect();
         order.sort_by_key(|&index| track.clips[index].start_frame);
         let mut previous_end = None;
-        for index in order {
-            let clip = &track.clips[index];
-            let source_end = clip.start_frame.checked_add(clip.duration_frames);
-            let Some(source_end) = source_end else {
-                return false;
+        for clip_index in order {
+            let clip = &track.clips[clip_index];
+            let fault = |kind| ProjectionFault {
+                sequence_path: Vec::new(),
+                track_index,
+                clip_index,
+                kind,
             };
+            let source_end = clip
+                .start_frame
+                .checked_add(clip.duration_frames)
+                .ok_or_else(|| fault(ProjectionFaultKind::SourceEnd))?;
             let scaled_start = round_scale(clip.start_frame, scale);
             let scaled_end = round_scale(source_end, scale);
             let start_frame = scaled_start.max(previous_end.unwrap_or(scaled_start));
-            let Some(duration_frames) = scaled_end.checked_sub(start_frame) else {
-                return false;
-            };
-            let duration_frames = duration_frames.max(1);
-            let mut projected = clip.clone();
-            projected.start_frame = start_frame;
-            projected.duration_frames = duration_frames;
-            projected.trim_start_frame = round_scale(clip.trim_start_frame, scale);
-            projected.trim_end_frame = round_scale(clip.trim_end_frame, scale);
-            if !clip_arithmetic_is_safe(&projected) {
-                return false;
-            }
-            previous_end = projected.start_frame.checked_add(projected.duration_frames);
+            let duration_frames = scaled_end
+                .checked_sub(start_frame)
+                .ok_or_else(|| fault(ProjectionFaultKind::Duration))?
+                .max(1);
+            previous_end = Some(
+                clip_frame_arithmetic(
+                    start_frame,
+                    duration_frames,
+                    round_scale(clip.trim_start_frame, scale),
+                    round_scale(clip.trim_end_frame, scale),
+                    clip.speed,
+                    clip.media_type,
+                )
+                .map_err(|error| fault(ProjectionFaultKind::Arithmetic(error)))?,
+            );
         }
     }
-    true
-}
-
-fn clip_arithmetic_is_safe(clip: &Clip) -> bool {
-    if clip.start_frame < 0
-        || clip.duration_frames < 1
-        || (!matches!(clip.media_type, ClipType::Image | ClipType::Text)
-            && (clip.trim_start_frame < 0 || clip.trim_end_frame < 0))
-        || !clip.speed.is_finite()
-        || clip.speed <= 0.0
-        || clip.start_frame.checked_add(clip.duration_frames).is_none()
-        || clip
-            .duration_frames
-            .checked_add(clip.trim_start_frame)
-            .and_then(|value| value.checked_add(clip.trim_end_frame))
-            .is_none()
-    {
-        return false;
-    }
-    let consumed = (clip.duration_frames as f64 * clip.speed).round();
-    if !(0.0..=i32::MAX as f64).contains(&consumed) {
-        return false;
-    }
-    let consumed = consumed as i32;
-    clip.trim_start_frame.checked_add(consumed).is_some()
-        && clip.trim_end_frame.checked_add(consumed).is_some()
-        && clip
-            .trim_start_frame
-            .checked_add(consumed)
-            .and_then(|value| value.checked_add(clip.trim_end_frame))
-            .is_some()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,6 +389,19 @@ mod tests {
         assert!(!set_timeline_settings(&mut tl, 30, 0, 1080));
         assert!(!set_timeline_settings(&mut tl, 30, 1920, -1));
         assert_eq!(tl, before);
+    }
+
+    #[test]
+    fn a_timeline_without_a_frame_rate_takes_the_new_rate_unscaled() {
+        let mut tl = Timeline::new();
+        tl.fps = 0;
+        tl.tracks
+            .push(track("v", ClipType::Video, vec![clip("x", 10, 40)]));
+        assert!(set_timeline_settings(&mut tl, 24, 1280, 720));
+        assert_eq!((tl.fps, tl.width, tl.height), (24, 1280, 720));
+        assert!(tl.settings_configured);
+        let c = &tl.tracks[0].clips[0];
+        assert_eq!((c.start_frame, c.duration_frames), (10, 40));
     }
 
     #[test]

@@ -284,6 +284,7 @@ impl Project {
         let (mut timeline, timeline_blockers, timeline_document) =
             decode_component::<Timeline>(&timeline_bytes, layout::TIMELINE_FILE)?;
         compatibility::repair_timeline_ids(&mut timeline, &timeline_document);
+        compatibility::repair_timeline_settings(&mut timeline);
         timeline
             .validate_nested_sequences()
             .map_err(|reason| ProjectError::InvalidTimeline {
