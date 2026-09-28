@@ -16,7 +16,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::Command;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
