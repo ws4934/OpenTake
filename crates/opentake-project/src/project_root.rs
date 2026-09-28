@@ -819,6 +819,16 @@ impl ProjectRoot {
     /// List no-follow regular leaves in `chat-sessions/`. Callers own the
     /// filename policy (for example selecting only `<session>.json`).
     pub fn list_chat_session_files(&self, max_entries: usize) -> Result<Vec<OsString>> {
+        Ok(self
+            .list_chat_session_file_sizes(max_entries)?
+            .into_iter()
+            .map(|(name, _len)| name)
+            .collect())
+    }
+
+    /// [`Self::list_chat_session_files`] with each leaf's byte length, taken
+    /// from no-follow directory metadata without opening or reading the files.
+    pub fn list_chat_session_file_sizes(&self, max_entries: usize) -> Result<Vec<(OsString, u64)>> {
         let Some(directory) = self.chat_sessions_directory(false)? else {
             return Ok(Vec::new());
         };
@@ -841,21 +851,46 @@ impl ProjectRoot {
                     ),
                 ));
             }
-            if file_type.is_file() {
-                if files.len() == max_entries {
-                    return Err(ProjectError::io(
-                        &directory_path,
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "chat session directory exceeds the configured entry limit",
-                        ),
-                    ));
-                }
-                files.push(entry.file_name());
+            if files.len() == max_entries {
+                return Err(ProjectError::io(
+                    &directory_path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chat session directory exceeds the configured entry limit",
+                    ),
+                ));
             }
+            let len = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                // Raced with an atomic replace or removal: the leaf is gone.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ProjectError::io(
+                        directory_path.join(entry.file_name()),
+                        error,
+                    ))
+                }
+            };
+            files.push((entry.file_name(), len));
         }
         files.sort();
         Ok(files)
+    }
+
+    /// Remove one no-follow regular file from `chat-sessions/`. The unlink is
+    /// the single commit point; a missing file is already removed.
+    pub fn remove_chat_session(&self, name: &str) -> Result<()> {
+        validate_leaf(name).map_err(|error| {
+            ProjectError::io(
+                self.path.join(crate::layout::CHAT_SESSIONS_DIR).join(name),
+                error,
+            )
+        })?;
+        let Some(directory) = self.chat_sessions_directory(false)? else {
+            return Ok(());
+        };
+        let directory_path = self.path.join(crate::layout::CHAT_SESSIONS_DIR);
+        remove_file_artifact(&directory, &directory_path, OsStr::new(name))
     }
 
     fn chat_sessions_directory(&self, create: bool) -> Result<Option<Dir>> {
@@ -3108,6 +3143,29 @@ mod tests {
             .list_chat_session_files(16)
             .expect_err("non-regular directory entries must fail closed");
         assert!(error.to_string().contains("non-regular"), "{error}");
+    }
+
+    #[test]
+    fn chat_session_sizes_come_from_metadata_and_removal_is_scoped() {
+        let tmp = TmpDir::new("chat-session-sizes");
+        let bundle = tmp.path().join("Chat.opentake");
+        let root = ProjectRoot::create(&bundle).unwrap();
+        assert!(root.list_chat_session_file_sizes(16).unwrap().is_empty());
+        root.remove_chat_session("absent.json").unwrap();
+
+        root.write_chat_session_atomic("a.json", b"12345").unwrap();
+        root.write_chat_session_atomic("b.json", b"1").unwrap();
+        assert_eq!(
+            root.list_chat_session_file_sizes(16).unwrap(),
+            vec![(OsString::from("a.json"), 5), (OsString::from("b.json"), 1)]
+        );
+
+        root.remove_chat_session("a.json").unwrap();
+        assert_eq!(
+            root.list_chat_session_files(16).unwrap(),
+            vec![OsString::from("b.json")]
+        );
+        assert!(root.remove_chat_session("../project.json").is_err());
     }
 
     #[cfg(unix)]

@@ -2455,6 +2455,23 @@ export async function chatSessionSetOpen(
   throw new Error("chat tabs require the desktop app");
 }
 
+/** Permanently delete one project chat session. The backend refuses a
+ *  session whose turn is still running. */
+export async function chatSessionDelete(
+  sessionId: string,
+  expectedProjectEpoch: number,
+  expectedProjectPath: string,
+): Promise<void> {
+  await ensureTauri();
+  if (invokeImpl)
+    return invokeImpl<void>("chat_session_delete", {
+      sessionId,
+      expectedProjectEpoch,
+      expectedProjectPath,
+    });
+  throw new Error("chat sessions require the desktop app");
+}
+
 export async function chatCancel(
   sessionId: string,
   expectedProjectEpoch: number,

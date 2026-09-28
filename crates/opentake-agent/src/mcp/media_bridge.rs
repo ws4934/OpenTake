@@ -391,6 +391,18 @@ pub trait MediaBridge: Send + Sync {
         ))
     }
 
+    /// Cancellation-aware [`Self::inspect_media`]. The desktop bridge stops
+    /// decoding and transcription when `cancel` fires; the default keeps
+    /// existing embedders source compatible.
+    fn inspect_media_cancellable(
+        &self,
+        request: &InspectMediaRequest,
+        cancel: &MediaCancelToken,
+    ) -> Result<InspectMediaResult, BridgeError> {
+        ensure_bridge_not_cancelled(cancel)?;
+        self.inspect_media(request)
+    }
+
     /// Transcribe each unique source for `get_transcript`, caching so a
     /// re-transcribe is instant. Per-source errors are returned inline (never
     /// fatal), matching upstream's skip-don't-fail loop. The default reports
@@ -403,6 +415,17 @@ pub trait MediaBridge: Send + Sync {
         Err(BridgeError::new(
             "get_transcript: transcription is not available in this build",
         ))
+    }
+
+    /// Cancellation-aware [`Self::transcribe_sources`]. A cancelled batch fails
+    /// as a whole instead of reporting each remaining source as skipped.
+    fn transcribe_sources_cancellable(
+        &self,
+        sources: &[TranscriptSource],
+        cancel: &MediaCancelToken,
+    ) -> Result<Vec<TranscriptSourceResult>, BridgeError> {
+        ensure_bridge_not_cancelled(cancel)?;
+        self.transcribe_sources(sources)
     }
 
     /// Composite the timeline at each `frames` value and return them as encoded
@@ -419,6 +442,18 @@ pub trait MediaBridge: Send + Sync {
         Err(BridgeError::new(
             "inspect_timeline: rendering is not available in this build",
         ))
+    }
+
+    /// Cancellation-aware [`Self::inspect_timeline`], checked between frames by
+    /// the desktop bridge.
+    fn inspect_timeline_cancellable(
+        &self,
+        frames: &[i32],
+        max_longest_edge: u32,
+        cancel: &MediaCancelToken,
+    ) -> Result<InspectResult, BridgeError> {
+        ensure_bridge_not_cancelled(cancel)?;
+        self.inspect_timeline(frames, max_longest_edge)
     }
 
     /// Import media through the SAME path as the user-facing import (posters,
@@ -469,6 +504,33 @@ pub trait MediaBridge: Send + Sync {
             moments: Vec::new(),
             spoken: Vec::new(),
         })
+    }
+
+    /// Cancellation-aware [`Self::search_media`].
+    fn search_media_cancellable(
+        &self,
+        candidates: &[SearchCandidate],
+        query: &str,
+        scope: &str,
+        limit: usize,
+        cancel: &MediaCancelToken,
+    ) -> Result<SearchMediaResult, BridgeError> {
+        ensure_bridge_not_cancelled(cancel)?;
+        self.search_media(candidates, query, scope, limit)
+    }
+}
+
+/// Error a bridge returns when its caller's token was cancelled.
+pub fn cancelled_bridge_error() -> BridgeError {
+    BridgeError::new("Cancelled")
+}
+
+/// `Err(Cancelled)` once `cancel` has fired.
+pub fn ensure_bridge_not_cancelled(cancel: &MediaCancelToken) -> Result<(), BridgeError> {
+    if cancel.is_cancelled() {
+        Err(cancelled_bridge_error())
+    } else {
+        Ok(())
     }
 }
 
