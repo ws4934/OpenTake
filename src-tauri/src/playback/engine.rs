@@ -561,10 +561,13 @@ pub struct EngineControl {
 
 /// Playback/export pressure held while the engine plays, so background
 /// inference yields (#43). The command layer fills it before a start or
-/// resume handshake; it is emptied by a pause (before any fallible step), by a
-/// stop, and by the render thread itself when it halts at the end of the
-/// timeline or on a render failure and when it exits for any reason.
-type PressureSlot = Arc<Mutex<Option<opentake_media::ExportPauseGuard>>>;
+/// resume handshake, tagged with that resume's token; it is emptied by a
+/// pause (before any fallible step), by a stop, and by the render thread
+/// itself when it halts at the end of the timeline or on a render failure and
+/// when it exits for any reason. The render thread does not release on a
+/// queued `Pause`: the control side already did, and a resume issued after
+/// that pause may have installed a newer guard by the time it is processed.
+type PressureSlot = Arc<Mutex<Option<(u64, opentake_media::ExportPauseGuard)>>>;
 
 fn release_pressure_slot(slot: &PressureSlot) {
     slot.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -589,13 +592,27 @@ impl EngineControl {
         }
     }
 
-    /// Hold playback pressure while this engine plays. At most one guard is
-    /// held per engine; a second hold replaces the first.
-    pub(crate) fn hold_pressure(&self, guard: opentake_media::ExportPauseGuard) {
-        *self.pressure.lock().unwrap_or_else(|p| p.into_inner()) = Some(guard);
+    /// Hold playback pressure for the resume identified by `token` (resume
+    /// tokens only grow). At most one guard is held per engine: a newer
+    /// resume replaces an older one's guard, and an older resume never
+    /// replaces a newer one's.
+    pub(crate) fn hold_pressure(&self, token: u64, guard: opentake_media::ExportPauseGuard) {
+        let mut slot = self.pressure.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(held, _)| *held <= token) {
+            *slot = Some((token, guard));
+        }
     }
 
-    /// Release playback pressure (pause, stop, failed start or resume).
+    /// Release the guard only if the resume identified by `token` still owns
+    /// it (a superseded or failed handshake must not drop a newer resume's).
+    pub(crate) fn release_pressure_for(&self, token: u64) {
+        let mut slot = self.pressure.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|(held, _)| *held == token) {
+            *slot = None;
+        }
+    }
+
+    /// Release playback pressure unconditionally (pause, stop).
     pub(crate) fn release_pressure(&self) {
         release_pressure_slot(&self.pressure);
     }
@@ -1131,7 +1148,6 @@ fn run_render_loop<R: FrameRenderer>(
         if paused {
             match rx.recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
-                    release_pressure_slot(&pressure);
                     clock.seek(frame);
                     resume_decode_streams(paused_frame, frame, || renderer.seek());
                     if paused_frame != Some(frame) {
@@ -1173,7 +1189,6 @@ fn run_render_loop<R: FrameRenderer>(
         loop {
             match rx.try_recv() {
                 Ok(PlaybackCmd::Pause(frame, reply)) => {
-                    release_pressure_slot(&pressure);
                     clock.seek(frame);
                     paused = true;
                     paused_frame = Some(frame);
@@ -1346,12 +1361,21 @@ mod tests {
         entered: mpsc::Sender<()>,
     }
 
+    /// A render at `frame` that signals `entered` and then waits for
+    /// `release` (a slow 4K or long-GOP frame), then succeeds.
+    struct HoldAt {
+        frame: i32,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
     struct StubRenderer {
         total: i32,
         fail_at: Option<i32>,
         renders: Arc<Mutex<Vec<i32>>>,
         seeks: Arc<AtomicI32>,
         block_at: Option<BlockAt>,
+        hold_at: Option<HoldAt>,
     }
 
     impl FrameRenderer for StubRenderer {
@@ -1365,6 +1389,14 @@ mod tests {
 
         fn render(&mut self, target: i32) -> Result<DecodedFrame, RenderFailure> {
             self.renders.lock().unwrap().push(target);
+            if let Some(hold) = self.hold_at.as_ref().filter(|hold| hold.frame == target) {
+                let _ = hold.entered.send(());
+                let _ = hold
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
             if let Some(block) = self.block_at.as_ref().filter(|block| block.frame == target) {
                 let _ = block.entered.send(());
                 while !block.cancel.is_cancelled() {
@@ -1440,6 +1472,16 @@ mod tests {
         block_at: Option<BlockAt>,
         cancel: MediaCancelToken,
     ) -> StubRun {
+        run_stub_full(total, fail_at, block_at, None, cancel)
+    }
+
+    fn run_stub_full(
+        total: i32,
+        fail_at: Option<i32>,
+        block_at: Option<BlockAt>,
+        hold_at: Option<HoldAt>,
+        cancel: MediaCancelToken,
+    ) -> StubRun {
         let renders = Arc::new(Mutex::new(Vec::new()));
         let seeks = Arc::new(AtomicI32::new(0));
         let sink = Arc::new(RecordingSink::default());
@@ -1451,6 +1493,7 @@ mod tests {
             renders: Arc::clone(&renders),
             seeks: Arc::clone(&seeks),
             block_at,
+            hold_at,
         };
         let engine = PlaybackEngine::spawn_with(
             move || Ok(renderer),
@@ -1488,7 +1531,7 @@ mod tests {
 
         // An explicit pause releases at once.
         let run = run_stub(1_000_000, None);
-        run.engine.control().hold_pressure(pressure.guard());
+        run.engine.control().hold_pressure(1, pressure.guard());
         run.engine.pause(0).expect("pause");
         assert!(!pressure.is_active(), "pause releases pressure");
 
@@ -1497,7 +1540,7 @@ mod tests {
         wait_until("the loop to reach the end", || {
             run.renders.lock().unwrap().contains(&49)
         });
-        run.engine.control().hold_pressure(pressure.guard());
+        run.engine.control().hold_pressure(2, pressure.guard());
         run.engine.resume(0).expect("resume from the start");
         wait_until("the end-of-timeline release", || !pressure.is_active());
 
@@ -1506,14 +1549,75 @@ mod tests {
         wait_until("the failing render", || {
             failing.errors.0.lock().unwrap().len() == 1
         });
-        failing.engine.control().hold_pressure(pressure.guard());
+        failing.engine.control().hold_pressure(3, pressure.guard());
         failing.engine.resume(5).expect("retry resume");
         wait_until("the failure-halt release", || !pressure.is_active());
 
         // Stopping (the render thread exits) releases.
-        failing.engine.control().hold_pressure(pressure.guard());
+        failing.engine.control().hold_pressure(4, pressure.guard());
         failing.engine.stop();
         assert!(!pressure.is_active(), "thread exit releases pressure");
+        run.engine.stop();
+    }
+
+    #[test]
+    fn a_stale_queued_pause_does_not_drop_a_newer_resumes_pressure() {
+        let pressure = opentake_media::ExportPause::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let run = run_stub_full(
+            1_000_000,
+            None,
+            None,
+            Some(HoldAt {
+                frame: 3,
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            MediaCancelToken::new(),
+        );
+        let control = run.engine.control();
+        control.hold_pressure(1, pressure.guard());
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a slow render is in flight");
+
+        // Pause while the render runs: the control side releases at once and
+        // the render thread sees the `Pause` only after the render returns.
+        control.pause(3).expect("pause");
+        assert!(!pressure.is_active());
+        // Play again before that: the new resume holds its own guard and
+        // waits for the render thread to adopt the resume.
+        control.hold_pressure(2, pressure.guard());
+        let resumer = {
+            let control = control.clone();
+            thread::spawn(move || control.resume(3))
+        };
+        release_tx.send(()).expect("finish the slow render");
+        resumer
+            .join()
+            .expect("join resumer")
+            .expect("resume after the stale pause");
+
+        assert!(
+            pressure.is_active(),
+            "the stale pause must not drop the newer resume's guard"
+        );
+        run.engine.stop();
+        assert!(!pressure.is_active());
+    }
+
+    #[test]
+    fn an_older_resume_cannot_replace_or_release_a_newer_resumes_pressure() {
+        let pressure = opentake_media::ExportPause::new();
+        let run = run_stub(1_000_000, None);
+        let control = run.engine.control();
+        control.hold_pressure(5, pressure.guard());
+        control.hold_pressure(4, opentake_media::ExportPause::new().guard());
+        control.release_pressure_for(4);
+        assert!(pressure.is_active(), "resume 5 still owns the guard");
+        control.release_pressure_for(5);
+        assert!(!pressure.is_active());
         run.engine.stop();
     }
 

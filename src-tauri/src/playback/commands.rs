@@ -576,7 +576,7 @@ impl PlaybackState {
         let identity = &identity;
         // Background inference yields from the moment playback is requested;
         // a failed handshake or a pause recorded meanwhile releases it.
-        handles.engine.hold_pressure(self.pressure.guard());
+        handles.engine.hold_pressure(token, self.pressure.guard());
         let handshake = (|| {
             if let Some(audio) = handles.audio.as_ref() {
                 audio.prepare_resume()?;
@@ -587,14 +587,15 @@ impl PlaybackState {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = slot.resuming.take_if(|pending| pending.token == token) else {
             // A stop, restart or project boundary took the session meanwhile
-            // and owns its teardown.
-            handles.engine.release_pressure();
+            // and owns its teardown. A newer resume may already hold the
+            // engine's guard; release only this resume's.
+            handles.engine.release_pressure_for(token);
             return Err(PlaybackCommandError::superseded(
                 "playback session changed while resuming",
             ));
         };
         if let Err(error) = handshake {
-            handles.engine.release_pressure();
+            handles.engine.release_pressure_for(token);
             handles.publication.close();
             if let Some(audio) = handles.audio.as_ref() {
                 let _ = audio.pause();
@@ -2208,6 +2209,97 @@ mod tests {
             .sessions
             .start_would_resume(current, current.revision())
             .expect("valid identity")
+    }
+
+    #[test]
+    fn a_superseded_resume_does_not_release_the_newer_resumes_pressure() {
+        let pressure = opentake_media::ExportPause::new();
+        let current = identity(6, 9, "superseded-resume-pressure");
+        let (engine, resume_seen, release_resume, _log) = PlaybackEngine::test_blocking_resume();
+        let state = PlaybackState::with_pressure(pressure.clone());
+        install_running(&state, current.clone(), engine);
+        state
+            .control(current.clone(), SessionControl::Pause, 17)
+            .expect("pause retained session");
+        assert!(!pressure.is_active());
+
+        // Resume 1 blocks in the render handshake.
+        let first = spawn_resume(&state, &current, 17);
+        assert_eq!(
+            resume_seen
+                .recv_timeout(Duration::from_secs(2))
+                .expect("resume 1 reaches the render thread"),
+            17
+        );
+        // Pause (recorded on the pending resume) and play again.
+        state
+            .control(current.clone(), SessionControl::Pause, 21)
+            .expect("pause during the blocked resume");
+        let second = spawn_resume(&state, &current, 30);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pressure.is_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume 2 holds pressure"
+            );
+            std::thread::yield_now();
+        }
+
+        // Resume 1 finishes superseded; resume 2 then commits.
+        release_resume.send(()).expect("release resume 1");
+        assert!(first.join().expect("join resume 1").is_err());
+        assert_eq!(
+            resume_seen
+                .recv_timeout(Duration::from_secs(2))
+                .expect("resume 2 reaches the render thread"),
+            30
+        );
+        release_resume.send(()).expect("release resume 2");
+        assert!(second
+            .join()
+            .expect("join resume 2")
+            .expect("resume 2 succeeds")
+            .is_none());
+
+        assert!(!session_is_paused(&state, &current));
+        assert!(
+            pressure.is_active(),
+            "the superseded resume must not drop resume 2's guard"
+        );
+        state
+            .control(current, SessionControl::Stop, 0)
+            .expect("stop");
+        assert!(!pressure.is_active());
+    }
+
+    /// Install `engine` as the running session of `state` (no audio).
+    fn install_running(state: &PlaybackState, identity: PlaybackIdentity, engine: PlaybackEngine) {
+        let mut slot = state
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let StartDecision::Build(ticket) = slot
+            .sessions
+            .begin_start(identity.clone(), identity.revision())
+            .expect("begin playback session")
+        else {
+            panic!("fresh session must build");
+        };
+        slot.sessions
+            .install_if_current(ticket, identity.revision())
+            .expect("install playback session");
+        slot.running = Some(RunningPlayback {
+            identity,
+            proxy_check_cancel: opentake_media::MediaCancelToken::new(),
+            engine,
+            audio: None,
+            publication: PublicationGate::open(),
+            server: None,
+            reap: state
+                .reaper
+                .try_reserve()
+                .expect("reserve test session reap"),
+        });
     }
 
     #[test]
