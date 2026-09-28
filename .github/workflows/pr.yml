@@ -1,9 +1,8 @@
 name: PR checks
 
 # Pull requests check the lightweight Rust crates, workflow/provisioning scripts,
-# and web build/tests. Changed desktop media commands also run a targeted native
-# Windows gate in native-media-qualification.yml. Full workspace and release
-# checks live in ci.yml and release.yml for tags or manual dispatch.
+# and web build/tests. Full workspace and desktop integration checks live in
+# ci.yml and release.yml for release tags or manual dispatch.
 on:
   pull_request:
 
