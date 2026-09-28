@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -30,6 +30,8 @@ use crate::frame::RgbaFrame;
 pub const DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY: usize = 8;
 
 const BACKPRESSURE_SLEEP: Duration = Duration::from_millis(5);
+/// How often a worker waiting for FFmpeg's next event checks for a stop.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Most recent ffmpeg error/fatal log lines attached to a stream failure.
 const FAILURE_LOG_TAIL_LINES: usize = 20;
@@ -252,22 +254,52 @@ fn run_video_stream(
             return;
         }
     };
+    // FFmpeg blocked on its input (a stalled network volume, a sleeping
+    // drive, a pipe without a writer) produces no event at all, so reading
+    // events here would never observe a stop request. A pump thread forwards
+    // them through a rendezvous channel, which keeps FFmpeg's backpressure,
+    // and this loop checks the stop flag between timed receives.
+    let (event_tx, event_rx) = sync_channel::<FfmpegEvent>(0);
+    let pump = match thread::Builder::new()
+        .name("opentake-video-decode-events".to_string())
+        .spawn(move || {
+            for event in iter {
+                if event_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        }) {
+        Ok(pump) => pump,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = send_with_backpressure(
+                &tx,
+                Err(MediaError::Ffmpeg(format!("spawn event pump: {e}"))),
+                &control,
+            );
+            return;
+        }
+    };
 
     let mut log_tail = VecDeque::with_capacity(FAILURE_LOG_TAIL_LINES);
     let mut fatal = false;
     let mut stopped = false;
-    for event in iter {
+    loop {
         if control.is_stopped() {
-            let _ = child.quit();
             stopped = true;
             break;
         }
+        let event = match event_rx.recv_timeout(STOP_POLL_INTERVAL) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
 
         match event {
             FfmpegEvent::OutputFrame(frame) => {
                 let decoded = stream_frame_from_output(&req, frame);
                 if !send_with_backpressure(&tx, Ok(decoded), &control) {
-                    let _ = child.quit();
                     stopped = true;
                     break;
                 }
@@ -287,7 +319,15 @@ fn run_video_stream(
         }
     }
 
+    if stopped {
+        // Killing FFmpeg closes its pipes even while it is blocked on input,
+        // which ends the pump's event iterator.
+        let _ = child.kill();
+    }
+    // A pump blocked on a send sees the closed channel and stops reading.
+    drop(event_rx);
     let status = child.wait();
+    let _ = pump.join();
     if stopped {
         return;
     }
@@ -431,6 +471,61 @@ fn video_stream_args_with_color(
 mod tests {
     use super::*;
 
+    /// FFmpeg opening a FIFO without a writer blocks before it logs or
+    /// outputs anything. A stop must still end the worker and reap FFmpeg
+    /// instead of waiting for an event that never comes.
+    #[cfg(unix)]
+    #[test]
+    fn stop_ends_a_decode_blocked_on_input_without_output() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !crate::ff::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("FIFO dir");
+        let fifo = dir.path().join("stalled.mp4");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let helpers = crate::ff::HelperProcessCount::start();
+        // A known color skips the ffprobe pass, so FFmpeg itself blocks.
+        let stream = spawn_video_stream_with_color(
+            VideoStreamRequest::new(fifo.clone(), 30),
+            ColorHint::Known(None),
+        )
+        .expect("spawn stalled stream");
+        let spawned_by = std::time::Instant::now() + Duration::from_secs(10);
+        while helpers.count() == 0 && std::time::Instant::now() < spawned_by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(helpers.count(), 1, "FFmpeg must have started");
+        // Give FFmpeg time to reach the blocking open of the FIFO.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            stream.receiver().try_recv().is_err(),
+            "a FIFO without a writer produces no frame"
+        );
+
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        let joiner = thread::spawn(move || {
+            let joined = stream.join();
+            let _ = joined_tx.send(joined.is_ok());
+        });
+        let joined = joined_rx.recv_timeout(Duration::from_secs(10));
+        if joined.is_err() {
+            // Release the stuck FFmpeg so the failure does not leak it.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        assert_eq!(
+            joined,
+            Ok(true),
+            "a stop must end the worker and reap FFmpeg while it blocks on input"
+        );
+        joiner.join().expect("joiner");
+    }
+
     fn request() -> VideoStreamRequest {
         VideoStreamRequest {
             path: PathBuf::from("/x/clip.mp4"),
@@ -521,7 +616,10 @@ mod tests {
         assert!(args[vf + 1].to_str().unwrap().starts_with(
             "setpts='if(eq(N,0),min(PTS,1.983333/TB),PTS)',fps=fps=30:round=up,trim=start_pts=60,"
         ));
-        assert!(args[vf + 1].to_str().unwrap().contains("force_original_aspect_ratio=decrease"));
+        assert!(args[vf + 1]
+            .to_str()
+            .unwrap()
+            .contains("force_original_aspect_ratio=decrease"));
         assert!(args.windows(2).any(|w| w == ["-fps_mode", "passthrough"]));
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "rgba"]));
         assert!(args.windows(2).any(|w| w == ["-f", "rawvideo"]));
