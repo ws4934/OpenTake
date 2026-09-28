@@ -1376,6 +1376,16 @@ impl TauriMotionBridge {
         );
         let committed = match committed {
             Ok(committed) => committed,
+            Err(opentake_core::CoreError::TargetTrackRemoved) => {
+                // Nothing references the output, and placing it on whichever
+                // track now has the old index would be wrong: drop it.
+                published.discard();
+                return Err(MotionBridgeError::new(
+                    MotionBridgeErrorKind::RenderFailed,
+                    "the target track was removed while the motion graphic rendered; \
+                     the render was discarded",
+                ));
+            }
             Err(error) => {
                 return Err(MotionBridgeError::new(
                     MotionBridgeErrorKind::RenderFailed,

@@ -991,6 +991,12 @@ impl ProjectImportGuard {
         self.committed = true;
     }
 
+    /// Undo [`Self::commit`] for a candidate that the project never came to
+    /// reference, so dropping the guard removes it again.
+    pub(crate) fn discard(&mut self) {
+        self.committed = false;
+    }
+
     fn owns_name(&self) -> bool {
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
@@ -1883,6 +1889,28 @@ mod tests {
             std::fs::read(bundle.join("media/motion.mp4")).unwrap(),
             b"motion bytes"
         );
+    }
+
+    #[test]
+    fn discarded_import_is_removed_and_committed_import_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("DiscardMedia.opentake");
+        std::fs::create_dir(&bundle).unwrap();
+        let capability =
+            ProjectMediaCapability::open_with_root_gate(&bundle, true, |_| Ok(())).unwrap();
+        for (name, discard) in [("kept.mp4", false), ("discarded.mp4", true)] {
+            let mut leaf = capability.create_import(Path::new(name)).unwrap();
+            leaf.file_mut().write_all(b"motion bytes").unwrap();
+            leaf.commit();
+            if discard {
+                leaf.discard();
+            }
+        }
+        assert_eq!(
+            std::fs::read(bundle.join("media/kept.mp4")).unwrap(),
+            b"motion bytes"
+        );
+        assert!(!bundle.join("media/discarded.mp4").exists());
     }
 
     #[test]
