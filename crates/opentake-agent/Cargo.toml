@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Tool layer (= ToolExecutor) + MCP server (rmcp) + in-app chat client + short-id + system prompts."
 
+[features]
+# Unauthenticated loopback MCP routers (`mcp::server::build_router*`,
+# `serve*`). Any local process can call every editing tool through them, so
+# they are off by default; the desktop app uses the Bearer-gated endpoints.
+legacy-unauthenticated-mcp = []
+
 [dependencies]
 opentake-domain = { workspace = true }
 opentake-ops = { workspace = true }
@@ -44,5 +50,7 @@ getrandom = "0.3"
 subtle = "2"
 
 [dev-dependencies]
+# `tests/mcp_http.rs` drives the legacy unauthenticated router.
+opentake-agent = { path = ".", features = ["legacy-unauthenticated-mcp"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "time", "test-util"] }
 tempfile = "3"
