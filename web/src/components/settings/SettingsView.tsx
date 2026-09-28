@@ -45,6 +45,7 @@ import {
   type CodexAuthStatus,
 } from "../../lib/api";
 import type { SecretStatus } from "../../lib/types";
+import { useImeComposition } from "../../hooks/useImeComposition";
 import { AccountPane } from "./AccountPane";
 import { ExternalMcpPane } from "./ExternalMcpPane";
 import { StoragePane } from "./StoragePane";
@@ -618,6 +619,7 @@ function errorMessage(error: unknown): string {
 
 function AiPane() {
   const t = useT();
+  const keyIme = useImeComposition();
   const provider = useSettingsStore((s) => s.byokProvider);
   const setProvider = useSettingsStore((s) => s.setByokProvider);
   const [draft, setDraft] = useState("");
@@ -862,8 +864,10 @@ function AiPane() {
               setError(null);
             }}
             onKeyDown={(e) => {
+              if (keyIme.isComposingKeyDown(e)) return;
               if (e.key === "Enter") void save();
             }}
+            {...keyIme.compositionHandlers}
             placeholder={status.hasKey ? status.masked : t("settings.byokKeyPlaceholder")}
             className="tabular"
             style={{

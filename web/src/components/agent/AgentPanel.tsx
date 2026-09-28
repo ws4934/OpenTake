@@ -42,6 +42,7 @@ import { useSettingsStore } from "../../store/settingsStore";
 import { mintSessionId, useChatStore } from "../../store/chatStore";
 import { useEditorUiStore } from "../../store/uiStore";
 import { useProjectStore } from "../../store/projectStore";
+import { useImeComposition } from "../../hooks/useImeComposition";
 import { Reveal } from "../ui/Reveal";
 
 const NO_KEY_HINT = /Settings|设置|API key/i;
@@ -90,6 +91,7 @@ export function AgentPanel() {
   const mountedRef = useRef(true);
   const turnLocked = streaming || pendingSessionId === sessionId;
   const interactionLocked = turnLocked || selectedSessionResyncing;
+  const ime = useImeComposition();
 
   useEffect(() => {
     mountedRef.current = true;
@@ -511,6 +513,8 @@ export function AgentPanel() {
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    // Enter that confirms an IME candidate belongs to the input method.
+    if (ime.isComposingKeyDown(event)) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void send();
@@ -684,6 +688,7 @@ export function AgentPanel() {
             setInput(event.target.value);
           }}
           onKeyDown={onKeyDown}
+          {...ime.compositionHandlers}
           placeholder={t("agent.inputPlaceholder")}
           aria-label={t("agent.inputPlaceholder")}
           disabled={!isTauri || interactionLocked}

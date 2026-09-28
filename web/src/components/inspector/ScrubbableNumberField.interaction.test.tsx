@@ -209,3 +209,27 @@ it("cancels text and pointer commits when the field becomes disabled", async () 
   expect(onCommit).not.toHaveBeenCalled();
   expect(container.querySelector("input")).toBeNull();
 });
+
+it("leaves IME candidate keys in text-entry mode to the input method", async () => {
+  const input = await enterTextMode();
+  await setInput(input, "８");
+  await act(async () => {
+    input.dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", isComposing: true, keyCode: 229, bubbles: true }),
+    );
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", isComposing: true, keyCode: 229, bubbles: true }),
+    );
+    input.dispatchEvent(new Event("compositionend", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true }));
+  });
+  expect(onCommit).not.toHaveBeenCalled();
+  expect(container.querySelector("input[aria-label='Opacity']")).toBe(input);
+
+  await setInput(input, "8");
+  await act(async () => {
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+  });
+  expect(onCommit).toHaveBeenCalledExactlyOnceWith(8);
+});

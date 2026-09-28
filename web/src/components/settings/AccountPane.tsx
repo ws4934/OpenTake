@@ -14,6 +14,7 @@ import {
   accountSetBackendUrl,
 } from "../../lib/api";
 import type { AccountStatus } from "../../lib/types";
+import { useImeComposition } from "../../hooks/useImeComposition";
 import { Icon } from "../ui/Icon";
 
 const controlStyle: CSSProperties = {
@@ -56,6 +57,8 @@ function errorMessage(error: unknown): string {
 
 export function AccountPane() {
   const t = useT();
+  const urlIme = useImeComposition();
+  const tokenIme = useImeComposition();
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [urlDraft, setUrlDraft] = useState("");
   const [tokenDraft, setTokenDraft] = useState("");
@@ -230,8 +233,10 @@ export function AccountPane() {
               setError(null);
             }}
             onKeyDown={(event) => {
+              if (urlIme.isComposingKeyDown(event)) return;
               if (event.key === "Enter") void saveUrl();
             }}
+            {...urlIme.compositionHandlers}
             placeholder={t("account.backendUrlPlaceholder")}
             spellCheck={false}
             className="tabular"
@@ -318,8 +323,10 @@ export function AccountPane() {
               setError(null);
             }}
             onKeyDown={(event) => {
+              if (tokenIme.isComposingKeyDown(event)) return;
               if (event.key === "Enter") void login();
             }}
+            {...tokenIme.compositionHandlers}
             placeholder={t("account.tokenPlaceholder")}
             className="tabular"
             style={{

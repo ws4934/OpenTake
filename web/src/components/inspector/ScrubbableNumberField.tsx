@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LAYOUT } from "../../lib/theme";
+import { useImeComposition } from "../../hooks/useImeComposition";
 
 interface Props {
   ariaLabel?: string;
@@ -50,6 +51,7 @@ export function ScrubbableNumberField(p: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const displayRef = useRef<HTMLSpanElement>(null);
   const restoreDisplayFocusRef = useRef(false);
+  const ime = useImeComposition();
 
   useEffect(() => {
     if (editing) {
@@ -216,9 +218,12 @@ export function ScrubbableNumberField(p: Props) {
         }}
         onBlur={() => commitEdit(false)}
         onKeyDown={(e) => {
+          // Enter/Escape that confirm or cancel an IME candidate stay with the IME.
+          if (ime.isComposingKeyDown(e)) return;
           if (e.key === "Enter") commitEdit(true);
           else if (e.key === "Escape") finishEditing(true);
         }}
+        {...ime.compositionHandlers}
         className="tabular"
         style={{
           width: p.width ?? 56,
