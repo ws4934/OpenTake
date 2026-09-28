@@ -4665,19 +4665,24 @@ fn mask_from_arg(m: &MaskArg, path: &str) -> Result<Mask, ToolError> {
 /// Build the typed [`KeyframeProperty`] + [`KeyframePayload`] from the raw
 /// `set_keyframes` rows. Rows are `[frame, ...values, interp?]`; the value arity
 /// is decided by the property (scalar / pair / crop). 1:1 with upstream's
-/// per-property row decoding.
+/// per-property row decoding (`parseKeyframes`); frame-range checks, sorting and
+/// duplicate resolution happen once in the `SetKeyframes` command so the
+/// Inspector path shares them.
 fn build_keyframe_payload(
     a: &SetKeyframesArgs,
 ) -> Result<(KeyframeProperty, KeyframePayload), ToolError> {
     let property = parse_keyframe_property(&a.property)?;
     let payload = match property {
         KeyframeProperty::Opacity | KeyframeProperty::Volume | KeyframeProperty::Rotation => {
+            let value_name = match property {
+                KeyframeProperty::Rotation => "degrees",
+                _ => "value",
+            };
             let mut kfs = Vec::with_capacity(a.keyframes.len());
             for (i, row) in a.keyframes.iter().enumerate() {
-                let (frame, vals, interp) = parse_kf_row(row, &format!("keyframes[{i}]"))?;
-                let value = *vals
-                    .first()
-                    .ok_or_else(|| ToolError::new(format!("keyframes[{i}]: missing value")))?;
+                let (frame, vals, interp) =
+                    parse_kf_row(row, &format!("keyframes[{i}]"), &[value_name])?;
+                let value = vals[0];
                 // The volume track is stored in dB (as the Inspector writes it);
                 // the tool contract takes linear 0–1 amplitude.
                 let value = match property {
@@ -4687,21 +4692,20 @@ fn build_keyframe_payload(
                     KeyframeProperty::Opacity => unit_interval(value, i, "opacity")?,
                     _ => value,
                 };
-                kfs.push(make_keyframe(frame, value, interp));
+                kfs.push(Keyframe::with_interpolation(frame, value, interp));
             }
             KeyframePayload::Scalar(KeyframeTrack::from_keyframes(kfs))
         }
         KeyframeProperty::Position | KeyframeProperty::Scale => {
+            let field_names: &[&str] = match property {
+                KeyframeProperty::Position => &["topLeftX", "topLeftY"],
+                _ => &["width", "height"],
+            };
             let mut kfs = Vec::with_capacity(a.keyframes.len());
             for (i, row) in a.keyframes.iter().enumerate() {
-                let (frame, vals, interp) = parse_kf_row(row, &format!("keyframes[{i}]"))?;
-                if vals.len() < 2 {
-                    return Err(ToolError::new(format!(
-                        "keyframes[{i}]: {} needs [frame, a, b]",
-                        a.property
-                    )));
-                }
-                kfs.push(make_keyframe(
+                let (frame, vals, interp) =
+                    parse_kf_row(row, &format!("keyframes[{i}]"), field_names)?;
+                kfs.push(Keyframe::with_interpolation(
                     frame,
                     AnimPair::new(vals[0], vals[1]),
                     interp,
@@ -4712,12 +4716,11 @@ fn build_keyframe_payload(
         KeyframeProperty::Crop => {
             let mut kfs = Vec::with_capacity(a.keyframes.len());
             for (i, row) in a.keyframes.iter().enumerate() {
-                let (frame, vals, interp) = parse_kf_row(row, &format!("keyframes[{i}]"))?;
-                if vals.len() < 4 {
-                    return Err(ToolError::new(format!(
-                        "keyframes[{i}]: crop needs [frame, top, right, bottom, left]"
-                    )));
-                }
+                let (frame, vals, interp) = parse_kf_row(
+                    row,
+                    &format!("keyframes[{i}]"),
+                    &["top", "right", "bottom", "left"],
+                )?;
                 let crop = Crop {
                     top: unit_interval(vals[0], i, "crop top")?,
                     right: unit_interval(vals[1], i, "crop right")?,
@@ -4729,7 +4732,7 @@ fn build_keyframe_payload(
                         "keyframes[{i}]: crop left+right and top+bottom must each be below 1.0"
                     )));
                 }
-                kfs.push(make_keyframe(frame, crop, interp));
+                kfs.push(Keyframe::with_interpolation(frame, crop, interp));
             }
             KeyframePayload::Crop(KeyframeTrack::from_keyframes(kfs))
         }
@@ -4747,13 +4750,6 @@ fn unit_interval(value: f64, row: usize, what: &str) -> Result<f64, ToolError> {
     }
 }
 
-fn make_keyframe<V>(frame: i32, value: V, interp: Option<Interpolation>) -> Keyframe<V> {
-    match interp {
-        Some(i) => Keyframe::with_interpolation(frame, value, i),
-        None => Keyframe::new(frame, value),
-    }
-}
-
 fn parse_keyframe_property(s: &str) -> Result<KeyframeProperty, ToolError> {
     match s.to_ascii_lowercase().as_str() {
         "opacity" => Ok(KeyframeProperty::Opacity),
@@ -4768,33 +4764,75 @@ fn parse_keyframe_property(s: &str) -> Result<KeyframeProperty, ToolError> {
     }
 }
 
-/// Parse one keyframe row `[frame, ...values, interp?]`. The optional trailing
-/// string element is the interpolation; numeric elements after `frame` are the
-/// values.
+/// Parse one keyframe row `[frame, value0, ..., interp?]` carrying exactly one
+/// value per entry of `field_names`. 1:1 port of the row checks in upstream
+/// `ToolExecutor.parseKeyframes` (`kfInt` / `kfDouble` / `kfInterp`): the row
+/// holds `arity + 1` or `arity + 2` elements, the frame is an integer (a float
+/// frame truncates toward zero like upstream `safeInt`) that must also fit the
+/// `i32` frame model, every value is a finite number, and the optional
+/// trailing element names an interpolation (default smooth).
 fn parse_kf_row(
     row: &Value,
     path: &str,
-) -> Result<(i32, Vec<f64>, Option<Interpolation>), ToolError> {
-    let Some(arr) = row.as_array() else {
-        return Err(ToolError::new(format!("{path}: expected an array row")));
+    field_names: &[&str],
+) -> Result<(i32, Vec<f64>, Interpolation), ToolError> {
+    let arity = field_names.len();
+    let labels = field_names.join(", ");
+    let Some(row) = row.as_array() else {
+        return Err(ToolError::new(format!(
+            "{path}: expected array [frame, {labels}, interp?]"
+        )));
     };
-    if arr.is_empty() {
-        return Err(ToolError::new(format!("{path}: empty row")));
+    if row.len() != arity + 1 && row.len() != arity + 2 {
+        return Err(ToolError::new(format!(
+            "{path}: expected [frame, {labels}] or [frame, {labels}, interp] (got {} element{})",
+            row.len(),
+            if row.len() == 1 { "" } else { "s" }
+        )));
     }
-    let frame = arr[0]
-        .as_f64()
-        .ok_or_else(|| ToolError::new(format!("{path}[0]: frame must be a number")))?
-        .round() as i32;
-    let mut values = Vec::new();
-    let mut interp = None;
-    for el in &arr[1..] {
-        match el {
-            Value::Number(n) => values.push(n.as_f64().unwrap_or(0.0)),
-            Value::String(s) => interp = parse_interpolation(s),
-            _ => {}
-        }
-    }
+    let frame = parse_kf_frame(&row[0], &format!("{path}[0] (frame)"))?;
+    let values = field_names
+        .iter()
+        .enumerate()
+        .map(|(k, name)| parse_kf_number(&row[k + 1], &format!("{path}[{}] ({name})", k + 1)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let interp = match row.get(arity + 1) {
+        None => Interpolation::Smooth,
+        Some(raw) => raw.as_str().and_then(parse_interpolation).ok_or_else(|| {
+            ToolError::new(format!(
+                "{path}[{}] (interp): expected one of 'linear', 'hold', 'smooth' (got {raw})",
+                arity + 1
+            ))
+        })?,
+    };
     Ok((frame, values, interp))
+}
+
+fn parse_kf_frame(raw: &Value, path: &str) -> Result<i32, ToolError> {
+    let value = raw
+        .as_f64()
+        .ok_or_else(|| ToolError::new(format!("{path}: expected integer")))?;
+    let frame = value.trunc();
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&frame) {
+        return Err(ToolError::new(format!(
+            "{path}: expected an integer frame between {} and {} (got {raw})",
+            i32::MIN,
+            i32::MAX
+        )));
+    }
+    Ok(frame as i32)
+}
+
+fn parse_kf_number(raw: &Value, path: &str) -> Result<f64, ToolError> {
+    let value = raw
+        .as_f64()
+        .ok_or_else(|| ToolError::new(format!("{path}: expected number")))?;
+    if !value.is_finite() {
+        return Err(ToolError::new(format!(
+            "{path}: value must be finite (got {value})"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_interpolation(s: &str) -> Option<Interpolation> {
@@ -9732,6 +9770,132 @@ mod tests {
             assert!(r.is_error, "{property} {row} must be rejected");
             assert_eq!(d.timeline(), before);
         }
+    }
+
+    #[test]
+    fn set_keyframes_rejects_malformed_rows_without_editing() {
+        let d = keyframe_dispatcher();
+        let before = d.timeline();
+        for (property, row, message) in [
+            (
+                "opacity",
+                serde_json::json!([1e12, 0.5]),
+                "keyframes[0][0] (frame)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([-3e9, 0.5]),
+                "keyframes[0][0] (frame)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([true, 0.5]),
+                "keyframes[0][0] (frame)",
+            ),
+            (
+                "opacity",
+                serde_json::json!(["0", 0.5]),
+                "keyframes[0][0] (frame)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([0, "x"]),
+                "keyframes[0][1] (value)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([0, null]),
+                "keyframes[0][1] (value)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([0, 0.5, "wobble"]),
+                "keyframes[0][2] (interp)",
+            ),
+            (
+                "opacity",
+                serde_json::json!([0, 0.5, 7]),
+                "keyframes[0][2] (interp)",
+            ),
+            ("opacity", serde_json::json!([0]), "got 1 element"),
+            (
+                "opacity",
+                serde_json::json!([0, 0.5, 0.5, 0.5]),
+                "got 4 elements",
+            ),
+            ("opacity", serde_json::json!(0.5), "expected array"),
+            ("position", serde_json::json!([0, 0.5]), "got 2 elements"),
+            (
+                "crop",
+                serde_json::json!([0, 0.1, 0.1, 0.1]),
+                "got 4 elements",
+            ),
+            ("opacity", serde_json::json!([61, 0.5]), "outside the clip"),
+        ] {
+            let r = d.dispatch(
+                "set_keyframes",
+                serde_json::json!({
+                    "clipId": "clip-v",
+                    "property": property,
+                    "keyframes": [row],
+                }),
+            );
+            assert!(r.is_error, "{property} {row} must be rejected");
+            assert!(
+                r.text_joined().contains(message),
+                "{property} {row}: {}",
+                r.text_joined()
+            );
+            assert_eq!(d.timeline(), before);
+        }
+    }
+
+    #[test]
+    fn set_keyframes_sorts_rows_truncates_float_frames_and_last_duplicate_wins() {
+        let d = keyframe_dispatcher();
+        let r = d.dispatch(
+            "set_keyframes",
+            serde_json::json!({
+                "clipId": "clip-v",
+                "property": "opacity",
+                "keyframes": [[30, 1.0, "linear"], [0.9, 0.0, "linear"], [0, 0.2, "linear"]],
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let clip = keyframe_clip(&d, "clip-v");
+        let rows = clip
+            .opacity_track
+            .as_ref()
+            .unwrap()
+            .keyframes
+            .iter()
+            .map(|kf| (kf.frame, kf.value, kf.interpolation_out))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                (0, 0.2, Interpolation::Linear),
+                (30, 1.0, Interpolation::Linear),
+            ]
+        );
+        assert!((clip.opacity_at(15) - 0.6).abs() < 1e-9);
+
+        // Omitted interpolation keeps the upstream default (smooth).
+        let r = d.dispatch(
+            "set_keyframes",
+            serde_json::json!({
+                "clipId": "clip-v",
+                "property": "rotation",
+                "keyframes": [[10, -45.5]],
+            }),
+        );
+        assert!(!r.is_error, "{}", r.text_joined());
+        let rotation = keyframe_clip(&d, "clip-v").rotation_track.unwrap();
+        assert_eq!(rotation.keyframes[0].frame, 10);
+        assert_eq!(
+            rotation.keyframes[0].interpolation_out,
+            Interpolation::Smooth
+        );
     }
 
     /// Text clip `text-1` (styled, off-center, rotated) on track 0 and video

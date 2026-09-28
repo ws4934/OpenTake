@@ -57,8 +57,8 @@ pub use grade::{
 };
 pub use inpaint::{InpaintPlan, InpaintPlanError};
 pub use keyframe::{
-    smoothstep, split_keyframe_track, AnimPair, AnimatableProperty, Interpolation, Keyframe,
-    KeyframeInterpolatable, KeyframeTrack,
+    smoothstep, split_keyframe_track, AnimPair, AnimatableProperty, FiniteKeyframeValue,
+    Interpolation, Keyframe, KeyframeInterpolatable, KeyframeTrack,
 };
 pub use lut::{CubeLut, CubeLutError, LutReference, LutReferenceValidationError};
 pub use media::{
@@ -70,8 +70,10 @@ pub use signal::{
     ContextSignal, EditingSkeleton, EditingStage, StageGuidance, TrackHint, TrackRole,
     TrackRoleAssignment, VideoType,
 };
-pub use split::split_clip;
-pub use stabilization::{StabilizationKeyframe, StabilizationTrack, StabilizationTransform};
+pub use split::{split_clip, trim_clip_to_window};
+pub use stabilization::{
+    SourceMapping, StabilizationKeyframe, StabilizationTrack, StabilizationTransform,
+};
 pub use subtitle_export::{collect_caption_cues, export_srt, export_vtt, SubtitleCue};
 pub use text::{Fill, Rgba, Shadow, TextAlignment, TextLayout, TextStyle};
 pub use timecode::{format_timecode, DropFrameSeparator};

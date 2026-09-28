@@ -13,6 +13,7 @@
 
 use crate::clip::Clip;
 use crate::keyframe::{split_keyframe_track, AnimPair};
+use crate::stabilization::SourceMapping;
 
 /// Split `clip` at the timeline frame `at_frame`, returning `(left, right)`.
 ///
@@ -101,7 +102,49 @@ pub fn split_clip(clip: &Clip, at_frame: i32, right_id: impl Into<String>) -> Op
     (left.crop_track, right.crop_track) =
         split_keyframe_track(clip.crop_track.as_ref(), split_offset, clip.crop);
 
+    // Stabilization corrections belong to source frames: each half moves them
+    // with the source frame it now starts on. Unlike the animatable tracks,
+    // both halves keep every correction, because the conservative crop zoom is
+    // computed over all of them and the picture must not change at the cut.
+    if let Some(stabilization) = &clip.stabilization {
+        let from = SourceMapping::of(clip)?;
+        for half in [&mut left, &mut right] {
+            half.stabilization =
+                SourceMapping::of(half).and_then(|to| stabilization.rebased(from, to, 1.0));
+        }
+    }
+
     Some((left, right))
+}
+
+/// Keep only the part of `clip` left after cutting `clipped_left` timeline
+/// frames from its head and `clipped_right` from its tail — the visible window
+/// a compound clip shows of one of its children.
+///
+/// The window is the middle piece of a split at both edges, so it shares every
+/// split invariant: consumed source is folded into the trims (reversed-aware),
+/// keyframe tracks are rebased and cut with boundary keyframes, the fade on a
+/// cut side is dropped, and loudness analysis is invalidated once the source
+/// range changes. A side that is not cut is left untouched. The id is kept and
+/// `start_frame` moves by `clipped_left`. Returns `None` when the window is
+/// empty, a cut is negative, or the arithmetic does not fit the clip model.
+pub fn trim_clip_to_window(clip: &Clip, clipped_left: i32, clipped_right: i32) -> Option<Clip> {
+    if clipped_left < 0 || clipped_right < 0 {
+        return None;
+    }
+    let mut window = clip.clone();
+    if clipped_left > 0 {
+        let at_frame = window.start_frame.checked_add(clipped_left)?;
+        window = split_clip(&window, at_frame, clip.id.clone())?.1;
+    }
+    if clipped_right > 0 {
+        let at_frame = window
+            .start_frame
+            .checked_add(window.duration_frames)?
+            .checked_sub(clipped_right)?;
+        window = split_clip(&window, at_frame, clip.id.clone())?.0;
+    }
+    Some(window)
 }
 
 #[cfg(test)]
@@ -304,6 +347,103 @@ mod tests {
         assert!(left.rotation_track.is_none() && right.rotation_track.is_none());
         assert!(left.crop_track.is_none() && right.crop_track.is_none());
         assert!(left.volume_track.is_none() && right.volume_track.is_none());
+    }
+
+    // --- Visible-window trim (compound dissolve) ---
+
+    fn loudness() -> crate::LoudnessNormalization {
+        crate::LoudnessNormalization {
+            target_lufs: -16.0,
+            true_peak_ceiling_dbtp: -1.0,
+            input_integrated_lufs: -20.0,
+            input_true_peak_dbtp: -3.0,
+            gain_db: 4.0,
+            output_integrated_lufs: -16.0,
+            output_true_peak_dbtp: -1.5,
+        }
+    }
+
+    /// A clip on `[0, 100)` with a linear opacity ramp, both fades and a
+    /// loudness analysis.
+    fn animated_clip() -> Clip {
+        let mut c = Clip::new("child", "asset", 0, 100);
+        c.trim_start_frame = 3;
+        c.trim_end_frame = 4;
+        c.fade_in_frames = 10;
+        c.fade_out_frames = 10;
+        c.opacity_track = Some(KeyframeTrack::from_keyframes(vec![
+            Keyframe::with_interpolation(0, 0.0, Interpolation::Linear),
+            Keyframe::with_interpolation(100, 1.0, Interpolation::Linear),
+        ]));
+        c.loudness_normalization = Some(loudness());
+        c
+    }
+
+    #[test]
+    fn window_trim_keeps_the_picture_of_every_remaining_frame() {
+        let c = animated_clip();
+        let w = trim_clip_to_window(&c, 20, 30).unwrap();
+        assert_eq!(
+            (w.id.as_str(), w.start_frame, w.duration_frames),
+            ("child", 20, 50)
+        );
+        assert_eq!((w.trim_start_frame, w.trim_end_frame), (23, 34));
+        assert_eq!((w.fade_in_frames, w.fade_out_frames), (0, 0));
+        assert!(w.loudness_normalization.is_none());
+        let rows = w
+            .opacity_track
+            .as_ref()
+            .unwrap()
+            .keyframes
+            .iter()
+            .map(|k| k.frame)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [0, 50]);
+        // Both fades lie inside the cut, so every remaining frame keeps its
+        // opacity (the linear ramp is rebased, not restarted).
+        for frame in 20..70 {
+            approx(w.opacity_at(frame), c.opacity_at(frame));
+        }
+    }
+
+    #[test]
+    fn window_trim_leaves_an_uncut_side_untouched() {
+        let c = animated_clip();
+        assert_eq!(trim_clip_to_window(&c, 0, 0).unwrap(), c);
+
+        let tail_cut = trim_clip_to_window(&c, 0, 30).unwrap();
+        assert_eq!((tail_cut.fade_in_frames, tail_cut.fade_out_frames), (10, 0));
+        assert_eq!(tail_cut.trim_start_frame, 3);
+        for frame in 0..70 {
+            approx(tail_cut.opacity_at(frame), c.opacity_at(frame));
+        }
+
+        let head_cut = trim_clip_to_window(&c, 30, 0).unwrap();
+        assert_eq!((head_cut.fade_in_frames, head_cut.fade_out_frames), (0, 10));
+        assert_eq!(head_cut.trim_end_frame, 4);
+        for frame in 30..100 {
+            approx(head_cut.opacity_at(frame), c.opacity_at(frame));
+        }
+    }
+
+    #[test]
+    fn window_trim_folds_a_reversed_source_like_split() {
+        let mut c = base_clip(); // [100, 130), TS=5, TE=7
+        c.reversed = true;
+        let w = trim_clip_to_window(&c, 4, 6).unwrap();
+        // Reversed playback shows the end of the source window first, so the
+        // head cut folds into trimEnd and the tail cut into trimStart.
+        assert_eq!((w.start_frame, w.duration_frames), (104, 20));
+        assert_eq!((w.trim_start_frame, w.trim_end_frame), (5 + 6, 7 + 4));
+    }
+
+    #[test]
+    fn window_trim_rejects_empty_or_negative_windows() {
+        let c = base_clip(); // 30 frames
+        assert!(trim_clip_to_window(&c, 30, 0).is_none());
+        assert!(trim_clip_to_window(&c, 10, 20).is_none());
+        assert!(trim_clip_to_window(&c, -1, 0).is_none());
+        assert!(trim_clip_to_window(&c, 0, -1).is_none());
     }
 
     #[test]

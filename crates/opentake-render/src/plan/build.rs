@@ -75,6 +75,7 @@ fn texture_source_for(clip: &Clip) -> TextureSource {
 /// Compose authored transform animation with the clip-relative stabilization
 /// track. The same helper is used by ordinary frames, transitions, preview, and
 /// export, preventing separate stabilization math from drifting by surface.
+/// A solution measured on other media than the clip now shows is ignored.
 fn evaluated_transform(
     clip: &Clip,
     frame: i32,
@@ -85,7 +86,11 @@ fn evaluated_transform(
     } else {
         clip.transform
     };
-    if let Some(stabilization) = &clip.stabilization {
+    if let Some(stabilization) = clip
+        .stabilization
+        .as_ref()
+        .filter(|solution| solution.source_identity == clip.media_ref)
+    {
         let correction = stabilization.sample(frame - clip.start_frame);
         let scale = stabilization.crop_scale(render_size.width_f() / render_size.height_f());
         transform.center_x += correction.translation_x;

@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 use opentake_domain::{
     AudioDenoise, CaptionTranslationInput, ChromaKey, Clip, ClipType, ColorGrade, ColorMatchInput,
     Crop, Effect, Interpolation, LoudnessNormalization, LutReference, Mask, MaskShape,
-    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, StabilizationTrack, TextStyle,
-    Timeline, Track, Transform, Transition, TransitionKind, VoiceModelRecord, VolumeScale,
-    MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
+    MediaManifestEntry, NestedSequence, ScriptAssemblyPlan, SourceMapping, StabilizationTrack,
+    TextStyle, Timeline, Track, Transform, Transition, TransitionKind, VoiceModelRecord,
+    VolumeScale, MAX_MASKS_PER_CLIP, MAX_POLYGON_MASK_POINTS,
 };
 
 use crate::editor_state::EditorState;
@@ -176,6 +176,65 @@ mod motion_media_transaction_tests {
         apply(&mut state, EditCommand::Undo, &ids).unwrap();
         assert_eq!(state.manifest.entries.len(), 1);
         assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "motion-a");
+    }
+
+    #[test]
+    fn register_and_swap_drops_a_stabilization_bound_to_the_replaced_source() {
+        let mut state = EditorState::default();
+        let ids = SeqIdGen::default();
+        let added = apply(
+            &mut state,
+            EditCommand::RegisterMediaAndAddClip {
+                media: media("motion-a"),
+                entry: clip("motion-a", 0),
+                auto_track: true,
+            },
+            &ids,
+        )
+        .unwrap();
+        let clip_id = added.affected_clip_ids[0].clone();
+        let solution = StabilizationTrack {
+            model: "test".into(),
+            model_version: 1,
+            source_identity: "motion-a".into(),
+            strength: 1.0,
+            crop_margin: 0.0,
+            keyframes: vec![
+                opentake_domain::StabilizationKeyframe::default(),
+                opentake_domain::StabilizationKeyframe {
+                    frame: 29,
+                    translation_x: 0.02,
+                    ..opentake_domain::StabilizationKeyframe::default()
+                },
+            ],
+        };
+        apply(
+            &mut state,
+            EditCommand::ApplyStabilization {
+                clip_id: clip_id.clone(),
+                solution: solution.clone(),
+            },
+            &ids,
+        )
+        .unwrap();
+
+        apply(
+            &mut state,
+            EditCommand::RegisterMediaAndSwapClip {
+                media: media("motion-b"),
+                clip_id: clip_id.clone(),
+            },
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(state.timeline.tracks[0].clips[0].media_ref, "motion-b");
+        assert!(state.timeline.tracks[0].clips[0].stabilization.is_none());
+
+        apply(&mut state, EditCommand::Undo, &ids).unwrap();
+        assert_eq!(
+            state.timeline.tracks[0].clips[0].stabilization,
+            Some(solution)
+        );
     }
 
     #[test]
@@ -1053,7 +1112,10 @@ pub enum EditCommand {
         frame: i32,
         transform: Transform,
     },
-    /// Replace (or clear) a clip's keyframe track for one property.
+    /// Replace (or clear) a clip's keyframe track for one property. Frames are
+    /// clip-relative and must lie in `[0, duration_frames]`; values must be
+    /// finite. The stored track is sorted by frame and the last row for a
+    /// duplicate frame wins.
     SetKeyframes {
         clip_id: String,
         property: KeyframeProperty,
@@ -1995,58 +2057,24 @@ fn dissolve_nested_sequence(
     let source_end = source_start
         .checked_add(compound.duration_frames)
         .ok_or_else(|| EditError::Invalid("compound source span overflows".into()))?;
-    for child_clip in child.tracks.iter().flat_map(|track| &track.clips) {
-        let child_end = child_clip
-            .start_frame
-            .checked_add(child_clip.duration_frames)
-            .expect("child arithmetic was validated at apply entry");
-        let visible_start = child_clip.start_frame.max(source_start);
-        let visible_end = child_end.min(source_end);
-        if visible_end <= visible_start {
-            continue;
+    let compound_end = compound
+        .start_frame
+        .checked_add(compound.duration_frames)
+        .ok_or_else(|| EditError::Invalid("compound span overflows".into()))?;
+    // Resolve every visible child into its root-level clip before any id is
+    // minted, so a child whose window arithmetic does not fit refuses the whole
+    // dissolve atomically.
+    let mut lanes = Vec::with_capacity(child.tracks.len());
+    for mut child_track in child.tracks {
+        let mut leaves = Vec::new();
+        for child_clip in std::mem::take(&mut child_track.clips) {
+            if let Some(leaf) = dissolved_leaf(&compound, &child_clip, source_start, source_end)? {
+                leaves.push(leaf);
+            }
         }
-        let clipped_left = visible_start
-            .checked_sub(child_clip.start_frame)
-            .ok_or_else(|| EditError::Invalid("dissolve left clip delta overflows".into()))?;
-        let clipped_right = child_end
-            .checked_sub(visible_end)
-            .ok_or_else(|| EditError::Invalid("dissolve right clip delta overflows".into()))?;
-        let relative_start = visible_start
-            .checked_sub(source_start)
-            .ok_or_else(|| EditError::Invalid("dissolve relative start overflows".into()))?;
-        let output_start = compound
-            .start_frame
-            .checked_add(relative_start)
-            .ok_or_else(|| EditError::Invalid("dissolve output start overflows".into()))?;
-        let output_duration = visible_end
-            .checked_sub(visible_start)
-            .ok_or_else(|| EditError::Invalid("dissolve output duration overflows".into()))?;
-        let left_source = (clipped_left as f64 * child_clip.speed).round();
-        let right_source = (clipped_right as f64 * child_clip.speed).round();
-        if !(0.0..=i32::MAX as f64).contains(&left_source)
-            || !(0.0..=i32::MAX as f64).contains(&right_source)
-        {
-            return Err(EditError::Invalid(
-                "dissolve source trim delta is out of range".into(),
-            ));
+        if !leaves.is_empty() {
+            lanes.push((child_track, leaves));
         }
-        let trim_start = child_clip
-            .trim_start_frame
-            .checked_add(left_source as i32)
-            .ok_or_else(|| EditError::Invalid("dissolve trimStart overflows".into()))?;
-        let trim_end = child_clip
-            .trim_end_frame
-            .checked_add(right_source as i32)
-            .ok_or_else(|| EditError::Invalid("dissolve trimEnd overflows".into()))?;
-        checked_clip_frame_arithmetic(
-            output_start,
-            output_duration,
-            trim_start,
-            trim_end,
-            child_clip.speed,
-            child_clip.media_type,
-            &format!("dissolved clip {}", child_clip.id),
-        )?;
     }
 
     transact(
@@ -2056,53 +2084,73 @@ fn dissolve_nested_sequence(
         |st| {
             let mut id_map = HashMap::new();
             let mut link_counts: HashMap<String, usize> = HashMap::new();
-            for child_clip in child.tracks.iter().flat_map(|track| &track.clips) {
-                let visible_start = child_clip.start_frame.max(source_start);
-                let child_end = child_clip
-                    .start_frame
-                    .checked_add(child_clip.duration_frames)
-                    .expect("dissolve child span was prevalidated");
-                let visible_end = child_end.min(source_end);
-                if visible_end <= visible_start {
-                    continue;
-                }
-                id_map.insert(child_clip.id.clone(), ids.next_id());
-                if let Some(group) = &child_clip.link_group_id {
+            for leaf in lanes.iter().flat_map(|(_, leaves)| leaves) {
+                id_map.insert(leaf.id.clone(), ids.next_id());
+                if let Some(group) = &leaf.link_group_id {
                     *link_counts.entry(group.clone()).or_default() += 1;
                 }
             }
             let mut link_map: HashMap<String, String> = HashMap::new();
 
+            let parent_index = st
+                .find_clip(&clip_id)
+                .expect("compound was resolved before the transaction")
+                .track_index;
+            let parent = &st.timeline.tracks[parent_index];
+            // Everything a hidden or muted compound track drew or played was
+            // hidden or muted with it.
+            let (parent_hidden, parent_muted) = (parent.hidden, parent.muted);
             ops::clear_region::remove_clip(&mut st.timeline, &clip_id);
+
+            // Upstream `decomposeNest`: the child's visual lanes keep their
+            // order at the compound's layer. The top lane reuses the compound's
+            // track, each further lane reuses the next track down only when it
+            // is free over the compound span, and otherwise a track is inserted
+            // there. Audio lanes stay in the audio zone.
+            let mut visual_index = parent_index;
             let mut affected = Vec::new();
+            for (child_track, leaves) in lanes {
+                let visual = child_track.kind != ClipType::Audio;
+                let hidden = child_track.hidden || (visual && parent_hidden);
+                let muted = child_track.muted || parent_muted;
+                let reusable = visual
+                    && st.timeline.tracks.get(visual_index).is_some_and(|track| {
+                        track.kind == child_track.kind
+                            && track.hidden == hidden
+                            && track.muted == muted
+                            && track.sync_locked == child_track.sync_locked
+                            && !track.clips.iter().any(|clip| {
+                                clip.start_frame < compound_end
+                                    && compound.start_frame < clip.end_frame()
+                            })
+                    });
+                let target = if reusable {
+                    visual_index
+                } else {
+                    let requested = if visual {
+                        visual_index
+                    } else {
+                        st.timeline.tracks.len()
+                    };
+                    let target =
+                        ops::insert_track(&mut st.timeline, requested, child_track.kind, ids);
+                    let track = &mut st.timeline.tracks[target];
+                    track.hidden = hidden;
+                    track.muted = muted;
+                    track.sync_locked = child_track.sync_locked;
+                    target
+                };
+                if visual {
+                    visual_index = target + 1;
+                }
 
-            for child_track in child.tracks {
-                let requested = st.timeline.tracks.len();
-                let target = ops::insert_track(&mut st.timeline, requested, child_track.kind, ids);
-                st.timeline.tracks[target].muted = child_track.muted;
-                st.timeline.tracks[target].hidden = child_track.hidden;
-                st.timeline.tracks[target].sync_locked = child_track.sync_locked;
-
-                for mut child_clip in child_track.clips {
-                    let visible_start = child_clip.start_frame.max(source_start);
-                    let child_end = child_clip
-                        .start_frame
-                        .checked_add(child_clip.duration_frames)
-                        .expect("dissolve child span was prevalidated");
-                    let visible_end = child_end.min(source_end);
-                    if visible_end <= visible_start {
-                        continue;
-                    }
-                    let clipped_left = visible_start - child_clip.start_frame;
-                    let clipped_right = child_end
-                        .checked_sub(visible_end)
-                        .expect("dissolve right delta was prevalidated");
-                    let old_id = child_clip.id.clone();
-                    child_clip.id = id_map
+                for mut leaf in leaves {
+                    let old_id = std::mem::take(&mut leaf.id);
+                    leaf.id = id_map
                         .get(&old_id)
                         .expect("visible child clip received a replacement id")
                         .clone();
-                    child_clip.link_group_id = child_clip.link_group_id.take().and_then(|group| {
+                    leaf.link_group_id = leaf.link_group_id.take().and_then(|group| {
                         (link_counts.get(&group).copied().unwrap_or(0) > 1).then(|| {
                             link_map
                                 .entry(group)
@@ -2110,35 +2158,15 @@ fn dissolve_nested_sequence(
                                 .clone()
                         })
                     });
-                    child_clip.transition_out =
-                        child_clip.transition_out.take().and_then(|mut transition| {
-                            id_map.get(&transition.to_clip_id).map(|to_id| {
-                                transition.from_clip_id = child_clip.id.clone();
-                                transition.to_clip_id = to_id.clone();
-                                transition
-                            })
-                        });
-                    child_clip.start_frame = compound
-                        .start_frame
-                        .checked_add(
-                            visible_start
-                                .checked_sub(source_start)
-                                .expect("dissolve relative start was prevalidated"),
-                        )
-                        .expect("dissolve output start was prevalidated");
-                    child_clip.duration_frames = visible_end
-                        .checked_sub(visible_start)
-                        .expect("dissolve duration was prevalidated");
-                    child_clip.trim_start_frame = child_clip
-                        .trim_start_frame
-                        .checked_add((clipped_left as f64 * child_clip.speed).round() as i32)
-                        .expect("dissolve trimStart was prevalidated");
-                    child_clip.trim_end_frame = child_clip
-                        .trim_end_frame
-                        .checked_add((clipped_right as f64 * child_clip.speed).round() as i32)
-                        .expect("dissolve trimEnd was prevalidated");
-                    affected.push(child_clip.id.clone());
-                    st.timeline.tracks[target].clips.push(child_clip);
+                    leaf.transition_out = leaf.transition_out.take().and_then(|mut transition| {
+                        id_map.get(&transition.to_clip_id).map(|to_id| {
+                            transition.from_clip_id = leaf.id.clone();
+                            transition.to_clip_id = to_id.clone();
+                            transition
+                        })
+                    });
+                    affected.push(leaf.id.clone());
+                    st.timeline.tracks[target].clips.push(leaf);
                 }
                 ops::sort_clips(&mut st.timeline.tracks[target]);
             }
@@ -2146,6 +2174,57 @@ fn dissolve_nested_sequence(
             Ok(affected)
         },
     )
+}
+
+/// Map one child clip of `compound` onto the root timeline, or `None` when the
+/// compound's source window `[source_start, source_end)` hides it. The child is
+/// cut to its visible window with split semantics
+/// ([`opentake_domain::trim_clip_to_window`]: trims, keyframes, fades,
+/// loudness) and placed where the compound showed that window, so every
+/// remaining frame keeps its picture.
+fn dissolved_leaf(
+    compound: &Clip,
+    child_clip: &Clip,
+    source_start: i32,
+    source_end: i32,
+) -> Result<Option<Clip>, EditError> {
+    let label = format!("dissolved clip {}", child_clip.id);
+    let overflow = |what: &str| EditError::Invalid(format!("{label}: {what} overflows"));
+    let child_end = child_clip
+        .start_frame
+        .checked_add(child_clip.duration_frames)
+        .ok_or_else(|| overflow("child span"))?;
+    let visible_start = child_clip.start_frame.max(source_start);
+    let visible_end = child_end.min(source_end);
+    if visible_end <= visible_start {
+        return Ok(None);
+    }
+    let clipped_left = visible_start
+        .checked_sub(child_clip.start_frame)
+        .ok_or_else(|| overflow("left clip delta"))?;
+    let clipped_right = child_end
+        .checked_sub(visible_end)
+        .ok_or_else(|| overflow("right clip delta"))?;
+    let mut leaf = opentake_domain::trim_clip_to_window(child_clip, clipped_left, clipped_right)
+        .ok_or_else(|| {
+            EditError::Invalid(format!(
+                "{label}: visible window source trims are out of range"
+            ))
+        })?;
+    leaf.start_frame = visible_start
+        .checked_sub(source_start)
+        .and_then(|relative_start| compound.start_frame.checked_add(relative_start))
+        .ok_or_else(|| overflow("output start"))?;
+    checked_clip_frame_arithmetic(
+        leaf.start_frame,
+        leaf.duration_frames,
+        leaf.trim_start_frame,
+        leaf.trim_end_frame,
+        leaf.speed,
+        leaf.media_type,
+        &label,
+    )?;
+    Ok(Some(leaf))
 }
 
 // MARK: - Transaction helper
@@ -2171,7 +2250,7 @@ fn transact(
             return Err(error);
         }
     };
-    if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+    if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
         state.restore(before);
         return Err(error);
     }
@@ -2194,12 +2273,88 @@ fn transact(
 }
 
 /// One post-edit invariant boundary for normal and ripple transactions.
-fn validate_edited_timeline(timeline: &mut Timeline) -> Result<(), EditError> {
+fn finish_edited_timeline(before: &Timeline, timeline: &mut Timeline) -> Result<(), EditError> {
+    rebase_stabilization_after_edit(before, timeline);
     validate_timeline_frame_arithmetic(timeline, "timeline")?;
     prune_invalid_transitions(timeline);
     timeline
         .validate_nested_sequences()
         .map_err(EditError::Invalid)
+}
+
+/// Keep every surviving clip's stabilization on the source frames it was
+/// measured on. An edit that keeps a clip's id but changes which source frame
+/// it shows at each clip-relative frame (a head trim, overwrite or ripple
+/// delete, slip, speed or direction change, timeline frame-rate change) leaves
+/// the corrections on the old clip-relative frames; move them with the source
+/// here, once, so no edit path can forget to. A clip whose media changed
+/// drops a solution measured on other media. Solutions the command itself
+/// replaced (apply, split, dissolve) are left alone, and undo/redo restore
+/// snapshots without passing through here.
+fn rebase_stabilization_after_edit(before: &Timeline, after: &mut Timeline) {
+    let mut previous = HashMap::new();
+    collect_stabilized_clips(before, &mut previous);
+    if !previous.is_empty() {
+        rebase_stabilized_clips(after, &previous);
+    }
+}
+
+fn collect_stabilized_clips<'a>(
+    timeline: &'a Timeline,
+    out: &mut HashMap<&'a str, (&'a Clip, i32)>,
+) {
+    for clip in timeline.tracks.iter().flat_map(|track| &track.clips) {
+        if clip.stabilization.is_some() {
+            out.insert(clip.id.as_str(), (clip, timeline.fps));
+        }
+    }
+    for sequence in &timeline.nested_sequences {
+        collect_stabilized_clips(&sequence.timeline, out);
+    }
+}
+
+fn rebase_stabilized_clips(timeline: &mut Timeline, previous: &HashMap<&str, (&Clip, i32)>) {
+    let fps = timeline.fps;
+    for clip in timeline
+        .tracks
+        .iter_mut()
+        .flat_map(|track| &mut track.clips)
+    {
+        let Some(&(old, old_fps)) = previous.get(clip.id.as_str()) else {
+            continue;
+        };
+        if clip.stabilization != old.stabilization {
+            continue;
+        }
+        if clip.media_ref != old.media_ref {
+            if clip
+                .stabilization
+                .as_ref()
+                .is_some_and(|solution| solution.source_identity != clip.media_ref)
+            {
+                clip.stabilization = None;
+            }
+            continue;
+        }
+        let fps_ratio = if old_fps > 0 && fps > 0 {
+            f64::from(fps) / f64::from(old_fps)
+        } else {
+            1.0
+        };
+        let (Some(from), Some(to)) = (SourceMapping::of(old), SourceMapping::of(clip)) else {
+            continue;
+        };
+        if from == to && fps_ratio == 1.0 {
+            continue;
+        }
+        clip.stabilization = clip
+            .stabilization
+            .as_ref()
+            .and_then(|solution| solution.rebased(from, to, fps_ratio));
+    }
+    for sequence in &mut timeline.nested_sequences {
+        rebase_stabilized_clips(&mut sequence.timeline, previous);
+    }
 }
 
 /// Keep transition pair identity aligned with the actual cut graph after every
@@ -5112,11 +5267,8 @@ fn set_keyframes(
     let location = state
         .find_clip(&clip_id)
         .ok_or_else(|| EditError::Invalid(format!("Clip not found: {clip_id}")))?;
-    if property == KeyframeProperty::Crop
-        && state.timeline.tracks[location.track_index].clips[location.clip_index]
-            .nested_sequence_id
-            .is_some()
-    {
+    let target = &state.timeline.tracks[location.track_index].clips[location.clip_index];
+    if property == KeyframeProperty::Crop && target.nested_sequence_id.is_some() {
         return Err(EditError::Invalid(
             "compound clips do not support crop keyframes".into(),
         ));
@@ -5136,6 +5288,11 @@ fn set_keyframes(
             "keyframe payload type does not match property".into(),
         ));
     }
+    // Every entry point (agent tool, Inspector IPC) shares one contract: rows
+    // are validated against the clip, then sorted by frame with the last
+    // duplicate winning, before anything is written.
+    let payload = normalized_keyframe_payload(payload, target.duration_frames)
+        .map_err(|message| EditError::Invalid(format!("Clip {clip_id}: {message}")))?;
     let summary = format!("Set keyframes on {clip_id}");
     transact(
         state,
@@ -5168,6 +5325,29 @@ fn set_keyframes(
             Ok(vec![loc_clip_id(st, loc)])
         },
     )
+}
+
+/// Validate a replacement keyframe track against a clip of `duration_frames`
+/// (frames inside `[0, duration_frames]`, finite values), then normalize it
+/// (sorted by frame, last duplicate wins; upstream `sortAndDedupe`).
+fn normalized_keyframe_payload(
+    payload: KeyframePayload,
+    duration_frames: i32,
+) -> Result<KeyframePayload, String> {
+    Ok(match payload {
+        KeyframePayload::Scalar(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Scalar(track.normalized())
+        }
+        KeyframePayload::Pair(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Pair(track.normalized())
+        }
+        KeyframePayload::Crop(track) => {
+            track.validate(duration_frames)?;
+            KeyframePayload::Crop(track.normalized())
+        }
+    })
 }
 
 fn stamp_keyframe(
@@ -6062,7 +6242,7 @@ fn ripple_delete_ranges(
             Err(EditError::Refused(reason))
         }
         RippleOutcome::Ok(report) => {
-            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+            if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }
@@ -6119,7 +6299,7 @@ fn ripple_delete_clips(
             Err(EditError::Refused(reason))
         }
         Ok(()) => {
-            if let Err(error) = validate_edited_timeline(&mut state.timeline) {
+            if let Err(error) = finish_edited_timeline(&before.timeline, &mut state.timeline) {
                 state.restore(before);
                 return Err(error);
             }
@@ -7388,6 +7568,37 @@ mod keyframe_edit_tests {
         let kfs = opacity_track_kfs(&state, &clip_id);
         assert_eq!(kfs.len(), 1);
         assert_eq!(kfs[0].0, 10);
+    }
+
+    #[test]
+    fn stamp_keyframe_between_persisted_extreme_frames_does_not_overflow() {
+        let (mut state, ids, clip_id) = make_state_with_clip();
+        set_opacity_track(
+            &mut state,
+            &clip_id,
+            vec![
+                Keyframe::with_interpolation(i32::MIN, 0.0, Interpolation::Linear),
+                Keyframe::new(i32::MAX, 1.0),
+            ],
+        );
+
+        apply(
+            &mut state,
+            EditCommand::StampKeyframe {
+                clip_id: clip_id.clone(),
+                property: KeyframeProperty::Opacity,
+                frame: 110,
+            },
+            &ids,
+        )
+        .unwrap();
+
+        let kfs = opacity_track_kfs(&state, &clip_id);
+        assert_eq!(
+            kfs.iter().map(|kf| kf.0).collect::<Vec<_>>(),
+            [i32::MIN, 10, i32::MAX]
+        );
+        assert!((kfs[1].1 - 0.5).abs() < 1e-6, "{}", kfs[1].1);
     }
 
     #[test]
