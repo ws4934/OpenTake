@@ -10,10 +10,12 @@
 //! can hoist the single shared projection into one `pub(crate)` helper once all
 //! three paths are stable (tracked as a follow-up; see the export.rs header note).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use opentake_domain::{Clip, ClipType, MediaManifest, MediaSource, TextStyle, Timeline, Track};
+use opentake_domain::{
+    Clip, ClipType, MediaManifest, MediaProxy, MediaSource, TextStyle, Timeline, Track,
+};
 use opentake_render::SourceMetrics;
 
 /// Resolvable info for one media asset, projected from the manifest.
@@ -95,17 +97,72 @@ pub fn project_media(
 
 /// Proxy-aware playback projection. A proxy is selected only when the app
 /// preference is enabled, the project-local path is lexically confined to
-/// `media/proxies/`, the file exists, and the current source bytes still match
-/// the digest recorded when the proxy was created. Every failure falls back to
-/// the original source; export never calls this function.
+/// `media/proxies/`, the file exists, and the source's retained identity still
+/// matches the stamp captured during proxy generation. Older proxies and
+/// changed sources fall back to the original until their digest is checked in
+/// the background. Export never calls this function.
 pub fn project_media_with_proxies(
     manifest: &MediaManifest,
     project_dir: &Option<PathBuf>,
     prefer_proxy: bool,
 ) -> (HashMap<String, (u32, u32)>, HashMap<String, MediaInfo>) {
+    let (sizes, media, _) =
+        project_media_with_proxies_for_refs(manifest, project_dir, prefer_proxy, None);
+    (sizes, media)
+}
+
+pub(crate) struct PendingProxyCheck {
+    pub asset_id: String,
+    pub source_path: PathBuf,
+    pub proxy: MediaProxy,
+}
+
+pub(crate) type ProxyMediaProjection = (
+    HashMap<String, (u32, u32)>,
+    HashMap<String, MediaInfo>,
+    Vec<PendingProxyCheck>,
+);
+
+/// Include clips reachable through nested sequences; unreferenced assets never
+/// cause source I/O just because they happen to have a stored proxy.
+pub(crate) fn timeline_media_refs(timeline: &Timeline) -> HashSet<String> {
+    let registry: HashMap<_, _> = timeline
+        .nested_sequences
+        .iter()
+        .map(|sequence| (sequence.id.as_str(), &sequence.timeline))
+        .collect();
+    let mut refs = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut pending = vec![timeline];
+    while let Some(candidate) = pending.pop() {
+        for clip in candidate.tracks.iter().flat_map(|track| &track.clips) {
+            if let Some(sequence_id) = clip.nested_sequence_id.as_deref() {
+                if visited.insert(sequence_id) {
+                    if let Some(sequence) = registry.get(sequence_id) {
+                        pending.push(sequence);
+                    }
+                }
+            } else if !clip.media_ref.is_empty() {
+                refs.insert(clip.media_ref.clone());
+            }
+        }
+    }
+    refs
+}
+
+pub(crate) fn project_media_with_proxies_for_refs(
+    manifest: &MediaManifest,
+    project_dir: &Option<PathBuf>,
+    prefer_proxy: bool,
+    referenced: Option<&HashSet<String>>,
+) -> ProxyMediaProjection {
     let mut sizes: HashMap<String, (u32, u32)> = HashMap::new();
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
+    let mut pending = Vec::new();
     for entry in &manifest.entries {
+        if referenced.is_some_and(|references| !references.contains(&entry.id)) {
+            continue;
+        }
         let source_path = match &entry.source {
             MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
             MediaSource::Project { relative_path } => match project_dir {
@@ -121,12 +178,16 @@ pub fn project_media_with_proxies(
                     let base = project_dir.as_ref()?;
                     let candidate =
                         crate::media::trusted_project_proxy_path(base, &proxy.relative_path)?;
-                    if opentake_media::file_sha256(&source_path).ok().as_deref()
-                        != Some(proxy.source_sha256.as_str())
-                    {
-                        return None;
+                    let stamp = opentake_media::source_file_stamp(&source_path).ok();
+                    if stamp.is_some() && stamp == proxy.source_stamp {
+                        return Some(candidate);
                     }
-                    Some(candidate)
+                    pending.push(PendingProxyCheck {
+                        asset_id: entry.id.clone(),
+                        source_path: source_path.clone(),
+                        proxy: proxy.clone(),
+                    });
+                    None
                 })
                 .unwrap_or(source_path)
         } else {
@@ -139,7 +200,7 @@ pub fn project_media_with_proxies(
         }
         media.insert(entry.id.clone(), MediaInfo { path });
     }
-    (sizes, media)
+    (sizes, media, pending)
 }
 
 /// Build the one-track render graph used by the source-preview tab. Keeping the
@@ -311,6 +372,7 @@ mod tests {
         item.proxy = Some(MediaProxy {
             relative_path: "media/proxies/proxy.mp4".into(),
             source_sha256: opentake_media::file_sha256(&source).unwrap(),
+            source_stamp: Some(opentake_media::source_file_stamp(&source).unwrap()),
             width: 640,
             height: 360,
         });
@@ -322,9 +384,57 @@ mod tests {
         let (_, proxied) = project_media_with_proxies(&manifest, &project_dir, true);
         assert_eq!(proxied["asset"].path, proxy);
 
-        std::fs::write(&source, b"source-v2").unwrap();
+        std::fs::write(&source, b"source-v2-longer").unwrap();
         let (_, stale) = project_media_with_proxies(&manifest, &project_dir, true);
         assert_eq!(stale["asset"].path, source);
+    }
+
+    #[test]
+    fn only_reachable_media_are_checked_and_old_proxies_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.mp4");
+        let proxy = temp.path().join("media/proxies/proxy.mp4");
+        std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"original").unwrap();
+        std::fs::write(&proxy, b"proxy").unwrap();
+        let mut manifest = MediaManifest::new();
+        for index in 0..10 {
+            let mut item = entry(
+                &format!("asset-{index}"),
+                MediaSource::External {
+                    absolute_path: if index == 7 {
+                        original.to_string_lossy().into_owned()
+                    } else {
+                        "/missing/unreferenced.mp4".into()
+                    },
+                },
+                Some((640, 360)),
+            );
+            item.proxy = Some(MediaProxy {
+                relative_path: "media/proxies/proxy.mp4".into(),
+                source_sha256: "a".repeat(64),
+                source_stamp: None,
+                width: 320,
+                height: 180,
+            });
+            manifest.entries.push(item);
+        }
+        let mut timeline = Timeline::new();
+        let mut track = Track::new("track", ClipType::Video);
+        track.clips.push(Clip::new("clip", "asset-7", 0, 30));
+        timeline.tracks.push(track);
+        let referenced = timeline_media_refs(&timeline);
+        let (sizes, media, checks) = project_media_with_proxies_for_refs(
+            &manifest,
+            &Some(temp.path().to_path_buf()),
+            true,
+            Some(&referenced),
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(media["asset-7"].path, original);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].asset_id, "asset-7");
     }
 
     #[test]

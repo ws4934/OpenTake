@@ -66,7 +66,7 @@ use opentake_media::{
     },
     waveform::store::CACHE_SUBDIR,
     FrameRequest, MediaEngine, MediaError, PcmFormat, PcmSpec, ProxyProgressCallback, ProxyRequest,
-    RgbaFrame,
+    ProxyResult, RgbaFrame,
 };
 use opentake_ops::{ClipEntry, EditCommand};
 use opentake_project::ProjectRoot;
@@ -5018,41 +5018,69 @@ fn create_media_proxy_blocking(
     max_height: Option<u32>,
     cancel: opentake_media::MediaCancelToken,
 ) -> Result<MediaProxyDto, String> {
-    let core = app.state::<AppCore>();
-    let _identity = core.lock_project_identity_workflow();
-    core.ensure_project_mutable()
-        .map_err(|error| error.to_string())?;
-    let snapshot = core.runtime_snapshot();
-    let project_dir = snapshot
-        .project_dir
-        .clone()
-        .ok_or_else(|| "media_proxy_project_must_be_saved".to_string())?;
-    let entry = snapshot
-        .media
-        .entries
-        .iter()
-        .find(|entry| entry.id == asset_id)
-        .cloned()
-        .ok_or_else(|| format!("media_proxy_source_not_found:{asset_id}"))?;
-    if entry.kind != ClipType::Video {
-        return Err("media_proxy_video_required".to_string());
-    }
-    let source = source_path_for_entry(&entry, Some(&project_dir))?;
-    if !source.is_file() {
-        return Err("media_proxy_source_unreadable".to_string());
-    }
+    create_media_proxy_blocking_with(app, asset_id, max_width, max_height, cancel, create_proxy)
+}
 
-    let project_root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
-    core.ensure_project_root_identity_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        project_root.identity(),
-    )
-    .map_err(|error| error.to_string())?;
-    let proxy_dir = project_proxy_directory(&project_dir, true)?;
+#[allow(clippy::too_many_arguments)]
+fn create_media_proxy_blocking_with<R: Runtime>(
+    app: AppHandle<R>,
+    asset_id: String,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    cancel: opentake_media::MediaCancelToken,
+    transcode: impl for<'a> FnOnce(
+        ProxyRequest<'a>,
+        &opentake_media::MediaCancelToken,
+        Option<ProxyProgressCallback>,
+    ) -> Result<ProxyResult, MediaError>,
+) -> Result<MediaProxyDto, String> {
+    let core = app.state::<AppCore>();
+    // Take only the initial identity snapshot under the shared lease. A save
+    // must never wait for the source hash or FFmpeg to finish (#64).
+    let (project_epoch, project_dir, entry, source) = {
+        let _identity = core.lock_project_identity_workflow();
+        core.ensure_project_mutable()
+            .map_err(|error| error.to_string())?;
+        let snapshot = core.runtime_snapshot();
+        let project_dir = snapshot
+            .project_dir
+            .ok_or_else(|| "media_proxy_project_must_be_saved".to_string())?;
+        let entry = snapshot
+            .media
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == asset_id)
+            .ok_or_else(|| format!("media_proxy_source_not_found:{asset_id}"))?;
+        if entry.kind != ClipType::Video {
+            return Err("media_proxy_video_required".to_string());
+        }
+        let source = source_path_for_entry(&entry, Some(&project_dir))?;
+        if !source.is_file() {
+            return Err("media_proxy_source_unreadable".to_string());
+        }
+        let root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
+        core.ensure_project_root_identity_for_project(
+            snapshot.project_epoch,
+            &project_dir,
+            root.identity(),
+        )
+        .map_err(|error| error.to_string())?;
+        (snapshot.project_epoch, project_dir, entry, source)
+    };
+
+    // The private stage is a sibling of the bundle: it shares its filesystem
+    // for an atomic publication, but no save can accidentally copy partial
+    // transcode bytes into the project while the worker runs.
+    let stage_parent = project_dir
+        .parent()
+        .ok_or_else(|| "media_proxy_project_parent_missing".to_string())?;
+    let stage = tempfile::Builder::new()
+        .prefix(".opentake-proxy-job-")
+        .tempdir_in(stage_parent)
+        .map_err(|error| format!("media_proxy_stage_failed:{error}"))?;
+    let stage_output = stage.path().join("proxy.mp4");
     let leaf = format!("{}.mp4", uuid::Uuid::new_v4());
     let relative_path = format!("media/proxies/{leaf}");
-    let output = proxy_dir.join(leaf);
     let progress_app = app.clone();
     let progress_asset_id = asset_id.clone();
     let progress: ProxyProgressCallback = Arc::new(move |done, total| {
@@ -5065,10 +5093,10 @@ fn create_media_proxy_blocking(
             },
         );
     });
-    let created = match create_proxy(
+    let created = match transcode(
         ProxyRequest {
             source: &source,
-            output: &output,
+            output: &stage_output,
             max_size: (max_width.unwrap_or(1280), max_height.unwrap_or(720)),
         },
         &cancel,
@@ -5078,43 +5106,61 @@ fn create_media_proxy_blocking(
         Err(MediaError::Cancelled) => return Err("media_proxy_cancelled".to_string()),
         Err(error) => return Err(format!("media_proxy_failed:{error}")),
     };
+    // Project replacement/Save As cancels the worker. Check once more under a
+    // short identity lease before exposing the file and its manifest entry.
+    let _identity = core.lock_project_identity_workflow();
+    if cancel.checkpoint() {
+        return Err("media_proxy_cancelled".to_string());
+    }
+    let current_root = ProjectRoot::open(&project_dir).map_err(|error| error.to_string())?;
+    core.ensure_project_root_identity_for_project(
+        project_epoch,
+        &project_dir,
+        current_root.identity(),
+    )
+    .map_err(|error| error.to_string())?;
+    core.ensure_project_mutable()
+        .map_err(|error| error.to_string())?;
+    let proxy_dir = project_proxy_directory(&project_dir, true)?;
+    let output = proxy_dir.join(leaf);
+    // Move the file out of the private sibling stage with a same-volume rename
+    // that refuses to clobber a destination that unexpectedly already exists.
+    // Unlike a hard link, this also works on FAT and exFAT volumes.
+    tempfile::TempPath::try_from_path(&stage_output)
+        .map_err(|error| format!("media_proxy_publish_failed:{error}"))?
+        .persist_noclobber(&output)
+        .map_err(|error| format!("media_proxy_publish_failed:{}", error.error))?;
     let proxy = MediaProxy {
         relative_path: relative_path.clone(),
         source_sha256: created.source_sha256.clone(),
+        source_stamp: created.source_stamp,
         width: created.width,
         height: created.height,
     };
-    if let Err(error) = core.ensure_project_root_identity_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        project_root.identity(),
-    ) {
-        let _ = std::fs::remove_file(&output);
-        return Err(error.to_string());
-    }
-    if let Err(error) = core.set_media_proxy_for_project(
-        snapshot.project_epoch,
-        &project_dir,
-        &asset_id,
-        Some(proxy),
-    ) {
-        let _ = std::fs::remove_file(&output);
-        return Err(format!("media_proxy_persist_failed:{error}"));
-    }
+    // Grant access before writing the manifest, so failure cannot leave a
+    // persisted proxy whose asset URL is unusable.
     if let Err(error) = grant_proxy_asset_file(&app, &output) {
-        let rollback = core.set_media_proxy_for_project(
-            snapshot.project_epoch,
-            &project_dir,
-            &asset_id,
-            entry.proxy.clone(),
-        );
         let _ = std::fs::remove_file(&output);
-        return match rollback {
-            Ok(_) => Err(error),
-            Err(rollback_error) => Err(format!(
-                "{error};media_proxy_scope_rollback_failed:{rollback_error}"
-            )),
-        };
+        return Err(error);
+    }
+    let committed = if cancel.checkpoint() {
+        Err("media_proxy_cancelled".to_string())
+    } else {
+        match core.set_media_proxy_if_source_unchanged_for_project(
+            project_epoch,
+            &project_dir,
+            &entry,
+            Some(proxy),
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("media_proxy_source_changed".to_string()),
+            Err(error) => Err(format!("media_proxy_persist_failed:{error}")),
+        }
+    };
+    if let Err(error) = committed {
+        revoke_proxy_asset_file(&app, &output);
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
     }
     if let Some(old) = entry
         .proxy
@@ -8725,6 +8771,7 @@ mod tests {
                 relative_path: "media/proxies/proxy.mp4".into(),
                 source_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
+                source_stamp: None,
                 width: 1280,
                 height: 720,
             }),
@@ -8787,6 +8834,204 @@ mod tests {
     }
 
     #[test]
+    fn proxy_transcode_allows_save_and_readers_and_cleans_stale_stage() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let other_source = temp.path().join("second.mp4");
+        fs::write(&other_source, b"second source").unwrap();
+        core.import_media_file(&other_source, "second", &ProbedMedia::default())
+            .unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_app = app.handle().clone();
+        let worker = std::thread::spawn(move || {
+            create_media_proxy_blocking_with(
+                worker_app,
+                asset_id,
+                None,
+                None,
+                MediaCancelToken::new(),
+                move |request, _, _| {
+                    stage_tx.send(request.output.to_path_buf()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    fs::write(request.output, b"completed proxy").unwrap();
+                    Ok(ProxyResult {
+                        path: request.output.to_path_buf(),
+                        source_sha256: opentake_media::file_sha256(request.source).unwrap(),
+                        source_stamp: Some(
+                            opentake_media::source_file_stamp(request.source).unwrap(),
+                        ),
+                        width: 320,
+                        height: 180,
+                    })
+                },
+            )
+        });
+        let stage_output = stage_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy reached its transcode stage");
+        assert!(!stage_output.starts_with(&bundle));
+
+        let (save_tx, save_rx) = mpsc::channel();
+        let save_core = core.clone();
+        let saver = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = save_core.save_project(None);
+            save_tx.send((started.elapsed(), result)).unwrap();
+        });
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_core = core.clone();
+        let reader = std::thread::spawn(move || {
+            let started = Instant::now();
+            let lease = read_core.lock_project_identity_workflow();
+            drop(lease);
+            read_tx.send(started.elapsed()).unwrap();
+        });
+
+        let saved = save_rx.recv_timeout(Duration::from_secs(1));
+        let read = read_rx.recv_timeout(Duration::from_secs(1));
+        let (transition_tx, transition_rx) = mpsc::channel();
+        let transition_core = core.clone();
+        let transition = std::thread::spawn(move || {
+            transition_core.new_project();
+            transition_tx.send(()).unwrap();
+        });
+        let transitioned = transition_rx.recv_timeout(Duration::from_secs(1));
+        // Unblock the worker before asserting any deadline, so a regression
+        // holding the read lease cannot deadlock the test itself.
+        release_tx.send(()).unwrap();
+        let worker_result = worker.join().unwrap();
+        saver.join().unwrap();
+        reader.join().unwrap();
+        transition.join().unwrap();
+        let (save_time, save_result) = saved.expect("in-place save must finish during transcode");
+        save_result.expect("save must succeed");
+        assert!(save_time < Duration::from_secs(1));
+        assert!(read.expect("reader must finish during transcode") < Duration::from_millis(100));
+        transitioned.expect("project transition must finish during transcode");
+        let error = worker_result.err().expect("stale project rejects proxy");
+        assert!(error.contains("project changed"), "{error}");
+        assert!(
+            !stage_output.exists(),
+            "stale transcode stage must be removed"
+        );
+        let reopened = AppCore::new();
+        reopened.open_project(bundle.clone()).unwrap();
+        assert_eq!(
+            reopened.media().entries.len(),
+            2,
+            "latest save was persisted"
+        );
+        assert!(reopened
+            .media()
+            .entries
+            .iter()
+            .all(|entry| entry.proxy.is_none()));
+        assert!(!bundle.join("media/proxies").exists());
+        assert!(
+            core.media().entries.is_empty(),
+            "replacement project was untouched"
+        );
+    }
+
+    #[test]
+    fn proxy_transcode_cancellation_cleans_private_stage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let token = MediaCancelToken::new();
+        let worker_token = token.clone();
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_app = app.handle().clone();
+        let worker = std::thread::spawn(move || {
+            create_media_proxy_blocking_with(
+                worker_app,
+                asset_id,
+                None,
+                None,
+                worker_token,
+                move |request, cancel, _| {
+                    fs::write(request.output, b"incomplete proxy").unwrap();
+                    stage_tx.send(request.output.to_path_buf()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(cancel.checkpoint());
+                    Err(MediaError::Cancelled)
+                },
+            )
+        });
+        let stage_output = stage_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap().err().expect("cancelled proxy fails"),
+            "media_proxy_cancelled"
+        );
+        assert!(!stage_output.exists());
+        assert!(core.media().entries[0].proxy.is_none());
+        assert!(!bundle.join("media/proxies").exists());
+    }
+
+    #[test]
+    fn completed_proxy_moves_from_private_stage_into_the_bundle() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let app = tauri::test::mock_app();
+        app.manage(core.clone());
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let created = create_media_proxy_blocking_with(
+            app.handle().clone(),
+            asset_id,
+            None,
+            None,
+            MediaCancelToken::new(),
+            move |request, _, _| {
+                fs::write(request.output, b"completed proxy").unwrap();
+                stage_tx.send(request.output.to_path_buf()).unwrap();
+                Ok(ProxyResult {
+                    path: request.output.to_path_buf(),
+                    source_sha256: opentake_media::file_sha256(request.source).unwrap(),
+                    source_stamp: Some(opentake_media::source_file_stamp(request.source).unwrap()),
+                    width: 320,
+                    height: 180,
+                })
+            },
+        )
+        .expect("completed proxy is published");
+
+        let stage_output = stage_rx.recv().unwrap();
+        assert!(
+            !stage_output.parent().unwrap().exists(),
+            "private stage is removed after publication"
+        );
+        let published = PathBuf::from(&created.path);
+        assert_eq!(fs::read(&published).unwrap(), b"completed proxy");
+        assert!(app.handle().asset_protocol_scope().is_allowed(&published));
+        let proxy = core.media().entries[0]
+            .proxy
+            .clone()
+            .expect("proxy recorded");
+        assert!(proxy.relative_path.starts_with("media/proxies/"));
+        assert_eq!(
+            fs::read(bundle.join(&proxy.relative_path)).unwrap(),
+            b"completed proxy"
+        );
+        assert!(proxy.source_stamp.is_some());
+    }
+
+    #[test]
     fn remove_proxy_holds_project_identity_through_file_cleanup() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -8812,6 +9057,7 @@ mod tests {
                 relative_path: "media/proxies/proxy.mp4".into(),
                 source_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
+                source_stamp: None,
                 width: 1280,
                 height: 720,
             }),

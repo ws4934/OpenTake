@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
+use opentake_domain::MediaSourceStamp;
 use same_file::Handle as FileIdentity;
 use sha2::{Digest, Sha256};
 
@@ -35,6 +36,7 @@ pub struct ProxyRequest<'a> {
 pub struct ProxyResult {
     pub path: PathBuf,
     pub source_sha256: String,
+    pub source_stamp: Option<MediaSourceStamp>,
     pub width: u32,
     pub height: u32,
 }
@@ -48,6 +50,69 @@ fn report(progress: &Option<ProxyProgressCallback>, done: usize) {
 pub fn file_sha256(path: &Path) -> Result<String> {
     let file = open_retained_regular_file(path)?;
     file_sha256_file_cancellable(&file, &MediaCancelToken::new())
+}
+
+/// A cheap identity for the same retained source file used for proxy creation.
+/// A missing or different stamp causes playback to use the original until the
+/// proxy digest is checked in the background.
+pub fn source_file_stamp(path: &Path) -> Result<MediaSourceStamp> {
+    source_file_stamp_file(&open_retained_regular_file(path)?)
+}
+
+pub fn source_file_stamp_file(file: &File) -> Result<MediaSourceStamp> {
+    let metadata = file.metadata()?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| std::io::Error::other("source modification precedes the Unix epoch"))?
+        .as_nanos();
+    let modified_ns = i64::try_from(modified_ns)
+        .map_err(|_| std::io::Error::other("source modification time is out of range"))?;
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        format!("unix:{}:{}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(windows)]
+    let file_id = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        format!("windows:{}:{index}", info.dwVolumeSerialNumber)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file_id = String::new();
+    Ok(MediaSourceStamp {
+        len: metadata.len(),
+        modified_ns,
+        file_id,
+    })
+}
+
+/// Hash one retained regular file and return its identity only if the path and
+/// open handle still name the same source before and after the read.
+pub fn file_sha256_with_stamp_cancellable(
+    path: &Path,
+    cancel: &MediaCancelToken,
+) -> Result<Option<(MediaSourceStamp, String)>> {
+    let file = open_retained_regular_file(path)?;
+    let stamp = source_file_stamp_file(&file)?;
+    if source_file_stamp(path)? != stamp {
+        return Ok(None);
+    }
+    let hash = file_sha256_file_cancellable(&file, cancel)?;
+    if source_file_stamp_file(&file)? != stamp || source_file_stamp(path)? != stamp {
+        return Ok(None);
+    }
+    Ok(Some((stamp, hash)))
 }
 
 pub fn file_sha256_file_cancellable(file: &File, cancel: &MediaCancelToken) -> Result<String> {
@@ -212,6 +277,7 @@ pub fn create_proxy(
     }
     let stage = PrivateStage::create(request.output)?;
 
+    let source_stamp = source_file_stamp_file(&source).ok();
     let source_sha256 = file_sha256_file_cancellable(&source, cancel)?;
     report(&progress, 100);
     if cancel.is_cancelled() {
@@ -295,6 +361,14 @@ pub fn create_proxy(
             "source changed while proxy was being created".to_string(),
         ));
     }
+    // Compare the retained handle only: renaming or unlinking the source path
+    // does not change the bytes the proxy was made from, and playback compares
+    // the stamp with whatever the path names before it uses the proxy.
+    if source_stamp != source_file_stamp_file(&source).ok() {
+        return Err(MediaError::Checksum(
+            "source identity changed while proxy was being created".to_string(),
+        ));
+    }
 
     report(&progress, 950);
     let metadata = match probe::probe_file_cancellable(stage.file(), cancel, PROXY_PROBE_TIMEOUT) {
@@ -327,6 +401,7 @@ pub fn create_proxy(
     Ok(ProxyResult {
         path: request.output.to_path_buf(),
         source_sha256,
+        source_stamp,
         width,
         height,
     })
@@ -337,6 +412,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn background_proxy_source_check_is_cancellable_and_detects_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.mp4");
+        fs::write(&path, b"original").unwrap();
+        let cancel = MediaCancelToken::new();
+        let (stamp, digest) = file_sha256_with_stamp_cancellable(&path, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamp, source_file_stamp(&path).unwrap());
+        assert_eq!(digest, file_sha256(&path).unwrap());
+        fs::write(&path, b"different-size").unwrap();
+        assert_ne!(stamp, source_file_stamp(&path).unwrap());
+        assert_ne!(digest, file_sha256(&path).unwrap());
+        cancel.cancel();
+        assert!(matches!(
+            file_sha256_with_stamp_cancellable(&path, &cancel),
+            Err(MediaError::Cancelled)
+        ));
+    }
 
     fn assert_proxy_tools_available() {
         assert!(ff::ffmpeg_available(), "ffmpeg is required for proxy tests");

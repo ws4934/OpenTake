@@ -102,6 +102,7 @@ fn get_media_tool_result_allowlists_model_safe_metadata() {
         proxy: Some(MediaProxy {
             relative_path: "proxy/private.mov?token=PROXY_SECRET".into(),
             source_sha256: "SOURCE_DIGEST_SECRET".into(),
+            source_stamp: None,
             width: 960,
             height: 540,
         }),

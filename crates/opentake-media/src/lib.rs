@@ -158,8 +158,8 @@ pub use identity::{ContentHashCache, FileStamp};
 pub use color::{hdr_decode_input_args, hdr_tonemap_filter};
 pub use probe::{parse_probe, probe, MediaProbe};
 pub use proxy::{
-    create_proxy, file_sha256, file_sha256_file_cancellable, ProxyProgressCallback, ProxyRequest,
-    ProxyResult,
+    create_proxy, file_sha256, file_sha256_file_cancellable, file_sha256_with_stamp_cancellable,
+    source_file_stamp, source_file_stamp_file, ProxyProgressCallback, ProxyRequest, ProxyResult,
 };
 
 pub use decode::{

@@ -1840,6 +1840,7 @@ mod tests {
         let proxy = MediaProxy {
             relative_path: "media/proxies/asset.mp4".into(),
             source_sha256: "a".repeat(64),
+            source_stamp: None,
             width: 640,
             height: 360,
         };
@@ -1855,6 +1856,7 @@ mod tests {
                 Some(MediaProxy {
                     relative_path: "../outside.mp4".into(),
                     source_sha256: "a".repeat(64),
+                    source_stamp: None,
                     width: 640,
                     height: 360,
                 }),
@@ -1866,6 +1868,7 @@ mod tests {
                 Some(MediaProxy {
                     relative_path: "media/proxies/nested/asset.mp4".into(),
                     source_sha256: "a".repeat(64),
+                    source_stamp: None,
                     width: 640,
                     height: 360,
                 }),
