@@ -5,6 +5,29 @@ per-platform download URL, archive member (when applicable), archive SHA-256,
 extracted-binary SHA-256, and reported version are recorded in
 `scripts/ffmpeg-sidecars.lock.json`.
 
+## Download locations
+
+The primary download location is the
+[`ffmpeg-sidecars-v1` prerelease](https://github.com/ws4934/OpenTake/releases/tag/ffmpeg-sidecars-v1)
+of this repository. It holds byte-identical copies of the pinned upstream
+files (the original archive or raw binary, unchanged, named
+`<tool>-<target>` plus the upstream extension) and is listed as the
+`mirror_urls` of each lock record. The upstream `url` of each record remains
+the provenance of the file and the fallback: `scripts/provision_ffmpeg_sidecars.py`
+tries the mirror first and moves to the upstream URL on a network error, an
+HTTP error or a checksum mismatch. Every source is held to the same archive and
+binary SHA-256 pins, so a mirror can never change what is packaged.
+
+The `Mirror FFmpeg sidecars` workflow
+(`.github/workflows/mirror-ffmpeg-sidecars.yml`, run manually from `main`)
+fills the release with `scripts/mirror_ffmpeg_sidecars.py`: it downloads every
+file from its upstream URL, verifies both pins and uploads the missing assets.
+The release is append-only: an existing asset with the same SHA-256 is kept,
+one with different bytes fails the run, and nothing is deleted or replaced.
+Changing a pin therefore means a new release tag and new `mirror_urls`.
+
+## Builds and licences
+
 The Apple Silicon pair is the FFmpeg 7.0 arm64 build published by
 [OSXExperts](https://www.osxexperts.net/). Its reported configure line enables
 GPL components such as x264/x265 but does **not** enable FFmpeg's `nonfree`

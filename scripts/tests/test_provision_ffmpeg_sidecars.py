@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 import zipfile
 
@@ -267,6 +268,171 @@ class ProvisionFfmpegSidecarsTests(unittest.TestCase):
 
         self.assertEqual(len(remaining), 1, "one download per attempt")
         self.assertEqual(delays, list(range(1, attempts)))
+
+    def provision_from_sources(
+        self, record: dict[str, object], responses: dict[str, list[object]]
+    ) -> tuple[Path, list[str]]:
+        """Provision a Linux sidecar where each download of a URL pops the next
+        response for it: bytes are written, an exception is raised. Returns
+        the published path and the downloaded URLs in order."""
+        requested: list[str] = []
+
+        def download_fixture(url: str, path: Path) -> None:
+            requested.append(url)
+            response = responses[url].pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            assert isinstance(response, bytes)
+            path.write_bytes(response)
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        binary_dir = root / "src-tauri" / "binaries"
+        binary_dir.mkdir(parents=True)
+        with (
+            mock.patch.object(provisioner, "ROOT", root),
+            mock.patch.object(provisioner, "BIN_DIR", binary_dir),
+            mock.patch.object(provisioner, "download", download_fixture),
+            mock.patch.object(provisioner, "verify", lambda *_args: None),
+            mock.patch.object(provisioner.time, "sleep", lambda _delay: None),
+            mock.patch.object(provisioner.sys, "stderr", mock.MagicMock()),
+        ):
+            provisioner.provision("ffmpeg", record, "x86_64-unknown-linux-gnu")
+        return binary_dir / "ffmpeg-x86_64-unknown-linux-gnu", requested
+
+    MIRROR = "https://mirror.invalid/ffmpeg-x86_64-unknown-linux-gnu"
+    SECOND_MIRROR = "https://second-mirror.invalid/ffmpeg"
+    UPSTREAM = "https://upstream.invalid/ffmpeg-linux-x64"
+    PINNED = b"pinned ffmpeg"
+
+    def mirrored_record(self, *mirrors: str) -> dict[str, object]:
+        return {
+            "url": self.UPSTREAM,
+            "mirror_urls": list(mirrors),
+            "sha256": digest(self.PINNED),
+            "version": "7.0",
+        }
+
+    def test_mirror_is_downloaded_before_upstream(self) -> None:
+        record = self.mirrored_record(self.MIRROR, self.SECOND_MIRROR)
+        published, requested = self.provision_from_sources(
+            record, {self.MIRROR: [self.PINNED]}
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(requested, [self.MIRROR])
+        self.assertEqual(
+            provisioner.download_sources(record),
+            [self.MIRROR, self.SECOND_MIRROR, self.UPSTREAM],
+        )
+
+    def test_network_error_falls_back_to_the_next_source(self) -> None:
+        published, requested = self.provision_from_sources(
+            self.mirrored_record(self.MIRROR, self.SECOND_MIRROR),
+            {
+                self.MIRROR: [RuntimeError("download failed after 4 attempts")],
+                self.SECOND_MIRROR: [ConnectionResetError("reset by peer")],
+                self.UPSTREAM: [self.PINNED],
+            },
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(requested, [self.MIRROR, self.SECOND_MIRROR, self.UPSTREAM])
+
+    def test_missing_mirror_release_falls_back_to_upstream(self) -> None:
+        published, requested = self.provision_from_sources(
+            self.mirrored_record(self.MIRROR),
+            {
+                self.MIRROR: [RuntimeError("download failed: HTTP 404")],
+                self.UPSTREAM: [self.PINNED],
+            },
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(requested, [self.MIRROR, self.UPSTREAM])
+
+    def test_http_404_is_not_retried_but_network_errors_are(self) -> None:
+        not_found = urllib.error.HTTPError(self.MIRROR, 404, "Not Found", {}, None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "download"
+            with (
+                mock.patch.object(
+                    provisioner.urllib.request, "urlopen", side_effect=not_found
+                ) as urlopen,
+                mock.patch.object(provisioner.time, "sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 404"):
+                    provisioner.download(self.MIRROR, path)
+            self.assertEqual(urlopen.call_count, 1)
+            sleep.assert_not_called()
+
+            with (
+                mock.patch.object(
+                    provisioner.urllib.request,
+                    "urlopen",
+                    side_effect=urllib.error.URLError("connection refused"),
+                ) as urlopen,
+                mock.patch.object(provisioner.time, "sleep"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "after 4 attempts"):
+                    provisioner.download(self.MIRROR, path)
+            self.assertEqual(
+                urlopen.call_count, provisioner.DOWNLOAD_NETWORK_ATTEMPTS
+            )
+            self.assertFalse(path.exists())
+
+    def test_checksum_mismatch_falls_back_to_the_next_source(self) -> None:
+        attempts = provisioner.DOWNLOAD_CHECKSUM_ATTEMPTS
+        published, requested = self.provision_from_sources(
+            self.mirrored_record(self.MIRROR),
+            {
+                self.MIRROR: [b"stale mirror"] * attempts,
+                self.UPSTREAM: [self.PINNED],
+            },
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(requested, [self.MIRROR] * attempts + [self.UPSTREAM])
+
+    def test_failure_names_every_source_when_all_fail(self) -> None:
+        attempts = provisioner.DOWNLOAD_CHECKSUM_ATTEMPTS
+        with self.assertRaises(RuntimeError) as raised:
+            self.provision_from_sources(
+                self.mirrored_record(self.MIRROR, self.SECOND_MIRROR),
+                {
+                    self.MIRROR: [RuntimeError("download failed: HTTP 404")],
+                    self.SECOND_MIRROR: [TimeoutError("timed out")],
+                    self.UPSTREAM: [b"replaced upstream"] * attempts,
+                },
+            )
+
+        message = str(raised.exception)
+        self.assertIn("every download source failed for ffmpeg", message)
+        self.assertIn(f"{self.MIRROR}: download failed: HTTP 404", message)
+        self.assertIn(f"{self.SECOND_MIRROR}: timed out", message)
+        self.assertRegex(
+            message,
+            f"{self.UPSTREAM}: download checksum mismatch.*after {attempts} downloads",
+        )
+
+    def test_record_without_mirrors_downloads_only_upstream(self) -> None:
+        record = self.mirrored_record()
+        del record["mirror_urls"]
+        published, requested = self.provision_from_sources(
+            record, {self.UPSTREAM: [self.PINNED]}
+        )
+
+        self.assertEqual(published.read_bytes(), self.PINNED)
+        self.assertEqual(requested, [self.UPSTREAM])
+        self.assertEqual(provisioner.download_sources(record), [self.UPSTREAM])
+
+    def test_malformed_mirror_urls_are_rejected(self) -> None:
+        for mirrors in ("https://mirror.invalid/ffmpeg", [""], [None]):
+            with self.subTest(mirrors=mirrors):
+                record = {"url": self.UPSTREAM, "mirror_urls": mirrors}
+                with self.assertRaisesRegex(RuntimeError, "mirror_urls|url"):
+                    provisioner.download_sources(record)
 
     def test_rejects_archive_checksum_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

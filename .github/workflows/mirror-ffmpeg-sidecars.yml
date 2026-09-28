@@ -1,0 +1,39 @@
+name: Mirror FFmpeg sidecars
+
+# Copies every checksum-pinned FFmpeg sidecar download named by
+# scripts/ffmpeg-sidecars.lock.json, byte for byte, into the ffmpeg-sidecars-v1
+# prerelease of this repository. The provisioner downloads from that mirror
+# first and falls back to the upstream URLs. The release is append-only: an
+# asset that already exists with the same SHA-256 is kept, one with different
+# bytes fails the run, and nothing is deleted or replaced. See
+# src-tauri/resources/ffmpeg/SOURCE.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-ffmpeg-sidecars
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror pinned sidecars
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Mirror unit tests
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*ffmpeg_sidecars.py'
+
+      - name: Download, verify and publish the pinned files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/mirror_ffmpeg_sidecars.py --target-commit "$GITHUB_SHA"
