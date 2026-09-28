@@ -682,7 +682,11 @@ describe("edit gesture command routing", () => {
     expect(committed.timelineVersion).toBe(12);
     expect(committed.projectPath).toBe("/new.opentake");
     expect(Object.isFrozen(committed.timeline)).toBe(true);
-    newest.timeline.fps = 60;
+    // The store adopts and freezes the handed-over snapshot, so a reference the
+    // caller kept cannot change the mirror either.
+    expect(() => {
+      newest.timeline.fps = 60;
+    }).toThrow();
     expect(useProjectStore.getState().timeline.fps).toBe(30);
     expect(() => {
       useProjectStore.getState().timeline.fps = 120;

@@ -23,6 +23,7 @@ import { resolveEffectivePreviewState, useEditorUiStore } from "../../store/uiSt
 import { useMediaStore, refreshMedia } from "../../store/mediaStore";
 import { useSettingsStore } from "../../store/settingsStore";
 import { formatTimecode, totalFrames } from "../../lib/geometry";
+import { currentTimelineOf } from "../../lib/timelineScope";
 import { snapFrameToEdge } from "../../lib/snap";
 import { maybeSnapFeedback } from "../../lib/haptic";
 import { assetUrl } from "../../lib/asset";
@@ -115,10 +116,7 @@ export function Preview() {
   const t = useT();
   const rootTimeline = useProjectStore((s) => s.timeline);
   const activeNestedSequenceId = useEditorUiStore((s) => s.activeNestedSequenceId);
-  const timeline =
-    rootTimeline.nestedSequences?.find(
-      (sequence) => sequence.id === activeNestedSequenceId,
-    )?.timeline ?? rootTimeline;
+  const timeline = currentTimelineOf(rootTimeline, activeNestedSequenceId);
   const projectEpoch = useProjectStore((s) => s.projectEpoch);
   const timelineVersion = useProjectStore((s) => s.timelineVersion);
   // Whole frames: every consumer below floors or rounds the playhead, and a

@@ -816,6 +816,40 @@ export function linkOffsetForClip(timeline: Timeline, clipId: string): number | 
   return offset;
 }
 
+const linkOffsetCache = new WeakMap<Timeline, ReadonlyMap<string, number>>();
+
+/**
+ * {@link linkOffsetForClip} for every clip at once, in two passes over the
+ * timeline instead of two per clip: clip id → non-null offset (unlinked and
+ * lead clips are absent). A frozen timeline (every mirror snapshot) cannot
+ * change, so its map is built once and reused by later paints.
+ */
+export function linkOffsetsByClipId(timeline: Timeline): ReadonlyMap<string, number> {
+  const cached = linkOffsetCache.get(timeline);
+  if (cached) return cached;
+  const leadStarts = new Map<string, number>();
+  for (const track of timeline.tracks) {
+    for (const c of track.clips) {
+      if (!c.linkGroupId) continue;
+      if (c.startFrame < (leadStarts.get(c.linkGroupId) ?? Number.POSITIVE_INFINITY)) {
+        leadStarts.set(c.linkGroupId, c.startFrame);
+      }
+    }
+  }
+  // Like the single-clip scan, the last clip with a given id decides its entry.
+  const offsets = new Map<string, number>();
+  for (const track of timeline.tracks) {
+    for (const c of track.clips) {
+      const leadStart = c.linkGroupId ? leadStarts.get(c.linkGroupId) : undefined;
+      const offset = leadStart === undefined ? 0 : c.startFrame - leadStart;
+      if (offset !== 0) offsets.set(c.id, offset);
+      else offsets.delete(c.id);
+    }
+  }
+  if (Object.isFrozen(timeline)) linkOffsetCache.set(timeline, offsets);
+  return offsets;
+}
+
 /** Resolve one logical clip selection. A linked source video and its extracted
  * audio companion are selected together by timeline gestures, but represent one
  * user-facing clip for Inspector and on-canvas editing. Genuine marquee

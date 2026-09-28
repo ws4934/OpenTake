@@ -1,6 +1,9 @@
 import {
+  memo,
+  useCallback,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -49,6 +52,10 @@ const NO_KEY_HINT = /Settings|设置|API key/i;
 const HISTORY_RESYNC_RETRY_BASE_MS = 250;
 const HISTORY_RESYNC_RETRY_MAX_MS = 4_000;
 const HISTORY_RESYNC_RETRY_MAX_EXPONENT = 4;
+/** The transcript keeps following new output while its bottom edge is within
+ *  this distance; scrolling further up stops following until the reader
+ *  returns to the bottom. */
+const FOLLOW_LATEST_THRESHOLD_PX = 48;
 
 export function AgentPanel() {
   const t = useT();
@@ -88,6 +95,8 @@ export function AgentPanel() {
   const resyncProjectRef = useRef<Record<string, { projectEpoch: number; projectPath: string }>>({});
   const tabMutationRef = useRef<Promise<void>>(Promise.resolve());
   const scrollRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
+  const followedSessionRef = useRef(sessionId);
   const mountedRef = useRef(true);
   const turnLocked = streaming || pendingSessionId === sessionId;
   const interactionLocked = turnLocked || selectedSessionResyncing;
@@ -378,10 +387,17 @@ export function AgentPanel() {
 
   useEffect(() => {
     const element = scrollRef.current;
-    if (element) {
-      element.scrollTop = element.scrollHeight;
+    if (!element) return;
+    // Another chat opens at its latest message.
+    if (followedSessionRef.current !== sessionId) {
+      followedSessionRef.current = sessionId;
+      followLatestRef.current = true;
     }
-  }, [messages]);
+    if (followLatestRef.current) element.scrollTop = element.scrollHeight;
+  }, [messages, sessionId]);
+
+  const openSettings = useCallback(() => setSettingsOpen(true), [setSettingsOpen]);
+  const turns = useMemo(() => groupConversationMessages(messages), [messages]);
 
   async function send() {
     const text = input.trim();
@@ -391,6 +407,8 @@ export function AgentPanel() {
     const sendingSessionId = sessionId;
     inputRef.current = "";
     setInput("");
+    // The reader's own message always brings the transcript to its end.
+    followLatestRef.current = true;
     pushUser(text);
     setPendingSessionId(sendingSessionId);
     try {
@@ -638,6 +656,12 @@ export function AgentPanel() {
 
       <div
         ref={scrollRef}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          followLatestRef.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight <=
+            FOLLOW_LATEST_THRESHOLD_PX;
+        }}
         style={{
           flex: 1,
           minHeight: 0,
@@ -661,11 +685,11 @@ export function AgentPanel() {
             {isTauri ? t("agent.empty") : t("agent.desktopOnly")}
           </div>
         )}
-        {groupConversationMessages(messages).map((turnMessages) => (
+        {turns.map((turnMessages) => (
           <ConversationMessage
             key={turnMessages[0].id}
             messages={turnMessages}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={openSettings}
           />
         ))}
       </div>
@@ -757,7 +781,27 @@ type ConversationMessageProps = (
   onOpenSettings: () => void;
 };
 
-export function ConversationMessage({
+/** Chat store updates replace only the message that changed, so a turn whose
+ *  messages are all the same objects renders the same output. */
+function sameMessages(
+  left: readonly ChatMessage[] | undefined,
+  right: readonly ChatMessage[] | undefined,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  return left.every((message, index) => message === right[index]);
+}
+
+/** Streaming re-renders the panel for every token; earlier turns skip it. */
+export const ConversationMessage = memo(
+  ConversationMessageView,
+  (previous, next) =>
+    previous.message === next.message &&
+    sameMessages(previous.messages, next.messages) &&
+    previous.onOpenSettings === next.onOpenSettings,
+);
+
+function ConversationMessageView({
   message,
   messages,
   onOpenSettings,
@@ -833,7 +877,13 @@ type AssistantTurnProps =
   | { message: ChatMessage; messages?: never }
   | { message?: never; messages: ChatMessage[] };
 
-export function AssistantTurn({ message, messages }: AssistantTurnProps) {
+export const AssistantTurn = memo(
+  AssistantTurnView,
+  (previous, next) =>
+    previous.message === next.message && sameMessages(previous.messages, next.messages),
+);
+
+function AssistantTurnView({ message, messages }: AssistantTurnProps) {
   const turnMessages = messages ?? (message ? [message] : []);
   const toolNames = new Map<string, string>();
   turnMessages.forEach((candidate) => {
@@ -892,7 +942,7 @@ export function AssistantTurn({ message, messages }: AssistantTurnProps) {
   );
 }
 
-export function InlineToolActivity({
+export const InlineToolActivity = memo(function InlineToolActivity({
   block,
   dataBlockIndex,
   toolName,
@@ -965,28 +1015,57 @@ export function InlineToolActivity({
         </span>
       </div>
       <Reveal id={disclosureId} open={open} role="group">
-        <div className="agent-tool-activity__details">
-          {block.type === "toolUse"
-            ? <>
-                <ToolDetail label={t("agent.toolArgs")} value={prettyJson(block.input)} />
-                {block.result !== undefined && (() => {
-                  const content = codexMcpResultContent(block.result);
-                  if (content === undefined) {
-                    return <ToolDetail label={t("agent.toolResult")} value={prettyJson(block.result)} />;
-                  }
-                  return content === null
-                    ? <span className="agent-tool-activity__image-error">
-                        {t("agent.toolResultUnavailable")}
-                      </span>
-                    : <ToolResultContents content={content} label={label} />;
-                })()}
-              </>
-            : <ToolResultContents content={block.content} label={label} />}
-        </div>
+        <ToolActivityDetails block={block} label={label} />
       </Reveal>
     </div>
   );
-}
+});
+
+type ToolUseResultView =
+  | { kind: "json"; text: string }
+  | { kind: "content"; content: AgentToolResultContentBlock[] }
+  | { kind: "unavailable" };
+
+/** The body of an open tool disclosure. `Reveal` renders it only while the
+ *  disclosure is shown, so a collapsed block never serializes its payload or
+ *  runs the bounded-content validation over an image-sized result. */
+const ToolActivityDetails = memo(function ToolActivityDetails({
+  block,
+  label,
+}: {
+  block: ToolActivityBlock;
+  label: string;
+}) {
+  const t = useT();
+  const args = useMemo(
+    () => (block.type === "toolUse" ? prettyJson(block.input) : ""),
+    [block],
+  );
+  const result = useMemo((): ToolUseResultView | null => {
+    if (block.type !== "toolUse" || block.result === undefined) return null;
+    const content = codexMcpResultContent(block.result);
+    if (content === undefined) return { kind: "json", text: prettyJson(block.result) };
+    return content === null ? { kind: "unavailable" } : { kind: "content", content };
+  }, [block]);
+
+  return (
+    <div className="agent-tool-activity__details">
+      {block.type === "toolUse"
+        ? <>
+            <ToolDetail label={t("agent.toolArgs")} value={args} />
+            {result?.kind === "json" &&
+              <ToolDetail label={t("agent.toolResult")} value={result.text} />}
+            {result?.kind === "unavailable" &&
+              <span className="agent-tool-activity__image-error">
+                {t("agent.toolResultUnavailable")}
+              </span>}
+            {result?.kind === "content" &&
+              <ToolResultContents content={result.content} label={label} />}
+          </>
+        : <ToolResultContents content={block.content} label={label} />}
+    </div>
+  );
+});
 
 function codexMcpResultContent(
   value: unknown,

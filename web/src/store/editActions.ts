@@ -6,7 +6,7 @@
 
 import * as api from "../lib/api";
 import { isTauri } from "../lib/api";
-import { forceRefresh } from "./sync";
+import { awaitMirrorVersion, forceRefresh } from "./sync";
 import { useEditorUiStore } from "./uiStore";
 import { useProjectStore } from "./projectStore";
 import { refreshMedia } from "./mediaStore";
@@ -17,6 +17,7 @@ import { planNudge } from "../lib/timelineNudge";
 import { buildInsertPlan, type InsertPlan } from "../lib/timelineInsert";
 import { checkProjectSettings } from "../lib/projectSettings";
 import { roundHalfAwayFromZero } from "../lib/rounding";
+import { currentTimelineOf } from "../lib/timelineScope";
 import { expandLinkGroup } from "../components/timeline/hitTest";
 import { useClipboardStore } from "./clipboardStore";
 import { t } from "../i18n";
@@ -138,9 +139,10 @@ export const EDIT_GESTURE_COMMAND_MATRIX_IS_EXHAUSTIVE: [MissingEditRequestType]
   : never = true;
 
 export function currentTimeline(): Timeline {
-  const root = useProjectStore.getState().timeline;
-  const sequenceId = useEditorUiStore.getState().activeNestedSequenceId;
-  return root.nestedSequences?.find((sequence) => sequence.id === sequenceId)?.timeline ?? root;
+  return currentTimelineOf(
+    useProjectStore.getState().timeline,
+    useEditorUiStore.getState().activeNestedSequenceId,
+  );
 }
 
 /** End frame of the timeline currently shown in the editor. Nested timeline
@@ -208,7 +210,11 @@ function enqueueEdit<T>(run: () => Promise<T>): Promise<T> {
   return task;
 }
 
-async function catchUpMirrorToLastEdit(): Promise<void> {
+/** Resolve once the mirror shows the last committed edit of the open project.
+ *  Tauri publishes an edit through the async `timeline_changed` refresh, which
+ *  `awaitMirrorVersion` joins (or starts, when the event is late or lost), so a
+ *  caller reading the timeline next sees the edit without fetching it twice. */
+function awaitLastEditInMirror(): Promise<void> {
   const last = lastCommittedEdit;
   const mirror = useProjectStore.getState();
   if (
@@ -216,11 +222,17 @@ async function catchUpMirrorToLastEdit(): Promise<void> {
     mirror.projectEpoch !== last.projectEpoch ||
     mirror.timelineVersion >= last.timelineVersion
   ) {
-    return;
+    return Promise.resolve();
   }
-  // Tauri publishes the previous edit through the async `timeline_changed`
-  // refresh; fetch it now rather than send the next edit with its old version.
-  await forceRefresh().catch(() => undefined);
+  return awaitMirrorVersion({
+    projectEpoch: last.projectEpoch,
+    version: last.timelineVersion,
+  });
+}
+
+async function catchUpMirrorToLastEdit(): Promise<void> {
+  // Never send the next edit with the previous edit's old version.
+  await awaitLastEditInMirror().catch(() => undefined);
 }
 
 /** `TauriCommandError` code for an edit whose identity is behind core. */
@@ -414,7 +426,7 @@ export async function addTextsAutoTrack(entries: TextAutoTrackEntryReq[]) {
 export async function insertClips(trackIndex: number, atFrame: number, entries: ClipEntryReq[]) {
   if (entries.length === 0) return;
   const res = await applyAndRefresh({ type: "insertClips", trackIndex, atFrame, entries });
-  if (isTauri && res.changed) await forceRefresh();
+  if (res.changed) await awaitLastEditInMirror();
   if (res.affectedClipIds.length > 0) {
     const ui = useEditorUiStore.getState();
     ui.selectClips(new Set(res.affectedClipIds));
@@ -955,9 +967,9 @@ export async function deleteSelectedClips() {
   if (ids.length > 0) {
     try {
       await removeClips(ids);
-      // Tauri normally refreshes via the timeline_changed event; force it too so
-      // a missed/raced event can't leave the just-deleted clip painted on screen.
-      if (isTauri) await forceRefresh();
+      // Wait for the refresh so a missed/raced timeline_changed event can't
+      // leave the just-deleted clip painted on screen.
+      await awaitLastEditInMirror();
     } catch (err) {
       ui.pushToast(`删除失败 / Delete failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1069,7 +1081,7 @@ export async function rippleDeleteSelectedClips() {
   if (ids.length > 0) {
     try {
       await rippleDeleteClips(ids);
-      if (isTauri) await forceRefresh();
+      await awaitLastEditInMirror();
     } catch (err) {
       ui.pushToast(`删除失败 / Delete failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1099,7 +1111,7 @@ export async function rippleDeleteMarkedRange(): Promise<boolean> {
   if (trackIndex < 0) return false;
   try {
     await rippleDeleteRanges(trackIndex, [{ start: range.startFrame, end: range.endFrame }]);
-    if (isTauri) await forceRefresh();
+    await awaitLastEditInMirror();
   } catch (err) {
     ui.pushToast(`删除失败 / Delete failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1129,7 +1141,7 @@ export async function rippleDeleteSelectedGap(): Promise<boolean> {
   }
   try {
     await rippleDeleteRanges(gap.trackIndex, [{ start: gap.startFrame, end: gap.endFrame }]);
-    if (isTauri) await forceRefresh();
+    await awaitLastEditInMirror();
   } catch (err) {
     ui.pushToast(`删除失败 / Delete failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1361,7 +1373,10 @@ function enqueueMediaAdd(
     if (!result.changed || result.timelineVersion !== context.expected.timelineVersion + 1) {
       throw new Error("media placement did not produce exactly one committed revision");
     }
-    if (isTauri) await forceRefresh();
+    await awaitMirrorVersion({
+      projectEpoch: context.expected.projectEpoch,
+      version: result.timelineVersion,
+    });
     const next: MediaGestureContext = {
       expected: {
         projectEpoch: context.expected.projectEpoch,
@@ -1771,11 +1786,11 @@ export async function addTextClip() {
   };
 
   const res = await addTextsAutoTrack([entry]);
-  // Tauri's timeline_changed event refreshes the mirror asynchronously; force
-  // it synchronously so the mirror (and any caller reading it right after,
-  // e.g. selection logic elsewhere) reflects the new track immediately —
-  // same pattern as addMediaToTimeline.
-  if (isTauri) await forceRefresh();
+  // Tauri's timeline_changed event refreshes the mirror asynchronously; wait
+  // for it so the mirror (and any caller reading it right after, e.g.
+  // selection logic elsewhere) reflects the new track immediately — same
+  // pattern as addMediaToTimeline.
+  await awaitLastEditInMirror();
   if (res && res.affectedClipIds.length > 0) {
     ui.selectClips(new Set(res.affectedClipIds));
   }
@@ -1796,11 +1811,14 @@ export async function addCaptions(entries: CaptionEntryReq[]) {
  *  Rust) and refresh the mirror. Returns the caption count so the UI can report
  *  "no speech detected" (count 0) distinctly from a placed batch. */
 export async function generateCaptions(request: CaptionRequest) {
+  const { projectEpoch } = useProjectStore.getState();
   const result = await api.generateCaptions(request);
-  // A placed batch changed the timeline. Force a mirror refresh so it appears
-  // even if Tauri's timeline_changed event races (and the browser has no event
-  // channel at all), matching the other editActions' refresh discipline.
-  if (result.edit.changed) await forceRefresh();
+  // A placed batch changed the timeline. Wait for the mirror to show it even
+  // if Tauri's timeline_changed event races or is lost, matching the other
+  // editActions' refresh discipline.
+  if (result.edit.changed) {
+    await awaitMirrorVersion({ projectEpoch, version: result.edit.timelineVersion });
+  }
   return result;
 }
 
@@ -1881,7 +1899,7 @@ export async function pasteClipsAtPlayhead() {
     if (!res || res.affectedClipIds.length === 0) return;
     // Select the freshly pasted clips so the user can immediately move/trim them.
     ui.selectClips(new Set(res.affectedClipIds));
-    if (isTauri) await forceRefresh();
+    await awaitLastEditInMirror();
   } catch (error) {
     ui.pushToast(t("edit.pasteFailed", { error: String(error) }));
   }

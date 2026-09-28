@@ -131,6 +131,89 @@ describe("AssistantTurn", () => {
     expect(image?.classList.contains("agent-tool-activity__image")).toBe(true);
   });
 
+  it("renders the expanded details of each tool block kind exactly", async () => {
+    await render(assistant({
+      content: "",
+      toolCalls: [],
+      blocks: [
+        { type: "toolUse", id: "pending", name: "inspect_media", input: { mediaId: "m-1" } },
+        {
+          type: "toolUse",
+          id: "json-result",
+          name: "get_timeline",
+          input: { detail: "clips" },
+          result: { tracks: 2, names: ["V1", "A1"] },
+        },
+        {
+          type: "toolUse",
+          id: "codex-result",
+          name: "remove_clips",
+          input: { clipIds: ["clip-1"] },
+          result: {
+            content: [
+              { kind: "text", text: "Removed 1 clip" },
+              { kind: "image", mediaType: "IMAGE/PNG", base64: "iVBORw0KGgo=" },
+            ],
+          },
+        },
+        {
+          type: "toolUse",
+          id: "invalid-result",
+          name: "remove_clips",
+          input: {},
+          result: { content: [{ kind: "video", url: "file:///secret.mov" }] },
+          isError: true,
+        },
+        {
+          type: "toolResult",
+          toolUseId: "codex-result",
+          content: [
+            { kind: "image", mediaType: "image/webp", base64: "UklGRg==" },
+            { kind: "image", mediaType: "image/svg+xml", base64: "PHN2Zz4=" },
+            { kind: "text", text: "Frame 12" },
+          ],
+        },
+      ],
+    }));
+
+    const details: string[] = [];
+    for (const trigger of Array.from(
+      container.querySelectorAll<HTMLButtonElement>("[data-tool-activity-trigger]"),
+    )) {
+      await act(async () => trigger.click());
+      const region = document.getElementById(trigger.getAttribute("aria-controls")!);
+      details.push(region?.querySelector(".agent-tool-activity__details")?.outerHTML ?? "");
+    }
+
+    const detail = (label: string, value: string) =>
+      `<div class="agent-tool-activity__detail"><div class="agent-tool-activity__detail-label">${label}</div><pre>${value}</pre></div>`;
+    const wrap = (html: string) => `<div class="agent-tool-activity__details">${html}</div>`;
+    expect(details).toEqual([
+      wrap(detail("agent.toolArgs", '{\n  "mediaId": "m-1"\n}')),
+      wrap(
+        detail("agent.toolArgs", '{\n  "detail": "clips"\n}') +
+          detail(
+            "agent.toolResult",
+            '{\n  "tracks": 2,\n  "names": [\n    "V1",\n    "A1"\n  ]\n}',
+          ),
+      ),
+      wrap(
+        detail("agent.toolArgs", '{\n  "clipIds": [\n    "clip-1"\n  ]\n}') +
+          detail("agent.toolResult", "Removed 1 clip") +
+          '<img alt="agent.toolImageAlt:remove_clips" class="agent-tool-activity__image" src="data:image/png;base64,iVBORw0KGgo=">',
+      ),
+      wrap(
+        detail("agent.toolArgs", "{}") +
+          '<span class="agent-tool-activity__image-error">agent.toolResultUnavailable</span>',
+      ),
+      wrap(
+        '<img alt="agent.toolImageAlt:remove_clips" class="agent-tool-activity__image" src="data:image/webp;base64,UklGRg==">' +
+          '<span class="agent-tool-activity__image-error">agent.toolImageUnavailable</span>' +
+          detail("agent.toolResult", "Frame 12"),
+      ),
+    ]);
+  });
+
   it("renders a Codex MCP raster result inside its tool disclosure without dumping base64 text", async () => {
     await render(assistant({
       content: "",

@@ -46,9 +46,10 @@ import {
   subscribeNativePlaybackPublication,
 } from "./nativePlaybackSession";
 import { rustEngineEnabled } from "./rustEngine";
-import { resolveTimelinePlaybackRoute } from "./playbackRoute";
+import { resolveTimelinePlaybackGate, type TimelinePlaybackRoute } from "./playbackRoute";
 import { createPreviewAudioGainController } from "./audioGain";
 import { releaseMediaElement } from "../../lib/mediaElement";
+import { currentTimelineOf } from "../../lib/timelineScope";
 
 interface NativeFrameListenerSlot {
   registration: NativeFrameListenerRegistration | null;
@@ -246,6 +247,38 @@ const SEEK_EPSILON_FRAMES = 2;
 const interactiveSeekQueue = createInteractiveSeekQueue();
 let interactiveSeekTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** The timeline the transport plays: the open nested sequence, else the root.
+ *  `TimelinePlayback` mounts this timeline's media elements, so the clock reads
+ *  the same clips, frames and end frame. */
+function playbackTimeline(): Timeline {
+  return currentTimelineOf(
+    useProjectStore.getState().timeline,
+    useEditorUiStore.getState().activeNestedSequenceId,
+  );
+}
+
+/** The route for the timeline the transport plays, through the gate the Preview
+ *  play button and the Space shortcut use. An open nested sequence never plays
+ *  on the native engine, which renders the root timeline. */
+function playbackRoute(
+  capability: RustPlaybackCapability,
+  rustEngineFailed: boolean,
+  webkitPlaybackFailedRevision: string | null,
+): TimelinePlaybackRoute {
+  const project = useProjectStore.getState();
+  const nestedSequenceId = useEditorUiStore.getState().activeNestedSequenceId;
+  return resolveTimelinePlaybackGate({
+    timeline: currentTimelineOf(project.timeline, nestedSequenceId),
+    nested: Boolean(nestedSequenceId),
+    capability,
+    isTauri,
+    rustEngineEnabled: rustEngineEnabled(),
+    rustEngineFailed,
+    forceRust:
+      webkitPlaybackFailedRevision === `${project.projectEpoch}:${project.timelineVersion}`,
+  }).route;
+}
+
 /** Active clips at `frame`: every visual layer, then every audio clip — the
  *  elements the engine drives. */
 function activeAt(tl: Timeline, frame: number): ActiveMedia[] {
@@ -394,7 +427,7 @@ function scheduleInteractiveSeekFlush(delayMs: number): void {
       cancelInteractiveSeek(interactiveSeekQueue);
       return;
     }
-    const tl = useProjectStore.getState().timeline;
+    const tl = playbackTimeline();
     const fps = tl.fps > 0 ? tl.fps : 30;
     const pending = flushPendingInteractiveSeek(interactiveSeekQueue, nowMs());
     if (pending) performInteractiveSeek(tl, pending.frame, fps);
@@ -435,6 +468,8 @@ export function useTimelinePlaybackEngine(): void {
   // frame 0 instead of the playhead frame.
   const timelineVersion = useProjectStore((s) => s.timelineVersion);
   const projectEpoch = useProjectStore((s) => s.projectEpoch);
+  // Entering or leaving a nested sequence swaps the timeline the clock plays.
+  const activeNestedSequenceId = useEditorUiStore((s) => s.activeNestedSequenceId);
   const previousTransportState = useRef({ isPlaying: false, isScrubbing: false });
   const lastEngineFrameRef = useRef<number | null>(null);
   const activeNativeIdentityRef = useRef<ReturnType<
@@ -478,7 +513,7 @@ export function useTimelinePlaybackEngine(): void {
     if (!isPlaying && !isScrubbing) {
       cancelPendingInteractiveSeek();
       pauseAll();
-      const tl = useProjectStore.getState().timeline;
+      const tl = playbackTimeline();
       const fps = tl.fps > 0 ? tl.fps : 30;
       const project = useProjectStore.getState();
       const nativeIdentity = activeNativeIdentityRef.current;
@@ -517,7 +552,15 @@ export function useTimelinePlaybackEngine(): void {
       }
     }
     previousTransportState.current = { isPlaying, isScrubbing };
-  }, [playheadFrame, engineFailed, isPlaying, isScrubbing, projectEpoch, timelineVersion]);
+  }, [
+    playheadFrame,
+    engineFailed,
+    isPlaying,
+    isScrubbing,
+    projectEpoch,
+    timelineVersion,
+    activeNestedSequenceId,
+  ]);
 
   useEffect(() => {
     if (!rustPlaybackCapability.checked) {
@@ -525,13 +568,7 @@ export function useTimelinePlaybackEngine(): void {
       pauseAll();
       return;
     }
-    const timeline = useProjectStore.getState().timeline;
-    const route = resolveTimelinePlaybackRoute(timeline, {
-      rustAvailable: rustPlaybackCapability.available,
-      rustEnabled: rustEngineEnabled() && !engineFailed,
-      forceRust:
-        webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
-    });
+    const route = playbackRoute(rustPlaybackCapability, engineFailed, webkitPlaybackFailedRevision);
     if (route.kind === "unsupported") {
       cancelPendingInteractiveSeek();
       pauseAll();
@@ -670,7 +707,7 @@ export function useTimelinePlaybackEngine(): void {
 
     const tick = (ts: number) => {
       const ui = useEditorUiStore.getState();
-      const tl = useProjectStore.getState().timeline;
+      const tl = playbackTimeline();
       const fps = tl.fps > 0 ? tl.fps : 30;
 
       // SCRUB takes priority over play: live-seek to the scrub frame and never
@@ -720,7 +757,7 @@ export function useTimelinePlaybackEngine(): void {
     };
 
     if (isPlaying && !isScrubbing) {
-      const tl = useProjectStore.getState().timeline;
+      const tl = playbackTimeline();
       const fps = tl.fps > 0 ? tl.fps : 30;
       const f = useEditorUiStore.getState().activeFrame;
       // Resume from pause: do NOT force-seek every element. They are already
@@ -743,20 +780,17 @@ export function useTimelinePlaybackEngine(): void {
     isScrubbing,
     engineFailed,
     projectEpoch,
-    rustPlaybackCapability.available,
-    rustPlaybackCapability.checked,
+    rustPlaybackCapability,
     timelineVersion,
     setEngineFailed,
     webkitPlaybackFailedRevision,
+    activeNestedSequenceId,
   ]);
 
   useEffect(() => {
-    const route = resolveTimelinePlaybackRoute(useProjectStore.getState().timeline, {
-      rustAvailable: rustPlaybackCapability.available,
-      rustEnabled: rustEngineEnabled() && !engineFailed,
-      forceRust:
-        webkitPlaybackFailedRevision === `${projectEpoch}:${timelineVersion}`,
-    });
+    // A native session starts only once the capability probe has answered.
+    if (!rustPlaybackCapability.checked) return;
+    const route = playbackRoute(rustPlaybackCapability, engineFailed, webkitPlaybackFailedRevision);
     if (route.kind !== "rust" || !isPlaying || isScrubbing) {
       return;
     }
@@ -784,8 +818,9 @@ export function useTimelinePlaybackEngine(): void {
     isPlaying,
     isScrubbing,
     projectEpoch,
-    rustPlaybackCapability.available,
+    rustPlaybackCapability,
     timelineVersion,
     webkitPlaybackFailedRevision,
+    activeNestedSequenceId,
   ]);
 }

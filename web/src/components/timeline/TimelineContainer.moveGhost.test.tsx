@@ -91,7 +91,7 @@ beforeEach(() => {
     this: HTMLCanvasElement,
   ) {
     return this === container.querySelectorAll("canvas")[0]
-      ? ({} as unknown as CanvasRenderingContext2D)
+      ? ({ save() {}, restore() {}, clearRect() {} } as unknown as CanvasRenderingContext2D)
       : null;
   } as unknown as HTMLCanvasElement["getContext"]);
   useProjectStore.setState({ timeline, projectEpoch: 1, compatibilityReadOnly: false });
