@@ -26,7 +26,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use same_file::Handle;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use opentake_core::{
     importable_clip_type, AppCore, CoreError, DeferredCoreEvents, ImportCommitWarning, ProbedMedia,
@@ -195,43 +195,52 @@ pub fn library_list(
 /// from the wall clock so the front end never has to supply it. Returns the
 /// created (or pre-existing, on dedup) entry.
 #[tauri::command]
-pub fn library_favorite(
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn library_favorite(
+    app: AppHandle,
     source: String,
     kind: String,
     category: Option<String>,
     thumb: Option<String>,
 ) -> Result<LibraryEntryDto, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let _workflow = library.lock_workflow();
-    let store = library.store()?;
-    let source_path = PathBuf::from(&source);
-    if !source_path.is_file() {
-        return Err(format!("source file not found: {source}"));
-    }
-    let req = FavoriteRequest {
-        source: &source_path,
-        kind: &kind,
-        category,
-        favorited_at: now_epoch_secs(),
-        thumb,
-    };
-    let entry = store.favorite(&req).map_err(|e| e.to_string())?;
-    Ok(entry_dto(entry))
+    let activity = crate::updater::begin_mutating_activity(
+        &app.state::<crate::updater::InstallAdmissionGate>(),
+    )?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let library = app.state::<LibraryState>();
+        let _workflow = library.lock_workflow();
+        let store = library.store()?;
+        let source_path = PathBuf::from(&source);
+        if !source_path.is_file() {
+            return Err(format!("source file not found: {source}"));
+        }
+        let req = FavoriteRequest {
+            source: &source_path,
+            kind: &kind,
+            category,
+            favorited_at: now_epoch_secs(),
+            thumb,
+        };
+        let entry = store.favorite(&req).map_err(|e| e.to_string())?;
+        Ok(entry_dto(entry))
+    })
+    .await
+    .map_err(|error| format!("library_favorite worker failed: {error}"))?
 }
 
 /// `library_unfavorite`: remove an entry (and its stored copy) by id. Returns
 /// `true` if an entry was removed, `false` if the id was unknown (idempotent).
 #[tauri::command]
-pub fn library_unfavorite(
-    core: State<'_, AppCore>,
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
-    id: String,
-) -> Result<bool, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    remove_from_library_and_project(&core, &library, &id)
+pub async fn library_unfavorite(app: AppHandle, id: String) -> Result<bool, String> {
+    let activity = crate::updater::begin_mutating_activity(
+        &app.state::<crate::updater::InstallAdmissionGate>(),
+    )?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        remove_from_library_and_project(&app.state::<AppCore>(), &app.state::<LibraryState>(), &id)
+    })
+    .await
+    .map_err(|error| format!("library_unfavorite worker failed: {error}"))?
 }
 
 /// `library_categorize`: set (or clear, with `category = None`) the category of
@@ -275,14 +284,16 @@ pub fn library_rename(
 /// from library" affordance. Removes the entry and its stored copy by id;
 /// returns `true` if something was removed.
 #[tauri::command]
-pub fn library_delete(
-    core: State<'_, AppCore>,
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
-    id: String,
-) -> Result<bool, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    remove_from_library_and_project(&core, &library, &id)
+pub async fn library_delete(app: AppHandle, id: String) -> Result<bool, String> {
+    let activity = crate::updater::begin_mutating_activity(
+        &app.state::<crate::updater::InstallAdmissionGate>(),
+    )?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        remove_from_library_and_project(&app.state::<AppCore>(), &app.state::<LibraryState>(), &id)
+    })
+    .await
+    .map_err(|error| format!("library_delete worker failed: {error}"))?
 }
 
 fn remove_from_library_and_project(
@@ -340,15 +351,24 @@ fn remove_from_library_and_project(
 /// projects). Errors when the id is unknown, the stored file is missing, the
 /// kind is not importable, or the import is rejected by the core.
 #[tauri::command]
-pub fn library_import_to_project(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn library_import_to_project(
+    app: AppHandle,
     id: String,
 ) -> Result<LibraryImportDto, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    library_import_to_project_impl(&core, &media, &library, &id)
+    let activity = crate::updater::begin_mutating_activity(
+        &app.state::<crate::updater::InstallAdmissionGate>(),
+    )?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        library_import_to_project_impl(
+            &app.state::<AppCore>(),
+            &app.state::<MediaState>(),
+            &app.state::<LibraryState>(),
+            &id,
+        )
+    })
+    .await
+    .map_err(|error| format!("library_import_to_project worker failed: {error}"))?
 }
 
 fn library_import_to_project_impl(
@@ -359,10 +379,7 @@ fn library_import_to_project_impl(
 ) -> Result<LibraryImportDto, String> {
     let workflow = library.lock_workflow();
     let mut events = DeferredCoreEvents::default();
-    let result = {
-        let _project_identity = core.lock_project_identity_workflow();
-        library_import_to_project_with_events(core, media, library, id, &mut events)
-    };
+    let result = library_import_to_project_with_events(core, media, library, id, &mut events);
     drop(workflow);
     core.emit_deferred(events);
     result
@@ -437,48 +454,51 @@ fn library_import_to_project_with_hook(
         expected_kind,
         &extension,
     )? {
+        core.mutable_runtime_snapshot_for_project(project.project_epoch, &project_dir)
+            .map_err(|error| error.to_string())?;
         return Ok(existing);
     }
     static IMPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = IMPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let imported_name = format!("library-{id}-{}-{sequence}.{extension}", std::process::id());
-    let imported_handle = project_media.create_leaf(Path::new(&imported_name))?;
-    let mut imported = ProjectImportGuard {
-        path: project_media.absolute_path(Path::new(&imported_name)),
-        name: imported_name.into(),
-        media: project_media
-            .media
-            .try_clone()
-            .map_err(|error| error.to_string())?,
-        handle: imported_handle,
-        committed: false,
-    };
+    // Save As copies the complete project media directory. Keep the large
+    // copy and ffprobe in an uncommitted sibling leaf until the final identity
+    // check, then atomically link it into the media directory without replacing
+    // any existing leaf. Both names stay under retained directory handles.
+    let mut staged = project_media.create_staged_import(&imported_name)?;
     store
-        .copy_stored_verified(id, imported.handle.as_file_mut())
+        .copy_stored_verified(id, staged.handle.as_file_mut())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("library entry has no stored file: {id}"))?;
-    imported
+    staged
         .handle
         .as_file_mut()
         .flush()
         .map_err(|error| error.to_string())?;
-    imported
+    staged
         .handle
         .as_file()
         .sync_all()
         .map_err(|error| error.to_string())?;
-    if !project_media.matches_leaf(&imported)? {
-        return Err("project import leaf identity changed before probe".to_string());
+    if !staged.owns_name() {
+        return Err("project import staging identity changed before probe".to_string());
     }
 
-    hook(ImportHookPhase::BeforeProbe, &imported.path);
-    let probe = probe_or_default_file(media.engine(), imported.handle.as_file());
-    hook(ImportHookPhase::AfterProbe, &imported.path);
-    if !project_media.matches_leaf(&imported)? {
-        return Err("project import leaf identity changed during probe".to_string());
+    hook(ImportHookPhase::BeforeProbe, &staged.path);
+    let probe = probe_or_default_file(media.engine(), staged.handle.as_file());
+    hook(ImportHookPhase::AfterProbe, &staged.path);
+    if !staged.owns_name() || !project_media.matches_namespace()? {
+        return Err("project import staging identity changed during probe".to_string());
     }
     let name = display_name(source_path);
     let hook = std::cell::RefCell::new(hook);
+    let _project_identity = core.lock_project_identity_workflow();
+    core.mutable_runtime_snapshot_for_project(project.project_epoch, &project_dir)
+        .map_err(|error| error.to_string())?;
+    let mut imported = project_media.publish_staged_import(&mut staged, &imported_name)?;
+    if !project_media.matches_leaf(&imported)? {
+        return Err("project import leaf identity changed before commit".to_string());
+    }
     let commit = core
         .import_library_media_for_project_deferred_with_manifest_writer(
             project.project_epoch,
@@ -616,6 +636,10 @@ impl ProjectMediaCapability {
     }
 
     fn create_leaf(&self, name: &Path) -> Result<Handle, String> {
+        Self::create_leaf_in(&self.media, name)
+    }
+
+    fn create_leaf_in(directory: &Dir, name: &Path) -> Result<Handle, String> {
         if !matches!(
             name.components().collect::<Vec<_>>().as_slice(),
             [Component::Normal(_)]
@@ -642,11 +666,82 @@ impl ProjectMediaCapability {
                 // handle-relative rollback after a namespace move.
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         }
-        let file = self
-            .media
+        let file = directory
             .open_with(name, &options)
             .map_err(|error| error.to_string())?;
         Handle::from_file(file.into_std()).map_err(|error| error.to_string())
+    }
+
+    fn create_staged_import(&self, imported_name: &str) -> Result<ProjectImportGuard, String> {
+        let name = format!(".opentake-library-stage-{imported_name}");
+        let parent = self.parent.try_clone().map_err(|error| error.to_string())?;
+        let handle = Self::create_leaf_in(&parent, Path::new(&name))?;
+        Ok(ProjectImportGuard {
+            path: self.parent_path.join(&name),
+            name: name.into(),
+            media: parent,
+            handle,
+            committed: false,
+        })
+    }
+
+    fn publish_staged_import(
+        &self,
+        stage: &mut ProjectImportGuard,
+        imported_name: &str,
+    ) -> Result<ProjectImportGuard, String> {
+        if !stage.owns_name() || !self.matches_namespace()? {
+            return Err("project import staging identity changed before commit".to_string());
+        }
+        let media = self.media.try_clone().map_err(|error| error.to_string())?;
+        let handle = Handle::from_file(
+            stage
+                .handle
+                .as_file()
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        // hard_link creates a new name only when the destination is absent;
+        // rename would overwrite a concurrently created media leaf. FAT and
+        // exFAT volumes cannot hard-link, so there the stage is renamed once
+        // its unique destination name is confirmed free.
+        let renamed = match link_staged_import(&self.parent, &stage.name, &media, imported_name) {
+            Ok(()) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(error.to_string());
+            }
+            Err(link_error) => {
+                match media.symlink_metadata(imported_name) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(link_error.to_string()),
+                }
+                self.parent
+                    .rename(&stage.name, &media, imported_name)
+                    .map_err(|error| error.to_string())?;
+                true
+            }
+        };
+        let imported = ProjectImportGuard {
+            path: self.absolute_path(Path::new(imported_name)),
+            name: imported_name.into(),
+            media,
+            handle,
+            committed: false,
+        };
+        if renamed {
+            // The stage name moved with the file; the media guard owns it now.
+            stage.committed = true;
+            return Ok(imported);
+        }
+        if !stage.owns_name() {
+            return Err("project import staging identity changed during publication".to_string());
+        }
+        self.parent
+            .remove_file(&stage.name)
+            .map_err(|error| error.to_string())?;
+        stage.committed = true;
+        Ok(imported)
     }
 
     /// Create one uncommitted retained media leaf. Dropping the returned guard
@@ -914,6 +1009,24 @@ impl ProjectImportGuard {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static HARD_LINKS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn link_staged_import(
+    parent: &Dir,
+    stage_name: &std::ffi::OsStr,
+    media: &Dir,
+    imported_name: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if HARD_LINKS_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    parent.hard_link(stage_name, media, imported_name)
+}
+
 impl Drop for ProjectImportGuard {
     fn drop(&mut self) {
         if self.committed {
@@ -1170,6 +1283,54 @@ mod tests {
     }
 
     #[test]
+    fn library_import_publishes_by_rename_where_hard_links_are_unsupported() {
+        struct AllowHardLinks;
+        impl Drop for AllowHardLinks {
+            fn drop(&mut self) {
+                HARD_LINKS_UNSUPPORTED.with(|flag| flag.set(false));
+            }
+        }
+        HARD_LINKS_UNSUPPORTED.with(|flag| flag.set(true));
+        let _reset = AllowHardLinks;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"library bytes").unwrap();
+        let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
+        let entry = favorite_video(&library, &source);
+        let bundle = tmp.path().join("NoHardLinks.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+
+        let imported =
+            library_import_to_project_impl(&core, &engine_for(tmp.path()), &library, &entry.id)
+                .expect("import without hard links");
+
+        let resolved = core
+            .media()
+            .entries
+            .into_iter()
+            .find(|candidate| candidate.id == imported.id)
+            .unwrap();
+        let opentake_domain::MediaSource::Project { relative_path } = resolved.source else {
+            panic!("library import must be project media");
+        };
+        assert_eq!(
+            std::fs::read(bundle.join(relative_path)).unwrap(),
+            b"library bytes"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .starts_with(".opentake-library-stage-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "stage left behind: {leftovers:?}");
+    }
+
+    #[test]
     fn deferred_import_events_allow_core_and_library_reentry() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("clip.mp4");
@@ -1311,6 +1472,7 @@ mod tests {
         let core = AppCore::new();
         core.save_project(Some(bundle)).unwrap();
         let mut events = DeferredCoreEvents::default();
+        let probed_name = std::cell::RefCell::new(None);
 
         let imported = library_import_to_project_with_hook(
             &core,
@@ -1320,6 +1482,7 @@ mod tests {
             &mut events,
             |phase, path| match phase {
                 ImportHookPhase::BeforeProbe => {
+                    *probed_name.borrow_mut() = path.file_name().map(ToOwned::to_owned);
                     std::fs::rename(&projects, &retained_projects).unwrap();
                     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                     std::fs::copy(&replacement_video, path).unwrap();
@@ -1341,11 +1504,9 @@ mod tests {
 
         assert_eq!(imported_entry.source_width, Some(32));
         assert_eq!(imported_entry.source_height, Some(18));
-        assert!(
-            std::fs::metadata(replacement_projects.join("ProbeAba.opentake/media"))
-                .unwrap()
-                .is_dir()
-        );
+        // The probe ran while the ambient path named the replacement video.
+        let probed_name = probed_name.into_inner().expect("probe hook ran");
+        assert!(replacement_projects.join(probed_name).is_file());
     }
 
     #[cfg(unix)]
@@ -1777,6 +1938,72 @@ mod tests {
         let reopened_after_retry = AppCore::new();
         reopened_after_retry.open_project(bundle).unwrap();
         assert_eq!(reopened_after_retry.media(), core.media());
+    }
+
+    #[test]
+    fn library_import_probe_allows_save_as_without_copying_an_uncommitted_leaf() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.mp4");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let library = LibraryState::new(LibraryStore::new(tmp.path().join("library")));
+        let entry = favorite_video(&library, &source);
+        let core = AppCore::new();
+        core.save_project(Some(tmp.path().join("Original.opentake")))
+            .unwrap();
+        let media = engine_for(tmp.path());
+        let destination = tmp.path().join("SavedAs.opentake");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (saved_tx, saved_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let core_ref = &core;
+            let media_ref = &media;
+            let library_ref = &library;
+            let entry_id = &entry.id;
+            let importing = scope.spawn(move || {
+                let mut events = DeferredCoreEvents::default();
+                library_import_to_project_with_hook(
+                    core_ref,
+                    media_ref,
+                    library_ref,
+                    entry_id,
+                    &mut events,
+                    |phase, path| {
+                        if phase == ImportHookPhase::BeforeProbe {
+                            entered_tx.send(path.to_owned()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    },
+                )
+            });
+            let staging_path = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(staging_path.exists());
+            let save_destination = destination.clone();
+            let saving = scope.spawn(move || {
+                saved_tx
+                    .send(core_ref.save_project(Some(save_destination)).is_ok())
+                    .unwrap();
+            });
+            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));
+            resume_tx.send(()).unwrap();
+            saving.join().unwrap();
+            let error = importing
+                .join()
+                .unwrap()
+                .expect_err("old project cannot commit");
+            assert!(saved_without_waiting.unwrap());
+            assert!(error.contains("project changed"), "{error}");
+            assert!(!staging_path.exists());
+        });
+        assert!(core.media().entries.is_empty());
+        assert!(std::fs::read_dir(destination.join("media"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]

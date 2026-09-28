@@ -95,6 +95,7 @@ pub fn fail_next_repair_stored_copy_for_test() {
 #[cfg(test)]
 std::thread_local! {
     static STORED_INDEX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STREAM_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One favorited asset in the global library.
@@ -500,6 +501,8 @@ fn stream_hash_copy(reader: &mut impl Read, writer: &mut impl Write) -> std::io:
 }
 
 fn stream_hash(reader: &mut impl Read) -> std::io::Result<String> {
+    #[cfg(test)]
+    STREAM_HASH_CALLS.with(|count| count.set(count.get() + 1));
     stream_hash_copy(reader, &mut std::io::sink())
 }
 
@@ -1056,6 +1059,46 @@ impl LibraryStore {
             ids.insert(id);
         }
         Ok(ids)
+    }
+
+    /// Verify only content ids referenced by the current project. Listing the
+    /// directory is still required to retain no-follow file authority, but
+    /// unrelated library files are never opened or hashed during project open.
+    pub fn stored_ids_verified_for(
+        &self,
+        requested: &HashSet<String>,
+    ) -> Result<(HashSet<String>, HashMap<String, String>)> {
+        if requested.is_empty() {
+            return Ok((HashSet::new(), HashMap::new()));
+        }
+        let index = self.stored_index()?;
+        let capabilities = self.capabilities()?;
+        let mut ids = HashSet::with_capacity(requested.len());
+        let mut failures = HashMap::new();
+        for id in requested {
+            let Some(name) = index.get(id) else {
+                continue;
+            };
+            let verified = (|| -> Result<()> {
+                let mut leaf = OwnedLeaf::open(&capabilities.files, name)?;
+                let actual = stream_hash(leaf.handle.as_file_mut())?;
+                if actual != *id {
+                    return Err(MediaError::Other(anyhow::anyhow!(
+                        "stored library content hash mismatch: expected {id}, got {actual}"
+                    )));
+                }
+                Ok(())
+            })();
+            match verified {
+                Ok(()) => {
+                    ids.insert(id.clone());
+                }
+                Err(error) => {
+                    failures.insert(id.clone(), error.to_string());
+                }
+            }
+        }
+        Ok((ids, failures))
     }
 
     /// Stream one verified retained library leaf into `writer`. The source is
@@ -2006,6 +2049,48 @@ mod tests {
         );
         assert_eq!(reopened.entries().unwrap(), vec![kept]);
         assert_eq!(reopened.stored_ids_verified().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn project_scoped_verification_does_not_hash_unreferenced_library_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let entries: Vec<_> = (0..20)
+            .map(|index| {
+                let name = format!("clip-{index}.mp4");
+                let source = src_file(tmp.path(), &name, name.as_bytes());
+                store.favorite(&req(&source, "video", None)).unwrap()
+            })
+            .collect();
+        std::fs::write(
+            store.stored_path(&entries[1].id).unwrap().unwrap(),
+            b"corrupted copy",
+        )
+        .unwrap();
+
+        let requested = HashSet::from([entries[0].id.clone()]);
+        STREAM_HASH_CALLS.with(|count| count.set(0));
+        assert_eq!(
+            store.stored_ids_verified_for(&requested).unwrap().0,
+            requested
+        );
+        STREAM_HASH_CALLS.with(|count| assert_eq!(count.get(), 1));
+        assert!(store.stored_ids_verified().is_err());
+        let (verified, failures) = store
+            .stored_ids_verified_for(&HashSet::from([
+                entries[0].id.clone(),
+                entries[1].id.clone(),
+            ]))
+            .unwrap();
+        assert_eq!(verified, HashSet::from([entries[0].id.clone()]));
+        assert!(failures[&entries[1].id].contains("hash mismatch"));
+        STREAM_HASH_CALLS.with(|count| count.set(0));
+        assert!(store
+            .stored_ids_verified_for(&HashSet::new())
+            .unwrap()
+            .0
+            .is_empty());
+        STREAM_HASH_CALLS.with(|count| assert_eq!(count.get(), 0));
     }
 
     #[test]

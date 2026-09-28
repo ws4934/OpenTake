@@ -2924,28 +2924,33 @@ pub fn get_media<R: Runtime>(
 /// Persist one project asset in the content-addressed global library and mirror
 /// that identity in the current project manifest.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri injects project/media/library/update state
-pub fn toggle_favorite(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn toggle_favorite(
+    app: AppHandle,
     asset_id: String,
     favorite: bool,
     expected_project_epoch: u64,
     expected_project_path: String,
 ) -> Result<MediaListDto, String> {
-    let _activity = begin_direct_media_project_write(&admission)?;
-    let _workflow = library.lock_workflow();
-    toggle_favorite_impl_for_project(
-        &core,
-        media.engine().cache_root(),
-        library.store()?,
-        &asset_id,
-        favorite,
-        expected_project_epoch,
-        Path::new(&expected_project_path),
-    )
+    let activity =
+        begin_direct_media_project_write(&app.state::<crate::updater::InstallAdmissionGate>())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let core = app.state::<AppCore>();
+        let media = app.state::<MediaState>();
+        let library = app.state::<LibraryState>();
+        let _workflow = library.lock_workflow();
+        toggle_favorite_impl_for_project(
+            &core,
+            media.engine().cache_root(),
+            library.store()?,
+            &asset_id,
+            favorite,
+            expected_project_epoch,
+            Path::new(&expected_project_path),
+        )
+    })
+    .await
+    .map_err(|error| format!("toggle_favorite worker failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -2989,26 +2994,23 @@ fn toggle_favorite_impl_for_project(
     expected_project_dir: &Path,
 ) -> Result<MediaListDto, String> {
     let mut events = DeferredCoreEvents::default();
-    let result = {
-        let _project_identity = core.lock_project_identity_workflow();
-        toggle_favorite_impl_with(
-            core,
-            cache_root,
-            store,
-            asset_id,
-            favorite,
-            ExpectedFavoriteProject {
-                epoch: expected_project_epoch,
-                dir: expected_project_dir,
-            },
-            &mut events,
-            |request| {
-                store
-                    .prepare_favorite(request)
-                    .map_err(|error| error.to_string())
-            },
-        )
-    };
+    let result = toggle_favorite_impl_with(
+        core,
+        cache_root,
+        store,
+        asset_id,
+        favorite,
+        ExpectedFavoriteProject {
+            epoch: expected_project_epoch,
+            dir: expected_project_dir,
+        },
+        &mut events,
+        |request| {
+            store
+                .prepare_favorite(request)
+                .map_err(|error| error.to_string())
+        },
+    );
     core.emit_deferred(events);
     result
 }
@@ -3057,6 +3059,11 @@ where
             thumb: None,
         };
         let prepared = favorite_file(&request)?;
+        // The source can take minutes to copy; only keep the identity stable
+        // while the project mapping and global entry are committed together.
+        let _identity = core.lock_project_identity_workflow();
+        core.mutable_runtime_snapshot_for_project(expected_project.epoch, expected_project.dir)
+            .map_err(|error| error.to_string())?;
         let library_id = prepared.entry().id.clone();
         let needs_publish = prepared.needs_publish();
         let changed = match core.set_media_global_favorite_for_project_deferred(
@@ -3116,6 +3123,9 @@ where
             }
             None => return Ok(MediaListDto::from_core(core, Some(cache_root))),
         };
+        let _identity = core.lock_project_identity_workflow();
+        core.mutable_runtime_snapshot_for_project(expected_project.epoch, expected_project.dir)
+            .map_err(|error| error.to_string())?;
         store
             .remove(&library_id)
             .map_err(|error| format!("global favorite could not be removed: {error}"))?;
@@ -3159,25 +3169,31 @@ where
 }
 
 #[tauri::command]
-pub fn sync_project_favorites(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-    library: State<'_, LibraryState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn sync_project_favorites(
+    app: AppHandle,
     legacy_asset_ids: Vec<String>,
     expected_project_epoch: u64,
     expected_project_path: String,
 ) -> Result<FavoriteSyncDto, String> {
-    let _activity = begin_direct_media_project_write(&admission)?;
-    let _workflow = library.lock_workflow();
-    sync_project_favorites_impl_for_project(
-        &core,
-        media.engine().cache_root(),
-        library.store()?,
-        legacy_asset_ids,
-        expected_project_epoch,
-        Path::new(&expected_project_path),
-    )
+    let activity =
+        begin_direct_media_project_write(&app.state::<crate::updater::InstallAdmissionGate>())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
+        let core = app.state::<AppCore>();
+        let media = app.state::<MediaState>();
+        let library = app.state::<LibraryState>();
+        let _workflow = library.lock_workflow();
+        sync_project_favorites_impl_for_project(
+            &core,
+            media.engine().cache_root(),
+            library.store()?,
+            legacy_asset_ids,
+            expected_project_epoch,
+            Path::new(&expected_project_path),
+        )
+    })
+    .await
+    .map_err(|error| format!("sync_project_favorites worker failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -3210,18 +3226,15 @@ fn sync_project_favorites_impl_for_project(
     expected_project_dir: &Path,
 ) -> Result<FavoriteSyncDto, String> {
     let mut events = DeferredCoreEvents::default();
-    let result = {
-        let _project_identity = core.lock_project_identity_workflow();
-        sync_project_favorites_impl_with_events(
-            core,
-            cache_root,
-            store,
-            legacy_asset_ids,
-            expected_project_epoch,
-            expected_project_dir,
-            &mut events,
-        )
-    };
+    let result = sync_project_favorites_impl_with_events(
+        core,
+        cache_root,
+        store,
+        legacy_asset_ids,
+        expected_project_epoch,
+        expected_project_dir,
+        &mut events,
+    );
     core.emit_deferred(events);
     result
 }
@@ -3258,8 +3271,9 @@ fn sync_project_favorites_impl_with_events(
         .into_iter()
         .map(|entry| entry.id)
         .collect();
-    let stored_ids = store
-        .stored_ids_verified()
+    let requested_ids: HashSet<String> = before.favorite_library_ids.values().cloned().collect();
+    let (stored_ids, verification_failures) = store
+        .stored_ids_verified_for(&requested_ids)
         .map_err(|error| error.to_string())?;
     let mapped_at_start: HashSet<String> = before.favorite_library_ids.keys().cloned().collect();
     let mut migrated = BTreeSet::new();
@@ -3273,32 +3287,18 @@ fn sync_project_favorites_impl_with_events(
         .filter(|id| !library_ids.contains(*id))
         .cloned()
         .collect();
-    for library_id in stale_ids {
-        let cleared = match core.clear_media_global_favorite_id_for_project_deferred(
-            project.project_epoch,
-            &project_dir,
-            &library_id,
-            events,
-        ) {
-            Ok(cleared) => cleared,
-            Err(error) => {
-                restore_project_favorites(
-                    core,
-                    project.project_epoch,
-                    &project_dir,
-                    &before,
-                    events,
-                );
-                return Err(error.to_string());
-            }
-        };
-        changed |= cleared > 0;
-    }
     for (asset_id, library_id) in &before.favorite_library_ids {
         if !library_ids.contains(library_id) {
             if legacy_inputs.contains(asset_id) {
                 migrated.insert(asset_id.clone());
             }
+            continue;
+        }
+        if let Some(message) = verification_failures.get(library_id) {
+            failures.push(FavoriteSyncFailureDto {
+                asset_id: asset_id.clone(),
+                message: message.clone(),
+            });
             continue;
         }
         let stored_exists = stored_ids.contains(library_id);
@@ -3366,15 +3366,6 @@ fn sync_project_favorites_impl_with_events(
             let prepared = store
                 .prepare_favorite(&request)
                 .map_err(|error| error.to_string())?;
-            changed |= core
-                .set_media_global_favorite_for_project_deferred(
-                    project.project_epoch,
-                    &project_dir,
-                    &asset_id,
-                    Some(prepared.entry().id.clone()),
-                    events,
-                )
-                .map_err(|error| error.to_string())?;
             Ok(prepared)
         })();
         match result {
@@ -3386,6 +3377,54 @@ fn sync_project_favorites_impl_with_events(
             Err(message) => failures.push(FavoriteSyncFailureDto { asset_id, message }),
         }
     }
+
+    // All requested hashes and source copies are prepared before the identity
+    // lease. A project switch during preparation rejects the whole commit.
+    let _identity = core.lock_project_identity_workflow();
+    core.mutable_runtime_snapshot_for_project(expected_project_epoch, expected_project_dir)
+        .map_err(|error| error.to_string())?;
+    for library_id in stale_ids {
+        let cleared = match core.clear_media_global_favorite_id_for_project_deferred(
+            project.project_epoch,
+            &project_dir,
+            &library_id,
+            events,
+        ) {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                restore_project_favorites(
+                    core,
+                    project.project_epoch,
+                    &project_dir,
+                    &before,
+                    events,
+                );
+                return Err(error.to_string());
+            }
+        };
+        changed |= cleared > 0;
+    }
+    pending_publications.retain(|(asset_id, _, prepared)| {
+        match core.set_media_global_favorite_for_project_deferred(
+            project.project_epoch,
+            &project_dir,
+            asset_id,
+            Some(prepared.entry().id.clone()),
+            events,
+        ) {
+            Ok(updated) => {
+                changed |= updated;
+                true
+            }
+            Err(error) => {
+                failures.push(FavoriteSyncFailureDto {
+                    asset_id: asset_id.clone(),
+                    message: error.to_string(),
+                });
+                false
+            }
+        }
+    });
 
     if changed
         || pending_publications
@@ -5527,6 +5566,71 @@ mod tests {
     }
 
     #[test]
+    fn slow_favorite_copy_allows_save_as_and_rejects_stale_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _bundle, _source, asset_id) = saved_core_with_media(tmp.path());
+        let current = core.runtime_snapshot();
+        let current_dir = current.project_dir.clone().unwrap();
+        let store = LibraryStore::new(tmp.path().join("library"));
+        let destination = tmp.path().join("SavedAs.opentake");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (saved_tx, saved_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let core_ref = &core;
+            let store_ref = &store;
+            let asset_id_ref = &asset_id;
+            let project_dir = &current_dir;
+            let root = tmp.path();
+            let epoch = current.project_epoch;
+            let favorite = scope.spawn(move || {
+                let mut events = DeferredCoreEvents::default();
+                toggle_favorite_impl_with(
+                    core_ref,
+                    root,
+                    store_ref,
+                    asset_id_ref,
+                    true,
+                    ExpectedFavoriteProject {
+                        epoch,
+                        dir: project_dir,
+                    },
+                    &mut events,
+                    |request| {
+                        entered_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                        store_ref
+                            .prepare_favorite(request)
+                            .map_err(|error| error.to_string())
+                    },
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let save = scope.spawn(move || {
+                saved_tx
+                    .send(core_ref.save_project(Some(destination)).is_ok())
+                    .unwrap();
+            });
+            // A held identity lease would make this time out until copy resumes.
+            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));
+            resume_tx.send(()).unwrap();
+            save.join().unwrap();
+            let error = favorite
+                .join()
+                .unwrap()
+                .expect_err("old project cannot commit");
+            assert!(saved_without_waiting.unwrap());
+            assert!(error.contains("project changed"), "{error}");
+        });
+        assert!(store.entries().unwrap().is_empty());
+        assert!(core.media().favorite_library_ids.is_empty());
+    }
+
+    #[test]
     fn global_favorite_is_copied_mapped_and_durable_on_reopen() {
         let tmp = tempfile::tempdir().expect("temp root");
         let (core, bundle, _source, asset_id) = saved_core_with_media(tmp.path());
@@ -5946,6 +6050,55 @@ mod tests {
                 .library_favorite_id(&synced.failures[0].asset_id),
             Some(global_b.id.as_str())
         );
+    }
+
+    #[test]
+    fn sync_ignores_corrupted_content_unreferenced_by_this_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, bundle, _source, asset_id) = saved_core_with_media(tmp.path());
+        let store = LibraryStore::new(tmp.path().join("library"));
+        toggle_favorite_impl(&core, tmp.path(), &store, &asset_id, true).unwrap();
+        let mapped_id = core
+            .media()
+            .library_favorite_id(&asset_id)
+            .unwrap()
+            .to_string();
+        let unrelated = tmp.path().join("unrelated.mp4");
+        fs::write(&unrelated, b"content from another project").unwrap();
+        let unrelated_entry = store
+            .favorite(&FavoriteRequest {
+                source: &unrelated,
+                kind: "video",
+                category: None,
+                favorited_at: 1.0,
+                thumb: None,
+            })
+            .unwrap();
+        fs::write(
+            store.stored_path(&unrelated_entry.id).unwrap().unwrap(),
+            b"corrupt",
+        )
+        .unwrap();
+
+        let synced = sync_project_favorites_impl(&core, tmp.path(), &store, vec![])
+            .expect("unreferenced library content cannot block this project");
+        assert!(synced.failures.is_empty());
+        assert_eq!(
+            core.media().library_favorite_id(&asset_id),
+            Some(mapped_id.as_str())
+        );
+        let reopened = AppCore::new();
+        reopened.open_project(bundle).unwrap();
+        assert_eq!(
+            reopened.media().library_favorite_id(&asset_id),
+            Some(mapped_id.as_str())
+        );
+        fs::write(store.stored_path(&mapped_id).unwrap().unwrap(), b"corrupt").unwrap();
+        let failed = sync_project_favorites_impl(&core, tmp.path(), &store, vec![])
+            .expect("corrupt referenced content is reported per asset");
+        assert_eq!(failed.failures.len(), 1);
+        assert_eq!(failed.failures[0].asset_id, asset_id);
+        assert!(failed.failures[0].message.contains("hash mismatch"));
     }
 
     #[test]
