@@ -56,22 +56,51 @@ pub fn filter(r: &TranscriptionResult, range: (f64, f64)) -> TranscriptionResult
     }
 }
 
-/// Disk-only existence check (`hasCachedOnDisk`).
-pub fn has_cached_on_disk(cache_root: &Path, path: &Path) -> bool {
-    match file_identity_key(path) {
-        Some(key) => disk_path(cache_root, &key).exists(),
-        None => false,
-    }
+/// Whether the word rows still carry every non-ASCII letter or digit of the
+/// segment texts, in order. Transcripts cached before whisper tokens were
+/// reassembled into whole characters silently dropped CJK characters (and
+/// other multi-byte ones) from their word rows while the segment text kept
+/// them; such a transcript is treated as missing so it is transcribed again
+/// and overwritten. The cache format is unchanged, so upstream-compatible
+/// files stay readable, and ASCII-only transcripts are never affected.
+fn words_cover_segment_text(result: &TranscriptionResult) -> bool {
+    let multi_byte = |c: &char| !c.is_ascii() && c.is_alphanumeric();
+    let segment_chars = result
+        .segments
+        .iter()
+        .flat_map(|segment| segment.text.chars())
+        .filter(multi_byte);
+    let word_chars = result
+        .words
+        .iter()
+        .flat_map(|word| word.text.chars())
+        .filter(multi_byte);
+    segment_chars.eq(word_chars)
 }
 
-/// Disk-only read (`cachedOnDisk`). Returns `None` on missing/unparsable file.
+/// Parse a cached transcript, applying the read-side repairs and rejecting
+/// stale entries.
+fn load_cached(data: &[u8]) -> Option<TranscriptionResult> {
+    let r: TranscriptionResult = serde_json::from_slice(data).ok()?;
+    // Read-side #198 defense: scrub non-speech markers out of transcripts
+    // cached before the whisper-layer filter existed.
+    let r = super::sanitize_transcription(r);
+    words_cover_segment_text(&r).then_some(r)
+}
+
+/// Disk-only check for a usable cached transcript (`hasCachedOnDisk`). A stale
+/// entry (see [`cached_on_disk`]) does not count, so indexing transcribes the
+/// source again.
+pub fn has_cached_on_disk(cache_root: &Path, path: &Path) -> bool {
+    cached_on_disk(cache_root, path).is_some()
+}
+
+/// Disk-only read (`cachedOnDisk`). Returns `None` on a missing, unparsable,
+/// or stale file (word rows missing characters of their segment text).
 pub fn cached_on_disk(cache_root: &Path, path: &Path) -> Option<TranscriptionResult> {
     let key = file_identity_key(path)?;
     let data = std::fs::read(disk_path(cache_root, &key)).ok()?;
-    let r: TranscriptionResult = serde_json::from_slice(&data).ok()?;
-    // Read-side #198 defense: scrub non-speech markers out of transcripts
-    // cached before the whisper-layer filter existed.
-    Some(super::sanitize_transcription(r))
+    load_cached(&data)
 }
 
 /// In-memory + disk transcript cache. Thread-safe.
@@ -134,10 +163,10 @@ impl TranscriptCache {
             return Some(r);
         }
         let data = std::fs::read(disk_path(&self.cache_root, key)).ok()?;
-        let r: TranscriptionResult = serde_json::from_slice(&data).ok()?;
-        // Read-side #198 defense (same as `cached_on_disk`): a pre-filter disk
-        // cache must not resurrect "[BLANK_AUDIO]" rows via the memory cache.
-        let r = super::sanitize_transcription(r);
+        // Same read-side repairs as `cached_on_disk`: a pre-filter disk cache
+        // must not resurrect "[BLANK_AUDIO]" rows or stale word rows via the
+        // memory cache.
+        let r = load_cached(&data)?;
         self.remember(key, r.clone());
         Some(r)
     }
@@ -325,6 +354,59 @@ mod tests {
     fn has_cached_missing_file_is_false() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!has_cached_on_disk(dir.path(), Path::new("/no/such.wav")));
+    }
+
+    fn cjk_transcript(words: &[&str]) -> TranscriptionResult {
+        TranscriptionResult {
+            text: "今天天气很好".into(),
+            language: Some("zh".into()),
+            words: words
+                .iter()
+                .enumerate()
+                .map(|(index, text)| TranscriptionWord {
+                    text: (*text).into(),
+                    start: Some(index as f64),
+                    end: Some(index as f64 + 1.0),
+                })
+                .collect(),
+            segments: vec![TranscriptionSegment {
+                text: "今天天气很好。".into(),
+                start: 0.0,
+                end: 3.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn transcripts_whose_words_lost_characters_are_not_served_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut media = tempfile::NamedTempFile::new().unwrap();
+        media.write_all(b"zh-media").unwrap();
+        media.flush().unwrap();
+
+        // Written before tokens were reassembled: split characters are gone
+        // from the word rows though the segment text has them.
+        write_disk_for_test(
+            dir.path(),
+            media.path(),
+            &cjk_transcript(&["今", "天", "很"]),
+        );
+        assert!(cached_on_disk(dir.path(), media.path()).is_none());
+        assert!(!has_cached_on_disk(dir.path(), media.path()));
+        let key = file_identity_key(media.path()).unwrap();
+        assert!(TranscriptCache::new(dir.path()).cached(&key).is_none());
+
+        // A complete transcript is served as before.
+        let complete = cjk_transcript(&["今天", "天气", "很好"]);
+        write_disk_for_test(dir.path(), media.path(), &complete);
+        assert_eq!(cached_on_disk(dir.path(), media.path()), Some(complete));
+        assert!(has_cached_on_disk(dir.path(), media.path()));
+
+        // ASCII-only transcripts are never judged by their word rows.
+        let mut english = res();
+        english.words.truncate(1);
+        write_disk_for_test(dir.path(), media.path(), &english);
+        assert!(cached_on_disk(dir.path(), media.path()).is_some());
     }
 
     /// #198 read-side defense: a disk cache written BEFORE the whisper-layer

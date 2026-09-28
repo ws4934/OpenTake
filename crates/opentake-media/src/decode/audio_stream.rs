@@ -12,8 +12,10 @@
 use std::path::Path;
 
 use crate::cancel::MediaCancelToken;
-use crate::decode::pcm::{decode_raw_pcm_cancellable, PcmFormat, PcmSpec};
-use crate::error::{MediaError, Result};
+#[cfg(test)]
+use crate::decode::pcm::PcmFormat;
+use crate::decode::pcm::{decode_pcm_streaming, InterleavedF32Sink, PcmSpec};
+use crate::error::Result;
 
 /// Build the ffmpeg args to decode the first audio track to raw interleaved PCM
 /// on stdout, honoring an optional `[lo, hi)` absolute-seconds range. Mirrors
@@ -46,36 +48,6 @@ fn interleaved_args(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> V
     args
 }
 
-/// Convert raw interleaved PCM bytes to interleaved f32, **without** folding
-/// channels (the playback mixer pans/sums per channel later).
-fn raw_to_interleaved_f32(bytes: &[u8], spec: &PcmSpec) -> Result<Vec<f32>> {
-    let bytes_per_sample = spec.format.bytes_per_sample();
-    let samples = bytes.len() / bytes_per_sample;
-    let mut out = Vec::new();
-    out.try_reserve_exact(samples).map_err(|error| {
-        MediaError::Decode(format!(
-            "audio_allocation_failed: interleaved f32 reserve {samples}: {error}"
-        ))
-    })?;
-    match spec.format {
-        PcmFormat::F32 => out.extend(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        ),
-        PcmFormat::S16Le => out.extend(
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
-        ),
-    }
-    Ok(out)
-}
-
 /// Decode `path`'s first audio track to interleaved f32 at the requested spec
 /// (channels preserved). `range` is an absolute-seconds `[lo, hi)` window. Errors
 /// with `NoTrack("audio", …)` when the file has no audio stream.
@@ -87,14 +59,20 @@ pub fn decode_pcm_interleaved(
     decode_pcm_interleaved_cancellable(path, spec, range, &MediaCancelToken::new())
 }
 
+/// Channels stay interleaved and unfolded (the playback mixer pans/sums per
+/// channel later). Samples are converted as FFmpeg streams them, so only the
+/// f32 result is ever held, not a raw byte copy of the track beside it.
 pub fn decode_pcm_interleaved_cancellable(
     path: &Path,
     spec: &PcmSpec,
     range: Option<(f64, f64)>,
     cancel: &MediaCancelToken,
 ) -> Result<Vec<f32>> {
-    let raw = decode_raw_pcm_cancellable(path, spec, range, cancel, None)?;
-    raw_to_interleaved_f32(&raw, spec)
+    let channels = usize::from(spec.channels);
+    let sink = decode_pcm_streaming(path, spec, range, cancel, None, |frames| {
+        InterleavedF32Sink::with_capacity(spec.format, frames.saturating_mul(channels))
+    })?;
+    Ok(sink.into_samples())
 }
 
 #[cfg(test)]
@@ -133,6 +111,17 @@ mod tests {
         assert!(!args.iter().any(|a| a == "-ss"));
     }
 
+    /// Interleaved f32 of `bytes` streamed through the decode's framing.
+    fn interleaved(bytes: &[u8], spec: &PcmSpec) -> Vec<f32> {
+        let frame_bytes = spec.format.bytes_per_sample() * usize::from(spec.channels);
+        let mut sink = InterleavedF32Sink::with_capacity(spec.format, 0).unwrap();
+        let mut aligner = crate::decode::pcm::FrameAligner::new(frame_bytes);
+        for read in bytes.chunks(3) {
+            aligner.feed(read, &mut sink).unwrap();
+        }
+        sink.into_samples()
+    }
+
     #[test]
     fn f32_interleaved_keeps_channels_unfolded() {
         // Stereo: (L=1.0 R=-1.0), (L=0.5 R=0.0) — NOT averaged to mono.
@@ -140,7 +129,7 @@ mod tests {
         for v in [1.0f32, -1.0, 0.5, 0.0] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        let out = raw_to_interleaved_f32(&bytes, &spec(2, PcmFormat::F32)).unwrap();
+        let out = interleaved(&bytes, &spec(2, PcmFormat::F32));
         assert_eq!(out, vec![1.0, -1.0, 0.5, 0.0]);
     }
 
@@ -150,7 +139,7 @@ mod tests {
         for v in [0i16, 16384, -32768, 0] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        let out = raw_to_interleaved_f32(&bytes, &spec(2, PcmFormat::S16Le)).unwrap();
+        let out = interleaved(&bytes, &spec(2, PcmFormat::S16Le));
         assert_eq!(out.len(), 4);
         assert!((out[0] - 0.0).abs() < 1e-6);
         assert!((out[1] - 0.5).abs() < 1e-3);
@@ -160,7 +149,7 @@ mod tests {
     #[test]
     fn trailing_partial_sample_is_ignored() {
         // 5 bytes of f32 = 1 full sample + 1 stray byte → 1 sample.
-        let out = raw_to_interleaved_f32(&[0, 0, 0, 63, 7], &spec(1, PcmFormat::F32)).unwrap();
+        let out = interleaved(&[0, 0, 0, 63, 7], &spec(1, PcmFormat::F32));
         assert_eq!(out.len(), 1);
     }
 }

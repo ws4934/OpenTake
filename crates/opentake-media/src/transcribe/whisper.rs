@@ -6,12 +6,15 @@
 //! whisper's centisecond segment times are converted to seconds, mirroring
 //! upstream `decodeResults` (`Transcription.swift:284-322`): one
 //! `TranscriptionSegment` per endpointed segment, one `TranscriptionWord` per
-//! non-blank token, `text` = trimmed concatenation of segment texts.
+//! non-blank token (tokens that split one multi-byte character between them
+//! form a single word, see `tokens.rs`), `text` = trimmed concatenation of
+//! segment texts.
 
 use std::path::Path;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use super::tokens::{assemble_segments, cs_to_secs, RawSegment, RawToken};
 use super::{
     TranscribeOptions, Transcriber, TranscriptionResult, TranscriptionSegment, TranscriptionWord,
 };
@@ -43,11 +46,6 @@ impl WhisperTranscriber {
         self.n_threads = threads.max(1);
         self
     }
-}
-
-/// whisper segment times are in centiseconds (1/100 s).
-fn cs_to_secs(cs: i64) -> f64 {
-    cs as f64 / 100.0
 }
 
 // whisper.cpp's experimental token timestamps can spread the first words of
@@ -294,66 +292,63 @@ impl Transcriber for WhisperTranscriber {
         let n_segments = state
             .full_n_segments()
             .map_err(|e| MediaError::Transcribe(format!("n_segments: {e}")))?;
+        let eot = self.ctx.token_eot();
+
+        // Read raw bytes: BPE tokens (and even a segment boundary) may split a
+        // multi-byte character, so a token or segment is not valid UTF-8 on
+        // its own. `assemble_segments` rebuilds whole characters.
+        let mut raw_segments = Vec::new();
+        for i in 0..n_segments {
+            let text = state
+                .full_get_segment_bytes(i)
+                .map_err(|e| MediaError::Transcribe(format!("segment text: {e}")))?;
+            let n_tokens = state.full_n_tokens(i).unwrap_or(0);
+            let mut tokens = Vec::new();
+            for j in 0..n_tokens {
+                let Ok(bytes) = state.full_get_token_bytes(i, j) else {
+                    continue;
+                };
+                let data = state.full_get_token_data(i, j).ok();
+                tokens.push(RawToken {
+                    bytes,
+                    special: state.full_get_token_id(i, j).is_ok_and(|id| id >= eot),
+                    t0: data.map(|d| d.t0),
+                    t1: data.map(|d| d.t1),
+                });
+            }
+            raw_segments.push(RawSegment {
+                text,
+                t0: state.full_get_segment_t0(i).unwrap_or(0),
+                t1: state.full_get_segment_t1(i).unwrap_or(0),
+                tokens,
+            });
+        }
 
         let mut segments = Vec::new();
         let mut words = Vec::new();
         let mut full_text = String::new();
 
-        for i in 0..n_segments {
-            let seg_text = state
-                .full_get_segment_text(i)
-                .map_err(|e| MediaError::Transcribe(format!("segment text: {e}")))?;
-
-            let t0 = state.full_get_segment_t0(i).unwrap_or(0);
-            let t1 = state.full_get_segment_t1(i).unwrap_or(0);
-            let trimmed = seg_text.trim();
+        for assembled in assemble_segments(raw_segments) {
+            if assembled.text.contains('\u{FFFD}') {
+                tracing::warn!("whisper segment text was not valid UTF-8; replaced invalid bytes");
+            }
+            let trimmed = assembled.text.trim();
             // Skip a segment that is (once trimmed) nothing but a non-speech
             // marker whisper learned from its training captions — e.g.
             // "[BLANK_AUDIO]" over a silent gap (#198). These are ordinary
-            // decoded text, not the internal special tokens filtered below, so
-            // they only ever show up reconstructed at the segment level.
-            // Excluded from `full_text` too, so the plain-text summary stays
-            // consistent with `segments`.
+            // decoded text, not the internal special tokens filtered from the
+            // words, so they only ever show up reconstructed at the segment
+            // level. Excluded from `full_text` too, so the plain-text summary
+            // stays consistent with `segments`.
             let keep_segment = !trimmed.is_empty() && !super::is_non_speech_marker(trimmed);
             if keep_segment {
-                full_text.push_str(&seg_text);
-            }
-
-            let n_tokens = state.full_n_tokens(i).unwrap_or(0);
-            let mut segment_words = Vec::new();
-            for j in 0..n_tokens {
-                let tok_text = match state.full_get_token_text(i, j) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let trimmed_tok = tok_text.trim();
-                // Skip special tokens (whisper wraps them in [..] / <|..|>),
-                // blanks, and a token that is itself a whole non-speech marker
-                // (a short marker like "[MUSIC]" can decode as one token).
-                if trimmed_tok.is_empty()
-                    || (trimmed_tok.starts_with("[_"))
-                    || (trimmed_tok.starts_with("<|") && trimmed_tok.ends_with("|>"))
-                    || super::is_non_speech_marker(trimmed_tok)
-                {
-                    continue;
-                }
-                let data = state.full_get_token_data(i, j).ok();
-                let (start, end) = match data {
-                    Some(d) => (Some(cs_to_secs(d.t0)), Some(cs_to_secs(d.t1))),
-                    None => (None, None),
-                };
-                segment_words.push(TranscriptionWord {
-                    text: trimmed_tok.to_string(),
-                    start,
-                    end,
-                });
-            }
-            if keep_segment {
+                full_text.push_str(&assembled.text);
                 let mut segment = TranscriptionSegment {
                     text: trimmed.to_string(),
-                    start: cs_to_secs(t0),
-                    end: cs_to_secs(t1),
+                    start: cs_to_secs(assembled.t0),
+                    end: cs_to_secs(assembled.t1),
                 };
+                let mut segment_words: Vec<TranscriptionWord> = assembled.words;
                 align_segment_to_speech(pcm, &mut segment, &mut segment_words);
                 normalize_word_timings(&segment, &mut segment_words);
                 segments.push(segment);

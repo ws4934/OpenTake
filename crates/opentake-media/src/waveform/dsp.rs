@@ -70,6 +70,98 @@ pub fn rms_downsample_normalized(samples: &[f32], count: usize) -> Vec<f32> {
     rms
 }
 
+/// Streaming form of [`rms_downsample_normalized`]: buckets laid out for an
+/// expected sample count, accumulated as samples arrive, in `O(count)` memory.
+///
+/// Bucket `b` spans the same half-open slice `[b * n / count, hi)` that
+/// [`rms_downsample_normalized`] uses for `n` samples, with `n` fixed to
+/// `expected` up front, and sums squares in the same order, so a stream of
+/// exactly `expected` samples yields the same values. A shorter stream leaves
+/// its trailing buckets silent (the audio ended before the requested
+/// duration) instead of stretching the audio across all of them; samples past
+/// `expected` are ignored.
+pub struct RmsBuckets {
+    count: usize,
+    expected: usize,
+    sum_squares: Vec<f64>,
+    lengths: Vec<usize>,
+    /// Index of the next sample to arrive.
+    next: usize,
+    /// First bucket whose span has not ended before `next`.
+    first_open: usize,
+}
+
+impl RmsBuckets {
+    pub fn new(count: usize, expected: usize) -> Self {
+        RmsBuckets {
+            count,
+            expected,
+            sum_squares: vec![0.0; count],
+            lengths: vec![0; count],
+            next: 0,
+            first_open: 0,
+        }
+    }
+
+    fn lo(&self, bucket: usize) -> usize {
+        bucket * self.expected / self.count
+    }
+
+    fn hi(&self, bucket: usize) -> usize {
+        ((bucket + 1) * self.expected / self.count)
+            .max(self.lo(bucket) + 1)
+            .min(self.expected)
+    }
+
+    pub fn push(&mut self, sample: f32) {
+        let index = self.next;
+        self.next += 1;
+        if index >= self.expected {
+            return;
+        }
+        while self.first_open < self.count && self.hi(self.first_open) <= index {
+            self.first_open += 1;
+        }
+        // Several buckets share a sample only when there are fewer samples
+        // than buckets.
+        let square = (sample as f64) * (sample as f64);
+        let mut bucket = self.first_open;
+        while bucket < self.count && self.lo(bucket) <= index {
+            if index < self.hi(bucket) {
+                self.sum_squares[bucket] += square;
+                self.lengths[bucket] += 1;
+            }
+            bucket += 1;
+        }
+    }
+
+    /// Normalized buckets, `0 = loud, 1 = silence`, as
+    /// [`rms_downsample_normalized`] reports them.
+    pub fn finish(self) -> Vec<f32> {
+        let mut rms = self
+            .sum_squares
+            .iter()
+            .zip(&self.lengths)
+            .map(|(&sum, &length)| {
+                if length == 0 {
+                    0.0
+                } else {
+                    (sum / length as f64).sqrt() as f32
+                }
+            })
+            .collect::<Vec<f32>>();
+        let peak = rms.iter().copied().fold(0.0f32, f32::max);
+        if peak <= f32::EPSILON {
+            return vec![1.0; self.count];
+        }
+        for v in rms.iter_mut() {
+            let amp = (*v / peak).clamp(0.0, 1.0);
+            *v = 1.0 - amp;
+        }
+        rms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +270,83 @@ mod tests {
         for v in out {
             assert!((0.0..=1.0).contains(&v), "out of [0,1]: {v}");
         }
+    }
+
+    // --- RmsBuckets: streaming equivalence ---
+
+    /// Deterministic pseudo-random signal with loud and quiet stretches.
+    fn signal(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state % 2001) as f32 / 1000.0 - 1.0;
+                let envelope = if (index / 997) % 3 == 0 { 0.05 } else { 0.9 };
+                noise * envelope
+            })
+            .collect()
+    }
+
+    fn streamed(samples: &[f32], count: usize, expected: usize) -> Vec<f32> {
+        let mut buckets = RmsBuckets::new(count, expected);
+        for &sample in samples {
+            buckets.push(sample);
+        }
+        buckets.finish()
+    }
+
+    fn max_error(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn streaming_rms_matches_the_whole_buffer_downsample() {
+        for (n, count) in [
+            (10_000, 4_000),
+            (88_200, 4_000),
+            (1_000_003, 20_000),
+            (3, 10),
+            (4_000, 4_000),
+            (1, 4_000),
+        ] {
+            let samples = signal(n, n as u64 + 1);
+            let error = max_error(
+                &streamed(&samples, count, n),
+                &rms_downsample_normalized(&samples, count),
+            );
+            assert!(error < 1e-4, "n={n} count={count} error={error}");
+        }
+        assert_eq!(streamed(&[], 4_000, 0), vec![1.0; 4_000]);
+        assert!(streamed(&[0.5], 0, 1).is_empty());
+    }
+
+    #[test]
+    fn streaming_rms_handles_a_slightly_short_or_long_stream() {
+        let expected = 22_050 * 3;
+        let samples = signal(expected, 7);
+        let exact = streamed(&samples, 4_000, expected);
+
+        // A few samples short (decoder padding): only the tail bucket changes,
+        // by little.
+        let short = streamed(&samples[..expected - 5], 4_000, expected);
+        assert_eq!(short.len(), 4_000);
+        assert!(max_error(&short[..3_999], &exact[..3_999]) < 1e-4);
+        assert!(short.iter().all(|v| (0.0..=1.0).contains(v)));
+
+        // Samples past the expected count are ignored.
+        let mut long = samples.clone();
+        long.extend(std::iter::repeat_n(1.0, 50));
+        assert_eq!(streamed(&long, 4_000, expected), exact);
+
+        // Audio that ends early leaves its missing tail silent.
+        let half = streamed(&samples[..expected / 2], 4_000, expected);
+        assert!(half[3_000..].iter().all(|v| *v == 1.0));
+        assert!(half[..1_990].iter().any(|v| *v < 0.5));
     }
 }

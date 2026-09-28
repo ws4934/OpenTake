@@ -93,14 +93,20 @@ struct ProbeAdmission;
 static FFPROBE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static FFPROBE_EXECUTOR: OnceLock<Result<ProbeExecutor, String>> = OnceLock::new();
 
+fn admission_limit_error() -> crate::error::MediaError {
+    crate::error::MediaError::Ffmpeg("ffprobe admission limit reached".to_string())
+}
+
 impl ProbeAdmission {
-    fn acquire() -> crate::error::Result<Self> {
+    fn try_acquire() -> Option<Self> {
+        #[cfg(test)]
+        if test_seams::admission_saturated() {
+            return None;
+        }
         let mut active = FFPROBE_ACTIVE.load(Ordering::Acquire);
         loop {
             if active >= FFPROBE_MAX_IN_FLIGHT {
-                return Err(crate::error::MediaError::Ffmpeg(
-                    "ffprobe admission limit reached".to_string(),
-                ));
+                return None;
             }
             match FFPROBE_ACTIVE.compare_exchange_weak(
                 active,
@@ -108,9 +114,41 @@ impl ProbeAdmission {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self),
+                Ok(_) => return Some(Self),
                 Err(observed) => active = observed,
             }
+        }
+    }
+
+    fn acquire() -> crate::error::Result<Self> {
+        Self::try_acquire().ok_or_else(admission_limit_error)
+    }
+
+    /// Wait for a free slot for at most `wait`, polling `cancel`. Decode-time
+    /// probes queue here instead of failing the moment other media work holds
+    /// every slot.
+    fn acquire_waiting(
+        cancel: &crate::MediaCancelToken,
+        wait: Duration,
+    ) -> crate::error::Result<Self> {
+        #[cfg(test)]
+        let wait = test_seams::admission_wait_override().unwrap_or(wait);
+        let deadline = Instant::now().checked_add(wait);
+        loop {
+            if let Some(admission) = Self::try_acquire() {
+                return Ok(admission);
+            }
+            if cancel.checkpoint() {
+                return Err(crate::error::MediaError::Cancelled);
+            }
+            let now = Instant::now();
+            let Some(remaining) = deadline
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Err(admission_limit_error());
+            };
+            std::thread::sleep(FFPROBE_POLL_INTERVAL.min(remaining));
         }
     }
 }
@@ -592,17 +630,26 @@ fn receive_probe_response<T>(
     }
 }
 
+/// Run one bounded ffprobe. `admission_wait` of zero fails at once when every
+/// admission slot is taken; a positive wait queues (cancellably) for a slot.
 fn run_ffprobe(
     executable: &std::ffi::OsStr,
     input_path: Option<&Path>,
     input_file: Option<&std::fs::File>,
     cancel: &crate::MediaCancelToken,
     timeout: Duration,
+    admission_wait: Duration,
 ) -> crate::error::Result<FfprobeOutput> {
+    #[cfg(test)]
+    test_seams::record_probe_request();
     if cancel.checkpoint() {
         return Err(crate::error::MediaError::Cancelled);
     }
-    let _admission = ProbeAdmission::acquire()?;
+    let _admission = if admission_wait.is_zero() {
+        ProbeAdmission::acquire()?
+    } else {
+        ProbeAdmission::acquire_waiting(cancel, admission_wait)?
+    };
     let (operation_deadline, api_deadline) = probe_deadlines(timeout)?;
     let input = match (input_path, input_file) {
         (Some(path), None) => ProbeInput::Path(path.to_path_buf()),
@@ -705,6 +752,10 @@ fn resolve_cli_path(
 
 /// Path to `ffmpeg`: explicit development override, packaged sidecar, then PATH.
 pub fn ffmpeg_path() -> OsString {
+    #[cfg(test)]
+    if let Some(path) = test_seams::ffmpeg_override() {
+        return path;
+    }
     let executable = std::env::current_exe().ok();
     resolve_cli_path(
         std::env::var_os("OPENTAKE_FFMPEG"),
@@ -715,6 +766,10 @@ pub fn ffmpeg_path() -> OsString {
 
 /// Path to `ffprobe`: explicit development override, packaged sidecar, then PATH.
 pub fn ffprobe_path() -> OsString {
+    #[cfg(test)]
+    if let Some(path) = test_seams::ffprobe_override() {
+        return path;
+    }
     let executable = std::env::current_exe().ok();
     resolve_cli_path(
         std::env::var_os("OPENTAKE_FFPROBE"),
@@ -775,6 +830,7 @@ pub fn ffprobe_json(path: &std::path::Path) -> crate::error::Result<serde_json::
         None,
         &crate::MediaCancelToken::new(),
         FFPROBE_TIMEOUT,
+        Duration::ZERO,
     )?;
     if !out.status.success() {
         return Err(crate::error::MediaError::Ffmpeg(format!(
@@ -783,6 +839,53 @@ pub fn ffprobe_json(path: &std::path::Path) -> crate::error::Result<serde_json::
         )));
     }
     serde_json::from_slice(&out.stdout)
+        .map_err(|e| crate::error::MediaError::Ffmpeg(format!("ffprobe json: {e}")))
+}
+
+/// Input of a queued probe: a pathname, or an already-open regular file
+/// probed through `fd:` without resolving any pathname.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProbeTarget<'a> {
+    Path(&'a Path),
+    File(&'a std::fs::File),
+}
+
+/// Outcome of a probe that ran to completion.
+pub(crate) enum QueuedProbe {
+    /// ffprobe read the input and reported its streams and format.
+    Parsed(serde_json::Value),
+    /// ffprobe ran and rejected the input as unreadable media (its error exit
+    /// status 1). Unlike a helper failure this is a verdict on the input.
+    Rejected,
+}
+
+/// Probe on behalf of a caller that is about to decode: the caller's
+/// cancellation token stops the helper, `timeout` bounds it, and a saturated
+/// admission limit is waited out for at most `admission_wait` rather than
+/// failing immediately.
+pub(crate) fn ffprobe_json_queued(
+    target: ProbeTarget<'_>,
+    cancel: &crate::MediaCancelToken,
+    timeout: Duration,
+    admission_wait: Duration,
+) -> crate::error::Result<QueuedProbe> {
+    let executable = ffprobe_path();
+    let (path, file) = match target {
+        ProbeTarget::Path(path) => (Some(path), None),
+        ProbeTarget::File(file) => (None, Some(file)),
+    };
+    let out = run_ffprobe(&executable, path, file, cancel, timeout, admission_wait)?;
+    if out.status.code() == Some(1) {
+        return Ok(QueuedProbe::Rejected);
+    }
+    if !out.status.success() {
+        return Err(crate::error::MediaError::Ffmpeg(format!(
+            "ffprobe exited {}",
+            out.status
+        )));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map(QueuedProbe::Parsed)
         .map_err(|e| crate::error::MediaError::Ffmpeg(format!("ffprobe json: {e}")))
 }
 
@@ -799,7 +902,14 @@ pub fn ffprobe_json_file_cancellable(
     timeout: Duration,
 ) -> crate::error::Result<serde_json::Value> {
     let executable = ffprobe_path();
-    let out = run_ffprobe(&executable, None, Some(file), cancel, timeout)?;
+    let out = run_ffprobe(
+        &executable,
+        None,
+        Some(file),
+        cancel,
+        timeout,
+        Duration::ZERO,
+    )?;
     if !out.status.success() {
         return Err(crate::error::MediaError::Ffmpeg(format!(
             "ffprobe fd input exited {}",
@@ -808,6 +918,76 @@ pub fn ffprobe_json_file_cancellable(
     }
     serde_json::from_slice(&out.stdout)
         .map_err(|e| crate::error::MediaError::Ffmpeg(format!("ffprobe json: {e}")))
+}
+
+/// Per-thread fault and observation seams for helper tests. The admission
+/// counter, probe runtime, and caches are process-wide and tests run in
+/// parallel, so every seam applies only to the calling thread (admission,
+/// executable resolution, and request accounting all happen on the thread
+/// that asks for the probe).
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    thread_local! {
+        static ADMISSION_SATURATED: Cell<bool> = const { Cell::new(false) };
+        static ADMISSION_WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
+        static PROBE_REQUESTS: Cell<usize> = const { Cell::new(0) };
+        static FFPROBE_OVERRIDE: RefCell<Option<OsString>> = const { RefCell::new(None) };
+        static FFMPEG_OVERRIDE: RefCell<Option<OsString>> = const { RefCell::new(None) };
+    }
+
+    /// Make every admission attempt on this thread behave as if all slots
+    /// were taken by other work.
+    pub(crate) fn saturate_admission(saturated: bool) {
+        ADMISSION_SATURATED.with(|cell| cell.set(saturated));
+    }
+
+    pub(crate) fn admission_saturated() -> bool {
+        ADMISSION_SATURATED.with(Cell::get)
+    }
+
+    /// Shorten (or restore with `None`) the queued-admission wait on this thread.
+    pub(crate) fn override_admission_wait(wait: Option<Duration>) {
+        ADMISSION_WAIT.with(|cell| cell.set(wait));
+    }
+
+    pub(crate) fn admission_wait_override() -> Option<Duration> {
+        ADMISSION_WAIT.with(Cell::get)
+    }
+
+    pub(crate) fn record_probe_request() {
+        PROBE_REQUESTS.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    /// Number of ffprobe requests this thread has made so far.
+    pub(crate) fn probe_requests() -> usize {
+        PROBE_REQUESTS.with(Cell::get)
+    }
+
+    /// Resolve `ffprobe` to `path` for probes requested by this thread. Only
+    /// Unix tests stand in a shell script for the executable.
+    #[cfg(unix)]
+    pub(crate) fn override_ffprobe(path: Option<OsString>) {
+        FFPROBE_OVERRIDE.with(|cell| *cell.borrow_mut() = path);
+    }
+
+    pub(crate) fn ffprobe_override() -> Option<OsString> {
+        FFPROBE_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+
+    /// Resolve `ffmpeg` to `path` for commands built on this thread (Unix
+    /// tests only, like `override_ffprobe`).
+    #[cfg(unix)]
+    pub(crate) fn override_ffmpeg(path: Option<OsString>) {
+        FFMPEG_OVERRIDE.with(|cell| *cell.borrow_mut() = path);
+    }
+
+    pub(crate) fn ffmpeg_override() -> Option<OsString> {
+        FFMPEG_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
 }
 
 #[cfg(test)]
@@ -849,6 +1029,7 @@ mod tests {
                 Some(&input),
                 &crate::MediaCancelToken::new(),
                 Duration::from_secs(3),
+                Duration::ZERO,
             );
             let starved = matches!(
                 &attempt,
@@ -1102,6 +1283,7 @@ mod tests {
                 Some(&input),
                 &worker_cancel,
                 Duration::from_secs(60),
+                Duration::ZERO,
             );
             done_tx.send(result).unwrap();
         });

@@ -214,6 +214,91 @@ fn extract_pcm_without_explicit_range_matches_full_track_decode() {
 }
 
 #[test]
+fn whole_track_pcm_decodes_a_vbr_mp3_past_its_estimated_duration() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mp3 = dir.path().join("vbr-no-xing.mp3");
+    // 20 s of noise then 100 s of silence as VBR MP3 without a Xing header:
+    // the demuxer estimates the duration from the loud opening frames.
+    let generated = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "anoisesrc=d=20:r=48000"])
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=100"])
+        .args(["-filter_complex", "[0][1]concat=n=2:v=0:a=1"])
+        .args(["-c:a", "libmp3lame", "-q:a", "5", "-write_xing", "0"])
+        .arg(&mp3)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !generated {
+        eprintln!("skip: this ffmpeg cannot encode MP3");
+        return;
+    }
+    let estimated = probe(&mp3).unwrap();
+    assert!(
+        estimated.duration_secs < 100.0,
+        "fixture must be underestimated, got {}",
+        estimated.duration_secs
+    );
+
+    let spec = PcmSpec {
+        sample_rate: 16_000,
+        channels: 1,
+        format: PcmFormat::F32,
+    };
+    let pcm = extract_pcm(&mp3, &spec, None).expect("whole-track VBR MP3 decode");
+    assert!(
+        (pcm.duration_secs() - 120.0).abs() < 0.1,
+        "decoded {} s",
+        pcm.duration_secs()
+    );
+}
+
+#[test]
+fn whole_track_pcm_keeps_audio_that_outlasts_the_video() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("long-audio.mp4");
+    let generated = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=64x36:rate=30:d=2"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:d=4",
+        ])
+        .args(["-c:v", "mpeg4", "-c:a", "aac"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(generated.success(), "generate long-audio fixture");
+    let probed = probe(&clip).unwrap();
+    assert!((probed.duration_secs - 2.0).abs() < 0.1, "{probed:?}");
+    assert!(probed.audio_duration_secs.is_some_and(|audio| audio > 3.9));
+
+    let spec = PcmSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        format: PcmFormat::F32,
+    };
+    let interleaved = opentake_media::decode_pcm_interleaved_cancellable(
+        &clip,
+        &spec,
+        None,
+        &opentake_media::MediaCancelToken::new(),
+    )
+    .expect("whole-track decode keeps the audio past the video");
+    let seconds = interleaved.len() as f64 / 2.0 / 48_000.0;
+    assert!((seconds - 4.0).abs() < 0.1, "decoded {seconds} s");
+}
+
+#[test]
 fn extract_pcm_range_is_shorter() {
     if !ffmpeg_available() {
         return;
@@ -661,8 +746,8 @@ fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
     assert_eq!((batch[0].1, batch[1].1), (0, 30));
     assert!((batch[1].0 - 1.0).abs() < 1e-5);
 
-    // The retained-handle path pipes the file and cannot seek; it must select
-    // the same frame.
+    // The retained-handle path decodes from the open file instead of the
+    // pathname; it must select the same frame.
     let file = std::fs::File::open(&clip).unwrap();
     let (actual, frame) = decode_frame_file_at_cancellable(
         &file,
@@ -675,6 +760,76 @@ fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
     .unwrap();
     assert_eq!(source_index(&frame), 90);
     assert!((actual - 3.0).abs() < 1e-5, "{actual}");
+}
+
+/// `(actual pts in µs, source frame)` per emitted frame of a batch decode.
+fn batched(path: &Path, times: &[f64]) -> Vec<(i64, i64)> {
+    decode_frames_at(path, times, &FrameRequest::default())
+        .into_iter()
+        .map(|result| {
+            let (actual, frame) = result.expect("batched frame");
+            ((actual * 1e6).round() as i64, source_index(&frame))
+        })
+        .collect()
+}
+
+/// The same selection made one seek-decode at a time, with the batch API's
+/// `t > lastTime` de-duplication.
+fn one_by_one(path: &Path, times: &[f64]) -> Vec<(i64, i64)> {
+    let mut last = f64::NEG_INFINITY;
+    let mut out = Vec::new();
+    for &time in times {
+        let (actual, index) = frame_at(path, time);
+        if actual > last {
+            last = actual;
+            out.push(((actual * 1e6).round() as i64, index));
+        }
+    }
+    out
+}
+
+#[test]
+fn batched_forward_decode_matches_single_frame_decodes() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfr = dir.path().join("numbered30.mp4");
+    let vfr = dir.path().join("vfr.mp4");
+    if !make_numbered(&cfr, "30", 150, None)
+        || !make_numbered(&vfr, "30", 60, Some("setpts='if(gte(N,30),PTS+1/TB,PTS)'"))
+    {
+        eprintln!("skip: could not generate test media");
+        return;
+    }
+
+    let half_seconds = (0..10).map(|i| i as f64 * 0.5).collect::<Vec<_>>();
+    for times in [
+        vec![0.0, 1.0, 2.0, 3.0, 4.0],
+        half_seconds,
+        // A grid subset whose last target repeats the frame at 1.0 s.
+        vec![0.0, 1.0, 1.01, 2.5, 4.9],
+    ] {
+        let expected = one_by_one(&cfr, &times);
+        assert_eq!(batched(&cfr, &times), expected, "targets {times:?}");
+    }
+    assert_eq!(
+        batched(&cfr, &[0.0, 1.0, 2.0])
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>(),
+        vec![0, 30, 60]
+    );
+
+    // Across a one-second VFR gap the frame before the gap stays on screen.
+    let times = [0.5, 1.0, 1.5, 2.0, 2.5];
+    let expected = one_by_one(&vfr, &times);
+    assert_eq!(
+        expected.iter().map(|(_, index)| *index).collect::<Vec<_>>(),
+        vec![15, 29, 30, 45]
+    );
+    assert_eq!(batched(&vfr, &times), expected);
 }
 
 #[test]

@@ -970,6 +970,46 @@ mod tests {
     }
 
     #[test]
+    fn caption_specs_rebuild_a_cut_cjk_segment_without_dropping_characters() {
+        // Word rows as the whisper backend assembles them for Chinese: whole
+        // characters, even where BPE split one across tokens. A cut removes
+        // the filler 嗯 between two fragments of the same source.
+        let before = clip("before", 0, 60, 0, 1.0); // source 0-2 s
+        let after = clip("after", 60, 90, 90, 1.0); // source 3-6 s
+        let transcript = result(
+            vec![
+                word("今天", 0.2, 1.0),
+                word("天气", 1.0, 1.8),
+                word("嗯", 2.2, 2.8),
+                word("很好", 3.2, 4.0),
+            ],
+            vec![seg("今天天气，嗯，很好。", 0.2, 4.0)],
+        );
+        let targets = vec![
+            CaptionTarget {
+                clip_id: "before".into(),
+                track_id: "voice".into(),
+                clip: &before,
+                transcript: Some(&transcript),
+            },
+            CaptionTarget {
+                clip_id: "after".into(),
+                track_id: "voice".into(),
+                clip: &after,
+                transcript: Some(&transcript),
+            },
+        ];
+
+        let out = caption_specs(&targets, 30, CaptionCase::Auto, "g", &fits_chars(20));
+
+        let contents = out
+            .iter()
+            .map(|spec| spec.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["今天天气，", "很好。"]);
+    }
+
+    #[test]
     fn caption_specs_empty_transcript_yields_nothing() {
         let c = clip("c1", 0, 300, 0, 1.0);
         let targets = vec![CaptionTarget {

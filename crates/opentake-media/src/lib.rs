@@ -164,13 +164,14 @@ pub use proxy::{
 
 pub use decode::{
     convert_frame_rate, decode_frame_at, decode_frame_at_cancellable,
-    decode_frame_file_at_cancellable, decode_frames_at, decode_frames_at_cancellable,
-    decode_pcm_interleaved, decode_pcm_interleaved_cancellable, extract_pcm,
-    extract_pcm_cancellable, extract_pcm_cancellable_with_progress, interpolate_frame_pair,
-    source_frame_pair, FrameInterpolationFallback, FrameInterpolationMode,
-    FrameInterpolationResult, FrameRateSample, FrameRequest, PcmBuffer, PcmFormat,
-    PcmProgressCallback, PcmSpec, StreamDecodeControl, StreamVideoFrame, VideoStream,
-    VideoStreamRequest, DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY,
+    decode_frame_at_with_color_cancellable, decode_frame_file_at_cancellable,
+    decode_frame_file_at_with_color_cancellable, decode_frames_at, decode_frames_at_cancellable,
+    decode_frames_at_with_color_cancellable, decode_pcm_interleaved,
+    decode_pcm_interleaved_cancellable, extract_pcm, extract_pcm_cancellable,
+    extract_pcm_cancellable_with_progress, interpolate_frame_pair, source_frame_pair, ColorHint,
+    FrameInterpolationFallback, FrameInterpolationMode, FrameInterpolationResult, FrameRateSample,
+    FrameRequest, PcmBuffer, PcmFormat, PcmProgressCallback, PcmSpec, StreamDecodeControl,
+    StreamVideoFrame, VideoStream, VideoStreamRequest, DEFAULT_VIDEO_STREAM_QUEUE_CAPACITY,
 };
 
 pub use encode::{ExportPreset, ExportResolution, VideoCodec, VideoEncoder};

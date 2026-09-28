@@ -1,6 +1,6 @@
-//! Waveform generation: ffmpeg audio decode → mono f32 → RMS downsample →
-//! normalized `0=loud, 1=silence` buckets, with an optional `.waveform` disk
-//! cache.
+//! Waveform generation: ffmpeg audio decode → streamed mono f32 → RMS
+//! downsample → normalized `0=loud, 1=silence` buckets, with an optional
+//! `.waveform` disk cache.
 //!
 //! Replaces upstream's `DSWaveformImage` dependency (`MediaVisualCache.swift`).
 //! The count formula and normalization are byte-for-byte intent-compatible; the
@@ -25,9 +25,12 @@ pub use dsp::{
 
 use std::path::Path;
 
+use dsp::RmsBuckets;
+
 use crate::cache_key::visual_file_identity_key;
+use crate::decode::pcm::{decode_pcm_streaming, PcmSink};
 use crate::error::Result;
-use crate::{extract_pcm_cancellable, MediaCancelToken, PcmFormat, PcmSpec};
+use crate::{MediaCancelToken, PcmFormat, PcmSpec};
 
 /// Sample rate for waveform decode. The exact rate is immaterial — the signal is
 /// RMS-downsampled to a fixed bucket count derived from duration — so a single
@@ -41,6 +44,22 @@ pub fn waveform(path: &Path, duration_secs: f64) -> Result<Vec<f32>> {
     waveform_cancellable(path, duration_secs, &MediaCancelToken::new())
 }
 
+/// Waveform RMS accumulated straight from the decoder's f32 mono output.
+struct WaveformSink(RmsBuckets);
+
+impl PcmSink for WaveformSink {
+    fn push_frames(&mut self, frames: &[u8]) -> Result<()> {
+        let (samples, _) = frames.as_chunks::<4>();
+        for sample in samples {
+            self.0.push(f32::from_le_bytes(*sample));
+        }
+        Ok(())
+    }
+}
+
+/// The decoded samples stream into per-bucket RMS sums, so memory stays
+/// bounded by the bucket count however long the source is. Buckets are laid
+/// out over the requested duration's exact frame budget; see [`RmsBuckets`].
 pub fn waveform_cancellable(
     path: &Path,
     duration_secs: f64,
@@ -51,9 +70,16 @@ pub fn waveform_cancellable(
         channels: 1,
         format: PcmFormat::F32,
     };
-    let pcm = extract_pcm_cancellable(path, &spec, Some((0.0, duration_secs)), cancel)?;
     let count = waveform_sample_count(duration_secs);
-    Ok(rms_downsample_normalized(&pcm.samples_f32, count))
+    let sink = decode_pcm_streaming(
+        path,
+        &spec,
+        Some((0.0, duration_secs)),
+        cancel,
+        None,
+        |expected_frames| Ok(WaveformSink(RmsBuckets::new(count, expected_frames))),
+    )?;
+    Ok(sink.0.finish())
 }
 
 /// Compute a cancellable waveform and serialize the cache payload without
