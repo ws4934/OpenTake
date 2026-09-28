@@ -45,6 +45,13 @@ impl PcmFormat {
 }
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Upper bound on the PCM one whole-track decode may buffer. A whole track's
+/// decoded length is only estimated by the container (a VBR MP3 without a
+/// Xing/VBRI header is sized from its first frames' bitrate, and audio may
+/// outlast the video), so the buffer grows until EOF and only this ceiling
+/// guards against runaway decoder output: about 18 hours of 16 kHz mono f32,
+/// or 3 hours of 48 kHz stereo f32.
+const WHOLE_TRACK_PCM_MAX_BYTES: u64 = 4 << 30;
 const STDERR_DETAIL_LIMIT: usize = 64 * 1024;
 const PCM_CONVERT_CHUNK_FRAMES: usize = 8 * 1024;
 const PCM_PROGRESS_TOTAL: usize = 4_000;
@@ -72,12 +79,17 @@ fn allocation_error(detail: impl std::fmt::Display) -> MediaError {
     MediaError::Decode(format!("audio_allocation_failed: {detail}"))
 }
 
-fn expected_pcm_bytes_for_duration(duration_secs: f64, spec: &PcmSpec) -> Result<usize> {
+fn validate_spec(spec: &PcmSpec) -> Result<()> {
     if spec.sample_rate == 0 || spec.channels == 0 {
         return Err(MediaError::Decode(
             "PCM sample rate and channel count must be non-zero".to_string(),
         ));
     }
+    Ok(())
+}
+
+fn expected_pcm_bytes_for_duration(duration_secs: f64, spec: &PcmSpec) -> Result<usize> {
+    validate_spec(spec)?;
     if !duration_secs.is_finite() {
         return Err(audio_buffer_too_large("non-finite duration"));
     }
@@ -93,33 +105,48 @@ fn expected_pcm_bytes_for_duration(duration_secs: f64, spec: &PcmSpec) -> Result
         .ok_or_else(|| audio_buffer_too_large("PCM output byte count overflow"))
 }
 
-fn expected_pcm_bytes(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> Result<usize> {
-    let duration_secs = match range {
-        Some((lo, hi)) => (hi - lo.max(0.0)).max(0.0),
-        None => {
-            let media = probe::probe(path)?;
-            if !media.has_audio {
-                return Err(MediaError::no_track("audio", path));
-            }
-            media.duration_secs
-        }
-    };
-    expected_pcm_bytes_for_duration(duration_secs, spec)
+fn expected_pcm_bytes_for_range(range: (f64, f64), spec: &PcmSpec) -> Result<usize> {
+    let (lo, hi) = range;
+    expected_pcm_bytes_for_duration((hi - lo.max(0.0)).max(0.0), spec)
+}
+
+/// Seconds a whole-track decode is expected to produce: the longer of the
+/// clip duration (video first) and the longest audio stream.
+fn whole_track_estimate_secs(media: &probe::MediaProbe) -> f64 {
+    let video_or_container = media.duration_secs;
+    let audio = media.audio_duration_secs.unwrap_or(0.0);
+    let estimate = video_or_container.max(audio);
+    if estimate.is_finite() && estimate > 0.0 {
+        estimate
+    } else {
+        0.0
+    }
+}
+
+/// How much decoded PCM the stdout reader accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadLimit {
+    /// Reading past this many bytes fails the decode with
+    /// `audio_buffer_too_large`.
+    cap: usize,
+    /// Expected output size: reserved up front (the buffer still grows past
+    /// it, up to `cap`) and used as the progress total.
+    expected: usize,
 }
 
 fn read_stdout(
     mut stdout: ChildStdout,
-    cap: usize,
-    progress_total: usize,
+    limit: ReadLimit,
     cancel: MediaCancelToken,
     progress: Option<PcmProgressCallback>,
 ) -> Result<StdoutRead> {
     cancel.reader_started();
     let result = (|| {
         let mut bytes = Vec::new();
+        let reserve = limit.expected.min(limit.cap);
         bytes
-            .try_reserve_exact(cap)
-            .map_err(|error| allocation_error(format!("stdout reserve {cap}: {error}")))?;
+            .try_reserve_exact(reserve)
+            .map_err(|error| allocation_error(format!("stdout reserve {reserve}: {error}")))?;
         let mut exceeded_cap = false;
         let mut total_read = 0_usize;
         let mut chunk = [0_u8; 64 * 1024];
@@ -132,12 +159,23 @@ fn read_stdout(
             }
             total_read = total_read.saturating_add(read);
             if let Some(report) = &progress {
-                report(total_read.min(progress_total), progress_total);
+                report(total_read.min(limit.expected), limit.expected);
             }
-            let remaining = cap.saturating_sub(bytes.len());
-            let retained = remaining.min(read);
+            let retained = limit.cap.saturating_sub(bytes.len()).min(read);
+            bytes.try_reserve(retained).map_err(|error| {
+                allocation_error(format!(
+                    "stdout grow to {}: {error}",
+                    bytes.len() + retained
+                ))
+            })?;
             bytes.extend_from_slice(&chunk[..retained]);
-            exceeded_cap |= retained < read;
+            if retained < read {
+                // Stop at the cap instead of draining a runaway stream: the
+                // closed pipe ends the decoder, and the error is reported
+                // once it has been reaped.
+                exceeded_cap = true;
+                break;
+            }
         }
         Ok(StdoutRead {
             bytes,
@@ -235,7 +273,7 @@ fn validate_pcm_output(
 ) -> Result<Vec<u8>> {
     if stdout.exceeded_cap {
         return Err(audio_buffer_too_large(format!(
-            "FFmpeg stdout read {} bytes, exceeding {reader_cap}",
+            "FFmpeg PCM output exceeded the {reader_cap}-byte limit after {} bytes",
             stdout.total_read
         )));
     }
@@ -438,9 +476,24 @@ pub(super) fn decode_raw_pcm_cancellable(
     cancel: &MediaCancelToken,
     progress: Option<PcmProgressCallback>,
 ) -> Result<Vec<u8>> {
+    let ceiling = usize::try_from(WHOLE_TRACK_PCM_MAX_BYTES).unwrap_or(usize::MAX);
+    decode_raw_pcm_with_ceiling(path, spec, range, cancel, progress, ceiling)
+}
+
+fn decode_raw_pcm_with_ceiling(
+    path: &Path,
+    spec: &PcmSpec,
+    range: Option<(f64, f64)>,
+    cancel: &MediaCancelToken,
+    progress: Option<PcmProgressCallback>,
+    whole_track_ceiling: usize,
+) -> Result<Vec<u8>> {
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
+    validate_spec(spec)?;
+    // One probe per ordinary file: it rejects files without audio up front
+    // and estimates how long a whole-track decode will be.
     let probed = if path.is_file() {
         let media = probe::probe(path)?;
         if !media.has_audio {
@@ -450,36 +503,39 @@ pub(super) fn decode_raw_pcm_cancellable(
     } else {
         None
     };
-    let expected_bytes = match range {
-        Some(range) => expected_pcm_bytes(path, spec, Some(range))?,
-        None => {
-            let media = probed.unwrap_or(probe::probe(path)?);
-            expected_pcm_bytes_for_duration(media.duration_secs, spec)?
-        }
-    };
     let frame_bytes = usize::from(spec.channels)
         .checked_mul(spec.format.bytes_per_sample())
         .ok_or_else(|| audio_buffer_too_large("PCM frame byte count overflow"))?;
-    // Full-track extraction must preserve decoder output, including padding
-    // excluded from a container's presentation duration. Admit at most one
-    // extra second for that discrepancy; explicit ranges retain one-frame
-    // rounding slack and are trimmed at the requested output sample rate.
-    let slack_frames = if range.is_none() {
-        spec.sample_rate as usize
-    } else {
-        1
-    };
-    let slack_bytes = slack_frames
-        .checked_mul(frame_bytes)
-        .ok_or_else(|| audio_buffer_too_large("PCM padding budget overflow"))?;
-    let reader_cap = expected_bytes
-        .checked_add(slack_bytes)
-        .ok_or_else(|| audio_buffer_too_large("PCM reader cap overflow"))?;
-
-    let args = if range.is_some() {
-        bounded_pcm_args(path, spec, range, expected_bytes / frame_bytes)
-    } else {
-        pcm_args(path, spec, None)
+    let (args, limit) = match range {
+        Some(range) => {
+            // Explicit ranges keep one frame of rounding slack and are trimmed
+            // at the requested output sample rate.
+            let expected = expected_pcm_bytes_for_range(range, spec)?;
+            let cap = expected
+                .checked_add(frame_bytes)
+                .ok_or_else(|| audio_buffer_too_large("PCM reader cap overflow"))?;
+            (
+                bounded_pcm_args(path, spec, Some(range), expected / frame_bytes),
+                ReadLimit { cap, expected },
+            )
+        }
+        None => {
+            // A whole track decodes to EOF. Container durations are estimates
+            // that can be far too short, so they only size the initial buffer
+            // and the progress total; the reader grows up to the ceiling.
+            let estimate = probed.as_ref().map_or(0.0, whole_track_estimate_secs);
+            // An estimate too large to represent reserves nothing up front.
+            let expected = expected_pcm_bytes_for_duration(estimate, spec)
+                .unwrap_or(0)
+                .min(whole_track_ceiling);
+            (
+                pcm_args(path, spec, None),
+                ReadLimit {
+                    cap: whole_track_ceiling,
+                    expected,
+                },
+            )
+        }
     };
     let mut child = ff::ffmpeg()
         .args(args)
@@ -504,7 +560,7 @@ pub(super) fn decode_raw_pcm_cancellable(
     let stderr_cancel = cancel.clone();
     let stdout_reader = match thread::Builder::new()
         .name("opentake-pcm-stdout".to_string())
-        .spawn(move || read_stdout(stdout, reader_cap, expected_bytes, stdout_cancel, progress))
+        .spawn(move || read_stdout(stdout, limit, stdout_cancel, progress))
     {
         Ok(reader) => reader,
         Err(error) => {
@@ -528,7 +584,7 @@ pub(super) fn decode_raw_pcm_cancellable(
         stderr: stderr_reader,
     };
     let (status, stdout, stderr) = wait_for_pcm_child(&mut child, readers, cancel)?;
-    validate_pcm_output(path, status, stdout, stderr, reader_cap)
+    validate_pcm_output(path, status, stdout, stderr, limit.cap)
 }
 
 #[cfg(test)]
@@ -567,6 +623,48 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(44 + data_len as usize, 0);
         std::fs::write(path, wav).expect("write wav fixture");
+    }
+
+    #[test]
+    fn whole_track_decode_probes_the_source_once() {
+        assert!(crate::ff::ffmpeg_available(), "requires runnable FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("one-second.wav");
+        write_silence_wav(&input, 16_000, 16_000);
+        let spec = PcmSpec {
+            sample_rate: 16_000,
+            channels: 1,
+            format: PcmFormat::F32,
+        };
+
+        let before = crate::ff::test_seams::probe_requests();
+        let pcm = extract_pcm(&input, &spec, None).unwrap();
+
+        assert_eq!(crate::ff::test_seams::probe_requests() - before, 1);
+        assert_eq!(pcm.samples_f32.len(), 16_000);
+    }
+
+    #[test]
+    fn whole_track_output_past_the_absolute_ceiling_is_rejected() {
+        assert!(crate::ff::ffmpeg_available(), "requires runnable FFmpeg");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("two-seconds.wav");
+        write_silence_wav(&input, 48_000, 96_000);
+        let cancel = MediaCancelToken::new();
+        let started = Instant::now();
+
+        let error =
+            decode_raw_pcm_with_ceiling(&input, &f32_mono_spec(), None, &cancel, None, 64 * 1024)
+                .expect_err("output past the ceiling must fail");
+
+        assert!(
+            error.to_string().contains("audio_buffer_too_large"),
+            "{error}"
+        );
+        // The reader stops at the ceiling and the decoder is reaped.
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(cancel.spawned_child_count(), 1);
+        assert_eq!(cancel.active_reader_count(), 0);
     }
 
     #[test]
@@ -728,7 +826,11 @@ mod tests {
         let stderr_cancel = cancel.clone();
         let readers = PipeReaders {
             stdout: std::thread::spawn(move || {
-                read_stdout(stdout, 1024 * 1024, 1024 * 1024, stdout_cancel, None)
+                let limit = ReadLimit {
+                    cap: 1024 * 1024,
+                    expected: 1024 * 1024,
+                };
+                read_stdout(stdout, limit, stdout_cancel, None)
             }),
             stderr: std::thread::spawn(move || read_stderr(stderr, stderr_cancel)),
         };

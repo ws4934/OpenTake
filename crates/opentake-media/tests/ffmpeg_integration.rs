@@ -214,6 +214,91 @@ fn extract_pcm_without_explicit_range_matches_full_track_decode() {
 }
 
 #[test]
+fn whole_track_pcm_decodes_a_vbr_mp3_past_its_estimated_duration() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mp3 = dir.path().join("vbr-no-xing.mp3");
+    // 20 s of noise then 100 s of silence as VBR MP3 without a Xing header:
+    // the demuxer estimates the duration from the loud opening frames.
+    let generated = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "anoisesrc=d=20:r=48000"])
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=100"])
+        .args(["-filter_complex", "[0][1]concat=n=2:v=0:a=1"])
+        .args(["-c:a", "libmp3lame", "-q:a", "5", "-write_xing", "0"])
+        .arg(&mp3)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !generated {
+        eprintln!("skip: this ffmpeg cannot encode MP3");
+        return;
+    }
+    let estimated = probe(&mp3).unwrap();
+    assert!(
+        estimated.duration_secs < 100.0,
+        "fixture must be underestimated, got {}",
+        estimated.duration_secs
+    );
+
+    let spec = PcmSpec {
+        sample_rate: 16_000,
+        channels: 1,
+        format: PcmFormat::F32,
+    };
+    let pcm = extract_pcm(&mp3, &spec, None).expect("whole-track VBR MP3 decode");
+    assert!(
+        (pcm.duration_secs() - 120.0).abs() < 0.1,
+        "decoded {} s",
+        pcm.duration_secs()
+    );
+}
+
+#[test]
+fn whole_track_pcm_keeps_audio_that_outlasts_the_video() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("long-audio.mp4");
+    let generated = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=64x36:rate=30:d=2"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:d=4",
+        ])
+        .args(["-c:v", "mpeg4", "-c:a", "aac"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(generated.success(), "generate long-audio fixture");
+    let probed = probe(&clip).unwrap();
+    assert!((probed.duration_secs - 2.0).abs() < 0.1, "{probed:?}");
+    assert!(probed.audio_duration_secs.is_some_and(|audio| audio > 3.9));
+
+    let spec = PcmSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        format: PcmFormat::F32,
+    };
+    let interleaved = opentake_media::decode_pcm_interleaved_cancellable(
+        &clip,
+        &spec,
+        None,
+        &opentake_media::MediaCancelToken::new(),
+    )
+    .expect("whole-track decode keeps the audio past the video");
+    let seconds = interleaved.len() as f64 / 2.0 / 48_000.0;
+    assert!((seconds - 4.0).abs() < 0.1, "decoded {seconds} s");
+}
+
+#[test]
 fn extract_pcm_range_is_shorter() {
     if !ffmpeg_available() {
         return;

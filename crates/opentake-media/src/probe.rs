@@ -19,6 +19,10 @@ use crate::ff;
 pub struct MediaProbe {
     /// Prefer the video stream duration, falling back to the container duration.
     pub duration_secs: f64,
+    /// Longest duration reported by an audio stream that carries channels.
+    /// Audio can outlast the video (and `duration_secs`); whole-track PCM
+    /// decoding sizes its buffers from the longer of the two.
+    pub audio_duration_secs: Option<f64>,
     /// Display width after applying rotation side-data / display matrix.
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -167,6 +171,19 @@ pub fn parse_probe(json: &serde_json::Value) -> MediaProbe {
         }
         s.get("channels").and_then(|v| v.as_u64()) != Some(0)
     });
+    let audio_duration_secs = streams
+        .iter()
+        .filter(|s| {
+            s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")
+                && s.get("channels").and_then(|v| v.as_u64()) != Some(0)
+        })
+        .filter_map(|s| {
+            s.get("duration")
+                .and_then(|x| x.as_str())
+                .and_then(|x| x.parse::<f64>().ok())
+                .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        })
+        .reduce(f64::max);
 
     let mut width = None;
     let mut height = None;
@@ -244,6 +261,7 @@ pub fn parse_probe(json: &serde_json::Value) -> MediaProbe {
 
     MediaProbe {
         duration_secs,
+        audio_duration_secs,
         width,
         height,
         fps,
@@ -438,6 +456,29 @@ mod tests {
         assert!(p.has_audio);
         assert_eq!(p.width, None);
         assert_eq!(p.duration_secs, 60.0);
+    }
+
+    #[test]
+    fn audio_outlasting_video_is_reported_without_changing_the_clip_duration() {
+        let p = parse_probe(&json!({
+            "streams": [
+                {"codec_type": "video", "width": 64, "height": 36,
+                 "avg_frame_rate": "30/1", "duration": "2.000000"},
+                {"codec_type": "audio", "channels": 2, "duration": "3.500000"},
+                {"codec_type": "audio", "channels": 1, "duration": "4.000000"},
+                {"codec_type": "audio", "channels": 0, "duration": "9.000000"}
+            ],
+            "format": {"duration": "4.000000"}
+        }));
+        // The timeline length stays video-first.
+        assert_eq!(p.duration_secs, 2.0);
+        // Placeholder (zero-channel) audio does not count.
+        assert_eq!(p.audio_duration_secs, Some(4.0));
+        let video_only = parse_probe(&json!({
+            "streams": [{"codec_type": "video", "width": 8, "height": 8, "duration": "1.0"}],
+            "format": {}
+        }));
+        assert_eq!(video_only.audio_duration_secs, None);
     }
 
     #[test]
