@@ -8,6 +8,7 @@ const apiMocks = vi.hoisted(() => ({
   chatHistory: vi.fn(),
   chatHistoryAuthoritative: vi.fn(),
   chatSessionSetOpen: vi.fn(),
+  chatSessionDelete: vi.fn(),
   chatSessions: vi.fn(),
   chatSend: vi.fn(),
   onChatDelta: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock("../../lib/api", () => ({
   chatHistoryAuthoritative: apiMocks.chatHistoryAuthoritative,
   chatSend: apiMocks.chatSend,
   chatSessionSetOpen: apiMocks.chatSessionSetOpen,
+  chatSessionDelete: apiMocks.chatSessionDelete,
   chatSessions: apiMocks.chatSessions,
   onChatDelta: apiMocks.onChatDelta,
   onChatToolCall: apiMocks.onChatToolCall,
@@ -117,6 +119,8 @@ beforeEach(() => {
   apiMocks.chatHistory.mockReset();
   apiMocks.chatHistoryAuthoritative.mockReset();
   apiMocks.chatSessionSetOpen.mockReset();
+  apiMocks.chatSessionDelete.mockReset();
+  apiMocks.chatSessionDelete.mockResolvedValue(undefined);
   apiMocks.chatSessions.mockReset();
   apiMocks.chatSend.mockReset();
   apiMocks.chatSend.mockResolvedValue(undefined);
@@ -157,6 +161,21 @@ afterEach(async () => {
   root = null;
   container = null;
 });
+
+/** happy-dom has no `window.confirm`; install a controllable one. */
+function installConfirm(answer: boolean) {
+  const confirm = vi.fn(() => answer);
+  Object.defineProperty(window, "confirm", {
+    configurable: true,
+    writable: true,
+    value: confirm,
+  });
+  return confirm;
+}
+
+function restoreConfirm() {
+  Reflect.deleteProperty(window, "confirm");
+}
 
 describe("AgentPanel project sessions", () => {
   it("routes Agent chat directly through the selected official Codex provider", async () => {
@@ -620,6 +639,96 @@ describe("AgentPanel project sessions", () => {
     expect(replacementCall[1]).toBe(true);
     expect(replacementCall[0]).not.toBe(initialId);
     expect(useChatStore.getState().sessionId).toBe(replacementCall[0]);
+  });
+
+  it("deletes a chat tab after confirmation and keeps it when refused", async () => {
+    apiMocks.chatSessions.mockResolvedValue([
+      { id: "chat-a", messages: [], createdAt: 2, isOpen: true },
+      { id: "chat-b", messages: [], createdAt: 1, isOpen: true },
+    ]);
+    const confirm = installConfirm(false);
+    try {
+      await act(async () => {
+        root?.render(<AgentPanel />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(useChatStore.getState().sessionId).toBe("chat-a");
+      const deleteButtons = () =>
+        Array.from(
+          container?.querySelectorAll<HTMLButtonElement>('button[aria-label^="agent.deleteChat "]') ??
+            [],
+        );
+      expect(deleteButtons()).toHaveLength(2);
+      expect(deleteButtons()[0].style.width).toBe("24px");
+
+      confirm.mockReturnValueOnce(false);
+      await act(async () => {
+        deleteButtons()[0].click();
+        await Promise.resolve();
+      });
+      expect(apiMocks.chatSessionDelete).not.toHaveBeenCalled();
+
+      apiMocks.chatSessionDelete.mockRejectedValueOnce(new Error("running turn"));
+      confirm.mockReturnValueOnce(true);
+      await act(async () => {
+        deleteButtons()[0].click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(deleteButtons()).toHaveLength(2);
+
+      confirm.mockReturnValueOnce(true);
+      await act(async () => {
+        deleteButtons()[0].click();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(apiMocks.chatSessionDelete).toHaveBeenLastCalledWith(
+        "chat-a",
+        41,
+        "/tmp/Current.opentake",
+      );
+      expect(deleteButtons()).toHaveLength(1);
+      expect(useChatStore.getState().sessionId).toBe("chat-b");
+      expect(apiMocks.chatSessionSetOpen).not.toHaveBeenCalled();
+    } finally {
+      restoreConfirm();
+    }
+  });
+
+  it("offers to delete closed chats that have no tab", async () => {
+    apiMocks.chatSessions.mockResolvedValue([
+      { id: "chat-open", messages: [], createdAt: 3, isOpen: true },
+      { id: "chat-closed-1", messages: [], createdAt: 2, isOpen: false },
+      { id: "chat-closed-2", messages: [], createdAt: 1, isOpen: false },
+    ]);
+    installConfirm(true);
+    try {
+      await act(async () => {
+        root?.render(<AgentPanel />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const deleteClosed = () =>
+        container?.querySelector<HTMLButtonElement>(
+          'button[aria-label="agent.deleteClosedChats"]',
+        ) ?? null;
+      expect(deleteClosed()).not.toBeNull();
+      await act(async () => {
+        deleteClosed()?.click();
+        for (let tick = 0; tick < 6; tick += 1) await Promise.resolve();
+      });
+      expect(apiMocks.chatSessionDelete.mock.calls.map((call) => call[0])).toEqual([
+        "chat-closed-1",
+        "chat-closed-2",
+      ]);
+      expect(deleteClosed()).toBeNull();
+      expect(container?.querySelectorAll('[role="tab"]')).toHaveLength(1);
+    } finally {
+      restoreConfirm();
+    }
   });
 
   it("keeps the session close-tab button on a 24px hit target", async () => {

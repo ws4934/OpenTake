@@ -16,6 +16,7 @@ import {
   Send,
   Settings as SettingsIcon,
   Square,
+  Trash2,
   Wrench,
   X,
 } from "lucide-react";
@@ -24,6 +25,7 @@ import {
   chatCancel,
   chatHistoryAuthoritative,
   chatSend,
+  chatSessionDelete,
   chatSessionSetOpen,
   chatSessions,
   isTauri,
@@ -90,6 +92,9 @@ export function AgentPanel() {
   const [input, setInput] = useState("");
   const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  // Closed conversations are not shown as tabs but still occupy the project's
+  // chat storage, so the panel offers to delete them.
+  const [closedSessionIds, setClosedSessionIds] = useState<string[]>([]);
   const sessionsRef = useRef<ChatSession[]>([]);
   const inputRef = useRef("");
   const resyncProjectRef = useRef<Record<string, { projectEpoch: number; projectPath: string }>>({});
@@ -294,6 +299,7 @@ export function AgentPanel() {
       setInput("");
     }
     commitSessions([]);
+    setClosedSessionIds([]);
     if (!isTauri || !projectPath) return;
     let disposed = false;
     const loadingEpoch = projectEpoch;
@@ -314,6 +320,11 @@ export function AgentPanel() {
           return;
         }
         const openSessions = projectSessions.filter((session) => session.isOpen !== false);
+        setClosedSessionIds(
+          projectSessions
+            .filter((session) => session.isOpen === false)
+            .map((session) => session.id),
+        );
         const mergedSessions = openSessions.map((session) => {
           if (!useChatStore.getState().resyncingSessionIds[session.id]) {
             installSessionSnapshot(
@@ -514,20 +525,67 @@ export function AgentPanel() {
     }
     const project = useProjectStore.getState();
     if (project.projectEpoch !== closingEpoch || project.projectPath !== closingPath) return;
+    setClosedSessionIds((current) =>
+      current.includes(closingSessionId) ? current : [...current, closingSessionId],
+    );
+    await removeTab(closingSessionId, closingEpoch, closingPath);
+  }
+
+  async function removeTab(removedSessionId: string, epoch: number, path: string) {
     const remaining = sessionsRef.current.filter(
-      (candidate) => candidate.id !== closingSessionId,
+      (candidate) => candidate.id !== removedSessionId,
     );
     commitSessions(remaining);
-    deleteSession(closingSessionId);
-    if (closingSessionId !== useChatStore.getState().sessionId) return;
+    deleteSession(removedSessionId);
+    if (removedSessionId !== useChatStore.getState().sessionId) return;
     const next = remaining[0];
     if (next) {
       const storedMessages = useChatStore.getState().sessionMessages[next.id];
       if (!storedMessages) setMessagesForSession(next.id, next.messages);
       reset(next.id);
     } else {
-      await createNewChatNow(closingEpoch, closingPath);
+      await createNewChatNow(epoch, path);
     }
+  }
+
+  function deleteChat(session: ChatSession) {
+    if (interactionLocked || !projectPath) return;
+    if (!window.confirm(t("agent.deleteChatConfirm"))) return;
+    const deletingEpoch = projectEpoch;
+    const deletingPath = projectPath;
+    enqueueTabMutation(async () => {
+      const before = useProjectStore.getState();
+      if (before.projectEpoch !== deletingEpoch || before.projectPath !== deletingPath) return;
+      try {
+        await chatSessionDelete(session.id, deletingEpoch, deletingPath);
+      } catch {
+        // The backend refused (for example a running turn); keep the tab.
+        return;
+      }
+      const project = useProjectStore.getState();
+      if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
+      await removeTab(session.id, deletingEpoch, deletingPath);
+    });
+  }
+
+  function deleteClosedChats() {
+    if (interactionLocked || !projectPath || closedSessionIds.length === 0) return;
+    if (!window.confirm(t("agent.deleteClosedChatsConfirm"))) return;
+    const deletingEpoch = projectEpoch;
+    const deletingPath = projectPath;
+    const deleting = [...closedSessionIds];
+    enqueueTabMutation(async () => {
+      for (const closedId of deleting) {
+        const project = useProjectStore.getState();
+        if (project.projectEpoch !== deletingEpoch || project.projectPath !== deletingPath) return;
+        try {
+          await chatSessionDelete(closedId, deletingEpoch, deletingPath);
+        } catch {
+          continue;
+        }
+        setClosedSessionIds((current) => current.filter((id) => id !== closedId));
+      }
+    });
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -562,26 +620,50 @@ export function AgentPanel() {
         <span style={{ fontSize: "var(--fs-sm)", fontWeight: 600, color: "var(--text-primary)" }}>
           {t("agent.title")}
         </span>
-        <button
-          type="button"
-          onClick={() => void newChat()}
-          disabled={interactionLocked || !projectPath}
-          title={t("agent.newTab")}
-          aria-label={t("agent.newTab")}
-          className="hover-area"
-          style={{
-            width: 26,
-            height: 26,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: "var(--radius-sm)",
-            color: "var(--text-secondary)",
-            opacity: interactionLocked || !projectPath ? 0.4 : 1,
-          }}
-        >
-          <Plus size={14} />
-        </button>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+          {closedSessionIds.length > 0 && (
+            <button
+              type="button"
+              onClick={() => deleteClosedChats()}
+              disabled={interactionLocked || !projectPath}
+              title={t("agent.deleteClosedChats")}
+              aria-label={t("agent.deleteClosedChats")}
+              className="hover-area"
+              style={{
+                width: 26,
+                height: 26,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: "var(--radius-sm)",
+                color: "var(--text-secondary)",
+                opacity: interactionLocked || !projectPath ? 0.4 : 1,
+              }}
+            >
+              <Trash2 size={14} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void newChat()}
+            disabled={interactionLocked || !projectPath}
+            title={t("agent.newTab")}
+            aria-label={t("agent.newTab")}
+            className="hover-area"
+            style={{
+              width: 26,
+              height: 26,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "var(--radius-sm)",
+              color: "var(--text-secondary)",
+              opacity: interactionLocked || !projectPath ? 0.4 : 1,
+            }}
+          >
+            <Plus size={14} />
+          </button>
+        </div>
       </div>
 
       <div
@@ -648,6 +730,26 @@ export function AgentPanel() {
                 }}
               >
                 <X size={11} />
+              </button>
+              <button
+                type="button"
+                aria-label={`${t("agent.deleteChat")} ${title}`}
+                title={t("agent.deleteChat")}
+                disabled={interactionLocked}
+                onClick={() => deleteChat(session)}
+                className="hover-area"
+                style={{
+                  width: 24,
+                  height: 24,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: "var(--radius-xs)",
+                  color: "var(--text-muted)",
+                  opacity: interactionLocked ? 0.4 : 1,
+                }}
+              >
+                <Trash2 size={11} />
               </button>
             </div>
           );

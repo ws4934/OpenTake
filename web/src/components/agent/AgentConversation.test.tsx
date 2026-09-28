@@ -243,6 +243,33 @@ describe("AssistantTurn", () => {
     expect(container.querySelector("pre")?.textContent).not.toContain("iVBORw0KGgo=");
   });
 
+  it("renders a saved-history image placeholder as text inside the tool disclosure", async () => {
+    const note = "[Image omitted from the saved chat history (image/png, 230400 bytes).]";
+    await render(assistant({
+      content: "",
+      toolCalls: [],
+      blocks: [{
+        type: "toolUse",
+        id: "inspect",
+        name: "inspect_timeline",
+        input: {},
+        result: {
+          content: [
+            { kind: "text", text: "Frame 1" },
+            { kind: "text", text: note },
+          ],
+        },
+        isError: false,
+      }],
+    }));
+
+    const trigger = container.querySelector<HTMLButtonElement>("[data-tool-activity-trigger]")!;
+    await act(async () => trigger.click());
+
+    expect(container.textContent).toContain(note);
+    expect(container.querySelector("img")).toBeNull();
+  });
+
   it.each([
     [
       "an oversized image",

@@ -541,6 +541,34 @@ impl ChatState {
         Ok(session)
     }
 
+    /// Permanently delete one conversation of the current project. A session
+    /// with a running turn is refused. The file is removed before the cached
+    /// copy, so a failed delete leaves memory and disk unchanged.
+    fn delete_project_session(
+        &self,
+        project: &ChatProjectContext,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let key = project.key(session_id);
+        let turns = self.turns.lock().map_err(|e| e.to_string())?;
+        if turns.running.contains_key(&key) {
+            return Err("finish or cancel the running turn before deleting this chat".into());
+        }
+        let _identity = self.core.lock_project_identity_workflow();
+        self.ensure_project_context(project)?;
+        let _persistence = self.persistence.lock().map_err(|e| e.to_string())?;
+        project
+            .store
+            .delete(session_id)
+            .map_err(|e| e.to_string())?;
+        self.sessions
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&key);
+        drop(turns);
+        Ok(())
+    }
+
     fn reserve_turn(
         &self,
         key: SessionKey,
@@ -1351,6 +1379,25 @@ pub fn chat_session_set_open(
     state.set_project_session_open(&project, &session_id, is_open)
 }
 
+/// `chat_session_delete`: permanently delete a conversation of the expected
+/// project. Refused while that conversation has a running turn.
+#[tauri::command]
+pub async fn chat_session_delete(
+    state: State<'_, ChatState>,
+    session_id: String,
+    expected_project_epoch: u64,
+    expected_project_path: String,
+) -> Result<(), String> {
+    let _activity = crate::updater::begin_mutating_activity(&state.admission)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = state.project_context_for(expected_project_epoch, &expected_project_path)?;
+        state.delete_project_session(&project, &session_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// `chat_cancel`: request a running turn stop at the next boundary. No-op when
 /// no turn is running.
 #[tauri::command]
@@ -2053,6 +2100,57 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "chat-tab");
         assert!(!sessions[0].is_open);
+    }
+
+    #[test]
+    fn deleting_a_session_removes_it_but_never_one_with_a_running_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("Delete.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+        let state = ChatState::new(
+            core.clone(),
+            temp.path().join("no-workflows"),
+            temp.path().join("chat-cache"),
+            temp.path().join("chat-models"),
+        );
+        let project = state.project_context().unwrap();
+        for id in ["chat-old", "chat-busy"] {
+            let mut session = ChatSession::new(id);
+            session.messages.push(ChatMessage::user("hello"));
+            state.put_project_session(&project, session).unwrap();
+        }
+
+        let busy = project.key("chat-busy");
+        let _lease = state
+            .reserve_turn(busy.clone(), Arc::new(TurnCancel::new()))
+            .unwrap();
+        let refused = state
+            .delete_project_session(&project, "chat-busy")
+            .expect_err("a running turn keeps its session");
+        assert!(refused.contains("running turn"), "{refused}");
+        state.release_turn(&busy);
+
+        state.delete_project_session(&project, "chat-old").unwrap();
+        assert!(!bundle.join("chat-sessions/chat-old.json").exists());
+        let listed = state
+            .list_project_sessions(&project)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ["chat-busy"]);
+        assert!(state
+            .take_project_session(&project, "chat-old")
+            .unwrap()
+            .messages
+            .is_empty());
+
+        core.new_project();
+        core.save_project(Some(temp.path().join("Other.opentake")))
+            .unwrap();
+        assert!(state.delete_project_session(&project, "chat-busy").is_err());
+        assert!(bundle.join("chat-sessions/chat-busy.json").exists());
     }
 
     #[test]
