@@ -967,7 +967,9 @@ pub(crate) mod test_seams {
         PROBE_REQUESTS.with(Cell::get)
     }
 
-    /// Resolve `ffprobe` to `path` for probes requested by this thread.
+    /// Resolve `ffprobe` to `path` for probes requested by this thread. Only
+    /// Unix tests stand in a shell script for the executable.
+    #[cfg(unix)]
     pub(crate) fn override_ffprobe(path: Option<OsString>) {
         FFPROBE_OVERRIDE.with(|cell| *cell.borrow_mut() = path);
     }
@@ -976,7 +978,9 @@ pub(crate) mod test_seams {
         FFPROBE_OVERRIDE.with(|cell| cell.borrow().clone())
     }
 
-    /// Resolve `ffmpeg` to `path` for commands built on this thread.
+    /// Resolve `ffmpeg` to `path` for commands built on this thread (Unix
+    /// tests only, like `override_ffprobe`).
+    #[cfg(unix)]
     pub(crate) fn override_ffmpeg(path: Option<OsString>) {
         FFMPEG_OVERRIDE.with(|cell| *cell.borrow_mut() = path);
     }
