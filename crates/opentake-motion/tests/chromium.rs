@@ -452,7 +452,7 @@ mod live {
         });
       </script></body></html>"#;
 
-    pub(super) fn cancelled_render_keeps_its_browser_probe() {
+    pub(super) fn cancelled_render_resumes_on_the_same_browser_probe() {
         let profiles_before = live_profiles();
         let root = tempfile::tempdir().unwrap();
         let renderer = renderer(root.path());
@@ -481,17 +481,134 @@ mod live {
             1,
             "a render cancelled mid-clip must keep its browser"
         );
+        let dir = renderer.cache().dir_for(&request);
+        for index in 0..2 {
+            let frame = image::open(MotionCache::frame_file(&dir, index))
+                .unwrap_or_else(|error| panic!("completed frame {index} must be kept: {error}"));
+            assert_eq!(frame.width(), 48);
+        }
+        assert!(!MotionCache::frame_file(&dir, 2).exists());
         assert!(!renderer.cache().is_cached(&request));
 
-        renderer.render(&request).unwrap();
+        let reported = std::sync::Mutex::new(Vec::new());
+        let resumed = renderer
+            .render_with_cancellation_and_progress(
+                &request,
+                &MotionCancellationToken::new(),
+                &|done, total| reported.lock().unwrap().push((done, total)),
+            )
+            .unwrap();
+        assert_eq!(
+            *reported.lock().unwrap(),
+            vec![(2, 6), (3, 6), (4, 6), (5, 6), (6, 6)],
+            "the resumed render captures only the missing frames"
+        );
         assert_eq!(
             live_profiles(),
             retained,
-            "the next render reuses the browser without a cold start"
+            "the resumed render reuses the browser without a cold start"
         );
         assert!(renderer.cache().is_cached(&request));
+
+        // Resuming yields exactly the frames of a render in one pass.
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh = self::renderer(fresh_root.path()).render(&request).unwrap();
+        for (index, (resumed_frame, fresh_frame)) in
+            resumed.frames.iter().zip(&fresh.frames).enumerate()
+        {
+            assert_eq!(
+                image::open(resumed_frame).unwrap().to_rgba8(),
+                image::open(fresh_frame).unwrap().to_rgba8(),
+                "resumed frame {index} differs from a one-pass render"
+            );
+        }
         drop(renderer);
         assert_eq!(live_profiles(), profiles_before);
+    }
+
+    pub(super) fn per_frame_watchdog_probe() {
+        let profiles_before = live_profiles();
+        let clip = |frames| {
+            MotionRenderRequest::new(MotionSource::code(STEPPED), 30, frames, 48, 32)
+                .with_transparent(false)
+        };
+        // Calibrate on this machine: document setup and per-frame cost on a
+        // warm browser.
+        let calibration_root = tempfile::tempdir().unwrap();
+        let calibration = renderer(calibration_root.path());
+        calibration.render(&clip(2)).unwrap();
+        let timed = |frames| {
+            let started = Instant::now();
+            calibration.render(&clip(frames)).unwrap();
+            started.elapsed()
+        };
+        let one = timed(1);
+        let nine = timed(9);
+        drop(calibration);
+        let per_frame = (nine.saturating_sub(one) / 8).max(Duration::from_millis(10));
+        // The policy covers the setup and each frame several times over, yet
+        // the clip as a whole takes about three policy timeouts.
+        let timeout = (per_frame * 4).max(one * 3).max(Duration::from_millis(300));
+        let frames = u32::try_from(timeout.as_nanos() * 3 / per_frame.as_nanos())
+            .unwrap_or(600)
+            .clamp(12, 600);
+
+        let root = tempfile::tempdir().unwrap();
+        let renderer = HeadlessChromiumRenderer::new(
+            MotionCache::new(root.path()),
+            SandboxPolicy::offline_with_timeout(timeout),
+        )
+        .with_browser_path(browser());
+        let started = Instant::now();
+        let long = renderer
+            .render(&clip(frames))
+            .expect("a clip that outlasts the policy timeout renders frame by frame");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "opentake-motion {frames}-frame render elapsed_ms={} policy_timeout_ms={}",
+            elapsed.as_millis(),
+            timeout.as_millis()
+        );
+        assert_eq!(long.frame_count(), frames as usize);
+        assert!(
+            elapsed > timeout,
+            "the clip must outlast the policy timeout to prove the watchdog is per frame: {elapsed:?} <= {timeout:?}"
+        );
+
+        // A frame that stalls past its watchdog times out; the frames before
+        // it stay on disk for the next render of the same request.
+        let stalled_request = MotionRenderRequest::new(
+            MotionSource::code(
+                r#"<!doctype html><script>
+                  OpenTake.onSeek((t) => { if (t >= 0.2) { while (true) {} } });
+                </script>"#,
+            ),
+            10,
+            4,
+            48,
+            32,
+        )
+        .with_transparent(false);
+        let stalled = renderer.render(&stalled_request);
+        assert!(
+            matches!(stalled, Err(MotionError::Timeout(budget)) if budget == timeout),
+            "{stalled:?}"
+        );
+        let dir = renderer.cache().dir_for(&stalled_request);
+        for index in 0..2 {
+            assert!(
+                image::open(MotionCache::frame_file(&dir, index)).is_ok(),
+                "frame {index} completed before the stall and must be kept"
+            );
+        }
+        assert!(!MotionCache::frame_file(&dir, 2).exists());
+        assert!(!renderer.cache().is_cached(&stalled_request));
+        drop(renderer);
+        assert_eq!(
+            live_profiles(),
+            profiles_before,
+            "a stalled browser is discarded"
+        );
     }
 
     pub(super) fn idle_browser_probe() {
@@ -1225,9 +1342,16 @@ fn cancelled_requests_leave_an_active_browser_lease_reusable() {
 
 #[cfg(feature = "chromium")]
 #[test]
-fn cancelled_render_keeps_its_browser() {
+fn cancelled_render_keeps_its_browser_and_resumes_completed_frames() {
     let _live_test_guard = live_test_guard();
-    live::cancelled_render_keeps_its_browser_probe();
+    live::cancelled_render_resumes_on_the_same_browser_probe();
+}
+
+#[cfg(feature = "chromium")]
+#[test]
+fn long_clips_are_watched_per_frame_and_keep_frames_on_timeout() {
+    let _live_test_guard = live_test_guard();
+    live::per_frame_watchdog_probe();
 }
 
 #[cfg(feature = "chromium")]

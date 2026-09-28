@@ -21,6 +21,11 @@ use crate::error::MotionResult;
 use crate::source::{MotionRenderRequest, MotionSource, ParamValue};
 
 const COMPLETION_MARKER_FILE: &str = ".opentake-motion-complete-v4";
+/// Written when a render starts in a directory. Frames next to it were
+/// produced by the current capture pipeline, so an interrupted render may
+/// resume from them; frames without it are never reused. Bump it together
+/// with the completion marker whenever the captured pixels change.
+const PARTIAL_MARKER_FILE: &str = ".opentake-motion-partial-v4";
 static COMPLETION_MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Compute the content hash (lowercase hex SHA-256) for a render request.
@@ -154,54 +159,58 @@ impl MotionCache {
         Ok(dir)
     }
 
-    /// Prepare a cache directory for a fresh render. Removing the marker first
+    /// Prepare a cache directory for a render. Removing the marker first
     /// makes every subsequent write fail-closed until completion is published.
+    ///
+    /// Frames of an interrupted render stay in place for [`Self::completed_prefix`]
+    /// only when the directory carries the current partial-render marker;
+    /// frames from any other pipeline version are removed first.
     pub(crate) fn begin_render(&self, req: &MotionRenderRequest) -> MotionResult<PathBuf> {
         let dir = self.ensure_dir(req)?;
         Self::remove_completion_marker(&dir)?;
+        if !partial_marker(&dir).is_file() {
+            remove_frame_files(&dir)?;
+            publish_marker(&dir, PARTIAL_MARKER_FILE, b"opentake-motion-partial/v4\n")?;
+        }
         Ok(dir)
     }
 
     /// Publish render completion with a write-sync-rename sequence so readers
     /// can never observe a partially written marker.
     pub(crate) fn mark_complete(dir: &Path) -> MotionResult<()> {
-        let marker = completion_marker(dir);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let counter = COMPLETION_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = dir.join(format!(
-            ".opentake-motion-complete-{pid}-{nanos}-{counter}.tmp",
-            pid = std::process::id()
-        ));
-
-        let result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(b"opentake-motion-cache/v4\n")?;
-            file.sync_all()?;
-            drop(file);
-            match std::fs::rename(&temporary, &marker) {
-                Ok(()) => Ok(()),
-                // Another identical renderer may have published the same key
-                // concurrently. Its atomic marker is equivalent completion.
-                Err(_) if marker.is_file() => Ok(()),
-                Err(error) => Err(error),
-            }
-        })();
-        let _ = std::fs::remove_file(&temporary);
-        result.map_err(Into::into)
+        publish_marker(dir, COMPLETION_MARKER_FILE, b"opentake-motion-cache/v4\n")
     }
 
     pub(crate) fn remove_completion_marker(dir: &Path) -> MotionResult<()> {
-        match std::fs::remove_file(completion_marker(dir)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        remove_file_if_present(&completion_marker(dir))
+    }
+
+    /// Remove everything a render wrote into `dir`: frames and both markers.
+    /// Used when a render fails in a way whose frames must not be resumed.
+    #[cfg(any(feature = "chromium", test))]
+    pub(crate) fn discard_render_output(dir: &Path) -> MotionResult<()> {
+        remove_file_if_present(&completion_marker(dir))?;
+        remove_frame_files(dir)?;
+        remove_file_if_present(&partial_marker(dir))
+    }
+
+    /// Number of leading frames of `req` that an interrupted render already
+    /// wrote completely into `dir`. The first missing or damaged frame is
+    /// removed so it is rendered again; a render resumes from the returned
+    /// index.
+    #[cfg(any(feature = "chromium", test))]
+    pub(crate) fn completed_prefix(dir: &Path, req: &MotionRenderRequest) -> MotionResult<usize> {
+        if !partial_marker(dir).is_file() {
+            return Ok(0);
         }
+        for index in 0..req.duration_frames as usize {
+            let frame = Self::frame_file(dir, index);
+            if !frame_file_is_intact(&frame, req.width, req.height) {
+                remove_file_if_present(&frame)?;
+                return Ok(index);
+            }
+        }
+        Ok(req.duration_frames as usize)
     }
 
     /// The expected per-frame file path inside a render dir: zero-padded so
@@ -211,8 +220,97 @@ impl MotionCache {
     }
 }
 
+/// Write `contents` to `dir/name` with a write-sync-rename sequence so
+/// readers never observe a partially written marker.
+fn publish_marker(dir: &Path, name: &str, contents: &[u8]) -> MotionResult<()> {
+    let marker = dir.join(name);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = COMPLETION_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = dir.join(format!(
+        "{name}-{pid}-{nanos}-{counter}.tmp",
+        pid = std::process::id()
+    ));
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::rename(&temporary, &marker) {
+            Ok(()) => Ok(()),
+            // Another identical renderer may have published the same key
+            // concurrently. Its atomic marker is equivalent.
+            Err(_) if marker.is_file() => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result.map_err(Into::into)
+}
+
+fn remove_file_if_present(path: &Path) -> MotionResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_frame_files(dir: &Path) -> MotionResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("frame_") && name.ends_with(".png") {
+            remove_file_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// A frame written by the renderer is an 8-bit RGBA PNG of the requested
+/// size that ends with its `IEND` chunk. Frames are published by an atomic
+/// rename, so this cheap header/trailer check rejects foreign files and a
+/// frame torn by a crash without decoding pixels.
+#[cfg(any(feature = "chromium", test))]
+fn frame_file_is_intact(path: &Path, width: u32, height: u32) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    const IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82];
+    let check = || -> std::io::Result<bool> {
+        let mut file = std::fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Ok(false);
+        }
+        let mut header = [0_u8; 26];
+        file.read_exact(&mut header)?;
+        let mut trailer = [0_u8; 12];
+        file.seek(SeekFrom::End(-12))?;
+        file.read_exact(&mut trailer)?;
+        Ok(header[..8] == SIGNATURE
+            && header[8..16] == [0, 0, 0, 13, b'I', b'H', b'D', b'R']
+            && header[16..20] == width.to_be_bytes()
+            && header[20..24] == height.to_be_bytes()
+            && header[24] == 8
+            && header[25] == 6
+            && trailer == IEND)
+    };
+    check().unwrap_or(false)
+}
+
 fn completion_marker(dir: &Path) -> PathBuf {
     dir.join(COMPLETION_MARKER_FILE)
+}
+
+fn partial_marker(dir: &Path) -> PathBuf {
+    dir.join(PARTIAL_MARKER_FILE)
 }
 
 fn has_exact_frame_files(dir: &Path, expected: usize) -> bool {
@@ -459,5 +557,66 @@ mod tests {
             dir,
             "cache directory contract is stable"
         );
+    }
+
+    fn write_frames(dir: &Path, count: usize, width: u32, height: u32) {
+        for index in 0..count {
+            std::fs::write(
+                MotionCache::frame_file(dir, index),
+                crate::renderer::encode_solid_rgba_png(width, height, [1, 2, 3, 255]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn resumable_frames_stop_at_the_first_missing_or_damaged_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let req = MotionRenderRequest::new(MotionSource::code("<resume/>"), 30, 5, 6, 4);
+        let dir = cache.begin_render(&req).unwrap();
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 0);
+
+        write_frames(&dir, 3, 6, 4);
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 3);
+
+        // A frame torn by a crash lacks its IEND trailer: it is removed and
+        // rendered again.
+        let torn = std::fs::read(MotionCache::frame_file(&dir, 1)).unwrap();
+        std::fs::write(MotionCache::frame_file(&dir, 1), &torn[..torn.len() - 5]).unwrap();
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 1);
+        assert!(!MotionCache::frame_file(&dir, 1).exists());
+
+        // A frame of another size never belongs to this request.
+        write_frames(&dir, 2, 6, 4);
+        std::fs::write(
+            MotionCache::frame_file(&dir, 1),
+            crate::renderer::encode_solid_rgba_png(4, 6, [0, 0, 0, 255]),
+        )
+        .unwrap();
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 1);
+
+        write_frames(&dir, 5, 6, 4);
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 5);
+        assert!(!cache.is_cached(&req), "frames alone are never a cache hit");
+    }
+
+    #[test]
+    fn frames_without_the_partial_marker_are_never_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let req = MotionRenderRequest::new(MotionSource::code("<legacy/>"), 30, 2, 6, 4);
+        let dir = cache.ensure_dir(&req).unwrap();
+        write_frames(&dir, 2, 6, 4);
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 0);
+
+        assert_eq!(cache.begin_render(&req).unwrap(), dir);
+        assert!(!MotionCache::frame_file(&dir, 0).exists());
+        write_frames(&dir, 1, 6, 4);
+        assert_eq!(cache.begin_render(&req).unwrap(), dir);
+        assert_eq!(MotionCache::completed_prefix(&dir, &req).unwrap(), 1);
+
+        MotionCache::discard_render_output(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

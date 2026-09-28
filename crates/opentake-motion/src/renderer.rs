@@ -379,8 +379,10 @@ impl Crc32 {
 /// disposable browser context and target. The backend injects a strict CSP,
 /// intercepts every request with `Fetch`, and discards the browser on a
 /// timeout, sandbox violation or protocol failure; a cancelled render closes
-/// its target and leaves the browser reusable. Without the feature, [`render`]
-/// returns [`MotionError::RendererUnavailable`].
+/// its target and leaves the browser reusable. Frames are written atomically,
+/// and a timed-out or cancelled render keeps its completed frames so the same
+/// request resumes after them. Without the feature, [`render`] returns
+/// [`MotionError::RendererUnavailable`].
 ///
 /// [`DEFAULT_BROWSER_IDLE_TIMEOUT`]: HeadlessChromiumRenderer::DEFAULT_BROWSER_IDLE_TIMEOUT
 #[derive(Clone, Debug)]
@@ -628,6 +630,7 @@ mod chromium_backend {
     use super::*;
 
     static AUTHOR_FENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static FRAME_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static BROWSER_POOLS: OnceLock<Mutex<Vec<Weak<BrowserPool>>>> = OnceLock::new();
     static IDLE_REAPER: OnceLock<(Mutex<IdleReaper>, Condvar)> = OnceLock::new();
     const GPU_TRACE_FIELD_LIMIT: usize = 96;
@@ -643,6 +646,14 @@ mod chromium_backend {
     /// A cancelled render gets this long to close its page and browser
     /// context; if that fails the browser is discarded instead of reused.
     const CANCELLED_RENDER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Waiting for the shared browser and cold-starting one is bounded by at
+    /// least this long, independent of the per-frame watchdog.
+    const MIN_BROWSER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The policy timeout is the watchdog for a frame of this many pixels.
+    const FRAME_WATCHDOG_REFERENCE_PIXELS: u64 = 1920 * 1080;
+    /// Resolution and transparency scaling never extends a frame watchdog
+    /// beyond this, unless the policy timeout itself is longer.
+    const MAX_FRAME_WATCHDOG: Duration = Duration::from_secs(10 * 60);
     const PROFILE_PREFIX: &str = "opentake-chromium-";
 
     fn trace_enabled() -> bool {
@@ -1076,6 +1087,62 @@ mod chromium_backend {
         }
     }
 
+    /// Time limits of one render. Waiting for the shared browser and launching
+    /// it is bounded on its own, and rendering is watched phase by phase and
+    /// frame by frame instead of by one deadline for the whole clip, so a long
+    /// or high-resolution clip only fails when a single step stalls.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct RenderBudget {
+        /// Waiting for the browser pool plus a cold start.
+        pub(super) acquire: Duration,
+        /// Loading the document and checking its sandbox contract, and closing
+        /// the render target afterwards.
+        pub(super) setup: Duration,
+        /// Watchdog for each frame: seek, compositor settle, capture, write.
+        pub(super) frame: Duration,
+    }
+
+    impl RenderBudget {
+        pub(super) fn new(
+            policy_timeout: Duration,
+            width: u32,
+            height: u32,
+            transparent: bool,
+        ) -> Self {
+            let frame = frame_watchdog(policy_timeout, width, height, transparent);
+            RenderBudget {
+                acquire: policy_timeout.max(MIN_BROWSER_ACQUIRE_TIMEOUT),
+                setup: frame,
+                frame,
+            }
+        }
+
+        /// The render deadline starts once the browser lease is held, so time
+        /// spent queueing for the pool or cold-starting never consumes it.
+        pub(super) fn setup_deadline(&self, lease_acquired_at: Instant) -> Instant {
+            deadline_after(lease_acquired_at, self.setup)
+        }
+    }
+
+    /// The policy timeout bounds one 1080p opaque frame. Frames with more
+    /// pixels scale it by their pixel count, transparent frames (captured on
+    /// two backgrounds) double it, and the result stays within
+    /// `MAX_FRAME_WATCHDOG` unless the policy itself is longer.
+    pub(super) fn frame_watchdog(
+        policy_timeout: Duration,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Duration {
+        let pixels = u64::from(width) * u64::from(height);
+        let resolution = pixels.div_ceil(FRAME_WATCHDOG_REFERENCE_PIXELS).max(1);
+        let passes = if transparent { 2 } else { 1 };
+        let scale = u32::try_from(resolution * passes).unwrap_or(u32::MAX);
+        policy_timeout
+            .saturating_mul(scale)
+            .min(MAX_FRAME_WATCHDOG.max(policy_timeout))
+    }
+
     /// An unrepresentable deadline fails closed, like an expired one.
     fn deadline_after(start: Instant, budget: Duration) -> Instant {
         start.checked_add(budget).unwrap_or(start)
@@ -1127,25 +1194,35 @@ mod chromium_backend {
             return Ok(clip_from_cache(req, hash, renderer.cache.dir_for(req)));
         }
 
-        let deadline = deadline_after(Instant::now(), renderer.policy.timeout);
+        let budget = RenderBudget::new(
+            renderer.policy.timeout,
+            req.width,
+            req.height,
+            req.transparent,
+        );
         let mut browser = renderer.browser_pool.acquire(
             &browser_path,
-            deadline,
-            renderer.policy.timeout,
+            deadline_after(Instant::now(), budget.acquire),
+            budget.acquire,
             cancellation,
         )?;
+        let acquired_at = Instant::now();
         // Nothing below has touched the browser yet: a cancellation or cache
         // failure here leaves it reusable.
         let prepared = (|| {
-            check_abort(cancellation, deadline, renderer.policy.timeout)?;
+            check_abort(
+                cancellation,
+                budget.setup_deadline(acquired_at),
+                budget.setup,
+            )?;
             if renderer.cache.is_cached(req) {
                 return Ok(None);
             }
             let dir = renderer.cache.begin_render(req)?;
-            remove_partial_frames(&dir)?;
-            Ok(Some(dir))
+            let resume_from = MotionCache::completed_prefix(&dir, req)?;
+            Ok(Some((dir, resume_from)))
         })();
-        let dir = match prepared {
+        let (dir, resume_from) = match prepared {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
                 browser.commit_reuse();
@@ -1158,13 +1235,23 @@ mod chromium_backend {
             }
         };
         let mut partial = PartialFrames::new(dir.clone());
+        if resume_from > 0 {
+            trace(format!(
+                "resuming after {resume_from} frames an interrupted render completed"
+            ));
+            progress(
+                u32::try_from(resume_from).unwrap_or(u32::MAX),
+                req.duration_frames,
+            );
+        }
 
         let mut cdp = Cdp::new(
             browser.take_pipe()?,
             renderer.policy.clone(),
             cancellation.clone(),
-            deadline,
+            budget.setup_deadline(acquired_at),
         );
+        cdp.timeout = budget.setup;
         let mut targets = RenderTargets::default();
         let job = FrameJob {
             req,
@@ -1172,18 +1259,17 @@ mod chromium_backend {
             guarded_width,
             guarded_height,
             dir: &dir,
+            resume_from,
+            budget,
         };
         let rendered = (|| {
-            capture_frames(&mut cdp, &mut targets, &job, progress)?;
+            if resume_from < req.duration_frames as usize {
+                capture_frames(&mut cdp, &mut targets, &job, progress)?;
+            }
+            cdp.arm_watchdog(budget.setup);
             close_render_targets(&mut cdp, &mut targets)?;
             cdp.check_abort()?;
-            publish_completed_render(
-                cancellation,
-                renderer.policy.timeout,
-                deadline,
-                &dir,
-                &mut partial,
-            )
+            publish_completed_render(cancellation, cdp.timeout, cdp.deadline, &dir, &mut partial)
         })();
 
         match rendered {
@@ -1202,6 +1288,11 @@ mod chromium_backend {
                 })
             }
             Err(error) => {
+                if matches!(error, MotionError::Timeout(_) | MotionError::Cancelled) {
+                    // Every frame on disk was completely captured and checked;
+                    // the next render of this request resumes after them.
+                    partial.keep_completed_frames();
+                }
                 if matches!(error, MotionError::Cancelled) {
                     // A superseded preview must not cost the next one a cold
                     // start: close what this render opened and keep the
@@ -1211,9 +1302,14 @@ mod chromium_backend {
                             browser.restore_pipe(cdp.into_pipe());
                             browser.commit_reuse();
                         }
-                        Err(cleanup) => trace(format!(
-                            "cancelled render cleanup failed; discarding Chromium: {cleanup}"
-                        )),
+                        Err(cleanup) => {
+                            if matches!(cleanup, MotionError::Sandbox(_)) {
+                                partial.discard_completed_frames();
+                            }
+                            trace(format!(
+                                "cancelled render cleanup failed; discarding Chromium: {cleanup}"
+                            ));
+                        }
                     }
                 }
                 Err(error)
@@ -1234,6 +1330,8 @@ mod chromium_backend {
         guarded_width: u32,
         guarded_height: u32,
         dir: &'a Path,
+        resume_from: usize,
+        budget: RenderBudget,
     }
 
     fn capture_frames(
@@ -1357,10 +1455,14 @@ mod chromium_backend {
         )?;
         cdp.ensure_no_blocked_url()?;
 
+        // A resumed render seeks straight to its first missing frame, exactly
+        // like a single-frame preview of that frame.
         for (index, seconds) in HeadlessChromiumRenderer::frame_time_grid(req)
             .into_iter()
             .enumerate()
+            .skip(job.resume_from)
         {
+            cdp.arm_watchdog(job.budget.frame);
             cdp.check_abort()?;
             trace(format!("frame {index}: seek start at {seconds:.17}s"));
             let expression = format!(
@@ -1408,7 +1510,7 @@ mod chromium_backend {
             cdp.check_abort()?;
             cdp.ensure_no_blocked_url()?;
             trace(format!("frame {index}: compositor captured"));
-            std::fs::write(MotionCache::frame_file(job.dir, index), png)?;
+            write_frame(job.dir, index, &png)?;
             progress(
                 u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
                 req.duration_frames,
@@ -1435,6 +1537,23 @@ mod chromium_backend {
         cdp.begin_cleanup(CANCELLED_RENDER_CLEANUP_TIMEOUT);
         close_render_targets(cdp, targets)?;
         cdp.ensure_no_blocked_url()
+    }
+
+    /// Publish one frame by writing a temporary file and renaming it into
+    /// place, so an interrupted render never leaves a truncated
+    /// `frame_*.png` for a later render to resume from.
+    fn write_frame(dir: &Path, index: usize, png: &[u8]) -> MotionResult<()> {
+        let counter = FRAME_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = dir.join(format!(
+            ".frame_{index:05}.{pid}-{counter}.tmp",
+            pid = std::process::id()
+        ));
+        let written = std::fs::write(&temporary, png)
+            .and_then(|()| std::fs::rename(&temporary, MotionCache::frame_file(dir, index)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        written.map_err(Into::into)
     }
 
     fn clip_from_cache(
@@ -1962,21 +2081,10 @@ mod chromium_backend {
         })
     }
 
-    fn remove_partial_frames(dir: &Path) -> MotionResult<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("frame_") && name.ends_with(".png") {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
-        Ok(())
-    }
-
     struct PartialFrames {
         dir: PathBuf,
         committed: bool,
+        keep_completed: bool,
     }
 
     impl PartialFrames {
@@ -1984,20 +2092,37 @@ mod chromium_backend {
             Self {
                 dir,
                 committed: false,
+                keep_completed: false,
             }
         }
 
         fn commit(&mut self) {
             self.committed = true;
         }
+
+        /// Keep the frames an interrupted render wrote completely, so the next
+        /// render of the same request resumes after them.
+        fn keep_completed_frames(&mut self) {
+            self.keep_completed = true;
+        }
+
+        fn discard_completed_frames(&mut self) {
+            self.keep_completed = false;
+        }
     }
 
     impl Drop for PartialFrames {
         fn drop(&mut self) {
-            if !self.committed {
-                let _ = MotionCache::remove_completion_marker(&self.dir);
-                let _ = remove_partial_frames(&self.dir);
+            if self.committed {
+                return;
             }
+            // Only the completion marker makes a directory a cache hit, so
+            // retained frames can never be mistaken for a finished render.
+            let _ = if self.keep_completed {
+                MotionCache::remove_completion_marker(&self.dir)
+            } else {
+                MotionCache::discard_render_output(&self.dir)
+            };
         }
     }
 
@@ -2765,7 +2890,10 @@ mod chromium_backend {
         pipe: CdpPipe,
         policy: SandboxPolicy,
         cancellation: MotionCancellationToken,
+        /// The watchdog of the current render phase and the budget reported
+        /// when it expires.
         deadline: Instant,
+        timeout: Duration,
         blocked_url: Option<String>,
         pending_events: Vec<Value>,
         next_capture_generation: u32,
@@ -2781,6 +2909,7 @@ mod chromium_backend {
         ) -> Self {
             Self {
                 pipe,
+                timeout: policy.timeout,
                 policy,
                 cancellation,
                 deadline,
@@ -2791,11 +2920,17 @@ mod chromium_backend {
             }
         }
 
+        /// Restart the watchdog: the next `budget` covers one render phase.
+        fn arm_watchdog(&mut self, budget: Duration) {
+            self.deadline = deadline_after(Instant::now(), budget);
+            self.timeout = budget;
+        }
+
         /// Continue on a fresh token after the render's own was cancelled, so
         /// cleanup commands can still complete within `budget`.
         fn begin_cleanup(&mut self, budget: Duration) {
             self.cancellation = MotionCancellationToken::new();
-            self.deadline = deadline_after(Instant::now(), budget);
+            self.arm_watchdog(budget);
         }
 
         /// Hand the connection back for the next render of this browser.
@@ -3373,7 +3508,7 @@ mod chromium_backend {
         }
 
         fn check_abort(&self) -> MotionResult<()> {
-            check_abort_state(&self.cancellation, self.deadline, self.policy.timeout)
+            check_abort_state(&self.cancellation, self.deadline, self.timeout)
         }
 
         fn close_target(&mut self, target_id: &str) -> MotionResult<()> {
@@ -4476,6 +4611,49 @@ mod chromium_backend {
             let (delivered, reason) = read(b"abc");
             assert!(delivered.is_empty());
             assert!(reason.contains("inside a message"), "{reason}");
+        }
+
+        #[test]
+        fn render_budget_excludes_pool_waiting_and_scales_frames_with_resolution() {
+            let base = Duration::from_secs(60);
+            let hd = RenderBudget::new(base, 1920, 1080, false);
+            assert_eq!(
+                hd,
+                RenderBudget {
+                    acquire: base,
+                    setup: base,
+                    frame: base
+                }
+            );
+            assert_eq!(RenderBudget::new(base, 1920, 1080, true).frame, base * 2);
+            assert_eq!(RenderBudget::new(base, 1921, 1080, false).frame, base * 2);
+            assert_eq!(RenderBudget::new(base, 3840, 2160, false).frame, base * 4);
+            assert_eq!(RenderBudget::new(base, 3840, 2160, true).frame, base * 8);
+            assert_eq!(
+                RenderBudget::new(base, 4096, 4096, true).frame,
+                MAX_FRAME_WATCHDOG,
+                "resolution scaling is capped"
+            );
+            let long_policy = Duration::from_secs(900);
+            assert_eq!(
+                RenderBudget::new(long_policy, 4096, 4096, true).frame,
+                long_policy,
+                "the cap never shortens the policy itself"
+            );
+            let tiny = RenderBudget::new(Duration::from_millis(500), 48, 32, false);
+            assert_eq!(tiny.frame, Duration::from_millis(500));
+            assert_eq!(tiny.setup, Duration::from_millis(500));
+            assert_eq!(
+                tiny.acquire, MIN_BROWSER_ACQUIRE_TIMEOUT,
+                "a cold start is not bounded by the frame watchdog"
+            );
+
+            // 45 s spent queueing behind another render (or cold-starting)
+            // leaves the whole render budget intact.
+            let requested = Instant::now();
+            let acquired = requested + Duration::from_secs(45);
+            assert_eq!(hd.setup_deadline(acquired), acquired + base);
+            assert!(hd.setup_deadline(acquired) > requested + base);
         }
 
         #[test]

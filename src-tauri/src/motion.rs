@@ -815,9 +815,11 @@ impl TauriMotionBridge {
             core,
             renderer: HeadlessChromiumRenderer::new(
                 MotionCache::new(cache_root.join("motion-frames")),
-                // Bounded but generous: a complex motion graphic on a slow or
-                // loaded machine can legitimately exceed a minute; 180s still
-                // fails closed rather than hanging forever.
+                // The timeout is a watchdog per render phase: launching the
+                // browser, loading the document, and each frame (scaled up for
+                // large and transparent frames). Generous for a complex scene
+                // on a slow machine, yet a stalled frame still fails closed;
+                // the clip length itself is unbounded apart from cancellation.
                 SandboxPolicy::offline_with_timeout(Duration::from_secs(180)),
             ),
             progress: Arc::new(|_| {}),
