@@ -75,16 +75,453 @@ struct CaptionTranslationProviderResult {
     errors: Vec<CaptionTranslationFailure>,
 }
 
+/// One provider round trip for a batch of captions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaptionBatchReply {
+    Translated(CaptionTranslationProviderResult),
+    /// The reply stopped at the output-token limit or skipped captions; the
+    /// batch is split and retried.
+    Incomplete,
+    /// HTTP 429: retry the same batch after the provider's `Retry-After`.
+    RateLimited(Option<std::time::Duration>),
+    /// A network failure, timeout or 5xx: the batch fails, and repeated ones
+    /// stop the run because every later request would fail the same way.
+    Unavailable(String),
+}
+
+/// Per-run provider state: the API key and HTTP client are read and built once
+/// per translation run, not once per batch.
+#[derive(Default)]
+struct CaptionRunContext {
+    network: Option<(String, reqwest::blocking::Client)>,
+}
+
 trait CaptionTranslationProvider: Send + Sync {
+    /// Called once per run before any batch. Configuration problems (unknown
+    /// provider, unreadable or missing key) fail here, before anything is billed.
+    fn prepare(&self, provider: &str) -> Result<CaptionRunContext, AdvancedWorkflowError> {
+        let _ = provider;
+        Ok(CaptionRunContext::default())
+    }
+
+    /// Translate one batch (at most [`CAPTION_TRANSLATION_BATCH_SIZE`]
+    /// captions). Errors of a fatal kind (see
+    /// [`caption_translation_error_is_fatal`]) stop the run; any other error
+    /// only fails this batch.
+    #[allow(clippy::too_many_arguments)]
     fn translate(
         &self,
+        run: &CaptionRunContext,
         provider: &str,
         model: &str,
         source_locale: &str,
         target_locale: &str,
         captions: &[CaptionTranslationDraft],
         cancel: &MediaCancelToken,
-    ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError>;
+    ) -> Result<CaptionBatchReply, AdvancedWorkflowError>;
+}
+
+/// Most captions one translation request (or review apply) accepts. Requests
+/// are split into provider batches, so this only bounds total work; the 1 MB
+/// source-text limit usually binds first.
+const MAX_TRANSLATION_CAPTIONS: usize = 5_000;
+/// Captions per provider request. Short enough that the reply fits well within
+/// the output-token cap and one request finishes inside the timeout (#32).
+const CAPTION_TRANSLATION_BATCH_SIZE: usize = 60;
+/// Source text per provider request, so long captions shrink the batch too.
+const CAPTION_TRANSLATION_BATCH_BYTES: usize = 12_000;
+/// How many times one initial batch may be bisected after truncation.
+const CAPTION_TRANSLATION_MAX_SPLITS: u32 = 4;
+/// Output-token cap sent to both providers.
+const CAPTION_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 8_192;
+/// Whole-request timeout for one batch.
+const CAPTION_TRANSLATION_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Consecutive unavailable batches (network errors, timeouts, 5xx) after which
+/// the run stops instead of sending the remaining batches into the same outage.
+const CAPTION_TRANSLATION_MAX_CONSECUTIVE_UNAVAILABLE: u32 = 2;
+/// Consecutive rate-limit replies after which a batch is failed.
+const CAPTION_TRANSLATION_MAX_RATE_LIMITS: u32 = 3;
+/// Longest `Retry-After` honoured; a default applies when none is sent.
+const CAPTION_TRANSLATION_MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+const CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(5);
+/// Total time one run may spend waiting out rate limits.
+const CAPTION_TRANSLATION_MAX_RATE_LIMIT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Split `captions` into provider batches bounded by count and source bytes.
+fn caption_translation_batches(
+    captions: &[CaptionTranslationDraft],
+) -> Vec<&[CaptionTranslationDraft]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0_usize;
+    for (index, caption) in captions.iter().enumerate() {
+        let len = index - start;
+        if len > 0
+            && (len >= CAPTION_TRANSLATION_BATCH_SIZE
+                || bytes.saturating_add(caption.text.len()) > CAPTION_TRANSLATION_BATCH_BYTES)
+        {
+            batches.push(&captions[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(caption.text.len());
+    }
+    if start < captions.len() {
+        batches.push(&captions[start..]);
+    }
+    batches
+}
+
+/// Whether a batch error should stop the whole translation instead of only
+/// failing that batch's captions (missing key, unsupported provider, cancel).
+fn caption_translation_error_is_fatal(error: &AdvancedWorkflowError) -> bool {
+    matches!(
+        error.kind,
+        AdvancedWorkflowErrorKind::Cancelled
+            | AdvancedWorkflowErrorKind::ConsentRequired
+            | AdvancedWorkflowErrorKind::CapabilityUnavailable
+            | AdvancedWorkflowErrorKind::CostAuthorizationRequired
+            | AdvancedWorkflowErrorKind::InvalidArguments
+    )
+}
+
+/// Sleep for `duration` unless `cancel` fires first.
+fn wait_cancellably(duration: std::time::Duration, cancel: &MediaCancelToken) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+    }
+}
+
+/// Keep a batch reply only for ids of that batch, each at most once; a reply
+/// naming anything else is untrustworthy, so the whole batch fails instead.
+fn confine_batch_reply(
+    batch: &[CaptionTranslationDraft],
+    reply: CaptionTranslationProviderResult,
+) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
+    let ids: std::collections::HashSet<&str> =
+        batch.iter().map(|caption| caption.id.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let returned = reply
+        .translations
+        .iter()
+        .map(|translation| translation.id.as_str())
+        .chain(reply.errors.iter().map(|failure| failure.id.as_str()));
+    for id in returned {
+        if !ids.contains(id) || !seen.insert(id) {
+            return Err(advanced_execution(
+                "translation provider returned an unknown or duplicate caption id",
+            ));
+        }
+    }
+    Ok(reply)
+}
+
+/// Translate `captions` batch by batch, in order.
+///
+/// An incomplete (truncated) batch is bisected and retried up to
+/// [`CAPTION_TRANSLATION_MAX_SPLITS`] times; a rate-limited batch is retried
+/// after `Retry-After`; a batch that still fails only turns its own captions
+/// into errors, so finished batches are kept. Fatal errors (key, auth, request
+/// rejected, cancellation) stop at once, repeated outages stop the run, and
+/// rate-limit retries share one budget per run. Cancellation is checked
+/// between requests and aborts everything.
+fn translate_caption_batches(
+    translator: &dyn CaptionTranslationProvider,
+    provider: &str,
+    model: &str,
+    source_locale: &str,
+    target_locale: &str,
+    captions: &[CaptionTranslationDraft],
+    cancel: &MediaCancelToken,
+) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
+    if cancel.checkpoint() {
+        return Err(cancelled_workflow("caption translation cancelled"));
+    }
+    let run = translator.prepare(provider)?;
+    let mut outcome = BatchOutcome::default();
+    // A stack of (batch, splits so far), processed front to back.
+    let mut pending: Vec<(&[CaptionTranslationDraft], u32)> = caption_translation_batches(captions)
+        .into_iter()
+        .rev()
+        .map(|batch| (batch, 0))
+        .collect();
+    // Bisection is bounded by the split limit; only rate-limit retries could
+    // otherwise repeat indefinitely, so they share one budget per run.
+    let max_retries = pending.len() + 8;
+    let mut retries = 0_usize;
+    let mut rate_limit_waited = std::time::Duration::ZERO;
+    let mut consecutive_unavailable = 0_u32;
+    let mut consecutive_rate_limits = 0_u32;
+    while let Some((batch, splits)) = pending.pop() {
+        if cancel.checkpoint() {
+            return Err(cancelled_workflow("caption translation cancelled"));
+        }
+        let reply = translator
+            .translate(
+                &run,
+                provider,
+                model,
+                source_locale,
+                target_locale,
+                batch,
+                cancel,
+            )
+            .and_then(|reply| match reply {
+                CaptionBatchReply::Translated(result) => {
+                    confine_batch_reply(batch, result).map(CaptionBatchReply::Translated)
+                }
+                other => Ok(other),
+            });
+        if cancel.checkpoint() {
+            return Err(cancelled_workflow("caption translation cancelled"));
+        }
+        match reply {
+            Ok(CaptionBatchReply::Translated(result)) => {
+                consecutive_unavailable = 0;
+                consecutive_rate_limits = 0;
+                outcome.merged.translations.extend(result.translations);
+                outcome.merged.errors.extend(result.errors);
+            }
+            Ok(CaptionBatchReply::Incomplete)
+                if batch.len() > 1 && splits < CAPTION_TRANSLATION_MAX_SPLITS =>
+            {
+                let (head, tail) = batch.split_at(batch.len() / 2);
+                pending.push((tail, splits + 1));
+                pending.push((head, splits + 1));
+            }
+            Ok(CaptionBatchReply::Incomplete) => {
+                outcome.fail(batch, "provider output was truncated or skipped captions");
+            }
+            Ok(CaptionBatchReply::RateLimited(retry_after))
+                if retries >= max_retries
+                    || rate_limit_waited
+                        + retry_after
+                            .unwrap_or(CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER)
+                            .min(CAPTION_TRANSLATION_MAX_RETRY_AFTER)
+                        > CAPTION_TRANSLATION_MAX_RATE_LIMIT_WAIT =>
+            {
+                let message = "caption translation stopped after too many rate-limited requests; retry the remaining captions later";
+                outcome.fail(batch, message);
+                for (rest, _) in pending.drain(..) {
+                    outcome.fail(rest, message);
+                }
+            }
+            Ok(CaptionBatchReply::RateLimited(retry_after))
+                if consecutive_rate_limits < CAPTION_TRANSLATION_MAX_RATE_LIMITS =>
+            {
+                consecutive_rate_limits += 1;
+                retries += 1;
+                let wait = retry_after
+                    .unwrap_or(CAPTION_TRANSLATION_DEFAULT_RETRY_AFTER)
+                    .min(CAPTION_TRANSLATION_MAX_RETRY_AFTER);
+                rate_limit_waited += wait;
+                if !wait_cancellably(wait, cancel) {
+                    return Err(cancelled_workflow("caption translation cancelled"));
+                }
+                pending.push((batch, splits));
+            }
+            Ok(CaptionBatchReply::RateLimited(_)) => {
+                consecutive_rate_limits = 0;
+                outcome.fail(
+                    batch,
+                    "the provider kept rate-limiting requests; retry later",
+                );
+            }
+            Ok(CaptionBatchReply::Unavailable(message)) => {
+                consecutive_unavailable += 1;
+                outcome.fail(batch, &message);
+                if consecutive_unavailable >= CAPTION_TRANSLATION_MAX_CONSECUTIVE_UNAVAILABLE {
+                    let stopped = format!("caption translation stopped: {message}");
+                    for (rest, _) in pending.drain(..) {
+                        outcome.fail(rest, &stopped);
+                    }
+                }
+            }
+            Err(error) if error.kind == AdvancedWorkflowErrorKind::Cancelled => return Err(error),
+            // A rejected key or request after some batches succeeded: stop
+            // sending, but keep the already-billed translations for review.
+            Err(error)
+                if caption_translation_error_is_fatal(&error)
+                    && !outcome.merged.translations.is_empty() =>
+            {
+                let message = format!("caption translation stopped: {}", error.message);
+                outcome.fail(batch, &message);
+                for (rest, _) in pending.drain(..) {
+                    outcome.fail(rest, &message);
+                }
+            }
+            Err(error) if caption_translation_error_is_fatal(&error) => return Err(error),
+            Err(error) => {
+                consecutive_unavailable = 0;
+                outcome.fail(batch, &error.message);
+            }
+        }
+    }
+    match outcome.first_failure {
+        // Nothing to review: surface the provider's own error, not a generic one.
+        Some(message) if outcome.merged.translations.is_empty() => Err(advanced_execution(message)),
+        _ => Ok(outcome.merged),
+    }
+}
+
+/// Results merged across batches, plus the first batch failure.
+#[derive(Default)]
+struct BatchOutcome {
+    merged: CaptionTranslationProviderResult,
+    first_failure: Option<String>,
+}
+
+impl BatchOutcome {
+    fn fail(&mut self, batch: &[CaptionTranslationDraft], message: &str) {
+        self.merged
+            .errors
+            .extend(batch.iter().map(|caption| CaptionTranslationFailure {
+                id: caption.id.clone(),
+                message: message.to_string(),
+            }));
+        self.first_failure
+            .get_or_insert_with(|| message.to_string());
+    }
+}
+
+/// Where the provider stopped, read from its response envelope.
+#[derive(Debug, PartialEq, Eq)]
+enum TranslationResponseText {
+    Complete(String),
+    Truncated,
+}
+
+/// Pull the model's text out of an OpenAI Chat Completions or Anthropic
+/// Messages response, recognizing `finish_reason == "length"` and
+/// `stop_reason == "max_tokens"` as truncation.
+fn parse_translation_response(
+    provider: &str,
+    wire: &serde_json::Value,
+) -> Result<TranslationResponseText, AdvancedWorkflowError> {
+    let (stop, text) = if provider == "openai" {
+        (
+            wire.pointer("/choices/0/finish_reason"),
+            wire.pointer("/choices/0/message/content"),
+        )
+    } else {
+        (
+            wire.pointer("/stop_reason"),
+            wire.pointer("/content/0/text"),
+        )
+    };
+    let truncated_reason = if provider == "openai" {
+        "length"
+    } else {
+        "max_tokens"
+    };
+    if stop.and_then(serde_json::Value::as_str) == Some(truncated_reason) {
+        return Ok(TranslationResponseText::Truncated);
+    }
+    let raw = text
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| advanced_execution("translation provider returned no JSON content"))?;
+    let raw = raw
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| raw.trim().strip_prefix("```"))
+        .unwrap_or(raw.trim())
+        .trim()
+        .strip_suffix("```")
+        .unwrap_or(raw.trim())
+        .trim();
+    Ok(TranslationResponseText::Complete(raw.to_string()))
+}
+
+/// Captions as the model sees them: the batch position replaces the 36-char
+/// clip UUID, which cuts output tokens substantially.
+#[derive(Serialize)]
+struct IndexedCaption<'a> {
+    id: usize,
+    text: &'a str,
+}
+
+#[derive(Deserialize)]
+struct IndexedTranslation {
+    id: serde_json::Value,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct IndexedFailure {
+    id: serde_json::Value,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct IndexedTranslationResult {
+    translations: Vec<IndexedTranslation>,
+    #[serde(default)]
+    errors: Vec<IndexedFailure>,
+}
+
+/// A batch position from the model: a non-negative integer, also accepted as a
+/// numeric string.
+fn batch_position(id: &serde_json::Value) -> Option<usize> {
+    match id {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+    .and_then(|position| usize::try_from(position).ok())
+}
+
+/// Parse the model's JSON and map batch positions back to clip ids. Positions
+/// out of range or repeated are rejected; a reply that does not cover every
+/// position `0..n` exactly once is [`CaptionBatchReply::Incomplete`], because a
+/// model that renumbered or dropped a caption would otherwise attach
+/// translations to the wrong clips.
+fn map_indexed_translations(
+    batch: &[CaptionTranslationDraft],
+    raw: &str,
+) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
+    let parsed: IndexedTranslationResult = serde_json::from_str(raw)
+        .map_err(|error| advanced_execution(format!("invalid translation JSON: {error}")))?;
+    let mut seen = vec![false; batch.len()];
+    let mut clip_id = |id: &serde_json::Value| -> Result<String, AdvancedWorkflowError> {
+        let index = batch_position(id).filter(|index| *index < batch.len());
+        match index {
+            Some(index) if !seen[index] => {
+                seen[index] = true;
+                Ok(batch[index].id.clone())
+            }
+            _ => Err(advanced_execution(
+                "translation provider returned an unknown or duplicate caption id",
+            )),
+        }
+    };
+    let mut result = CaptionTranslationProviderResult::default();
+    for translation in parsed.translations {
+        result.translations.push(CaptionTranslationDraft {
+            id: clip_id(&translation.id)?,
+            text: translation.text,
+        });
+    }
+    for failure in parsed.errors {
+        result.errors.push(CaptionTranslationFailure {
+            id: clip_id(&failure.id)?,
+            message: failure.message,
+        });
+    }
+    if seen.iter().any(|covered| !covered) {
+        return Ok(CaptionBatchReply::Incomplete);
+    }
+    Ok(CaptionBatchReply::Translated(result))
 }
 
 struct NetworkCaptionTranslationProvider;
@@ -529,18 +966,7 @@ impl VoiceCloneProvider for NetworkElevenLabsVoiceProvider {
 }
 
 impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
-    fn translate(
-        &self,
-        provider: &str,
-        model: &str,
-        source_locale: &str,
-        target_locale: &str,
-        captions: &[CaptionTranslationDraft],
-        cancel: &MediaCancelToken,
-    ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
-        if cancel.checkpoint() {
-            return Err(cancelled_workflow("caption translation cancelled"));
-        }
+    fn prepare(&self, provider: &str) -> Result<CaptionRunContext, AdvancedWorkflowError> {
         let key = match provider {
             "openai" => ProviderKey::OpenAI,
             "anthropic" => ProviderKey::Anthropic,
@@ -553,23 +979,65 @@ impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
         };
         let secret = KeyringStore::new()
             .load(key.account())
-            .map_err(|error| advanced_execution(format!("could not read {provider} key: {error}")))?
+            .map_err(|error| {
+                AdvancedWorkflowError::new(
+                    AdvancedWorkflowErrorKind::CapabilityUnavailable,
+                    format!("could not read the {provider} key: {error}"),
+                )
+            })?
             .ok_or_else(|| {
                 AdvancedWorkflowError::new(
                     AdvancedWorkflowErrorKind::ConsentRequired,
                     format!("no {provider} API key is configured; open Settings → AI"),
                 )
             })?;
-        let payload = serde_json::to_string(captions)
-            .map_err(|error| advanced_execution(error.to_string()))?;
-        let instruction = format!(
-            "Translate every caption from locale {source_locale} to {target_locale}. Preserve meaning and natural subtitle phrasing. Return only JSON with shape {{\"translations\":[{{\"id\":string,\"text\":string}}],\"errors\":[{{\"id\":string,\"message\":string}}]}}. Every input id must appear exactly once in translations or errors. Never change ids. Captions: {payload}"
-        );
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(CAPTION_TRANSLATION_BATCH_TIMEOUT)
             .build()
-            .map_err(|error| advanced_execution(format!("translation client: {error}")))?;
+            .map_err(|error| {
+                AdvancedWorkflowError::new(
+                    AdvancedWorkflowErrorKind::CapabilityUnavailable,
+                    format!("translation client: {error}"),
+                )
+            })?;
+        Ok(CaptionRunContext {
+            network: Some((secret, client)),
+        })
+    }
+
+    fn translate(
+        &self,
+        run: &CaptionRunContext,
+        provider: &str,
+        model: &str,
+        source_locale: &str,
+        target_locale: &str,
+        captions: &[CaptionTranslationDraft],
+        cancel: &MediaCancelToken,
+    ) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
+        if cancel.checkpoint() {
+            return Err(cancelled_workflow("caption translation cancelled"));
+        }
+        let (secret, client) = run.network.as_ref().ok_or_else(|| {
+            AdvancedWorkflowError::new(
+                AdvancedWorkflowErrorKind::CapabilityUnavailable,
+                "caption translation was not prepared",
+            )
+        })?;
+        let indexed: Vec<IndexedCaption<'_>> = captions
+            .iter()
+            .enumerate()
+            .map(|(id, caption)| IndexedCaption {
+                id,
+                text: &caption.text,
+            })
+            .collect();
+        let payload = serde_json::to_string(&indexed)
+            .map_err(|error| advanced_execution(error.to_string()))?;
+        let instruction = format!(
+            "Translate every caption from locale {source_locale} to {target_locale}. Preserve meaning and natural subtitle phrasing. Return only JSON with shape {{\"translations\":[{{\"id\":number,\"text\":string}}],\"errors\":[{{\"id\":number,\"message\":string}}]}}. Every input id must appear exactly once in translations or errors. Never change ids. Captions: {payload}"
+        );
         let response = match provider {
             "openai" => client
                 .post("https://api.openai.com/v1/chat/completions")
@@ -577,6 +1045,7 @@ impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
                 .json(&json!({
                     "model": model,
                     "temperature": 0,
+                    "max_completion_tokens": CAPTION_TRANSLATION_MAX_OUTPUT_TOKENS,
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": "You are a precise audiovisual subtitle translator."},
@@ -590,20 +1059,43 @@ impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
                     "model": model,
-                    "max_tokens": 8192,
+                    "max_tokens": CAPTION_TRANSLATION_MAX_OUTPUT_TOKENS,
                     "temperature": 0,
                     "system": "You are a precise audiovisual subtitle translator. Return only JSON.",
                     "messages": [{"role": "user", "content": instruction}]
                 }))
                 .send(),
-            _ => unreachable!(),
-        }
-        .map_err(|error| advanced_execution(format!("caption translation network error: {error}")))?;
-        if !response.status().is_success() {
-            return Err(advanced_execution(format!(
-                "caption translation provider returned HTTP {}",
-                response.status()
-            )));
+            _ => {
+                return Err(AdvancedWorkflowError::new(
+                    AdvancedWorkflowErrorKind::CapabilityUnavailable,
+                    "caption translation supports OpenAI or Anthropic",
+                ))
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return Ok(CaptionBatchReply::Unavailable(format!(
+                    "caption translation timed out after {}s for a batch of {} captions; check the network or choose a faster model, then retry",
+                    CAPTION_TRANSLATION_BATCH_TIMEOUT.as_secs(),
+                    captions.len()
+                )))
+            }
+            Err(error) => {
+                return Ok(CaptionBatchReply::Unavailable(format!(
+                    "caption translation network error: {error}"
+                )))
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
+            return classify_translation_status(provider, status.as_u16(), retry_after);
         }
         const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
         if response
@@ -614,7 +1106,6 @@ impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
                 "translation provider response is too large",
             ));
         }
-        let response = response;
         let mut body = Vec::new();
         response
             .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
@@ -632,24 +1123,36 @@ impl CaptionTranslationProvider for NetworkCaptionTranslationProvider {
         if cancel.checkpoint() {
             return Err(cancelled_workflow("caption translation cancelled"));
         }
-        let raw = if provider == "openai" {
-            wire.pointer("/choices/0/message/content")
-        } else {
-            wire.pointer("/content/0/text")
+        match parse_translation_response(provider, &wire)? {
+            TranslationResponseText::Truncated => Ok(CaptionBatchReply::Incomplete),
+            TranslationResponseText::Complete(raw) => map_indexed_translations(captions, &raw),
         }
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| advanced_execution("translation provider returned no JSON content"))?;
-        let raw = raw
-            .trim()
-            .strip_prefix("```json")
-            .or_else(|| raw.trim().strip_prefix("```"))
-            .unwrap_or(raw.trim())
-            .trim()
-            .strip_suffix("```")
-            .unwrap_or(raw.trim())
-            .trim();
-        serde_json::from_str(raw)
-            .map_err(|error| advanced_execution(format!("invalid translation JSON: {error}")))
+    }
+}
+
+/// Map a non-success HTTP status to what the batch loop should do: rejected
+/// credentials or requests stop the run (every later batch would fail and
+/// could still be billed), 429 waits, and 5xx counts as an outage.
+fn classify_translation_status(
+    provider: &str,
+    status: u16,
+    retry_after: Option<std::time::Duration>,
+) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
+    match status {
+        429 => Ok(CaptionBatchReply::RateLimited(retry_after)),
+        401 | 403 => Err(AdvancedWorkflowError::new(
+            AdvancedWorkflowErrorKind::ConsentRequired,
+            format!("{provider} rejected the API key (HTTP {status}); check Settings → AI"),
+        )),
+        400..=499 => Err(AdvancedWorkflowError::new(
+            AdvancedWorkflowErrorKind::InvalidArguments,
+            format!(
+                "{provider} rejected the translation request (HTTP {status}); check the model name"
+            ),
+        )),
+        _ => Ok(CaptionBatchReply::Unavailable(format!(
+            "caption translation provider returned HTTP {status}"
+        ))),
     }
 }
 
@@ -1071,8 +1574,10 @@ pub fn advanced_apply_caption_translation_review(
     request: ApplyCaptionTranslationReviewRequest,
 ) -> Result<GenerateMatteResultDto, String> {
     let _activity = crate::updater::begin_mutating_activity(&state.admission)?;
-    if request.changes.is_empty() || request.changes.len() > 500 {
-        return Err("select between 1 and 500 translated captions to apply".into());
+    if request.changes.is_empty() || request.changes.len() > MAX_TRANSLATION_CAPTIONS {
+        return Err(format!(
+            "select between 1 and {MAX_TRANSLATION_CAPTIONS} translated captions to apply"
+        ));
     }
     if request.source_locale.is_empty()
         || request.source_locale.len() > 64
@@ -2186,10 +2691,12 @@ impl TauriAdvancedWorkflowBridge {
         if cancel.checkpoint() {
             return Err(cancelled_workflow("caption translation cancelled"));
         }
-        if args.caption_clip_ids.is_empty() || args.caption_clip_ids.len() > 500 {
-            return Err(advanced_invalid(
-                "captionClipIds must contain between 1 and 500 captions",
-            ));
+        if args.caption_clip_ids.is_empty()
+            || args.caption_clip_ids.len() > MAX_TRANSLATION_CAPTIONS
+        {
+            return Err(advanced_invalid(format!(
+                "captionClipIds must contain between 1 and {MAX_TRANSLATION_CAPTIONS} captions"
+            )));
         }
         let source_locale = args.source_locale.as_deref().unwrap_or("auto").trim();
         let target_locale = args.target_locale.trim();
@@ -2257,7 +2764,8 @@ impl TauriAdvancedWorkflowBridge {
                 text: text.to_string(),
             });
         }
-        let returned = self.caption_translator.translate(
+        let returned = translate_caption_batches(
+            self.caption_translator.as_ref(),
             provider,
             model,
             source_locale,
@@ -4931,14 +5439,15 @@ mod tests {
     impl CaptionTranslationProvider for MockCaptionTranslator {
         fn translate(
             &self,
+            _run: &CaptionRunContext,
             _provider: &str,
             _model: &str,
             _source_locale: &str,
             _target_locale: &str,
             _captions: &[CaptionTranslationDraft],
             _cancel: &MediaCancelToken,
-        ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
-            self.result.clone()
+        ) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
+            self.result.clone().map(CaptionBatchReply::Translated)
         }
     }
 
@@ -5105,6 +5614,489 @@ mod tests {
         assert_eq!(core.runtime_snapshot().timeline, before.timeline);
     }
 
+    /// Echo translator: records batch sizes, reports truncation above
+    /// `truncate_above` captions, fails every batch holding `fail_id`, and
+    /// cancels `cancel_on_call`'s token on that (1-based) call.
+    #[derive(Default)]
+    struct BatchingCaptionTranslator {
+        truncate_above: Option<usize>,
+        fail_id: Option<String>,
+        cancel_on_call: Option<(usize, MediaCancelToken)>,
+        /// Replies returned (front first) before falling back to echoing.
+        script: std::sync::Mutex<
+            std::collections::VecDeque<Result<CaptionBatchReply, AdvancedWorkflowError>>,
+        >,
+        /// Reply returned for every call once `script` is empty.
+        always: Option<Result<CaptionBatchReply, AdvancedWorkflowError>>,
+        prepared: std::sync::atomic::AtomicUsize,
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl BatchingCaptionTranslator {
+        fn scripted(
+            replies: impl IntoIterator<Item = Result<CaptionBatchReply, AdvancedWorkflowError>>,
+        ) -> Self {
+            Self {
+                script: std::sync::Mutex::new(replies.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl CaptionTranslationProvider for BatchingCaptionTranslator {
+        fn prepare(&self, _provider: &str) -> Result<CaptionRunContext, AdvancedWorkflowError> {
+            self.prepared
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CaptionRunContext::default())
+        }
+
+        fn translate(
+            &self,
+            _run: &CaptionRunContext,
+            _provider: &str,
+            _model: &str,
+            _source_locale: &str,
+            _target_locale: &str,
+            captions: &[CaptionTranslationDraft],
+            _cancel: &MediaCancelToken,
+        ) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(captions.len());
+                calls.len()
+            };
+            if let Some((on_call, token)) = &self.cancel_on_call {
+                if *on_call == call {
+                    token.cancel();
+                }
+            }
+            if let Some(reply) = self.script.lock().unwrap().pop_front() {
+                return reply;
+            }
+            if let Some(reply) = &self.always {
+                return reply.clone();
+            }
+            if self
+                .fail_id
+                .as_ref()
+                .is_some_and(|id| captions.iter().any(|caption| &caption.id == id))
+            {
+                return Err(advanced_execution("batch provider failure"));
+            }
+            if self
+                .truncate_above
+                .is_some_and(|limit| captions.len() > limit)
+            {
+                return Ok(CaptionBatchReply::Incomplete);
+            }
+            Ok(CaptionBatchReply::Translated(
+                CaptionTranslationProviderResult {
+                    translations: captions
+                        .iter()
+                        .map(|caption| CaptionTranslationDraft {
+                            id: caption.id.clone(),
+                            text: format!("t:{}", caption.text),
+                        })
+                        .collect(),
+                    errors: vec![],
+                },
+            ))
+        }
+    }
+
+    fn drafts(count: usize) -> Vec<CaptionTranslationDraft> {
+        (0..count)
+            .map(|index| CaptionTranslationDraft {
+                id: format!("{index:08}-0000-4000-8000-000000000000"),
+                text: format!("caption {index}"),
+            })
+            .collect()
+    }
+
+    fn run_batches(
+        translator: &BatchingCaptionTranslator,
+        captions: &[CaptionTranslationDraft],
+        cancel: &MediaCancelToken,
+    ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
+        translate_caption_batches(translator, "openai", "m", "en", "zh", captions, cancel)
+    }
+
+    fn assert_each_id_once(
+        captions: &[CaptionTranslationDraft],
+        result: &CaptionTranslationProviderResult,
+    ) {
+        let mut returned: Vec<&str> = result
+            .translations
+            .iter()
+            .map(|t| t.id.as_str())
+            .chain(result.errors.iter().map(|e| e.id.as_str()))
+            .collect();
+        returned.sort_unstable();
+        let mut expected: Vec<&str> = captions.iter().map(|c| c.id.as_str()).collect();
+        expected.sort_unstable();
+        assert_eq!(returned, expected);
+    }
+
+    #[test]
+    fn long_caption_lists_are_split_into_bounded_batches() {
+        for count in [500, 1_234] {
+            let captions = drafts(count);
+            let translator = BatchingCaptionTranslator::default();
+
+            let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+            let calls = translator.calls.lock().unwrap().clone();
+            assert!(calls.len() > 1);
+            assert!(calls
+                .iter()
+                .all(|size| *size <= CAPTION_TRANSLATION_BATCH_SIZE));
+            assert_eq!(calls.iter().sum::<usize>(), count);
+            assert!(result.errors.is_empty());
+            assert_each_id_once(&captions, &result);
+        }
+    }
+
+    #[test]
+    fn batches_are_also_bounded_by_source_bytes() {
+        let captions: Vec<_> = (0..10)
+            .map(|index| CaptionTranslationDraft {
+                id: format!("id-{index}"),
+                text: "x".repeat(CAPTION_TRANSLATION_BATCH_BYTES / 3),
+            })
+            .collect();
+
+        let batches = caption_translation_batches(&captions);
+
+        assert!(batches.iter().all(|batch| batch
+            .iter()
+            .map(|caption| caption.text.len())
+            .sum::<usize>()
+            <= CAPTION_TRANSLATION_BATCH_BYTES));
+        assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 10);
+    }
+
+    #[test]
+    fn a_failed_batch_only_fails_its_own_captions() {
+        let captions = drafts(150);
+        let translator = BatchingCaptionTranslator {
+            fail_id: Some(captions[70].id.clone()),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+        let failed: std::collections::HashSet<&str> = result
+            .errors
+            .iter()
+            .map(|error| error.id.as_str())
+            .collect();
+        let failed_batch = &caption_translation_batches(&captions)[1];
+        assert_eq!(failed.len(), failed_batch.len());
+        assert!(failed_batch
+            .iter()
+            .all(|caption| failed.contains(caption.id.as_str())));
+        assert!(result
+            .errors
+            .iter()
+            .all(|error| error.message == "batch provider failure"));
+        assert_each_id_once(&captions, &result);
+    }
+
+    #[test]
+    fn truncated_batches_are_bisected_until_they_fit() {
+        let captions = drafts(120);
+        let translator = BatchingCaptionTranslator {
+            truncate_above: Some(16),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.translations.len(), 120);
+        // Order is preserved across bisection.
+        let ids: Vec<&str> = result.translations.iter().map(|t| t.id.as_str()).collect();
+        let expected: Vec<&str> = captions.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn a_batch_still_truncated_after_max_splits_fails_alone() {
+        let captions = drafts(CAPTION_TRANSLATION_BATCH_SIZE + 10);
+        // 60 -> 30 -> 15 -> 7/8 -> 3/4: four splits still exceed two captions.
+        let translator = BatchingCaptionTranslator {
+            truncate_above: Some(2),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+        assert!(!result.errors.is_empty());
+        assert!(result
+            .errors
+            .iter()
+            .all(|error| error.message.contains("truncated")));
+        assert!(!result.translations.is_empty());
+        assert_each_id_once(&captions, &result);
+    }
+
+    #[test]
+    fn cancelling_during_the_second_batch_cancels_without_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let placed = core
+            .apply(EditCommand::AddCaptions {
+                entries: (0..100)
+                    .map(|index| opentake_ops::CaptionEntry {
+                        start_frame: index * 10,
+                        duration_frames: 10,
+                        content: format!("line {index}"),
+                        text_style: opentake_domain::TextStyle::default(),
+                        transform: opentake_domain::Transform::default(),
+                        caption_group_id: "captions-1".into(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let before = core.runtime_snapshot();
+        let cancel = MediaCancelToken::new();
+        let translator = Arc::new(BatchingCaptionTranslator {
+            cancel_on_call: Some((2, cancel.clone())),
+            ..BatchingCaptionTranslator::default()
+        });
+        let bridge = TauriAdvancedWorkflowBridge::with_caption_translator(
+            core.clone(),
+            root.path().join("cache"),
+            root.path().join("models"),
+            translator.clone(),
+        );
+
+        let error = bridge
+            .translate_captions(translation_args(placed.affected_clip_ids, true), &cancel)
+            .unwrap_err();
+
+        assert_eq!(error.kind, AdvancedWorkflowErrorKind::Cancelled);
+        assert_eq!(translator.calls.lock().unwrap().len(), 2);
+        assert_eq!(core.runtime_snapshot().timeline, before.timeline);
+    }
+
+    #[test]
+    fn translation_response_parsing_detects_truncation() {
+        assert_eq!(
+            parse_translation_response(
+                "anthropic",
+                &json!({"stop_reason": "max_tokens", "content": [{"text": "{\"transl"}]})
+            )
+            .unwrap(),
+            TranslationResponseText::Truncated
+        );
+        assert_eq!(
+            parse_translation_response(
+                "openai",
+                &json!({"choices": [{"finish_reason": "length", "message": {"content": "{"}}]})
+            )
+            .unwrap(),
+            TranslationResponseText::Truncated
+        );
+        assert_eq!(
+            parse_translation_response(
+                "anthropic",
+                &json!({"stop_reason": "end_turn", "content": [{"text": "```json\n{\"translations\":[]}\n```"}]})
+            )
+            .unwrap(),
+            TranslationResponseText::Complete("{\"translations\":[]}".into())
+        );
+        assert_eq!(
+            parse_translation_response(
+                "openai",
+                &json!({"choices": [{"finish_reason": "stop", "message": {"content": "{\"translations\":[]}"}}]})
+            )
+            .unwrap(),
+            TranslationResponseText::Complete("{\"translations\":[]}".into())
+        );
+        assert!(parse_translation_response("openai", &json!({"choices": []})).is_err());
+    }
+
+    #[test]
+    fn indexed_translation_ids_map_back_to_clip_ids() {
+        let batch = drafts(3);
+
+        let CaptionBatchReply::Translated(result) = map_indexed_translations(
+            &batch,
+            r#"{"translations":[{"id":2,"text":"c"},{"id":"0","text":"a"}],"errors":[{"id":1,"message":"no"}]}"#,
+        )
+        .unwrap() else {
+            panic!("a complete reply maps back");
+        };
+
+        assert_eq!(result.translations[0].id, batch[2].id);
+        assert_eq!(result.translations[1].id, batch[0].id);
+        assert_eq!(result.errors[0].id, batch[1].id);
+        for invalid in [
+            r#"{"translations":[{"id":3,"text":"x"}]}"#,
+            r#"{"translations":[{"id":0,"text":"x"},{"id":0,"text":"y"}]}"#,
+            r#"{"translations":[{"id":0,"text":"x"}],"errors":[{"id":0,"message":"m"}]}"#,
+            r#"{"translations":[{"id":-1,"text":"x"}]}"#,
+            r#"{"translations":[{"id":"one","text":"x"}]}"#,
+        ] {
+            assert!(
+                map_indexed_translations(&batch, invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_missing_positions_is_incomplete_not_misattached() {
+        let batch = drafts(3);
+
+        // Renumbered from 1 and dropped a caption: positions 1 and 2 only.
+        let reply = map_indexed_translations(
+            &batch,
+            r#"{"translations":[{"id":1,"text":"a"},{"id":2,"text":"b"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(reply, CaptionBatchReply::Incomplete);
+    }
+
+    #[test]
+    fn provider_status_codes_map_to_fatal_retry_or_outage() {
+        let retry = Some(std::time::Duration::from_secs(7));
+        assert_eq!(
+            classify_translation_status("openai", 429, retry),
+            Ok(CaptionBatchReply::RateLimited(retry))
+        );
+        for status in [401, 403] {
+            let error = classify_translation_status("openai", status, None).unwrap_err();
+            assert_eq!(error.kind, AdvancedWorkflowErrorKind::ConsentRequired);
+            assert!(caption_translation_error_is_fatal(&error));
+        }
+        for status in [400, 404, 422] {
+            let error = classify_translation_status("anthropic", status, None).unwrap_err();
+            assert!(caption_translation_error_is_fatal(&error), "{status}");
+        }
+        assert!(matches!(
+            classify_translation_status("anthropic", 529, None),
+            Ok(CaptionBatchReply::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn a_rejected_key_stops_after_the_first_request() {
+        let captions = drafts(300);
+        let translator = BatchingCaptionTranslator {
+            always: Some(classify_translation_status("openai", 401, None).map(|_| unreachable!())),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let error = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap_err();
+
+        assert_eq!(error.kind, AdvancedWorkflowErrorKind::ConsentRequired);
+        assert_eq!(translator.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            translator
+                .prepared
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn a_fatal_error_after_successful_batches_keeps_them_for_review() {
+        let captions = drafts(200);
+        let rejected = classify_translation_status("openai", 400, None).map(|_| unreachable!());
+        let translator = BatchingCaptionTranslator::scripted([
+            Ok(CaptionBatchReply::Translated(
+                CaptionTranslationProviderResult {
+                    translations: captions[..CAPTION_TRANSLATION_BATCH_SIZE]
+                        .iter()
+                        .map(|caption| CaptionTranslationDraft {
+                            id: caption.id.clone(),
+                            text: "ok".into(),
+                        })
+                        .collect(),
+                    errors: vec![],
+                },
+            )),
+            rejected,
+        ]);
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new())
+            .expect("finished batches survive a later rejection");
+
+        assert_eq!(result.translations.len(), CAPTION_TRANSLATION_BATCH_SIZE);
+        assert_eq!(result.errors.len(), 200 - CAPTION_TRANSLATION_BATCH_SIZE);
+        assert!(result.errors.iter().all(|e| e.message.contains("HTTP 400")));
+        assert_eq!(translator.calls.lock().unwrap().len(), 2);
+        assert_each_id_once(&captions, &result);
+    }
+
+    #[test]
+    fn repeated_outages_stop_the_run_and_fail_the_rest() {
+        let captions = drafts(300);
+        let translator = BatchingCaptionTranslator {
+            always: Some(Ok(CaptionBatchReply::Unavailable("network down".into()))),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let error = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap_err();
+
+        assert!(error.message.contains("network down"), "{}", error.message);
+        assert_eq!(
+            translator.calls.lock().unwrap().len(),
+            CAPTION_TRANSLATION_MAX_CONSECUTIVE_UNAVAILABLE as usize
+        );
+    }
+
+    #[test]
+    fn an_isolated_outage_fails_only_its_batch() {
+        let captions = drafts(150);
+        let translator = BatchingCaptionTranslator::scripted([Ok(CaptionBatchReply::Unavailable(
+            "timed out".into(),
+        ))]);
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+        assert_eq!(result.errors.len(), CAPTION_TRANSLATION_BATCH_SIZE);
+        assert_eq!(
+            result.translations.len(),
+            150 - CAPTION_TRANSLATION_BATCH_SIZE
+        );
+        assert_each_id_once(&captions, &result);
+    }
+
+    #[test]
+    fn a_rate_limited_batch_is_retried_after_retry_after() {
+        let captions = drafts(90);
+        let translator = BatchingCaptionTranslator::scripted([Ok(CaptionBatchReply::RateLimited(
+            Some(std::time::Duration::ZERO),
+        ))]);
+
+        let result = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.translations.len(), 90);
+        assert_eq!(translator.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn requests_are_capped_when_a_provider_keeps_rate_limiting() {
+        let captions = drafts(120);
+        let translator = BatchingCaptionTranslator {
+            always: Some(Ok(CaptionBatchReply::RateLimited(Some(
+                std::time::Duration::ZERO,
+            )))),
+            ..BatchingCaptionTranslator::default()
+        };
+
+        let error = run_batches(&translator, &captions, &MediaCancelToken::new()).unwrap_err();
+
+        let batches = caption_translation_batches(&captions).len();
+        assert!(translator.calls.lock().unwrap().len() <= batches * 2 + 8 + 1);
+        assert!(!error.message.is_empty());
+    }
+
     #[derive(Default)]
     struct ModelRecordingCaptionTranslator {
         models: std::sync::Mutex<Vec<(String, String)>>,
@@ -5113,13 +6105,14 @@ mod tests {
     impl CaptionTranslationProvider for ModelRecordingCaptionTranslator {
         fn translate(
             &self,
+            _run: &CaptionRunContext,
             provider: &str,
             model: &str,
             _source_locale: &str,
             _target_locale: &str,
             _captions: &[CaptionTranslationDraft],
             _cancel: &MediaCancelToken,
-        ) -> Result<CaptionTranslationProviderResult, AdvancedWorkflowError> {
+        ) -> Result<CaptionBatchReply, AdvancedWorkflowError> {
             self.models
                 .lock()
                 .unwrap()

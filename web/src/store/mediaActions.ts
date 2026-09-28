@@ -54,6 +54,15 @@ function isCurrentProject(identity: ProjectIdentity): boolean {
 function reportSkipped(list: MediaList): void {
   const skipped = list.skipped ?? [];
   if (skipped.length === 0) return;
+  // A supported file that could not be read arrives as `name\treason`.
+  const unreadable = skipped.find((entry) => entry.includes("\t"));
+  if (unreadable) {
+    const [name, reason] = unreadable.split("\t", 2);
+    useEditorUiStore
+      .getState()
+      .pushToast(t("media.importSkippedUnreadable", { count: skipped.length, name, reason }));
+    return;
+  }
   useEditorUiStore.getState().pushToast(t("media.importSkipped", { count: skipped.length }));
 }
 

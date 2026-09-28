@@ -40,9 +40,9 @@ function projectStem(projectPath: string | null): string {
   return base.replace(/\.opentake$/i, "") || "Timeline";
 }
 
-/** Ensure a chosen path carries the given extension (case-insensitive check). */
-function withExt(path: string, ext: string): string {
-  return path.toLowerCase().endsWith(`.${ext}`) ? path : `${path}.${ext}`;
+/** The backend's message for a failed export (a string over IPC). */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -98,7 +98,7 @@ export function TitleBar() {
    */
   async function onExportInterchange(format: InterchangeFormat): Promise<void> {
     setExportMenuOpen(false);
-    const save = await saveDialog();
+    const save = await saveDialog("interchange");
     if (!save) return; // outside Tauri — no save panel / file system
     const dir = projectPath
       ? projectPath.replace(/[\\/][^\\/]*$/, "")
@@ -108,20 +108,26 @@ export function TitleBar() {
       ? `${dir}${sep}${projectStem(projectPath)}.${format.ext}`
       : undefined;
 
-    const chosen = await save({
-      title: t(`title.export${format.key}Dialog`),
-      defaultPath,
-      // rfd's deprecated macOS allowedFileTypes path disables Save for
-      // interchange extensions on macOS 26. withExt() enforces the type after
-      // confirmation while retaining the intended directory and filename.
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t(`title.export${format.key}Dialog`),
+        defaultPath,
+        // rfd's deprecated macOS allowedFileTypes path disables Save for
+        // interchange extensions on macOS 26. The backend appends the format's
+        // extension next to the dialog-approved path, so pass it through as is.
+      });
+    } catch (error) {
+      pushToast(t("title.exportInterchangeFailed", { error: errorText(error) }));
+      return;
+    }
     if (typeof chosen !== "string") return; // cancelled
 
     try {
-      await format.run(withExt(chosen, format.ext));
+      await format.run(chosen);
       pushToast(t("title.exportInterchangeDone"));
-    } catch {
-      pushToast(t("title.exportInterchangeFailed"));
+    } catch (error) {
+      pushToast(t("title.exportInterchangeFailed", { error: errorText(error) }));
     }
   }
 
@@ -133,7 +139,7 @@ export function TitleBar() {
    */
   async function onExportSubtitles(format: SubtitleFormat): Promise<void> {
     setSubMenuOpen(false);
-    const save = await saveDialog();
+    const save = await saveDialog("subtitles");
     if (!save) return; // outside Tauri — no save panel / file system
     const dir = projectPath
       ? projectPath.replace(/[\\/][^\\/]*$/, "")
@@ -143,27 +149,34 @@ export function TitleBar() {
       ? `${dir}${sep}${projectStem(projectPath)}.${format}`
       : undefined;
 
-    const chosen = await save({
-      title: t(format === "srt" ? "title.exportSrtDialog" : "title.exportVttDialog"),
-      defaultPath,
-      filters: [
-        {
-          name: t(format === "srt" ? "title.exportSrtFilter" : "title.exportVttFilter"),
-          extensions: [format],
-        },
-      ],
-    });
+    let chosen: string | null;
+    try {
+      chosen = await save({
+        title: t(format === "srt" ? "title.exportSrtDialog" : "title.exportVttDialog"),
+        defaultPath,
+        filters: [
+          {
+            name: t(format === "srt" ? "title.exportSrtFilter" : "title.exportVttFilter"),
+            extensions: [format],
+          },
+        ],
+      });
+    } catch (error) {
+      pushToast(t("title.exportSubtitlesFailed", { error: errorText(error) }));
+      return;
+    }
     if (typeof chosen !== "string") return; // cancelled
 
     try {
-      const summary = await api.exportSubtitles(withExt(chosen, format), format);
+      // The dialog grants exactly `chosen`; the backend appends the extension.
+      const summary = await api.exportSubtitles(chosen, format);
       pushToast(
         summary.cueCount > 0
           ? t("title.exportSubtitlesDone", { count: summary.cueCount })
           : t("title.exportSubtitlesEmpty"),
       );
-    } catch {
-      pushToast(t("title.exportSubtitlesFailed"));
+    } catch (error) {
+      pushToast(t("title.exportSubtitlesFailed", { error: errorText(error) }));
     }
   }
 

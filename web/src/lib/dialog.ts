@@ -6,8 +6,8 @@
  * allow `null`).
  */
 
-import type { open as TauriOpen, save as TauriSave } from "@tauri-apps/plugin-dialog";
-import { isTauri } from "./api";
+import type { open as TauriOpen } from "@tauri-apps/plugin-dialog";
+import { isTauri, pickSavePath, type SaveDialogRequest, type SavePurpose } from "./api";
 
 /** The typed `open` from the dialog plugin, or null outside Tauri. */
 export async function openDialog(): Promise<typeof TauriOpen | null> {
@@ -16,11 +16,13 @@ export async function openDialog(): Promise<typeof TauriOpen | null> {
   return mod.open;
 }
 
-/** The typed `save` from the dialog plugin, or null outside Tauri. Used by the
- *  new-project flow to let the user pick a save location + name (upstream
- *  `createNewProject` → `NSSavePanel`). */
-export async function saveDialog(): Promise<typeof TauriSave | null> {
+/** A save dialog whose result the backend may write for one purpose. */
+export type SaveDialogFn = (request: SaveDialogRequest) => Promise<string | null>;
+
+/** A native save dialog for `purpose`, or null outside Tauri. The dialog runs in
+ *  the backend, which grants the chosen path once for that purpose; write
+ *  commands accept nothing else (upstream `createNewProject` → `NSSavePanel`). */
+export async function saveDialog(purpose: SavePurpose): Promise<SaveDialogFn | null> {
   if (!isTauri) return null;
-  const mod = await import("@tauri-apps/plugin-dialog");
-  return mod.save;
+  return (request) => pickSavePath(purpose, request);
 }

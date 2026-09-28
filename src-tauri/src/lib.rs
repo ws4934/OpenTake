@@ -13,6 +13,7 @@ mod chat;
 mod close_coordinator;
 mod codex;
 mod commands;
+mod dialog_output;
 // `pub` so the ffmpeg-gated integration test (`tests/export_integration.rs`) can
 // drive the export orchestrator (`export::run_export`) against the library
 // target. The Tauri command itself is registered below like the other modules.
@@ -266,6 +267,7 @@ pub fn run() {
             app.manage(core);
             app.manage(motion_document_store);
             app.manage(commands::ProjectLifecycleCoordinator::default());
+            app.manage(dialog_output::SaveGrants::default());
             app.manage(generation_bridge);
             let motion_state =
                 motion::MotionCommandState::new(motion_bridge, install_admission.clone());
@@ -379,6 +381,7 @@ pub fn run() {
             commands::project_open,
             commands::project_save,
             commands::get_default_project_dir,
+            dialog_output::pick_save_path,
             commands::export_xmeml,
             commands::export_fcpxml,
             commands::export_fcpxml_modern,

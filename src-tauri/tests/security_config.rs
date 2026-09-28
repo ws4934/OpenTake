@@ -127,6 +127,14 @@ fn main_window_capability_exposes_no_shell_or_filesystem_commands() {
             && !permission.starts_with("process:")
     }));
 
+    // Save dialogs run through the backend `pick_save_path` command, which
+    // issues the single-use write grants; the plugin's own save command (and
+    // `dialog:default`, which includes it) would only widen the read scope.
+    assert!(permissions.contains(&"dialog:allow-open"));
+    assert!(permissions
+        .iter()
+        .all(|permission| !matches!(*permission, "dialog:default" | "dialog:allow-save")));
+
     assert!(
         permissions.contains(&"core:window:allow-set-size"),
         "Appearance settings must be allowed to resize the packaged main window"

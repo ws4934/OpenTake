@@ -520,6 +520,30 @@ describe("openProjectPath", () => {
     expect(useProjectStore.getState().projectPath).toBe("/tmp/fresh.opentake");
   });
 
+  it("passes an extensionless dialog path through and adopts the backend bundle path", async () => {
+    srv.save.mockResolvedValueOnce("/home/qa/Videos/Vlog");
+    srv.projectNew.mockImplementationOnce(async (path: string | null = null) => {
+      srv.order.push("new");
+      expect(path).toBe("/home/qa/Videos/Vlog");
+      srv.createdPath = "/home/qa/Videos/Vlog.opentake";
+      return {
+        timeline: srv.timeline,
+        projectEpoch: 5,
+        version: 0,
+        projectPath: "/home/qa/Videos/Vlog.opentake",
+        compatibilityReadOnly: false,
+        compatibilityBlockers: [],
+      };
+    });
+
+    await newProjectAndEnter();
+
+    expect(srv.saveDialog).toHaveBeenCalledWith("project");
+    expect(srv.projectNew).toHaveBeenCalledWith("/home/qa/Videos/Vlog");
+    expect(useProjectStore.getState().projectPath).toBe("/home/qa/Videos/Vlog.opentake");
+    expect(useRecentStore.getState().recents[0]?.path).toBe("/home/qa/Videos/Vlog.opentake");
+  });
+
   it("preserves the current project when initial creation fails", async () => {
     const oldTimeline: Timeline = {
       ...srv.timeline,
@@ -899,6 +923,22 @@ describe("saveCurrentProjectAs", () => {
     expect(useRecentStore.getState().recents[0]?.path).toBe(
       "/tmp/canonical-fresh.opentake",
     );
+  });
+
+  it("passes an extensionless Save As dialog path through unchanged", async () => {
+    srv.save.mockResolvedValueOnce("/home/qa/Videos/Copy");
+    srv.projectSave.mockResolvedValueOnce("/home/qa/Videos/Copy.opentake");
+
+    await saveCurrentProjectAs();
+
+    expect(srv.saveDialog).toHaveBeenCalledWith("project");
+    expect(srv.projectSave).toHaveBeenCalledWith(
+      "/home/qa/Videos/Copy",
+      1,
+      "/tmp/current.opentake",
+    );
+    expect(useProjectStore.getState().projectPath).toBe("/home/qa/Videos/Copy.opentake");
+    expect(useRecentStore.getState().recents[0]?.path).toBe("/home/qa/Videos/Copy.opentake");
   });
 
   it("coalesces overlapping Save As gestures into one native publication", async () => {

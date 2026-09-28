@@ -646,7 +646,8 @@ pub struct MediaListDto {
     /// importable (mirrors upstream `addMediaAsset` → `mediaPanelToast`). Always
     /// empty for pure listing/relink; only import commands populate it so the
     /// front end can toast "skipped N unsupported files" instead of dropping them
-    /// silently. Serialized as `skipped`.
+    /// silently. A supported file whose media information could not be read is
+    /// listed as `name\treason` so the UI can say why. Serialized as `skipped`.
     #[serde(default)]
     pub skipped: Vec<String>,
     /// Admission decisions for best-effort import poster prewarm. Import stays
@@ -1270,13 +1271,20 @@ fn cached_thumbnail_for_entry(
 }
 
 /// Probe `path` via the engine, mapping ffprobe facts to [`ProbedMedia`]. Probe
-/// failures (no ffprobe, unreadable file) degrade to defaults so a single bad
-/// file never sinks a batch import.
+/// failures (no ffprobe, unreadable file) degrade to defaults; only callers that
+/// validate the result themselves may use it. Paths that persist metadata use
+/// [`try_probe_media`] so a failed probe is never recorded as real metadata.
 pub(crate) fn probe_media(engine: &MediaEngine, path: &Path) -> ProbedMedia {
-    engine
-        .probe(path)
-        .map(media_probe_to_core)
-        .unwrap_or_default()
+    try_probe_media(engine, path).unwrap_or_default()
+}
+
+/// Probe `path`, surfacing ffprobe failures (including a saturated or
+/// cancelled probe queue) instead of zeroed metadata.
+pub(crate) fn try_probe_media(
+    engine: &MediaEngine,
+    path: &Path,
+) -> Result<ProbedMedia, opentake_media::MediaError> {
+    engine.probe(path).map(media_probe_to_core)
 }
 
 pub(crate) fn is_lottie_path(path: &Path) -> bool {
@@ -2321,7 +2329,16 @@ impl<'a> DirectoryImportPlanner<'a> {
                             }
                         }
                     } else {
-                        probe_media_file(engine, &file, self.cancel)
+                        let probed = probe_media_file(engine, &file, &child_path, self.cancel);
+                        // A cancelled probe is a cancelled import, not a bad file.
+                        self.checkpoint()?;
+                        match probed {
+                            Ok(probe) => probe,
+                            Err(reason) => {
+                                self.skipped.push(skipped_with_reason(&child_path, &reason));
+                                continue;
+                            }
+                        }
                     };
                     self.checkpoint()?;
                     self.plan.push(PreparedMediaImportOp::ImportFile {
@@ -2538,20 +2555,48 @@ fn open_regular_file_nofollow(
     Ok((file.into_std(), bytes))
 }
 
+/// Probe an import candidate. Video and audio need real metadata: a failed
+/// probe yields `None` so the caller reports the file as skipped instead of
+/// importing a 0-second asset without audio (#63). Images keep importing
+/// without dimensions, which their consumers tolerate.
 fn probe_media_file(
     engine: &MediaEngine,
     file: &std::fs::File,
+    path: &Path,
     cancel: Option<&opentake_media::MediaCancelToken>,
-) -> ProbedMedia {
+) -> Result<ProbedMedia, String> {
     let local_cancel = opentake_media::MediaCancelToken::new();
-    engine
+    let probed = engine
         .probe_file_cancellable(
             file,
             cancel.unwrap_or(&local_cancel),
             DIRECTORY_IMPORT_PROBE_TIMEOUT,
         )
-        .map(media_probe_to_core)
-        .unwrap_or_default()
+        .map(media_probe_to_core);
+    probe_result_for_import(importable_clip_type(path), probed)
+}
+
+/// Decide what an import does with a probe result. Video and audio need real
+/// metadata, so a failure becomes the reason the file is skipped; images still
+/// import without dimensions.
+pub(crate) fn probe_result_for_import(
+    kind: Option<ClipType>,
+    probed: Result<ProbedMedia, opentake_media::MediaError>,
+) -> Result<ProbedMedia, String> {
+    match (probed, kind) {
+        (Ok(probe), _) => Ok(probe),
+        (Err(_), Some(ClipType::Image)) => Ok(ProbedMedia::default()),
+        (Err(opentake_media::MediaError::Busy(_)), _) => {
+            Err("media probing is busy; try importing it again".to_string())
+        }
+        (Err(error), _) => Err(format!("cannot read media information ({error})")),
+    }
+}
+
+/// A `skipped` entry for a supported file that could not be read: its name,
+/// a tab, and the reason the UI shows.
+pub(crate) fn skipped_with_reason(path: &Path, reason: &str) -> String {
+    format!("{}\t{reason}", display_file_name(path))
 }
 
 fn is_single_normal_component(name: &OsStr) -> bool {
@@ -2798,7 +2843,13 @@ fn prepare_explicit_import_batch(
                 }
             }
         } else {
-            probe_media_file(engine, source.identity.as_file(), None)
+            match probe_media_file(engine, source.identity.as_file(), &source.final_path, None) {
+                Ok(probe) => probe,
+                Err(reason) => {
+                    skipped.push(skipped_with_reason(&source.final_path, &reason));
+                    continue;
+                }
+            }
         };
         plan.push(PreparedMediaImportOp::ImportFile {
             path: source.final_path.clone(),
@@ -3799,6 +3850,32 @@ fn validate_extract_output(out_path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Only a save-dialog result granted for audio extraction may be written
+/// (#95); the default `.m4a` is appended when the user typed no extension.
+/// ffmpeg writes to a staging file beside the target, which is then published
+/// by [`crate::dialog_output::publish_staged`], so it never writes through a
+/// symlink or over a file created at an appended path.
+fn authorize_extract_output(
+    grants: &crate::dialog_output::SaveGrants,
+    out_path: &str,
+) -> Result<crate::dialog_output::DialogOutput, String> {
+    let output = crate::dialog_output::authorize_dialog_output(
+        grants,
+        out_path,
+        crate::dialog_output::SavePurpose::ExtractAudio,
+        crate::dialog_output::OutputRule {
+            // The codec table matches exact lower-case extensions; any other
+            // extension is reported as unsupported instead of being extended.
+            extensions: &["m4a", "m4r", "aac", "mp3", "wav"],
+            ignore_case: false,
+            foreign: crate::dialog_output::ForeignExtension::Reject,
+        },
+    )?;
+    validate_extract_output(&output.path.to_string_lossy())?;
+    crate::dialog_output::ensure_replaceable_regular_file(&output.path)?;
+    Ok(output)
+}
+
 /// `extract_audio`: extract the audio track from a media asset into a
 /// self-contained audio file (`.m4a` / `.mp3` / `.wav`). The output path is
 /// chosen by the caller via a native save dialog; the codec falls out of the
@@ -3811,19 +3888,40 @@ fn validate_extract_output(out_path: &str) -> Result<PathBuf, String> {
 /// found, the output path is invalid, or ffmpeg fails (missing binary,
 /// non-zero exit, unsupported extension).
 #[tauri::command]
-pub fn extract_audio(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn extract_audio(
+    app: AppHandle,
     media_id: String,
     out_path: String,
 ) -> Result<String, String> {
+    // ffmpeg runs for the length of the source: keep it off the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_audio_blocking(
+            &app.state::<AppCore>(),
+            &app.state::<MediaState>(),
+            &app.state::<crate::updater::InstallAdmissionGate>(),
+            &app.state::<crate::dialog_output::SaveGrants>(),
+            &media_id,
+            &out_path,
+        )
+    })
+    .await
+    .map_err(|error| format!("audio extraction worker failed: {error}"))?
+}
+
+fn extract_audio_blocking(
+    core: &AppCore,
+    media: &MediaState,
+    admission: &crate::updater::InstallAdmissionGate,
+    grants: &crate::dialog_output::SaveGrants,
+    media_id: &str,
+    out_path: &str,
+) -> Result<String, String> {
     // The output is user-selected rather than project state, but it is a long
     // durable write that must not be cut off by the updater's process exit.
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
+    let _activity = crate::updater::begin_mutating_activity(admission)?;
     // Path boundary check first (review #4): fail fast on a bad output path
     // before touching the manifest or spawning ffmpeg.
-    let output = validate_extract_output(&out_path)?;
+    let output = authorize_extract_output(grants, out_path)?;
     let snapshot = core.runtime_snapshot();
     let manifest = snapshot.media;
     let entry = manifest
@@ -3841,11 +3939,19 @@ pub fn extract_audio(
     if !input.is_file() {
         return Err(format!("source file not found: {}", input.display()));
     }
-    media
-        .engine()
-        .extract_audio(&input, &output)
-        .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| e.to_string())
+    if output.path.exists()
+        && std::fs::canonicalize(&input).ok() == std::fs::canonicalize(&output.path).ok()
+    {
+        return Err("the audio file cannot replace its own source".into());
+    }
+    let (staging, file) = crate::dialog_output::create_staging(&output)?;
+    drop(file);
+    if let Err(error) = media.engine().extract_audio(&input, &staging) {
+        crate::dialog_output::remove_staging_file(&staging);
+        return Err(error.to_string());
+    }
+    crate::dialog_output::publish_staged(&staging, &output)?;
+    Ok(output.path.to_string_lossy().into_owned())
 }
 
 /// `relink_media`: point a missing/offline asset at a newly chosen file, KEEPING
@@ -3871,6 +3977,29 @@ pub fn relink_media(
         return Err(format!("file not found: {new_path}"));
     }
     let _identity = core.lock_project_identity_workflow();
+    let (project_dir, old_proxy) = relink_media_in_core(&core, media.engine(), &media_ref, &new)?;
+    if let (Some(project_dir), Some(proxy)) = (project_dir, old_proxy) {
+        if let Some(path) = trusted_project_proxy_path(&project_dir, &proxy.relative_path) {
+            let _ = std::fs::remove_file(&path);
+            revoke_proxy_asset_file(&app, &path);
+        }
+    }
+    Ok(MediaListDto::from_core(
+        &core,
+        Some(media.engine().cache_root()),
+    ))
+}
+
+/// The catalog half of [`relink_media`]: validate, probe and apply the relink,
+/// returning the project directory and the replaced proxy for cleanup. A probe
+/// failure rejects the relink before anything changes, so known-good metadata
+/// is never overwritten with zeros and `media.json` is not rewritten (#63).
+fn relink_media_in_core(
+    core: &AppCore,
+    engine: &MediaEngine,
+    media_ref: &str,
+    new: &Path,
+) -> Result<(Option<PathBuf>, Option<opentake_domain::MediaProxy>), String> {
     // Validate the target type matches before touching the catalog (upstream
     // rejects relinking across types). `relink_media_file` re-checks, but doing
     // it here yields a precise message and avoids a needless probe.
@@ -3882,7 +4011,7 @@ pub fn relink_media(
         .find(|e| e.id == media_ref)
         .ok_or_else(|| format!("media not found: {media_ref}"))?;
     let new_kind =
-        importable_clip_type(&new).ok_or_else(|| format!("unsupported file: {new_path}"))?;
+        importable_clip_type(new).ok_or_else(|| format!("unsupported file: {}", new.display()))?;
     if new_kind != entry.kind {
         return Err(format!(
             "cannot relink a {:?} asset to a {:?} file",
@@ -3890,7 +4019,20 @@ pub fn relink_media(
         ));
     }
 
-    let probe = probe_media(media.engine(), &new);
+    // Same rule as imports: unreadable video and audio are refused so good
+    // metadata is never overwritten with zeros, while images (for example HEIF
+    // stills an older ffprobe cannot parse) relink without dimensions.
+    let probe = if is_lottie_path(new) {
+        probe_lottie(new)
+    } else {
+        probe_result_for_import(Some(new_kind), try_probe_media(engine, new))
+    }
+    .map_err(|error| {
+        format!(
+            "cannot read media information from {}: {error}",
+            display_file_name(new)
+        )
+    })?;
     let old_proxy = entry.proxy.clone();
     if old_proxy.is_some() {
         let project_dir = snapshot
@@ -3905,18 +4047,9 @@ pub fn relink_media(
         )
         .map_err(|error| error.to_string())?;
     }
-    core.relink_media_file(&media_ref, &new, &probe)
+    core.relink_media_file(media_ref, new, &probe)
         .map_err(|e| e.to_string())?;
-    if let (Some(project_dir), Some(proxy)) = (snapshot.project_dir, old_proxy) {
-        if let Some(path) = trusted_project_proxy_path(&project_dir, &proxy.relative_path) {
-            let _ = std::fs::remove_file(&path);
-            revoke_proxy_asset_file(&app, &path);
-        }
-    }
-    Ok(MediaListDto::from_core(
-        &core,
-        Some(media.engine().cache_root()),
-    ))
+    Ok((snapshot.project_dir, old_proxy))
 }
 
 /// `generate_thumbnail`: generate (and disk-cache) a media asset thumbnail.
@@ -8019,10 +8152,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Trip");
         fs::create_dir(&root).unwrap();
-        touch(&root.join("a.mp4"));
+        // Images: fake bytes still import (without dimensions), whereas
+        // unprobeable video/audio is skipped (#63).
+        touch(&root.join("a.png"));
         let day1 = root.join("Day1");
         fs::create_dir(&day1).unwrap();
-        touch(&day1.join("b.mov"));
+        touch(&day1.join("b.jpg"));
         touch(&day1.join("note.txt")); // unsupported → skipped
         fs::create_dir(root.join("Empty")).unwrap(); // empty subfolder still mirrors
 
@@ -8043,7 +8178,7 @@ mod tests {
         assert_eq!(day1f.parent_folder_id.as_deref(), Some(trip.id.as_str()));
         assert_eq!(empty.parent_folder_id.as_deref(), Some(trip.id.as_str()));
 
-        // Entries: a.mp4 in Trip, b.mov in Day1; the .txt was skipped.
+        // Entries: a.png in Trip, b.jpg in Day1; the .txt was skipped.
         assert_eq!(m.entries.len(), 2, "{:?}", m.entries);
         let a = m.entries.iter().find(|e| e.name == "a").unwrap();
         let b = m.entries.iter().find(|e| e.name == "b").unwrap();
@@ -8471,8 +8606,8 @@ mod tests {
         let root = tmp.path().join("ExactTree");
         let nested = root.join("Nested");
         fs::create_dir_all(&nested).unwrap();
-        let first = root.join("first.mp4");
-        let second = nested.join("second.wav");
+        let first = root.join("first.png");
+        let second = nested.join("second.jpg");
         fs::write(&first, b"first-exact-bytes").unwrap();
         fs::write(&second, b"second-exact-bytes").unwrap();
         let core = AppCore::new();
@@ -9384,6 +9519,98 @@ mod tests {
         assert!(core.relink_media_file("nope", &f, &probe).is_err());
     }
 
+    #[test]
+    fn relink_with_a_failed_probe_keeps_metadata_and_disk_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let core = AppCore::new();
+        let bundle = root.join("Relink.opentake");
+        core.save_project(Some(bundle.clone())).unwrap();
+        let engine = engine_for(root);
+        let orig = root.join("clip.mp4");
+        touch(&orig);
+        let probe = ProbedMedia {
+            duration_secs: 12.5,
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            has_audio: true,
+            color: None,
+        };
+        let id = core
+            .import_media_file(&orig, "clip".to_string(), &probe)
+            .unwrap()
+            .id;
+        core.save_project(None).unwrap();
+        let before_live = core.media();
+        let before_disk = fs::read(bundle.join("media.json")).unwrap();
+
+        // Not decodable media: ffprobe fails (or is absent) for this file.
+        let unreadable = root.join("moved.mp4");
+        fs::write(&unreadable, b"not a movie").unwrap();
+        let error = relink_media_in_core(&core, &engine, &id, &unreadable).unwrap_err();
+
+        assert!(error.contains("cannot read media information"), "{error}");
+        assert_eq!(core.media(), before_live);
+        assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+    }
+
+    #[test]
+    fn import_probe_failure_skips_video_and_audio_but_keeps_images() {
+        let failed = || Err(opentake_media::MediaError::Ffmpeg("bad".to_string()));
+        assert!(probe_result_for_import(Some(ClipType::Video), failed()).is_err());
+        assert!(probe_result_for_import(Some(ClipType::Audio), failed()).is_err());
+        assert_eq!(
+            probe_result_for_import(Some(ClipType::Image), failed()),
+            Ok(ProbedMedia::default())
+        );
+        let busy = probe_result_for_import(
+            Some(ClipType::Video),
+            Err(opentake_media::MediaError::Busy("saturated".to_string())),
+        )
+        .unwrap_err();
+        assert!(busy.contains("busy"), "{busy}");
+        let probe = ProbedMedia {
+            duration_secs: 3.0,
+            ..ProbedMedia::default()
+        };
+        assert_eq!(
+            probe_result_for_import(Some(ClipType::Video), Ok(probe.clone())),
+            Ok(probe)
+        );
+    }
+
+    #[test]
+    fn explicit_import_reports_unprobeable_video_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        core.save_project(Some(tmp.path().join("Skip.opentake")))
+            .unwrap();
+        let engine = engine_for(tmp.path());
+        let prewarm = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
+        let broken = tmp.path().join("broken.mp4");
+        fs::write(&broken, b"not a movie").unwrap();
+
+        let list = import_media_impl(
+            &core,
+            &engine,
+            &prewarm,
+            vec![broken.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(list.skipped.len(), 1);
+        let (name, reason) = list.skipped[0].split_once('\t').expect("skip reason");
+        assert_eq!(name, "broken.mp4");
+        assert!(reason.contains("cannot read media information"), "{reason}");
+        assert!(core
+            .media()
+            .entries
+            .iter()
+            .all(|entry| !(entry.kind == ClipType::Video && entry.duration <= 0.0)));
+        assert!(core.media().entries.is_empty());
+    }
+
     // --- extract_audio output-path validation (Issue #39 review #4) ---
     //
     // The command is callable from the WebView with an arbitrary string; these
@@ -9430,6 +9657,138 @@ mod tests {
         assert!(
             err.contains("unsupported audio extension"),
             "video extension must be rejected: got {err}"
+        );
+    }
+
+    #[test]
+    fn relink_to_an_unprobeable_image_still_relinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let engine = engine_for(tmp.path());
+        let original = tmp.path().join("still.png");
+        touch(&original);
+        let id = core
+            .import_media_file(&original, "still".to_string(), &ProbedMedia::default())
+            .unwrap()
+            .id;
+        let moved = tmp.path().join("moved.png");
+        fs::write(&moved, b"not decodable").unwrap();
+
+        relink_media_in_core(&core, &engine, &id, &moved).expect("images relink leniently");
+
+        let entry = core
+            .media()
+            .entries
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
+        assert_eq!(
+            entry.source,
+            MediaSource::External {
+                absolute_path: moved.to_string_lossy().into_owned()
+            }
+        );
+    }
+
+    /// Command-level authorization of `extract_audio`: neither a forged path
+    /// nor an asset-scope grant (what imports and open dialogs leave behind)
+    /// may be written; only a save-dialog grant for audio extraction.
+    #[test]
+    fn extract_audio_writes_only_through_an_audio_save_grant() {
+        use crate::dialog_output::{SaveGrants, SavePurpose};
+        let tmp = tempfile::tempdir().unwrap();
+        let core = AppCore::new();
+        let media = MediaState::new(engine_for(tmp.path()));
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let source = tmp.path().join("interview.wav");
+        let samples = vec![0.0_f32; 4_800];
+        fs::File::create(&source).unwrap();
+        crate::export::write_wav_s16le(&samples, 48_000, &source).unwrap();
+        let id = core
+            .import_media_file(
+                &source,
+                "interview".to_string(),
+                &ProbedMedia {
+                    duration_secs: 0.1,
+                    has_audio: true,
+                    ..ProbedMedia::default()
+                },
+            )
+            .unwrap()
+            .id;
+        let victim = tmp.path().join("imported.wav");
+        fs::write(&victim, b"keep").unwrap();
+        let app = tauri::test::mock_app();
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&victim)
+            .unwrap();
+        let grants = SaveGrants::default();
+        grants.issue(&victim, SavePurpose::Interchange);
+
+        let error = extract_audio_blocking(
+            &core,
+            &media,
+            &admission,
+            &grants,
+            &id,
+            &victim.to_string_lossy(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, crate::dialog_output::UNAPPROVED_OUTPUT);
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            eprintln!("skip: the granted extraction needs ffmpeg");
+            return;
+        }
+        let raw = tmp.path().join("voice");
+        grants.issue(&raw, SavePurpose::ExtractAudio);
+        let written = extract_audio_blocking(
+            &core,
+            &media,
+            &admission,
+            &grants,
+            &id,
+            &raw.to_string_lossy(),
+        )
+        .expect("granted extraction");
+        assert_eq!(PathBuf::from(&written), tmp.path().join("voice.m4a"));
+        assert!(fs::metadata(&written).unwrap().len() > 0);
+        let leftovers = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp.m4a"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn extract_output_requires_a_dialog_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("existing.m4a");
+        std::fs::write(&target, b"keep").expect("seed target");
+        let scope = crate::dialog_output::SaveGrants::default();
+        use crate::dialog_output::SavePurpose;
+
+        assert_eq!(
+            authorize_extract_output(&scope, &target.to_string_lossy()),
+            Err(crate::dialog_output::UNAPPROVED_OUTPUT.to_string())
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+
+        let raw = dir.path().join("voice");
+        scope.issue(&raw, SavePurpose::ExtractAudio);
+        assert_eq!(
+            authorize_extract_output(&scope, &raw.to_string_lossy()).map(|output| output.path),
+            Ok(dir.path().join("voice.m4a"))
+        );
+        let mp3 = dir.path().join("voice.mp3");
+        scope.issue(&mp3, SavePurpose::ExtractAudio);
+        assert_eq!(
+            authorize_extract_output(&scope, &mp3.to_string_lossy()).map(|output| output.path),
+            Ok(mp3)
         );
     }
 

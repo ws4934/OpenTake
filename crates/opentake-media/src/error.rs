@@ -49,6 +49,12 @@ pub enum MediaError {
     #[error("cancelled")]
     Cancelled,
 
+    /// A shared resource (for example the ffprobe admission limit) stayed
+    /// saturated for the caller's whole budget. Transient: retrying may succeed,
+    /// and it says nothing about the input file.
+    #[error("busy: {0}")]
+    Busy(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

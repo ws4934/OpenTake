@@ -93,14 +93,17 @@ struct ProbeAdmission;
 static FFPROBE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static FFPROBE_EXECUTOR: OnceLock<Result<ProbeExecutor, String>> = OnceLock::new();
 
+/// Saturation is transient and says nothing about the input, so callers get
+/// [`MediaError::Busy`](crate::error::MediaError::Busy) rather than an ffmpeg
+/// error they could take for an unreadable file (#63).
 fn admission_limit_error() -> crate::error::MediaError {
-    crate::error::MediaError::Ffmpeg("ffprobe admission limit reached".to_string())
+    crate::error::MediaError::Busy("ffprobe admission limit reached".to_string())
 }
 
 impl ProbeAdmission {
     fn try_acquire() -> Option<Self> {
         #[cfg(test)]
-        if test_seams::admission_saturated() {
+        if test_seams::admission_saturated() || test_seams::take_saturated_attempt() {
             return None;
         }
         let mut active = FFPROBE_ACTIVE.load(Ordering::Acquire);
@@ -645,11 +648,15 @@ fn run_ffprobe(
     if cancel.checkpoint() {
         return Err(crate::error::MediaError::Cancelled);
     }
+    let queued_at = Instant::now();
     let _admission = if admission_wait.is_zero() {
         ProbeAdmission::acquire()?
     } else {
         ProbeAdmission::acquire_waiting(cancel, admission_wait)?
     };
+    // Time spent queueing counts against `timeout`, so a queued probe never
+    // takes longer than its caller's bound.
+    let timeout = timeout.saturating_sub(queued_at.elapsed());
     let (operation_deadline, api_deadline) = probe_deadlines(timeout)?;
     let input = match (input_path, input_file) {
         (Some(path), None) => ProbeInput::Path(path.to_path_buf()),
@@ -893,13 +900,32 @@ pub(crate) fn ffprobe_json_queued(
 /// ffprobe's `fd:` protocol keeps normal file seek semantics (unlike `pipe:`),
 /// which is required by containers whose metadata lives near the end.
 pub fn ffprobe_json_file(file: &std::fs::File) -> crate::error::Result<serde_json::Value> {
-    ffprobe_json_file_cancellable(file, &crate::MediaCancelToken::new(), FFPROBE_TIMEOUT)
+    // Uncancellable callers must not block on the queue: a saturated limit
+    // fails at once with `MediaError::Busy`.
+    ffprobe_json_file_with_wait(
+        file,
+        &crate::MediaCancelToken::new(),
+        FFPROBE_TIMEOUT,
+        Duration::ZERO,
+    )
 }
 
+/// Cancellable probe of an open file, used by imports and proxy builds that
+/// run off the UI thread: a saturated admission limit is waited out
+/// (cancellably, for up to half of `timeout`) instead of failing at once (#63).
 pub fn ffprobe_json_file_cancellable(
     file: &std::fs::File,
     cancel: &crate::MediaCancelToken,
     timeout: Duration,
+) -> crate::error::Result<serde_json::Value> {
+    ffprobe_json_file_with_wait(file, cancel, timeout, timeout / 2)
+}
+
+fn ffprobe_json_file_with_wait(
+    file: &std::fs::File,
+    cancel: &crate::MediaCancelToken,
+    timeout: Duration,
+    admission_wait: Duration,
 ) -> crate::error::Result<serde_json::Value> {
     let executable = ffprobe_path();
     let out = run_ffprobe(
@@ -908,7 +934,7 @@ pub fn ffprobe_json_file_cancellable(
         Some(file),
         cancel,
         timeout,
-        Duration::ZERO,
+        admission_wait,
     )?;
     if !out.status.success() {
         return Err(crate::error::MediaError::Ffmpeg(format!(
@@ -933,6 +959,7 @@ pub(crate) mod test_seams {
 
     thread_local! {
         static ADMISSION_SATURATED: Cell<bool> = const { Cell::new(false) };
+        static ADMISSION_SATURATED_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static ADMISSION_WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
         static PROBE_REQUESTS: Cell<usize> = const { Cell::new(0) };
         static FFPROBE_OVERRIDE: RefCell<Option<OsString>> = const { RefCell::new(None) };
@@ -947,6 +974,20 @@ pub(crate) mod test_seams {
 
     pub(crate) fn admission_saturated() -> bool {
         ADMISSION_SATURATED.with(Cell::get)
+    }
+
+    /// Reject the next `attempts` admission attempts on this thread, as if a
+    /// slot were freed by other work only afterwards.
+    pub(crate) fn saturate_admission_attempts(attempts: usize) {
+        ADMISSION_SATURATED_ATTEMPTS.with(|cell| cell.set(attempts));
+    }
+
+    pub(crate) fn take_saturated_attempt() -> bool {
+        ADMISSION_SATURATED_ATTEMPTS.with(|cell| {
+            let remaining = cell.get();
+            cell.set(remaining.saturating_sub(1));
+            remaining > 0
+        })
     }
 
     /// Shorten (or restore with `None`) the queued-admission wait on this thread.
@@ -994,6 +1035,47 @@ pub(crate) mod test_seams {
 mod tests {
     use super::*;
 
+    #[test]
+    fn saturated_admission_queues_until_a_slot_frees() {
+        test_seams::saturate_admission_attempts(3);
+        let admission = ProbeAdmission::acquire_waiting(
+            &crate::MediaCancelToken::new(),
+            Duration::from_secs(5),
+        );
+        test_seams::saturate_admission_attempts(0);
+        assert!(admission.is_ok(), "a queued probe must get the freed slot");
+    }
+
+    #[test]
+    fn saturated_admission_reports_busy_not_a_media_error() {
+        test_seams::saturate_admission(true);
+        let immediate = ProbeAdmission::acquire();
+        let waited = ProbeAdmission::acquire_waiting(
+            &crate::MediaCancelToken::new(),
+            Duration::from_millis(60),
+        );
+        test_seams::saturate_admission(false);
+        assert!(matches!(immediate, Err(crate::MediaError::Busy(_))));
+        assert!(matches!(waited, Err(crate::MediaError::Busy(_))));
+    }
+
+    #[test]
+    fn cancelling_a_queued_admission_returns_promptly() {
+        let cancel = crate::MediaCancelToken::new();
+        let canceller = cancel.clone();
+        let started = Instant::now();
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+        });
+        test_seams::saturate_admission(true);
+        let result = ProbeAdmission::acquire_waiting(&cancel, Duration::from_secs(30));
+        test_seams::saturate_admission(false);
+        trigger.join().unwrap();
+        assert!(matches!(result, Err(crate::MediaError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[cfg(unix)]
     fn assert_capture_limit_kills_tree(output_redirection: &str, expected_stream: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -1033,9 +1115,8 @@ mod tests {
             );
             let starved = matches!(
                 &attempt,
-                Err(crate::MediaError::Ffmpeg(message))
-                    if message == "ffprobe timed out" || message == "ffprobe admission limit reached"
-            );
+                Err(crate::MediaError::Ffmpeg(message)) if message == "ffprobe timed out"
+            ) || matches!(&attempt, Err(crate::MediaError::Busy(_)));
             if !starved {
                 result = Some(attempt);
                 break;

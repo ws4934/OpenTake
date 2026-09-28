@@ -264,6 +264,19 @@ describe("mediaActions import warmup", () => {
     expect(useMediaStore.getState().error).toBe("current project relink failed");
   });
 
+  it("names an unreadable file and the reason when an import skips it", async () => {
+    srv.importMedia.mockResolvedValueOnce({
+      ...srv.imported,
+      skipped: ["notes.bin", "broken.mp4\tcannot read media information (ffprobe exited 1)"],
+    });
+
+    await importFilesViaDialog();
+
+    const message = useEditorUiStore.getState().toast?.message ?? "";
+    expect(message).toContain("broken.mp4");
+    expect(message).toContain("cannot read media information");
+  });
+
   it("does not report skipped media after switching projects during refresh", async () => {
     const pendingRefresh = deferred<MediaList>();
     srv.importMedia.mockResolvedValueOnce({
