@@ -53,11 +53,11 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 #[cfg(test)]
 use crate::clip_audio::clip_source_window_secs;
-use crate::clip_audio::{self, ClipAudioLayout, ClipAudioReader};
+use crate::clip_audio::{self, AudioPlanLike, ClipAudioLayout, ClipAudioReader};
 use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
-use opentake_domain::{AudioDenoise, Clip, ClipType, LutReference, MediaSource, TextStyle};
+use opentake_domain::{ClipType, LutReference, MediaSource, TextStyle};
 use opentake_media::decode::spawn_video_stream;
 #[cfg(test)]
 use opentake_media::encode::ClipAudio;
@@ -80,7 +80,7 @@ use opentake_render::gpu::compositor::{
 };
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::{
-    export_render_size, source_frame_index, try_build_render_plan, AudioClipPlan, Compositor,
+    export_render_size, source_frame_index, try_build_render_plan, Compositor,
     CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, FramePlan,
     GpuLutTexture, GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest,
     TextRasterizer, TextureCache, TextureResolver, TextureSource,
@@ -1262,58 +1262,6 @@ fn retime_pcm_to_len_with_external(
 /// Returns `Ok(None)` when the clip contributes no audio (no media path, no
 /// audio track, zero-length window, or a fully-decoded-to-empty buffer). Decode
 /// failures other than "no audio track" propagate as `Err`.
-trait AudioPlanLike {
-    fn clip(&self) -> &Clip;
-    fn volume_at(&self, frame: i32) -> f64;
-    fn true_peak_ceiling_dbtp(&self) -> Option<f64>;
-    fn audio_denoise(&self) -> Option<AudioDenoise>;
-}
-
-impl AudioPlanLike for Clip {
-    fn clip(&self) -> &Clip {
-        self
-    }
-
-    fn volume_at(&self, frame: i32) -> f64 {
-        Clip::volume_at(self, frame)
-    }
-
-    fn true_peak_ceiling_dbtp(&self) -> Option<f64> {
-        self.loudness_normalization
-            .map(|normalization| normalization.true_peak_ceiling_dbtp)
-    }
-
-    fn audio_denoise(&self) -> Option<AudioDenoise> {
-        self.audio_denoise
-    }
-}
-
-impl AudioPlanLike for AudioClipPlan {
-    fn clip(&self) -> &Clip {
-        &self.clip
-    }
-
-    fn volume_at(&self, frame: i32) -> f64 {
-        AudioClipPlan::volume_at(self, frame)
-    }
-
-    fn true_peak_ceiling_dbtp(&self) -> Option<f64> {
-        std::iter::once(&self.gain_clip)
-            .chain(self.compound_ancestors.iter())
-            .filter_map(|clip| {
-                clip.loudness_normalization
-                    .map(|normalization| normalization.true_peak_ceiling_dbtp)
-            })
-            .min_by(f64::total_cmp)
-    }
-
-    fn audio_denoise(&self) -> Option<AudioDenoise> {
-        std::iter::once(&self.gain_clip)
-            .chain(self.compound_ancestors.iter())
-            .find_map(|clip| clip.audio_denoise)
-    }
-}
-
 #[cfg(test)]
 fn project_clip_audio<T: AudioPlanLike>(
     plan: &T,
@@ -1402,7 +1350,7 @@ fn project_clip_audio<T: AudioPlanLike>(
 fn apply_export_denoise(
     samples: &[f32],
     channels: usize,
-    config: Option<AudioDenoise>,
+    config: Option<opentake_domain::AudioDenoise>,
     control: Option<&ExportControl>,
 ) -> Result<Vec<f32>, String> {
     apply_export_denoise_with_external(samples, channels, config, control, None)
@@ -1412,7 +1360,7 @@ fn apply_export_denoise(
 fn apply_export_denoise_with_external(
     samples: &[f32],
     channels: usize,
-    config: Option<AudioDenoise>,
+    config: Option<opentake_domain::AudioDenoise>,
     control: Option<&ExportControl>,
     external_cancel: Option<&MediaCancelToken>,
 ) -> Result<Vec<f32>, String> {
@@ -1450,15 +1398,11 @@ fn mix_timeline_audio(
     control: Option<&ExportControl>,
     on_progress: Option<AudioExportProgress>,
 ) -> Result<Option<PcmBuffer>, String> {
-    let clips = timeline
-        .tracks
-        .iter()
-        .filter(|track| !track.muted)
-        .flat_map(|track| &track.clips)
-        .filter(|clip| matches!(clip.media_type, ClipType::Audio | ClipType::Video))
-        .cloned()
-        .collect::<Vec<_>>();
+    // The video export mixes the render plan's flattened clips; so does this
+    // reference, which the preview parity tests compare against.
+    let clips = opentake_render::try_collect_audio_clips(timeline)?;
     let mut samples_f32 = Vec::new();
+
     let has_audio = stream_flattened_audio(
         &clips,
         media,
@@ -1769,15 +1713,11 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
     on_progress: Option<AudioExportProgress>,
 ) -> Result<Option<usize>, String> {
     let (_sizes, media) = project_media(manifest, project_dir);
-    let clips = timeline
-        .tracks
-        .iter()
-        .filter(|track| !track.muted)
-        .flat_map(|track| &track.clips)
-        .filter(|clip| matches!(clip.media_type, ClipType::Audio | ClipType::Video))
-        .cloned()
-        .collect::<Vec<_>>();
+    // The render plan's flattened clips, as the video export mixes them: sound
+    // inside a compound clip is included with its ancestors' gain (#33).
+    let clips = opentake_render::try_collect_audio_clips(timeline)?;
     let end_frame = timeline.total_frames();
+
     let expected_samples = if timeline.fps > 0 {
         ((end_frame.max(0) as f64 / timeline.fps as f64) * MIX_SAMPLE_RATE as f64).round() as usize
     } else {
@@ -3750,6 +3690,88 @@ fn project_frame_time_secs(source_frame: i64, timeline_fps: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentake_domain::{AudioDenoise, Clip};
+
+    #[test]
+    fn timeline_wav_includes_the_sound_inside_a_compound_clip() {
+        use crate::clip_audio::fixtures::{ffmpeg_ready, write_wav, RATE};
+        use opentake_domain::{MediaManifestEntry, NestedSequence, Track};
+
+        if !ffmpeg_ready() {
+            eprintln!("SKIP: ffmpeg sidecars are required for the compound WAV test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("dc.wav");
+        write_wav(&source, &vec![0.8; 2 * RATE as usize]);
+        let mut inner = Clip::new("inner", "dc", 0, 30);
+        inner.media_type = ClipType::Audio;
+        inner.source_clip_type = ClipType::Audio;
+        inner.volume = 0.5;
+        let mut child = opentake_domain::Timeline::new();
+        child.fps = 30;
+        let mut child_track = Track::new("a1", ClipType::Audio);
+        child_track.clips.push(inner);
+        child.tracks.push(child_track);
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        timeline
+            .nested_sequences
+            .push(NestedSequence::new("sequence", "Sequence", child));
+        let mut compound = Clip::new_nested("compound", "sequence", 0, 30);
+        compound.volume = 0.5;
+        let mut track = Track::new("v1", ClipType::Video);
+        track.clips.push(compound);
+        timeline.tracks.push(track);
+        let mut manifest = opentake_domain::MediaManifest::default();
+        manifest.entries.push(MediaManifestEntry {
+            id: "dc".into(),
+            name: "dc".into(),
+            kind: ClipType::Audio,
+            source: MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: 2.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+
+        let out = dir.path().join("out.wav");
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&out)
+            .unwrap();
+        let samples = write_timeline_audio_wav_for_manifest_with_control(
+            &timeline,
+            &manifest,
+            &None,
+            &mut file,
+            &ExportControl::default(),
+            None,
+        )
+        .unwrap()
+        .expect("the compound clip's sound is written");
+        assert_eq!(samples, MIX_SAMPLE_RATE as usize);
+        drop(file);
+        let bytes = std::fs::read(&out).unwrap();
+        let data = &bytes[44..];
+        assert_eq!(data.len(), samples * 2);
+        // Inner volume 0.5 times compound volume 0.5, as the export mix.
+        for sample in data.chunks(2) {
+            let value = i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32_768.0;
+            assert!((value - 0.2).abs() < 1.0e-3, "{value}");
+        }
+    }
 
     #[test]
     fn sequential_export_decodes_300_frames_with_one_stream_per_clip() {

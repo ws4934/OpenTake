@@ -206,7 +206,7 @@ pub fn try_build_render_plan(
     let total_frames = timeline.total_frames();
     let mut clip_plans: Vec<ClipPlan> = Vec::new();
     let mut text_plans: Vec<ClipPlan> = Vec::new();
-    let mut audio_clips: Vec<AudioClipPlan> = Vec::new();
+    let audio_clips = collect_audio_clips(timeline);
 
     let registry: HashMap<&str, &NestedSequence> = timeline
         .nested_sequences
@@ -226,16 +226,6 @@ pub fn try_build_render_plan(
         &mut clip_plans,
         &mut text_plans,
     );
-    collect_nested_audio(
-        timeline,
-        &registry,
-        0,
-        None,
-        None,
-        false,
-        &[],
-        &mut audio_clips,
-    );
 
     // Final blend order: bottom-to-top. Upstream keeps visual track 0 topmost,
     // so higher track indexes draw first and lower indexes draw last.
@@ -253,6 +243,37 @@ pub fn try_build_render_plan(
         text_plans,
         audio_clips,
     })
+}
+
+/// The audio-bearing leaves of `timeline`, nested sequences flattened into
+/// root timeline coordinates: exactly [`RenderPlan::audio_clips`] of
+/// [`try_build_render_plan`], without the render size and source metrics the
+/// visual plan needs. Preview audio and export mix this one list.
+pub fn try_collect_audio_clips(timeline: &Timeline) -> Result<Vec<AudioClipPlan>, String> {
+    timeline.validate_nested_sequences()?;
+    validate_nested_render_constraints(timeline)?;
+    Ok(collect_audio_clips(timeline))
+}
+
+/// [`try_collect_audio_clips`] for a validated timeline.
+fn collect_audio_clips(timeline: &Timeline) -> Vec<AudioClipPlan> {
+    let registry: HashMap<&str, &NestedSequence> = timeline
+        .nested_sequences
+        .iter()
+        .map(|sequence| (sequence.id.as_str(), sequence))
+        .collect();
+    let mut audio_clips = Vec::new();
+    collect_nested_audio(
+        timeline,
+        &registry,
+        0,
+        None,
+        None,
+        false,
+        &[],
+        &mut audio_clips,
+    );
+    audio_clips
 }
 
 #[allow(clippy::too_many_arguments)]
