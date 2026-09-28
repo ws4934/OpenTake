@@ -93,6 +93,7 @@ struct PrewarmJob {
     work: PrewarmWork,
 }
 
+#[derive(Clone)]
 pub struct PrewarmScheduler {
     inner: Arc<SchedulerInner>,
 }
