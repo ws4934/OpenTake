@@ -297,23 +297,36 @@ impl MotionCache {
 
     /// Remove least recently used entries until the cache fits
     /// `limits.max_bytes`, and every unfinished render untouched for
-    /// `limits.max_incomplete_age`. Pinned entries and unknown files are never
-    /// removed. Returns the first removal failure after trying every candidate.
+    /// `limits.max_incomplete_age`. The most recently used unfinished render
+    /// is kept outside the byte budget until it is that old, so retrying an
+    /// interrupted long render resumes it even when its frames alone exceed
+    /// the budget. Pinned entries and unknown files are never removed.
+    /// Returns the first removal failure after trying every candidate.
     pub fn evict(&self, limits: MotionCacheLimits) -> MotionResult<MotionCacheSweep> {
         let now = SystemTime::now();
+        let abandoned = |entry: &CacheEntry| {
+            !entry.complete
+                && now
+                    .duration_since(entry.last_used)
+                    .is_ok_and(|age| age >= limits.max_incomplete_age)
+        };
         let mut failures = Vec::new();
         let mut entries = self.entries(&mut failures)?;
+        entries.sort_by_key(|entry| entry.last_used);
+        let resumable = entries
+            .iter()
+            .rposition(|entry| !entry.complete && !abandoned(entry));
+        let resumable_bytes = resumable.map_or(0, |index| entries[index].bytes);
         let mut sweep = MotionCacheSweep {
             retained_bytes: entries.iter().map(|entry| entry.bytes).sum(),
             ..MotionCacheSweep::default()
         };
-        entries.sort_by_key(|entry| entry.last_used);
-        for entry in entries {
-            let abandoned = !entry.complete
-                && now
-                    .duration_since(entry.last_used)
-                    .is_ok_and(|age| age >= limits.max_incomplete_age);
-            if sweep.retained_bytes <= limits.max_bytes && !abandoned {
+        for (index, entry) in entries.into_iter().enumerate() {
+            if Some(index) == resumable {
+                continue;
+            }
+            let budgeted_bytes = sweep.retained_bytes.saturating_sub(resumable_bytes);
+            if budgeted_bytes <= limits.max_bytes && !abandoned(&entry) {
                 continue;
             }
             match self.remove_unpinned(&entry.path) {
@@ -1011,6 +1024,65 @@ mod tests {
         assert_eq!(
             MotionCache::completed_prefix(&recent, &recent_req).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_the_latest_interrupted_render_outside_the_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = MotionCache::new(tmp.path());
+        let partial = |body: &str, bytes: usize, age: Duration| {
+            let req = MotionRenderRequest::new(MotionSource::code(body), 30, 4, 4, 4);
+            let dir = cache.begin_render(&req).unwrap();
+            write_frames(&dir, 2, 4, 4);
+            std::fs::write(dir.join("padding.bin"), vec![0_u8; bytes]).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(partial_marker(&dir))
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+            (req, dir)
+        };
+        let oldest = cached_entry(&cache, "<oldest/>", 1000, Duration::from_secs(400));
+        let (_, older_partial) = partial("<older/>", 2000, Duration::from_secs(300));
+        let (latest_req, latest_partial) = partial("<latest/>", 5000, Duration::from_secs(200));
+        let newest = cached_entry(&cache, "<newest/>", 1000, Duration::from_secs(1));
+
+        let sweep = cache
+            .evict(MotionCacheLimits {
+                max_bytes: 1500,
+                max_incomplete_age: Duration::from_secs(3600),
+            })
+            .unwrap();
+
+        assert!(
+            latest_partial.is_dir(),
+            "the latest interrupted render survives although it alone exceeds the budget"
+        );
+        assert_eq!(
+            MotionCache::completed_prefix(&latest_partial, &latest_req).unwrap(),
+            2
+        );
+        assert!(!oldest.exists() && !older_partial.exists());
+        assert!(newest.is_dir(), "the other entries share the budget");
+        assert_eq!(sweep.removed_entries, 2);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(partial_marker(&latest_partial))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        cache
+            .evict(MotionCacheLimits {
+                max_bytes: u64::MAX,
+                max_incomplete_age: Duration::from_secs(3600),
+            })
+            .unwrap();
+        assert!(
+            !latest_partial.exists(),
+            "an abandoned render is removed whatever the budget"
         );
     }
 
