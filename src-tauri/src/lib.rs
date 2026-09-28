@@ -306,6 +306,7 @@ pub fn run() {
                 engine,
                 install_admission.clone(),
             ));
+            app.manage(captions::CaptionGenerationState::default());
             app.manage(media::StabilizationAnalysisState::new(
                 install_admission.clone(),
             ));
@@ -481,6 +482,7 @@ pub fn run() {
             transcribe::transcribe_media,
             transcribe::transcript_get,
             captions::generate_captions,
+            captions::cancel_caption_generation,
             search::search_model_status,
             search::download_search_model,
             search::search_index_status,
@@ -515,6 +517,10 @@ pub fn run() {
         .run(|_app, _event| {
             if matches!(&_event, RunEvent::Exit) {
                 external_mcp::shutdown_on_exit(_app);
+                if let Some(motion) = _app.try_state::<motion::MotionCommandState>() {
+                    motion.cancel_active();
+                }
+                opentake_motion::HeadlessChromiumRenderer::shutdown_all_pools();
             }
             // Programmatic exits (including updater restart and a successful
             // save barrier) bypass this handler to avoid recursive saves.
