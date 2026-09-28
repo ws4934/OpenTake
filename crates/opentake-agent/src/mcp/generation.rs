@@ -103,6 +103,20 @@ pub trait GenerationFinalizationStore {
     /// Persist the aggregate job terminal state after every placeholder has a
     /// terminal record.
     fn complete_job(&self, job_id: &str, succeeded: usize, failed: usize) -> Result<(), String>;
+
+    /// Whether a placeholder already has a terminal record, from an earlier
+    /// finalization of a job that was interrupted before all its outputs
+    /// were finished. Such an output is skipped: its result is kept.
+    fn finished_output(&self, _asset_id: &str) -> Result<Option<FinishedOutput>, String> {
+        Ok(None)
+    }
+}
+
+/// How an already terminal placeholder ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishedOutput {
+    Succeeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +128,8 @@ pub struct GenerationFinalizationSummary {
 }
 
 /// Pair provider URLs to placeholders in order and terminalize every
-/// placeholder exactly once. Missing, malformed, download-failed, and
+/// placeholder exactly once; placeholders that are already terminal keep
+/// their record. Missing, malformed, download-failed, and
 /// commit-failed results become fixed failure codes; extra URLs are ignored.
 pub fn finalize_terminal_outputs(
     store: &dyn GenerationFinalizationStore,
@@ -136,6 +151,17 @@ pub fn finalize_terminal_outputs(
         let mut succeeded = 0;
         let mut failed = 0;
         for (index, asset_id) in placeholder_ids.iter().enumerate() {
+            match store.finished_output(asset_id)? {
+                Some(FinishedOutput::Succeeded) => {
+                    succeeded += 1;
+                    continue;
+                }
+                Some(FinishedOutput::Failed) => {
+                    failed += 1;
+                    continue;
+                }
+                None => {}
+            }
             let Some(url) = result_urls.get(index) else {
                 store.fail_output(asset_id, "GENERATION_RESULT_MISSING")?;
                 failed += 1;
