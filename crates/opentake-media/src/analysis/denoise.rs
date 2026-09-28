@@ -660,15 +660,21 @@ mod tests {
     #[test]
     fn stream_refactor_reproduces_the_previous_one_shot_bit_for_bit() {
         let cancel = MediaCancelToken::new();
-        // Short (one frame), exact frame, strided noise estimate (over 512
-        // frames), stereo, and the 512-sample framing below 32 kHz.
+        // Short (one frame), exact frame, noise-estimate strides 2 to 5 (a
+        // stride above 4 skips input between sampled frames), stereo, and the
+        // 512-sample framing below 32 kHz.
         for (frames, channels, sample_rate) in [
             (700, 1, RATE),
             (1_024, 1, RATE),
             (150_000, 1, RATE),
+            (300_000, 1, RATE),
+            (450_000, 1, RATE),
+            (600_000, 1, RATE),
             (20_000, 2, RATE),
             (9_000, 1, 16_000),
         ] {
+            let (frame_len, hop) = framing(sample_rate);
+            let stride = frame_count(frames, frame_len, hop).div_ceil(MAX_NOISE_ESTIMATE_WINDOWS);
             let samples = noisy_sine(frames, channels, sample_rate);
             for denoise in [
                 config(0.8),
@@ -691,7 +697,14 @@ mod tests {
                         .unwrap();
                 assert!(
                     actual == expected,
-                    "{frames} frames x {channels} ch @ {sample_rate} Hz diverged"
+                    "{frames} frames x {channels} ch @ {sample_rate} Hz (stride {stride}) diverged"
+                );
+                // Chunks that split sampled frames and the gaps between them.
+                let chunked = stream_in_chunks(&samples, channels, sample_rate, denoise, 4_099);
+                assert!(
+                    chunked == expected,
+                    "{frames} frames x {channels} ch @ {sample_rate} Hz (stride {stride}) \
+                     diverged when streamed in chunks"
                 );
             }
         }
