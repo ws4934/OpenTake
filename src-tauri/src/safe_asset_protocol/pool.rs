@@ -139,7 +139,7 @@ impl HelperPool {
     }
 
     /// Test hook: retire every idle helper and wait for the bounded reap.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) async fn retire_idle_for_test(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.retire_idle_helpers(true).await;

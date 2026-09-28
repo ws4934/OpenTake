@@ -116,7 +116,9 @@ use helper::{
     open_helper_asset, opened_metadata, serve_helper_asset, OpenedMetadata, WireIoErrorKind,
 };
 #[cfg(test)]
-use pool::{bounded_reap, terminate_or_quarantine};
+use pool::bounded_reap;
+#[cfg(all(test, unix))]
+use pool::terminate_or_quarantine;
 
 #[derive(Clone)]
 pub(crate) struct SafeAssetProtocol {
