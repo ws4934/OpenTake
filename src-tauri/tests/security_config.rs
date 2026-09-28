@@ -82,10 +82,14 @@ fn packaged_asset_scope_has_no_global_or_home_wildcard() {
         .map(|value| value.as_str().expect("asset scope entry must be text"))
         .collect::<Vec<_>>();
 
+    // Sample projects are materialized under `app_data_dir()/Projects` without
+    // a native file dialog, and `project_open` only opens paths inside the
+    // asset scope, so that directory is pre-approved.
     assert_eq!(
         allowed,
         vec![
             "$APPCACHE/**/*",
+            "$APPDATA/Projects/**/*",
             "$APPDATA/OpenTake/Library/**/*",
             "$RESOURCE/**/*"
         ]
