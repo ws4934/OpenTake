@@ -151,6 +151,8 @@ export function RustFrameBuffer({
     loaded: boolean;
   } | null>(null);
   const [idleComposite, setIdleComposite] = useState<CompositeFrame | null>(null);
+  useEffect(() => () => composite?.image.release?.(), [composite?.image]);
+  useEffect(() => () => idleComposite?.release?.(), [idleComposite]);
   const idleSessionRef = useRef<ReturnType<typeof createIdleCompositeSession> | null>(null);
   if (idleSessionRef.current === null) idleSessionRef.current = createIdleCompositeSession();
   const idleQueueRef = useRef<{
@@ -200,6 +202,8 @@ export function RustFrameBuffer({
           requestCompositeStillRef.current === job.requester
         ) {
           setIdleComposite(image);
+        } else {
+          image?.release?.();
         }
       })
       .catch(() => undefined)
@@ -370,6 +374,7 @@ export function RustFrameBuffer({
     })
       .then((image) => {
         if (!disposed && image) setComposite({ image, frame: activeFrame, loaded: false });
+        else image?.release?.();
       })
       .catch(() => undefined);
     return () => {

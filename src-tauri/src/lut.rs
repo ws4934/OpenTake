@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use cap_fs_ext::{ambient_authority, FollowSymlinks, OpenOptionsFollowExt};
 #[cfg(unix)]
@@ -127,7 +127,7 @@ pub(crate) fn resolve_project_lut(
     device: &opentake_render::wgpu::Device,
     queue: &opentake_render::wgpu::Queue,
     label: &str,
-) -> Result<Option<Rc<GpuLutTexture>>, RenderError> {
+) -> Result<Option<Arc<GpuLutTexture>>, RenderError> {
     reference.validate()?;
     let Some(root) = root else {
         return Ok(None);
@@ -144,7 +144,7 @@ pub(crate) fn resolve_project_lut(
         )));
     }
     let lut = CubeLut::parse(&bytes).map_err(|error| RenderError::InvalidLut(error.to_string()))?;
-    Ok(Some(Rc::new(upload_lut_3d(
+    Ok(Some(Arc::new(upload_lut_3d(
         device,
         queue,
         &lut,

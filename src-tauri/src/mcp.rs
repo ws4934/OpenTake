@@ -2983,7 +2983,7 @@ struct InspectResolver<'d> {
     text_rasterizer: &'d CosmicTextRasterizer,
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
-    lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
+    lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
     lottie: &'d mut crate::render::LottieMaterializer,
 }
 
@@ -3009,7 +3009,7 @@ impl InspectResolver<'_> {
     fn resolve_managed_lut(
         &mut self,
         reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, opentake_render::RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, opentake_render::RenderError> {
         if let Some(cached) = self.lut_cache.get(&reference.id) {
             return Ok(Some(cached.clone()));
         }
@@ -3084,7 +3084,7 @@ impl TextureResolver for InspectResolver<'_> {
     fn resolve_lut(
         &mut self,
         reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, opentake_render::RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, opentake_render::RenderError> {
         self.resolve_managed_lut(reference)
     }
 }

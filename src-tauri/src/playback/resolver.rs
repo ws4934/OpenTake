@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
+use std::sync::Arc;
 
 use opentake_domain::LutReference;
 use opentake_media::decode::{
@@ -377,7 +378,7 @@ pub struct PlaybackResolverState {
     render_box: (u32, u32),
     cancel: MediaCancelToken,
     project_root: Option<ProjectRoot>,
-    lut_cache: HashMap<String, Rc<GpuLutTexture>>,
+    lut_cache: HashMap<String, Arc<GpuLutTexture>>,
     materialization_error: Option<String>,
 }
 
@@ -738,7 +739,7 @@ impl TextureResolver for StreamingResolver<'_, '_> {
     fn resolve_lut(
         &mut self,
         reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, opentake_render::RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, opentake_render::RenderError> {
         if let Some(cached) = self.state.lut_cache.get(&reference.id) {
             return Ok(Some(cached.clone()));
         }

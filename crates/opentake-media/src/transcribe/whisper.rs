@@ -262,6 +262,16 @@ impl Transcriber for WhisperTranscriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
+        if let Some(cancel) = opts.cancel.clone() {
+            let callback: Box<dyn FnMut() -> bool> = Box::new(move || cancel.is_cancelled());
+            params.set_abort_callback_safe::<_, Box<dyn FnMut() -> bool>>(Some(callback));
+        }
+        if let Some(progress) = opts.progress.clone() {
+            let callback: Box<dyn FnMut(i32)> = Box::new(move |percent: i32| {
+                (progress.0)(0.25 + 0.75 * (percent as f64 / 100.0).clamp(0.0, 1.0));
+            });
+            params.set_progress_callback_safe::<_, Box<dyn FnMut(i32)>>(Some(callback));
+        }
         if let Some(lang) = opts.preferred_language.as_deref() {
             params.set_language(Some(lang));
         }
@@ -273,6 +283,13 @@ impl Transcriber for WhisperTranscriber {
         state
             .full(params, &pcm.samples_f32)
             .map_err(|e| MediaError::Transcribe(format!("full: {e}")))?;
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            return Err(MediaError::Cancelled);
+        }
 
         let n_segments = state
             .full_n_segments()
