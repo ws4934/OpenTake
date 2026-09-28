@@ -28,6 +28,7 @@ mod generation;
 mod haptic;
 mod home;
 mod instance_lock;
+pub mod jpeg;
 mod library;
 mod lifecycle;
 mod lut;

@@ -296,6 +296,40 @@ fn ensure_stream_with<'a, S, E>(
     }
 }
 
+/// A clip whose decoder could not start or ended early. It is not retried
+/// until a seek (or a new session), so a broken source does not respawn
+/// ffprobe/ffmpeg on every render tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamFailure {
+    media_ref: String,
+    message: String,
+}
+
+/// [`ensure_stream_with`] behind the negative cache: a recorded failure of the
+/// same clip and media answers immediately; a new failure is recorded.
+fn ensure_stream_or_cached_failure<'a, S>(
+    streams: &'a mut HashMap<String, S>,
+    failures: &mut HashMap<String, StreamFailure>,
+    clip_id: &str,
+    media_ref: &str,
+    create: impl FnOnce() -> Result<S, String>,
+) -> Result<&'a mut S, String> {
+    if let Some(failure) = failures.get(clip_id) {
+        if failure.media_ref == media_ref {
+            return Err(failure.message.clone());
+        }
+    }
+    ensure_stream_with(streams, clip_id, create).inspect_err(|message| {
+        failures.insert(
+            clip_id.to_string(),
+            StreamFailure {
+                media_ref: media_ref.to_string(),
+                message: message.clone(),
+            },
+        );
+    })
+}
+
 fn bootstrap_frame_request(
     source_frame: i64,
     timeline_fps: i32,
@@ -380,6 +414,8 @@ pub struct PlaybackResolverState {
     project_root: Option<ProjectRoot>,
     lut_cache: HashMap<String, Arc<GpuLutTexture>>,
     materialization_error: Option<String>,
+    /// Negative cache of clips whose decoder failed, keyed by clip id.
+    failed_streams: HashMap<String, StreamFailure>,
 }
 
 impl PlaybackResolverState {
@@ -416,17 +452,25 @@ impl PlaybackResolverState {
             project_root,
             lut_cache: HashMap::new(),
             materialization_error: None,
+            failed_streams: HashMap::new(),
         }
     }
 
     /// Stop and drop every active stream (used on seek: streams restart at the
-    /// new position on the next `sync_active`). Cooperative stop is requested;
-    /// the worker threads are reaped in the background via `Drop`, never joined
-    /// on the render thread.
+    /// new position on the next `sync_active`, and failed clips are retried).
+    /// Cooperative stop is requested; the worker threads are reaped in the
+    /// background via `Drop`, never joined on the render thread.
     pub fn clear_streams(&mut self) {
         for (_, cs) in self.streams.drain() {
             cs.request_stop();
         }
+        self.failed_streams.clear();
+    }
+
+    /// Replace every authorized media path in `message` with its file name, so
+    /// errors shown to the user (and events) never carry absolute paths.
+    pub fn redact_media_paths(&self, message: &str) -> String {
+        super::project::redact_media_paths(&self.media, message)
     }
 
     /// Stop and drop only the given clips' streams (a source that moved
@@ -547,50 +591,68 @@ impl<'d, 's> StreamingResolver<'d, 's> {
             let timeline_fps = self.state.timeline_fps;
             let render_box = self.state.render_box;
             let reversed = self.state.reversed_clips.contains(&t.clip_id);
-            ensure_stream_with(&mut self.state.streams, &t.clip_id, || {
-                let request = bootstrap_frame_request(t.source_frame, timeline_fps, render_box);
-                let (_, frame) =
-                    decode_frame_at_cancellable(&media_path, &request, &self.state.cancel)
-                        .map_err(|error| {
-                            format!(
+            ensure_stream_or_cached_failure(
+                &mut self.state.streams,
+                &mut self.state.failed_streams,
+                &t.clip_id,
+                &t.media_ref,
+                || {
+                    let request = bootstrap_frame_request(t.source_frame, timeline_fps, render_box);
+                    let (_, frame) =
+                        decode_frame_at_cancellable(&media_path, &request, &self.state.cancel)
+                            .map_err(|error| {
+                                format!(
                         "playback bootstrap decode failed for {} at source frame {}: {error}",
                         t.media_ref, t.source_frame
                     )
-                        })?;
-                let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
-                let texture = Rc::new(upload_rgba(
-                    self.device,
-                    self.queue,
-                    &decoded,
-                    false,
-                    Some("playback-bootstrap"),
-                ));
+                            })?;
+                    let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
+                    let texture = Rc::new(upload_rgba(
+                        self.device,
+                        self.queue,
+                        &decoded,
+                        false,
+                        Some("playback-bootstrap"),
+                    ));
 
-                let mut req = VideoStreamRequest::new(media_path, timeline_fps);
-                req.timeline_fps = timeline_fps;
-                req.max_size = render_box;
-                let decoder = if reversed {
-                    ClipDecoder::Reverse {
-                        windows: ReverseWindows::new(t.source_frame),
-                        request: req,
-                    }
-                } else {
-                    req.start_frame = t.source_frame.max(0).saturating_add(1);
-                    let stream = spawn_video_stream(req).map_err(|error| {
-                        format!(
+                    let mut req = VideoStreamRequest::new(media_path, timeline_fps);
+                    req.timeline_fps = timeline_fps;
+                    req.max_size = render_box;
+                    let decoder = if reversed {
+                        ClipDecoder::Reverse {
+                            windows: ReverseWindows::new(t.source_frame),
+                            request: req,
+                        }
+                    } else {
+                        req.start_frame = t.source_frame.max(0).saturating_add(1);
+                        let stream = spawn_video_stream(req).map_err(|error| {
+                            format!(
                             "playback bootstrap stream failed for {} at source frame {}: {error}",
                             t.media_ref, t.source_frame
                         )
-                    })?;
-                    ClipDecoder::Forward {
-                        stream,
-                        pending: None,
-                    }
-                };
-                Ok::<_, String>(ClipStream::new(decoder, texture, t.source_frame))
-            })?;
+                        })?;
+                        ClipDecoder::Forward {
+                            stream,
+                            pending: None,
+                        }
+                    };
+                    Ok(ClipStream::new(decoder, texture, t.source_frame))
+                },
+            )?;
             if let Some(cs) = self.state.streams.get_mut(&t.clip_id) {
-                cs.advance(t.source_frame, self.device, self.queue)?;
+                if let Err(message) = cs.advance(t.source_frame, self.device, self.queue) {
+                    if let Some(failed) = self.state.streams.remove(&t.clip_id) {
+                        failed.request_stop();
+                    }
+                    self.state.failed_streams.insert(
+                        t.clip_id.clone(),
+                        StreamFailure {
+                            media_ref: t.media_ref.clone(),
+                            message: message.clone(),
+                        },
+                    );
+                    return Err(message);
+                }
                 uploaded.push((
                     format!("v:{}:{}", t.media_ref, t.source_frame),
                     cs.cached_tex.clone(),
@@ -1455,5 +1517,90 @@ mod tests {
         assert!(classify_stream_pull(Err(TryRecvError::Empty), 4, 5)
             .expect("an empty live queue may temporarily reuse cache")
             .is_none());
+    }
+
+    #[test]
+    fn failed_bootstrap_runs_once_until_a_seek_clears_the_negative_cache() {
+        let mut streams: HashMap<String, u32> = HashMap::new();
+        let mut failures = HashMap::new();
+        let mut factory_calls = 0;
+        for _ in 0..2 {
+            let error = ensure_stream_or_cached_failure(
+                &mut streams,
+                &mut failures,
+                "clip-1",
+                "asset-1",
+                || {
+                    factory_calls += 1;
+                    Err::<u32, _>("playback bootstrap decode failed for asset-1".to_string())
+                },
+            )
+            .expect_err("bootstrap fails");
+            assert!(error.contains("asset-1"));
+        }
+        assert_eq!(
+            factory_calls, 1,
+            "a failed bootstrap must not respawn per tick"
+        );
+
+        // Another clip, or the same clip bound to different media, still builds.
+        assert_eq!(
+            *ensure_stream_or_cached_failure(
+                &mut streams,
+                &mut failures,
+                "clip-1",
+                "asset-2",
+                || Ok(7)
+            )
+            .expect("replacement media builds"),
+            7
+        );
+
+        // A seek (`clear_streams`) clears the negative cache and retries.
+        streams.clear();
+        failures.clear();
+        ensure_stream_or_cached_failure(&mut streams, &mut failures, "clip-1", "asset-1", || {
+            factory_calls += 1;
+            Ok(1)
+        })
+        .expect("retried after seek");
+        assert_eq!(factory_calls, 2);
+    }
+
+    #[test]
+    fn seek_clears_recorded_stream_failures() {
+        let mut state = PlaybackResolverState::new(
+            HashMap::new(),
+            HashMap::new(),
+            30,
+            (64, 36),
+            MediaCancelToken::new(),
+        );
+        state.failed_streams.insert(
+            "clip-1".to_string(),
+            StreamFailure {
+                media_ref: "asset-1".to_string(),
+                message: "broken".to_string(),
+            },
+        );
+        state.reset_streams(["clip-1"]);
+        assert_eq!(state.failed_streams.len(), 1, "a rewind keeps the failure");
+        state.clear_streams();
+        assert!(state.failed_streams.is_empty());
+    }
+
+    #[test]
+    fn user_visible_errors_name_files_not_absolute_paths() {
+        let path = std::env::temp_dir().join("private-dir").join("take-3.mov");
+        let state = PlaybackResolverState::new(
+            HashMap::from([("asset-1".to_string(), MediaInfo { path: path.clone() })]),
+            HashMap::new(),
+            30,
+            (64, 36),
+            MediaCancelToken::new(),
+        );
+        let message = format!("ffmpeg: {}: Invalid data found", path.display());
+        let redacted = state.redact_media_paths(&message);
+        assert_eq!(redacted, "ffmpeg: take-3.mov: Invalid data found");
     }
 }

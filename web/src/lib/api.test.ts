@@ -6,6 +6,7 @@ import {
   accountLogout,
   accountSetBackendUrl,
   decodePlaybackCommandError,
+  decodePlaybackErrorEvent,
   decodePlaybackFrameEvent,
   decodePrewarmResult,
   externalMcpPair,
@@ -132,6 +133,27 @@ describe("playback IPC decoding", () => {
         key,
       ).toBeNull();
     }
+  });
+
+  it("decodes playback error events with their session identity", () => {
+    const valid = {
+      projectEpoch: 3,
+      timelineVersion: 4,
+      sessionId: "session-err",
+      frame: 17,
+      code: "videoDecode",
+      message: "clip-1 decode failed",
+      fatal: true,
+    };
+    expect(decodePlaybackErrorEvent(valid)).toEqual(valid);
+    for (const code of ["materialization", "render", "audioDecode"]) {
+      expect(decodePlaybackErrorEvent({ ...valid, code, fatal: false })).not.toBeNull();
+    }
+    expect(decodePlaybackErrorEvent({ ...valid, code: "unknown" })).toBeNull();
+    for (const key of Object.keys(valid)) {
+      expect(decodePlaybackErrorEvent({ ...valid, [key]: undefined }), key).toBeNull();
+    }
+    expect(decodePlaybackErrorEvent("boom")).toBeNull();
   });
 
   it("decodes only the four structured playback command errors", () => {

@@ -11,6 +11,7 @@
 //! moves its playhead from the `playback_frame` events; scrub / pause stay on the
 //! existing `<video>` + `composite_frame` path (wired in PR3).
 
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -21,11 +22,12 @@ use opentake_core::AppCore;
 use opentake_render::{even, RenderSize};
 
 use super::audio::{
-    build_clock_paused_cancellable, AudioPlayback, AudioPreparePermit, AudioPrepareWorker,
-    AUDIO_PREPARE_BUSY,
+    build_clock_paused_cancellable, AudioControl, AudioPlayback, AudioPreparePermit,
+    AudioPrepareWorker, AUDIO_PREPARE_BUSY,
 };
 use super::engine::{
-    BoundedReaper, FrameSink, PlaybackClock, PlaybackEngine, PlayheadEmitter, ReapPermit,
+    BoundedReaper, EngineControl, FrameSink, PlaybackClock, PlaybackEngine, PlaybackErrorSink,
+    ReapPermit,
 };
 use super::project::{
     project_media_with_proxies_for_refs, project_text, source_preview_timeline,
@@ -35,7 +37,9 @@ use super::session::{
     PlaybackCommandError, PlaybackIdentity, ProjectTransition, SessionControl, SessionRegistry,
     StartDecision, StartTicket,
 };
-use super::transport::{PreviewServer, PublicationGate, TauriPlayheadEmitter};
+use super::transport::{
+    tauri_frame_publisher, PreviewServer, PublicationGate, TauriPlaybackErrorEmitter,
+};
 
 /// Preview downscale cap (longest side, px) for streaming playback — matches the
 /// single-frame preview so PLAY and scrub/pause look identical.
@@ -99,6 +103,69 @@ struct PlaybackSlot {
     running: Option<RunningPlayback>,
     prepare: Option<PendingPrepare>,
     paused_prepare_restart: Option<PlaybackIdentity>,
+    /// A resume or install whose blocking audio/render handshake is running
+    /// without the slot lock (#42). Transport controls for its session are
+    /// recorded here and applied when the handshake commits.
+    resuming: Option<PendingResume>,
+    resume_tokens: u64,
+}
+
+impl PlaybackSlot {
+    /// Detach the installed session (and any resume in flight for it) so the
+    /// caller can shut it down after releasing the lock.
+    fn take_running(&mut self) -> Option<RunningPlayback> {
+        self.resuming = None;
+        self.running.take()
+    }
+}
+
+struct PendingResume {
+    token: u64,
+    identity: PlaybackIdentity,
+    /// The latest pause requested while the handshake was blocking.
+    pause: Option<i32>,
+    /// The latest seek requested while the handshake was blocking.
+    seek: Option<i32>,
+}
+
+/// Cloned control endpoints of the session being resumed, used while the slot
+/// lock is released.
+struct ResumeHandles {
+    engine: EngineControl,
+    audio: Option<AudioControl>,
+    publication: PublicationGate,
+}
+
+impl ResumeHandles {
+    fn of(running: &RunningPlayback) -> Self {
+        Self {
+            engine: running.engine.control(),
+            audio: running.audio.as_ref().map(AudioPlayback::control),
+            publication: running.publication.clone(),
+        }
+    }
+}
+
+/// The unlocked half of a resume or install, handed from the lock phase.
+struct ResumeWork {
+    token: u64,
+    identity: PlaybackIdentity,
+    handles: ResumeHandles,
+    frame: i32,
+    kind: ResumeKind,
+}
+
+enum CoordinatedStart {
+    Build(StartTicket, ReapPermit, AudioPreparePermit<PreparedAudio>),
+    Resume(ResumeWork),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeKind {
+    /// A paused retained session: a failed handshake returns it to paused.
+    Retained,
+    /// A freshly installed session: a failed handshake stops it.
+    Fresh,
 }
 
 struct PendingPrepare {
@@ -106,20 +173,44 @@ struct PendingPrepare {
     cancel: opentake_media::MediaCancelToken,
 }
 
-pub struct PlaybackState {
+pub struct PlaybackStateInner {
     slot: Mutex<PlaybackSlot>,
     audio_prepare: AudioPrepareWorker<PreparedAudio>,
     reaper: BoundedReaper,
 }
 
+/// Managed playback state. Cloning shares it, so async commands can move the
+/// blocking parts of a start onto a blocking worker.
+#[derive(Clone)]
+pub struct PlaybackState(Arc<PlaybackStateInner>);
+
+impl Deref for PlaybackState {
+    type Target = PlaybackStateInner;
+
+    fn deref(&self) -> &PlaybackStateInner {
+        &self.0
+    }
+}
+
 impl Default for PlaybackState {
     fn default() -> Self {
-        Self {
+        Self(Arc::new(PlaybackStateInner {
             slot: Mutex::new(PlaybackSlot::default()),
             audio_prepare: AudioPrepareWorker::new(),
             reaper: BoundedReaper::new(),
-        }
+        }))
     }
+}
+
+/// Run a blocking playback coordination step off the async executor.
+async fn run_blocking<T, F>(work: F) -> Result<T, PlaybackCommandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PlaybackCommandError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| PlaybackCommandError::engine(format!("playback task failed: {error}")))?
 }
 
 impl PlaybackState {
@@ -145,7 +236,9 @@ impl PlaybackState {
         Option<(StartTicket, ReapPermit, AudioPreparePermit<PreparedAudio>)>,
         PlaybackCommandError,
     > {
-        let initial = self.coordinate_start(identity.clone(), authoritative, frame, cancel.clone());
+        let initial = self
+            .coordinate_start_off_executor(identity.clone(), authoritative, frame, cancel.clone())
+            .await;
         let error = match initial {
             Ok(start) => return Ok(start),
             Err(error) => error,
@@ -175,8 +268,9 @@ impl PlaybackState {
             ));
         }
 
-        let restarted =
-            self.coordinate_start(identity.clone(), authoritative, frame, cancel.clone());
+        let restarted = self
+            .coordinate_start_off_executor(identity.clone(), authoritative, frame, cancel.clone())
+            .await;
         if let Err(error) = &restarted {
             self.abandon_paused_prepare_handoff(
                 &identity,
@@ -224,6 +318,8 @@ impl PlaybackState {
         }
     }
 
+    /// Coordinate a start synchronously, including a retained resume's
+    /// blocking handshake (which runs without the slot lock).
     fn coordinate_start(
         &self,
         identity: PlaybackIdentity,
@@ -234,6 +330,44 @@ impl PlaybackState {
         Option<(StartTicket, ReapPermit, AudioPreparePermit<PreparedAudio>)>,
         PlaybackCommandError,
     > {
+        match self.begin_coordinated_start(identity, authoritative, frame, cancel)? {
+            CoordinatedStart::Build(ticket, reap, admission) => Ok(Some((ticket, reap, admission))),
+            CoordinatedStart::Resume(work) => {
+                self.complete_resume(work)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// [`Self::coordinate_start`] for async commands: the lock-only decision
+    /// runs inline, a retained resume's blocking handshake on a blocking worker.
+    async fn coordinate_start_off_executor(
+        &self,
+        identity: PlaybackIdentity,
+        authoritative: opentake_core::ProjectRevision,
+        frame: i32,
+        cancel: opentake_media::MediaCancelToken,
+    ) -> Result<
+        Option<(StartTicket, ReapPermit, AudioPreparePermit<PreparedAudio>)>,
+        PlaybackCommandError,
+    > {
+        match self.begin_coordinated_start(identity, authoritative, frame, cancel)? {
+            CoordinatedStart::Build(ticket, reap, admission) => Ok(Some((ticket, reap, admission))),
+            CoordinatedStart::Resume(work) => {
+                let state = self.clone();
+                run_blocking(move || state.complete_resume(work)).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn begin_coordinated_start(
+        &self,
+        identity: PlaybackIdentity,
+        authoritative: opentake_core::ProjectRevision,
+        frame: i32,
+        cancel: opentake_media::MediaCancelToken,
+    ) -> Result<CoordinatedStart, PlaybackCommandError> {
         let (decision, old, pending_reap, audio_admission) = {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
             if cancel.is_cancelled() {
@@ -242,8 +376,6 @@ impl PlaybackState {
                 ));
             }
             if slot.sessions.start_would_resume(&identity, authoritative)? {
-                let decision = slot.sessions.begin_start(identity.clone(), authoritative)?;
-                debug_assert!(matches!(decision, StartDecision::Resume));
                 let Some(running) = slot.running.as_ref() else {
                     return Err(PlaybackCommandError::superseded(
                         "retained playback resources are no longer installed",
@@ -254,26 +386,19 @@ impl PlaybackState {
                         "retained playback identity changed",
                     ));
                 }
-                if let Some(audio) = running.audio.as_ref() {
-                    if let Err(error) = audio.prepare_resume() {
-                        slot.sessions.control(&identity, SessionControl::Pause);
-                        return Err(PlaybackCommandError::engine(error));
-                    }
-                }
-                running.publication.reopen();
-                if let Err(error) = running.engine.resume(frame) {
-                    running.publication.close();
-                    if let Some(audio) = running.audio.as_ref() {
-                        let _ = audio.pause();
-                    }
-                    slot.sessions.control(&identity, SessionControl::Pause);
-                    return Err(PlaybackCommandError::engine(error));
-                }
-                if let Some(audio) = running.audio.as_ref() {
-                    audio.commit_resume();
-                }
+                let handles = ResumeHandles::of(running);
+                let decision = slot.sessions.begin_start(identity.clone(), authoritative)?;
+                debug_assert!(matches!(decision, StartDecision::Resume));
+                handles.publication.reopen();
                 slot.paused_prepare_restart = None;
-                return Ok(None);
+                let token = Self::begin_resume_locked(&mut slot, &identity);
+                return Ok(CoordinatedStart::Resume(ResumeWork {
+                    token,
+                    identity,
+                    handles,
+                    frame,
+                    kind: ResumeKind::Retained,
+                }));
             }
             let audio_admission = self
                 .audio_prepare
@@ -297,7 +422,7 @@ impl PlaybackState {
                 }
             }
             slot.paused_prepare_restart = None;
-            let old = slot.running.take();
+            let old = slot.take_running();
             (decision, old, pending_reap, audio_admission)
         };
         if let Some(running) = old {
@@ -306,7 +431,11 @@ impl PlaybackState {
         let StartDecision::Build(ticket) = decision else {
             unreachable!("resume returned above")
         };
-        Ok(Some((ticket, pending_reap, audio_admission)))
+        Ok(CoordinatedStart::Build(
+            ticket,
+            pending_reap,
+            audio_admission,
+        ))
     }
 
     #[cfg(test)]
@@ -375,67 +504,115 @@ impl PlaybackState {
             publication,
             server,
         } = resources;
-        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        Self::finish_prepare_locked(&mut slot, prepare_cancel);
-        if let Err(error) = slot.sessions.install_if_current(ticket, authoritative) {
-            drop(slot);
-            publication.close();
-            let running = RunningPlayback {
-                identity,
-                proxy_check_cancel,
-                engine,
-                audio,
-                publication,
-                server: Some(server),
-                reap: cleanup,
-            };
-            running.shutdown()?;
-            return Err(error);
-        }
-        if let Some(audio_playback) = audio.as_ref() {
-            if let Err(error) = audio_playback.prepare_resume() {
-                slot.sessions.control(&identity, SessionControl::Stop);
-                drop(slot);
-                let running = RunningPlayback {
-                    identity,
-                    proxy_check_cancel,
-                    engine,
-                    audio,
-                    publication,
-                    server: Some(server),
-                    reap: cleanup,
-                };
-                running.shutdown()?;
-                return Err(PlaybackCommandError::engine(error));
-            }
-        }
-        if let Err(error) = engine.resume(frame) {
-            slot.sessions.control(&identity, SessionControl::Stop);
-            drop(slot);
-            let running = RunningPlayback {
-                identity,
-                proxy_check_cancel,
-                engine,
-                audio,
-                publication,
-                server: Some(server),
-                reap: cleanup,
-            };
-            running.shutdown()?;
-            return Err(PlaybackCommandError::engine(error));
-        }
-        if let Some(audio_playback) = audio.as_ref() {
-            audio_playback.commit_resume();
-        }
-        slot.running = Some(RunningPlayback {
-            identity,
+        let running = RunningPlayback {
+            identity: identity.clone(),
             proxy_check_cancel,
             engine,
             audio,
             publication,
             server: Some(server),
             reap: cleanup,
+        };
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        Self::finish_prepare_locked(&mut slot, prepare_cancel);
+        if let Err(error) = slot.sessions.install_if_current(ticket, authoritative) {
+            drop(slot);
+            running.close_publication();
+            running.shutdown()?;
+            return Err(error);
+        }
+        let handles = ResumeHandles::of(&running);
+        let replaced = slot.take_running();
+        slot.running = Some(running);
+        let token = Self::begin_resume_locked(&mut slot, &identity);
+        drop(slot);
+        if let Some(replaced) = replaced {
+            replaced.shutdown()?;
+        }
+        self.complete_resume(ResumeWork {
+            token,
+            identity,
+            handles,
+            frame,
+            kind: ResumeKind::Fresh,
+        })
+    }
+
+    fn begin_resume_locked(slot: &mut PlaybackSlot, identity: &PlaybackIdentity) -> u64 {
+        slot.resume_tokens = slot.resume_tokens.wrapping_add(1);
+        slot.resuming = Some(PendingResume {
+            token: slot.resume_tokens,
+            identity: identity.clone(),
+            pause: None,
+            seek: None,
         });
+        slot.resume_tokens
+    }
+
+    /// Run the blocking half of a resume/install — the audio liveness (or
+    /// device rebuild) handshake and the render-thread barrier — without the
+    /// slot lock, then commit under the lock. Pause/seek/stop issued meanwhile
+    /// return at once (#42); the commit applies the latest of them.
+    fn complete_resume(&self, work: ResumeWork) -> Result<(), PlaybackCommandError> {
+        let ResumeWork {
+            token,
+            identity,
+            handles,
+            frame,
+            kind,
+        } = work;
+        let identity = &identity;
+        let handshake = (|| {
+            if let Some(audio) = handles.audio.as_ref() {
+                audio.prepare_resume()?;
+            }
+            handles.engine.resume(frame)
+        })();
+
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(pending) = slot.resuming.take_if(|pending| pending.token == token) else {
+            // A stop, restart or project boundary took the session meanwhile
+            // and owns its teardown.
+            return Err(PlaybackCommandError::superseded(
+                "playback session changed while resuming",
+            ));
+        };
+        if let Err(error) = handshake {
+            handles.publication.close();
+            if let Some(audio) = handles.audio.as_ref() {
+                let _ = audio.pause();
+            }
+            match kind {
+                ResumeKind::Retained => {
+                    slot.sessions.control(identity, SessionControl::Pause);
+                }
+                ResumeKind::Fresh => {
+                    slot.sessions.control(identity, SessionControl::Stop);
+                    let running = slot
+                        .running
+                        .take_if(|running| &running.identity == identity);
+                    drop(slot);
+                    if let Some(running) = running {
+                        running.shutdown()?;
+                    }
+                }
+            }
+            return Err(PlaybackCommandError::engine(error));
+        }
+        if let Some(paused_at) = pending.pause {
+            // The pause already closed publication and muted audio; freeze the
+            // render thread that the handshake just resumed.
+            return handles
+                .engine
+                .pause(paused_at)
+                .map_err(PlaybackCommandError::engine);
+        }
+        if let Some(seek) = pending.seek {
+            handles.engine.seek(seek);
+        }
+        if let Some(audio) = handles.audio.as_ref() {
+            audio.commit_resume();
+        }
         Ok(())
     }
 
@@ -459,7 +636,7 @@ impl PlaybackState {
             };
             slot.sessions.stop_all();
             Self::cancel_prepare(&mut slot);
-            let running = slot.running.take();
+            let running = slot.take_running();
             drop(slot);
             if let Some(running) = running {
                 running.shutdown()?;
@@ -473,6 +650,40 @@ impl PlaybackState {
                 slot.paused_prepare_restart = None;
             }
             return Ok(());
+        }
+        let slot_ref = &mut *slot;
+        if let Some(pending) = slot_ref
+            .resuming
+            .as_mut()
+            .filter(|pending| pending.identity == identity)
+        {
+            match control {
+                SessionControl::Pause => {
+                    if !slot_ref.sessions.control(&identity, control) {
+                        return Err(PlaybackCommandError::superseded(
+                            "playback control targeted a stale session",
+                        ));
+                    }
+                    pending.pause = Some(frame);
+                    pending.seek = None;
+                    if let Some(running) = slot_ref.running.as_ref() {
+                        running.proxy_check_cancel.cancel();
+                        running.close_publication();
+                        if let Some(audio) = running.audio.as_ref() {
+                            audio.mute();
+                        }
+                    }
+                    return Ok(());
+                }
+                SessionControl::Seek => {
+                    match pending.pause.as_mut() {
+                        Some(paused_at) => *paused_at = frame,
+                        None => pending.seek = Some(frame),
+                    }
+                    return Ok(());
+                }
+                SessionControl::Stop => {}
+            }
         }
         if !slot.sessions.control(&identity, control) {
             return Err(PlaybackCommandError::superseded(
@@ -504,7 +715,7 @@ impl PlaybackState {
                 running.engine.seek(frame);
             }
             SessionControl::Stop => {
-                let running = slot.running.take();
+                let running = slot.take_running();
                 drop(slot);
                 if let Some(running) = running {
                     running.shutdown()?;
@@ -543,7 +754,7 @@ impl PlaybackState {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
             if slot.sessions.activate_project(transition, project_epoch) {
                 slot.paused_prepare_restart = None;
-                slot.running.take()
+                slot.take_running()
             } else {
                 None
             }
@@ -559,7 +770,7 @@ impl PlaybackState {
             if slot.sessions.activate_project_event(project_epoch) {
                 slot.paused_prepare_restart = None;
                 Self::cancel_prepare(&mut slot);
-                slot.running.take()
+                slot.take_running()
             } else {
                 None
             }
@@ -600,7 +811,7 @@ impl PlaybackState {
                 slot.paused_prepare_restart = None;
             }
             if running_invalid {
-                slot.running.take()
+                slot.take_running()
             } else {
                 None
             }
@@ -795,7 +1006,7 @@ pub async fn playback_start(
         render_size,
         fps,
         sink,
-        emitter,
+        errors,
         publication,
         server,
         project_dir,
@@ -816,13 +1027,17 @@ pub async fn playback_start(
         let fps = timeline.fps;
         let server = app.state::<Arc<PreviewServer>>().inner().clone();
         let publication = PublicationGate::open();
-        let concrete_sink = server.sink(identity.clone(), publication.clone());
-        let emitter: Arc<dyn PlayheadEmitter> = Arc::new(TauriPlayheadEmitter::new(
-            app.clone(),
-            &concrete_sink,
+        let sink: Arc<dyn FrameSink> = Arc::new(server.sink(
+            identity.clone(),
+            publication.clone(),
             timeline.total_frames().max(1) - 1,
+            tauri_frame_publisher(app.clone()),
         ));
-        let sink: Arc<dyn FrameSink> = Arc::new(concrete_sink);
+        let errors: Arc<dyn PlaybackErrorSink> = Arc::new(TauriPlaybackErrorEmitter::new(
+            app.clone(),
+            identity.clone(),
+            publication.clone(),
+        ));
         (
             timeline,
             manifest,
@@ -832,7 +1047,7 @@ pub async fn playback_start(
             render_size,
             fps,
             sink,
-            emitter,
+            errors,
             publication,
             server,
             project_dir,
@@ -920,7 +1135,7 @@ pub async fn playback_start(
             render_size,
             clock,
             sink,
-            emitter,
+            errors,
             start_at,
             ready_cancel,
             project_dir,
@@ -946,20 +1161,28 @@ pub async fn playback_start(
     };
     let current = app.state::<AppCore>().project_revision();
     let proxy_check_cancel = opentake_media::MediaCancelToken::new();
-    let result = app.state::<PlaybackState>().install_if_current(
-        ticket,
-        cleanup,
-        current,
-        PlaybackResources {
+    let result = {
+        let state = app.state::<PlaybackState>().inner().clone();
+        let resources = PlaybackResources {
             proxy_check_cancel: proxy_check_cancel.clone(),
             engine,
             audio,
             publication,
             server,
-        },
-        start_at,
-        &cancel,
-    );
+        };
+        let install_cancel = cancel.clone();
+        run_blocking(move || {
+            state.install_if_current(
+                ticket,
+                cleanup,
+                current,
+                resources,
+                start_at,
+                &install_cancel,
+            )
+        })
+        .await
+    };
     if result.is_ok() {
         if let Some(project_dir) = verification_dir {
             revalidate_proxies_in_background(
@@ -1024,13 +1247,15 @@ mod tests {
     struct NoopSink;
 
     impl FrameSink for NoopSink {
-        fn push_frame(&self, _frame: &opentake_render::DecodedFrame) {}
+        fn push_frame(&self, _frame: i32, _image: opentake_render::DecodedFrame) {}
+
+        fn push_terminal(&self, _frame: i32) {}
     }
 
-    struct NoopEmitter;
+    struct NoopErrors;
 
-    impl PlayheadEmitter for NoopEmitter {
-        fn emit(&self, _frame: i32) {}
+    impl super::super::engine::PlaybackErrorSink for NoopErrors {
+        fn report(&self, _failure: super::super::engine::PlaybackFailure) {}
     }
 
     fn identity(epoch: u64, version: u64, session_id: &str) -> PlaybackIdentity {
@@ -1048,7 +1273,7 @@ mod tests {
             RenderSize::new(2, 2),
             Arc::new(InstantClock::new(0)) as Arc<dyn PlaybackClock>,
             Arc::new(NoopSink),
-            Arc::new(NoopEmitter),
+            Arc::new(NoopErrors),
         )
         .expect("spawn inert playback resource");
         {
@@ -1099,15 +1324,13 @@ mod tests {
         gate: PublicationGate,
         frame: i32,
     ) {
-        let sink = server.sink(identity, gate);
-        let publication = sink.publication();
-        sink.push_frame(&opentake_render::DecodedFrame::new(
-            1,
-            1,
-            vec![255, 0, 0, 255],
-            false,
-        ));
-        assert!(publication.commit(frame, frame).is_some());
+        let sink = server.sink(identity, gate, frame, Arc::new(|_| {}));
+        assert!(sink
+            .publish_now(
+                frame,
+                &opentake_render::DecodedFrame::new(1, 1, vec![255, 0, 0, 255], false),
+            )
+            .is_some());
     }
 
     fn frame_status(server: &PreviewServer, identity: &PlaybackIdentity, frame: i32) -> u16 {
@@ -1847,6 +2070,280 @@ mod tests {
             .expect("failed resume remains retryable"));
     }
 
+    type StartResult = Result<
+        Option<(StartTicket, ReapPermit, AudioPreparePermit<PreparedAudio>)>,
+        PlaybackCommandError,
+    >;
+
+    /// Install `engine` and `audio` into a paused retained session.
+    fn paused_retained_session(
+        current: &PlaybackIdentity,
+        engine: PlaybackEngine,
+        audio: Option<AudioPlayback>,
+    ) -> (PlaybackState, PublicationGate) {
+        let (state, gate) = state_with_running(current.clone());
+        {
+            let mut slot = state
+                .slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let running = slot.running.as_mut().expect("running playback");
+            running.engine = engine;
+            running.audio = audio;
+        }
+        state
+            .control(current.clone(), SessionControl::Pause, 17)
+            .expect("pause retained session");
+        (state, gate)
+    }
+
+    fn spawn_resume(
+        state: &PlaybackState,
+        current: &PlaybackIdentity,
+        frame: i32,
+    ) -> std::thread::JoinHandle<StartResult> {
+        let state = state.clone();
+        let current = current.clone();
+        std::thread::spawn(move || {
+            state.coordinate_start(
+                current.clone(),
+                current.revision(),
+                frame,
+                opentake_media::MediaCancelToken::new(),
+            )
+        })
+    }
+
+    fn session_is_paused(state: &PlaybackState, current: &PlaybackIdentity) -> bool {
+        state
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sessions
+            .start_would_resume(current, current.revision())
+            .expect("valid identity")
+    }
+
+    #[test]
+    fn pause_returns_at_once_while_a_retained_resume_waits_for_audio() {
+        let current = identity(6, 1, "blocked-audio-resume");
+        let (audio, audio_paused, resume_entered, release_resume) =
+            super::super::audio::AudioPlayback::test_blocking_resume();
+        let (engine, _stopped) = PlaybackEngine::test_stub();
+        let (state, gate) = paused_retained_session(&current, engine, Some(audio));
+
+        let resumer = spawn_resume(&state, &current, 17);
+        resume_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resume is blocked in the audio handshake");
+        let started = std::time::Instant::now();
+        state
+            .control(current.clone(), SessionControl::Pause, 21)
+            .expect("pause during a blocked resume");
+        let pause_latency = started.elapsed();
+        release_resume.send(()).expect("release audio handshake");
+        assert!(resumer
+            .join()
+            .expect("join resumer")
+            .expect("superseded resume still completes")
+            .is_none());
+
+        assert!(
+            pause_latency < Duration::from_millis(50),
+            "pause waited {pause_latency:?} for the audio handshake"
+        );
+        assert!(
+            audio_paused.load(std::sync::atomic::Ordering::Acquire),
+            "audio must stay muted after Resume→Pause"
+        );
+        assert!(!gate.is_open());
+        assert!(session_is_paused(&state, &current));
+    }
+
+    #[test]
+    fn seek_returns_at_once_while_the_render_barrier_blocks_and_applies_after_resume() {
+        let current = identity(6, 2, "blocked-render-resume");
+        let (engine, resume_seen, release_resume, log) = PlaybackEngine::test_blocking_resume();
+        let (state, gate) = paused_retained_session(&current, engine, None);
+
+        let resumer = spawn_resume(&state, &current, 17);
+        assert_eq!(
+            resume_seen
+                .recv_timeout(Duration::from_secs(2))
+                .expect("resume reaches the render thread"),
+            17
+        );
+        let started = std::time::Instant::now();
+        state
+            .control(current.clone(), SessionControl::Seek, 40)
+            .expect("seek during a blocked resume");
+        let seek_latency = started.elapsed();
+        release_resume.send(()).expect("release render barrier");
+        assert!(resumer
+            .join()
+            .expect("join resumer")
+            .expect("resume succeeds")
+            .is_none());
+
+        assert!(
+            seek_latency < Duration::from_millis(50),
+            "seek waited {seek_latency:?} for the render barrier"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let entries = log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if entries.iter().any(|entry| entry == "seek:40") {
+                let resume = entries.iter().position(|entry| entry == "resume:17");
+                let seek = entries.iter().position(|entry| entry == "seek:40");
+                assert!(resume < seek, "seek applies after the resume: {entries:?}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{entries:?}");
+            std::thread::yield_now();
+        }
+        assert!(gate.is_open());
+        assert!(!session_is_paused(&state, &current));
+    }
+
+    #[test]
+    fn pause_then_resume_ends_playing_and_resume_then_pause_ends_paused() {
+        let current = identity(6, 3, "ordering");
+        let (audio, audio_paused, _stopped_audio) = super::super::audio::AudioPlayback::test_stub();
+        let (engine, _stopped) = PlaybackEngine::test_stub();
+        let (state, gate) = paused_retained_session(&current, engine, Some(audio));
+
+        assert!(state
+            .coordinate_start(
+                current.clone(),
+                current.revision(),
+                17,
+                opentake_media::MediaCancelToken::new(),
+            )
+            .expect("resume")
+            .is_none());
+        assert!(gate.is_open());
+        assert!(!audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!session_is_paused(&state, &current));
+
+        state
+            .control(current.clone(), SessionControl::Pause, 30)
+            .expect("pause");
+        assert!(!gate.is_open());
+        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(session_is_paused(&state, &current));
+    }
+
+    #[test]
+    fn stop_during_a_blocked_resume_tears_the_session_down() {
+        let current = identity(6, 4, "stop-while-resuming");
+        let (audio, audio_paused, resume_entered, release_resume) =
+            super::super::audio::AudioPlayback::test_blocking_resume();
+        let (engine, engine_stopped) = PlaybackEngine::test_stub();
+        let (state, gate) = paused_retained_session(&current, engine, Some(audio));
+
+        let resumer = spawn_resume(&state, &current, 17);
+        resume_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resume is blocked in the audio handshake");
+        let started = std::time::Instant::now();
+        state
+            .control(current.clone(), SessionControl::Stop, 0)
+            .expect("stop during a blocked resume");
+        assert!(started.elapsed() < Duration::from_millis(50));
+        release_resume.send(()).expect("release audio handshake");
+        let error = match resumer.join().expect("join resumer") {
+            Err(error) => error,
+            Ok(_) => panic!("a stopped session cannot finish resuming"),
+        };
+
+        assert_eq!(
+            error.code,
+            super::super::session::PlaybackErrorCode::Superseded
+        );
+        engine_stopped
+            .recv_timeout(Duration::from_secs(2))
+            .expect("render thread stopped");
+        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!gate.is_open());
+        assert_eq!(state.active_identity(), None);
+        assert!(state
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_during_a_fresh_install_handshake_leaves_the_session_paused() {
+        let current = identity(6, 5, "fresh-install-pause");
+        let state = PlaybackState::new();
+        let ticket = {
+            let mut slot = state
+                .slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let StartDecision::Build(ticket) = slot
+                .sessions
+                .begin_start(current.clone(), current.revision())
+                .expect("begin fresh playback")
+            else {
+                panic!("fresh playback must build");
+            };
+            ticket
+        };
+        let cleanup = state.reaper.try_reserve().expect("reserve fresh cleanup");
+        let server = PreviewServer::start().await.expect("start preview server");
+        let publication = PublicationGate::open();
+        let (audio, audio_paused, resume_entered, release_resume) =
+            super::super::audio::AudioPlayback::test_blocking_resume();
+        let (engine, _stopped) = PlaybackEngine::test_stub();
+        let installer = {
+            let state = state.clone();
+            let publication = publication.clone();
+            std::thread::spawn(move || {
+                state.install_if_current(
+                    ticket,
+                    cleanup,
+                    current.revision(),
+                    PlaybackResources {
+                        proxy_check_cancel: opentake_media::MediaCancelToken::new(),
+                        engine,
+                        audio: Some(audio),
+                        publication,
+                        server,
+                    },
+                    3,
+                    &opentake_media::MediaCancelToken::new(),
+                )
+            })
+        };
+        resume_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("install is blocked in the audio handshake");
+        let current = identity(6, 5, "fresh-install-pause");
+        let started = std::time::Instant::now();
+        state
+            .control(current.clone(), SessionControl::Pause, 3)
+            .expect("pause during install");
+        assert!(started.elapsed() < Duration::from_millis(50));
+        release_resume.send(()).expect("release audio handshake");
+        installer
+            .join()
+            .expect("join installer")
+            .expect("install completes paused");
+
+        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!publication.is_open());
+        assert!(session_is_paused(&state, &current));
+        state
+            .control(current, SessionControl::Stop, 0)
+            .expect("stop installed session");
+    }
+
     #[test]
     fn project_and_timeline_boundaries_cancel_inflight_prepare_atomically() {
         let cases = ["transition", "project-event", "timeline-change"];
@@ -2062,16 +2559,12 @@ mod tests {
         let _transition = state
             .begin_project_transition()
             .expect("begin project boundary");
-        let sink = server.sink(identity.clone(), gate);
-        let publication = sink.publication();
+        let sink = server.sink(identity.clone(), gate, 1, Arc::new(|_| {}));
         let late = std::thread::spawn(move || {
-            sink.push_frame(&opentake_render::DecodedFrame::new(
+            sink.publish_now(
                 1,
-                1,
-                vec![0, 255, 0, 255],
-                false,
-            ));
-            publication.commit(1, 1)
+                &opentake_render::DecodedFrame::new(1, 1, vec![0, 255, 0, 255], false),
+            )
         });
 
         assert!(late.join().expect("join late render").is_none());
@@ -2099,8 +2592,7 @@ mod tests {
         let server = PreviewServer::start().await.expect("start preview server");
         let (state, gate) = state_with_running(old.clone());
         install_server_on_running(&state, Arc::clone(&server));
-        let sink = server.sink(old.clone(), gate.clone());
-        let publication = sink.publication();
+        let sink = server.sink(old.clone(), gate.clone(), 1, Arc::new(|_| {}));
 
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backlog = state
@@ -2117,7 +2609,12 @@ mod tests {
 
         assert_eq!(invalidated, Some(old.clone()));
         assert!(!gate.is_open());
-        assert!(publication.commit(1, 1).is_none());
+        assert!(sink
+            .publish_now(
+                1,
+                &opentake_render::DecodedFrame::new(1, 1, vec![0, 0, 0, 255], false),
+            )
+            .is_none());
         let error = state
             .control(old, SessionControl::Seek, 1)
             .expect_err("external boundary invalidates old identity synchronously");
@@ -2147,8 +2644,7 @@ mod tests {
         let server = PreviewServer::start().await.expect("start preview server");
         let (state, gate) = state_with_running(old.clone());
         install_server_on_running(&state, Arc::clone(&server));
-        let sink = server.sink(old.clone(), gate.clone());
-        let publication = sink.publication();
+        let sink = server.sink(old.clone(), gate.clone(), 1, Arc::new(|_| {}));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         state
             .reaper
@@ -2163,7 +2659,12 @@ mod tests {
 
         assert_eq!(invalidated, Some(old.clone()));
         assert!(!gate.is_open());
-        assert!(publication.commit(1, 1).is_none());
+        assert!(sink
+            .publish_now(
+                1,
+                &opentake_render::DecodedFrame::new(1, 1, vec![0, 0, 0, 255], false),
+            )
+            .is_none());
         let error = state
             .control(old, SessionControl::Pause, 1)
             .expect_err("timeline invalidation supersedes old control immediately");

@@ -17,10 +17,8 @@ use opentake_render::{build_render_plan, source_frame_index, DecodedFrame, Rende
 use opentake_tauri_lib::playback::session::PlaybackIdentity;
 use opentake_tauri_lib::playback::transport::PublicationGate;
 use opentake_tauri_lib::playback::{
-    project_media, project_text, FrameSink, ManifestMetrics, PreviewServer, RenderLoop,
+    project_media, project_text, ManifestMetrics, PreviewServer, RenderLoop,
 };
-
-const BOUNDARY: &[u8] = b"\r\n--opentake_mjpeg_boundary\r\n";
 
 struct HttpHead {
     status: u16,
@@ -148,7 +146,7 @@ fn open_request(port: u16, path: &str, extra_headers: &str) -> (TcpStream, HttpH
         .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("set read timeout");
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_headers}Connection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra_headers}Connection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).expect("write request");
 
@@ -216,88 +214,24 @@ fn solid_frame(width: u32, height: u32, rgb: [u8; 3]) -> DecodedFrame {
     DecodedFrame::new(width, height, rgba, false)
 }
 
-struct ChunkedReader {
-    stream: TcpStream,
-    raw: Vec<u8>,
-}
-
-impl ChunkedReader {
-    fn next(&mut self) -> Vec<u8> {
-        loop {
-            if let Some(line_end) = find_bytes(&self.raw, b"\r\n") {
-                let size_text = std::str::from_utf8(&self.raw[..line_end])
-                    .expect("ASCII chunk size")
-                    .split(';')
-                    .next()
-                    .expect("chunk size field");
-                let size = usize::from_str_radix(size_text.trim(), 16).expect("hex chunk size");
-                let payload_start = line_end + 2;
-                let payload_end = payload_start + size;
-                if self.raw.len() >= payload_end + 2 {
-                    assert_ne!(size, 0, "stream closed before two JPEG parts");
-                    assert_eq!(&self.raw[payload_end..payload_end + 2], b"\r\n");
-                    let payload = self.raw[payload_start..payload_end].to_vec();
-                    self.raw.drain(..payload_end + 2);
-                    return payload;
-                }
-            }
-            let mut chunk = [0u8; 4096];
-            let count = self.stream.read(&mut chunk).expect("read stream chunk");
-            assert!(count > 0, "stream closed before complete chunk");
-            self.raw.extend_from_slice(&chunk[..count]);
-        }
-    }
-}
-
-fn complete_multipart_parts(reader: &mut ChunkedReader, count: usize) -> Vec<Vec<u8>> {
-    let mut decoded = Vec::new();
-    loop {
-        decoded.extend_from_slice(&reader.next());
-        let mut parts = Vec::new();
-        let mut cursor = 0;
-        while let Some(relative) = find_bytes(&decoded[cursor..], BOUNDARY) {
-            let header_start = cursor + relative + BOUNDARY.len();
-            let Some(relative_end) = find_bytes(&decoded[header_start..], b"\r\n\r\n") else {
-                break;
-            };
-            let header_end = header_start + relative_end;
-            let header_text = std::str::from_utf8(&decoded[header_start..header_end])
-                .expect("ASCII multipart headers");
-            let content_length = header_text
-                .split("\r\n")
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("multipart length"))
-                })
-                .expect("multipart Content-Length");
-            let body_start = header_end + 4;
-            let body_end = body_start + content_length;
-            if decoded.len() < body_end {
-                break;
-            }
-            parts.push(decoded[body_start..body_end].to_vec());
-            cursor = body_end;
-        }
-        if parts.len() >= count {
-            return parts;
-        }
-    }
-}
-
 #[test]
 fn frame_route_transitions_from_204_to_valid_200_jpeg() {
     let server = start_server();
-    let port = port_of(&server.endpoint());
+    let port = port_of(&server.endpoint_frame());
     let identity = PlaybackIdentity::new(7, 11, "session-frame-transition").unwrap();
     let path = frame_path(&identity, 4, 1);
     let (empty, body) = finite_get(port, &path, "");
     assert_eq!(empty.status, 204);
     assert!(body.is_empty());
 
-    let sink = server.sink(identity.clone(), PublicationGate::open());
-    sink.push_frame(&solid_frame(3, 2, [220, 20, 20]));
-    sink.publication().commit(4, 20).expect("commit frame");
+    let sink = server.sink(
+        identity.clone(),
+        PublicationGate::open(),
+        20,
+        Arc::new(|_| {}),
+    );
+    sink.publish_now(4, &solid_frame(3, 2, [220, 20, 20]))
+        .expect("commit frame");
 
     let (ready, jpeg) = finite_get(port, &path, "");
     assert_eq!(ready.status, 200);
@@ -312,11 +246,16 @@ fn frame_route_transitions_from_204_to_valid_200_jpeg() {
 #[test]
 fn frame_route_returns_complete_decodable_jpeg_body() {
     let server = start_server();
-    let port = port_of(&server.endpoint());
+    let port = port_of(&server.endpoint_frame());
     let identity = PlaybackIdentity::new(3, 5, "session-complete-body").unwrap();
-    let sink = server.sink(identity.clone(), PublicationGate::open());
-    sink.push_frame(&solid_frame(5, 4, [10, 200, 40]));
-    sink.publication().commit(9, 30).expect("commit frame");
+    let sink = server.sink(
+        identity.clone(),
+        PublicationGate::open(),
+        30,
+        Arc::new(|_| {}),
+    );
+    sink.publish_now(9, &solid_frame(5, 4, [10, 200, 40]))
+        .expect("commit frame");
 
     let (head, jpeg) = finite_get(port, &frame_path(&identity, 9, 1), "");
     assert_eq!(head.status, 200);
@@ -333,7 +272,7 @@ fn frame_route_rejects_cross_origin() {
     let server = start_server();
     let identity = PlaybackIdentity::new(1, 0, "session-origin").unwrap();
     let (head, _) = finite_get(
-        port_of(&server.endpoint()),
+        port_of(&server.endpoint_frame()),
         &frame_path(&identity, 0, 1),
         "Origin: http://127.0.0.1.evil.example\r\n",
     );
@@ -343,11 +282,16 @@ fn frame_route_rejects_cross_origin() {
 #[test]
 fn frame_route_returns_204_for_wrong_session_identity() {
     let server = start_server();
-    let port = port_of(&server.endpoint());
+    let port = port_of(&server.endpoint_frame());
     let identity = PlaybackIdentity::new(2, 8, "session-current").unwrap();
-    let sink = server.sink(identity.clone(), PublicationGate::open());
-    sink.push_frame(&solid_frame(2, 2, [80, 90, 100]));
-    sink.publication().commit(6, 10).expect("commit frame");
+    let sink = server.sink(
+        identity.clone(),
+        PublicationGate::open(),
+        10,
+        Arc::new(|_| {}),
+    );
+    sink.publish_now(6, &solid_frame(2, 2, [80, 90, 100]))
+        .expect("commit frame");
 
     let wrong = PlaybackIdentity::new(2, 8, "session-replaced").unwrap();
     let (head, body) = finite_get(port, &frame_path(&wrong, 6, 1), "");
@@ -356,43 +300,37 @@ fn frame_route_returns_204_for_wrong_session_identity() {
 }
 
 #[test]
-fn stream_route_delivers_two_distinct_complete_jpeg_parts() {
+fn stream_routes_are_not_served() {
     let server = start_server();
-    let port = port_of(&server.endpoint());
-    let (stream, head, remainder) = open_request(port, "/stream", "");
-    assert_eq!(head.status, 200);
-    assert!(head.headers["content-type"].contains("multipart/x-mixed-replace"));
-    assert_eq!(
-        head.headers.get("transfer-encoding").map(String::as_str),
-        Some("chunked")
-    );
-
-    let identity = PlaybackIdentity::new(9, 2, "session-stream").unwrap();
-    let sink = server.sink(identity, PublicationGate::open());
-    sink.push_frame(&solid_frame(2, 2, [255, 0, 0]));
-    sink.push_frame(&solid_frame(4, 3, [0, 0, 255]));
-
-    let mut reader = ChunkedReader {
-        stream,
-        raw: remainder,
-    };
-    let parts = complete_multipart_parts(&mut reader, 2);
-    assert_ne!(parts[0], parts[1]);
-    let first = image::load_from_memory(&parts[0]).expect("decode first complete JPEG");
-    let second = image::load_from_memory(&parts[1]).expect("decode second complete JPEG");
-    assert_eq!((first.width(), first.height()), (2, 2));
-    assert_eq!((second.width(), second.height()), (4, 3));
+    let port = port_of(&server.endpoint_frame());
+    for path in ["/stream", "/ws"] {
+        let (head, _) = finite_get(port, path, "");
+        assert_eq!(head.status, 404, "{path} must not exist");
+    }
 }
 
 #[test]
-fn stream_route_rejects_cross_origin() {
+fn frame_route_rejects_a_rebinding_host() {
     let server = start_server();
-    let (head, _) = finite_get(
-        port_of(&server.endpoint()),
-        "/stream",
-        "Origin: http://localhost.evil.example\r\n",
+    let port = port_of(&server.endpoint_frame());
+    let identity = PlaybackIdentity::new(1, 0, "session-rebinding").unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect loopback");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout");
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: attacker.example:{port}\r\nConnection: close\r\n\r\n",
+        frame_path(&identity, 0, 1)
+    )
+    .expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 403"),
+        "{}",
+        String::from_utf8_lossy(&response)
     );
-    assert_eq!(head.status, 403);
 }
 
 #[test]
@@ -422,12 +360,16 @@ fn frame_route_first_publication_matches_fractional_speed_plan() {
     let mut render_loop = require_render_loop(timeline, &manifest, render_size);
 
     let server = start_server();
-    let port = port_of(&server.endpoint());
+    let port = port_of(&server.endpoint_frame());
     let identity = PlaybackIdentity::new(19, 27, "session-speed-15").unwrap();
-    let sink = server.sink(identity.clone(), PublicationGate::open());
-    let publication = sink.publication();
     let targets = [0, 3, 5];
     let last_frame = *targets.last().expect("terminal target");
+    let sink = server.sink(
+        identity.clone(),
+        PublicationGate::open(),
+        last_frame,
+        Arc::new(|_| {}),
+    );
     let mut emitted = Vec::new();
     let mut mapped_sources = Vec::new();
 
@@ -443,10 +385,9 @@ fn frame_route_first_publication_matches_fractional_speed_plan() {
             frame.rgba, expected.rgba,
             "first render for timeline frame {target} must match plan source frame {source_frame}"
         );
-        sink.push_frame(&frame);
-        let event = publication
-            .commit(target, last_frame)
-            .expect("commit staged playback frame");
+        let event = sink
+            .publish_now(target, &frame)
+            .expect("commit playback frame");
         let payload = serde_json::to_value(&event).expect("serialize playback publication");
         let sequence = payload["sequence"]
             .as_u64()
@@ -509,12 +450,16 @@ fn frame_route_first_publication_matches_reversed_plan() {
     let mut render_loop = require_render_loop(timeline, &manifest, render_size);
 
     let server = start_server();
-    let port = port_of(&server.endpoint());
+    let port = port_of(&server.endpoint_frame());
     let identity = PlaybackIdentity::new(19, 28, "session-reversed").unwrap();
-    let sink = server.sink(identity.clone(), PublicationGate::open());
-    let publication = sink.publication();
     let targets = [0, 5];
     let last_frame = *targets.last().expect("terminal target");
+    let sink = server.sink(
+        identity.clone(),
+        PublicationGate::open(),
+        last_frame,
+        Arc::new(|_| {}),
+    );
     let mut emitted = Vec::new();
     let mut mapped_sources = Vec::new();
 
@@ -530,10 +475,9 @@ fn frame_route_first_publication_matches_reversed_plan() {
             frame.rgba, expected.rgba,
             "first reversed render for timeline frame {target} must match plan source frame {source_frame}"
         );
-        sink.push_frame(&frame);
-        let event = publication
-            .commit(target, last_frame)
-            .expect("commit staged reversed playback frame");
+        let event = sink
+            .publish_now(target, &frame)
+            .expect("commit reversed playback frame");
         let payload =
             serde_json::to_value(&event).expect("serialize reversed playback publication");
         let sequence = payload["sequence"]

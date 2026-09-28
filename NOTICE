@@ -42,6 +42,15 @@ embedded in the OpenTake application; it is installed on demand after the user
 selects the model-install action and is verified against a pinned byte size and
 SHA-256 digest before use.
 
+-------------------------------------------------------------------------------
+JPEG encoder
+-------------------------------------------------------------------------------
+
+Preview and playback frames are encoded with the `jpeg-encoder` crate
+(https://github.com/vstroebel/jpeg-encoder), licensed under (MIT OR Apache-2.0)
+AND IJG. This software is based in part on the work of the Independent JPEG
+Group.
+
 # OpenTake third-party notices
 
 OpenTake includes the following CodeMirror packages for the Motion Studio source editor. Each package is used under the MIT License and is distributed from the exact version pinned in `web/pnpm-lock.yaml`.

@@ -59,6 +59,7 @@ import type {
   DenoiseMode,
   ModelStatus,
   PlaybackCommandError,
+  PlaybackErrorEvent,
   PlaybackFrameEvent,
   PlaybackIdentity,
   ProjectEditIdentity,
@@ -2726,6 +2727,42 @@ export function decodePlaybackFrameEvent(payload: unknown): PlaybackFrameEvent |
     return null;
   }
   return event as PlaybackFrameEvent;
+}
+
+/** Subscribe to `playback_error` (a render/decode failure after playback
+ *  started). Returns an unlisten function; no-op outside Tauri. */
+export async function onPlaybackError(
+  handler: (event: PlaybackErrorEvent) => void,
+): Promise<() => void> {
+  await ensureTauri();
+  if (!listenImpl) return () => {};
+  return listenImpl("playback_error", (e) => {
+    const event = decodePlaybackErrorEvent(e.payload);
+    if (event) handler(event);
+  });
+}
+
+const PLAYBACK_FAILURE_CODES = ["videoDecode", "materialization", "render", "audioDecode"];
+
+export function decodePlaybackErrorEvent(payload: unknown): PlaybackErrorEvent | null {
+  if (!payload || typeof payload !== "object") return null;
+  const event = payload as Partial<PlaybackErrorEvent>;
+  if (
+    !Number.isSafeInteger(event.projectEpoch) ||
+    (event.projectEpoch ?? -1) < 0 ||
+    !Number.isSafeInteger(event.timelineVersion) ||
+    (event.timelineVersion ?? -1) < 0 ||
+    typeof event.sessionId !== "string" ||
+    !/^[A-Za-z0-9-]{1,128}$/.test(event.sessionId) ||
+    !Number.isSafeInteger(event.frame) ||
+    (event.frame ?? -1) < 0 ||
+    !PLAYBACK_FAILURE_CODES.includes(event.code ?? "") ||
+    typeof event.message !== "string" ||
+    typeof event.fatal !== "boolean"
+  ) {
+    return null;
+  }
+  return event as PlaybackErrorEvent;
 }
 
 export function decodePlaybackCommandError(error: unknown): PlaybackCommandError | null {

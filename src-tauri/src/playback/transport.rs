@@ -1,66 +1,45 @@
-//! MJPEG loopback frame transport for streaming playback (#64).
+//! Loopback JPEG frame transport for streaming playback (#64, #9, #80).
 //!
 //! The render thread ([`super::engine`]) composites frames and hands each to a
-//! [`super::engine::FrameSink`]; [`MjpegSink`] JPEG-encodes it and pushes it into
-//! a `broadcast` channel. A loopback axum server relays those JPEGs as a
-//! `multipart/x-mixed-replace` stream, which the WebView consumes with a single
-//! `<img>` — the browser decodes JPEG on its own threads and paces the display.
+//! [`super::engine::FrameSink`]. [`MjpegSink`] does not encode on the render
+//! thread: it drops the RGBA frame into a one-slot, newest-wins mailbox and a
+//! per-session encoder thread JPEG-encodes it, stores it as the session's
+//! latest frame and emits the matching `playback_frame` event. The WebView
+//! requests `GET /frame` with the event's session identity for each event, so
+//! an event is only ever emitted after its JPEG is retrievable.
 //!
-//! This is the transport half of #53. Unlike the abandoned PR #153 (which fed the
-//! stream from the slow per-frame `composite_frame`), the producer here is the
-//! continuous render thread, so the stream is real-time. The sink is a trait so
-//! the transport can be swapped (WS binary / custom scheme) if `multipart` proves
-//! unreliable on a given WebView, without touching the engine.
-//!
-//! Security: the server binds `127.0.0.1:<random port>` (not externally
-//! reachable) and the `/stream` route additionally rejects any request carrying a
-//! non-loopback `Origin` (defence-in-depth, mirroring the MCP server's guard).
+//! Security: the server binds `127.0.0.1:<random port>`, requires a loopback
+//! `Host` carrying that port (so a DNS-rebinding page cannot read frames through
+//! its own hostname), and rejects any request carrying a non-loopback `Origin`.
+//! A frame is only served to a request naming the exact playback session.
 
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::Query;
-use axum::extract::State;
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::broadcast;
 
 use opentake_render::DecodedFrame;
 
-use super::engine::{FrameSink, PlayheadEmitter};
+use super::engine::{FrameSink, PlaybackErrorSink, PlaybackFailure, PlaybackFailureCode};
 use super::session::PlaybackIdentity;
 
-/// Broadcast channel depth. 2 keeps latency low: a slow `<img>` consumer drops
-/// stale frames (the receiver sees `Lagged`) rather than back-pressuring the
-/// render thread.
-const FRAME_CHANNEL_DEPTH: usize = 2;
-
-/// JPEG quality for preview frames (0–100). 75 is visually clean for a preview
-/// while keeping each frame small enough for a 30–60 fps loopback stream.
-const JPEG_QUALITY: u8 = 75;
-
-/// The multipart boundary marker for the MJPEG stream.
-const BOUNDARY: &str = "opentake_mjpeg_boundary";
-
-/// The loopback MJPEG preview server: a bound port + the frame broadcast sender.
-/// The axum task is spawned on the Tauri async runtime and shuts down when the
-/// process exits. Managed as Tauri state so `get_preview_endpoint` and the sink
-/// can reach it.
+/// The loopback preview server: a bound port plus the latest encoded frame of
+/// the current session. The axum task is spawned on the Tauri async runtime and
+/// shuts down when the process exits. Managed as Tauri state so
+/// `get_preview_endpoint` and the sink can reach it.
 pub struct PreviewServer {
     port: u16,
-    tx: broadcast::Sender<Bytes>,
     latest: LatestFrameStore,
 }
 
-/// Shared axum state: the live broadcast sender plus the latest encoded frame
-/// (for the polling `/frame` route).
+/// Shared axum state: the latest encoded frame for the polling `/frame` route.
 #[derive(Clone)]
 struct ServerState {
-    tx: broadcast::Sender<Bytes>,
     latest: LatestFrameStore,
 }
 
@@ -171,136 +150,180 @@ impl FrameQuery {
     }
 }
 
+#[derive(Default)]
+struct GateState {
+    open: bool,
+    /// Bumped by every close and every invalidation. Work captured under an
+    /// older epoch (a frame queued before a pause or a seek) can never publish
+    /// after a later reopen.
+    epoch: u64,
+}
+
 #[derive(Clone, Default)]
-pub struct PublicationGate(Arc<Mutex<bool>>);
+pub struct PublicationGate(Arc<Mutex<GateState>>);
 
 impl PublicationGate {
     pub fn open() -> Self {
         let gate = Self::default();
-        *gate
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        gate.lock().open = true;
         gate
     }
 
-    pub fn close(&self) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-    }
-
-    pub fn reopen(&self) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-    }
-
-    pub(crate) fn is_open(&self) -> bool {
-        *self
-            .0
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn with_open<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        let open = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !*open {
+    pub fn close(&self) {
+        let mut state = self.lock();
+        state.open = false;
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+
+    pub fn reopen(&self) {
+        self.lock().open = true;
+    }
+
+    /// Retire every frame captured so far without closing publication: the
+    /// playhead moved, so queued and in-flight frames are stale while the
+    /// frames rendered after this call publish normally.
+    pub fn invalidate(&self) {
+        let mut state = self.lock();
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.lock().open
+    }
+
+    /// The epoch to tag work with, or `None` while publication is closed.
+    fn open_epoch(&self) -> Option<u64> {
+        let state = self.lock();
+        state.open.then_some(state.epoch)
+    }
+
+    fn with_epoch<T>(&self, epoch: u64, publish: impl FnOnce() -> T) -> Option<T> {
+        let state = self.lock();
+        if !state.open || state.epoch != epoch {
             return None;
         }
         Some(publish())
     }
 }
 
-#[derive(Clone)]
-struct PendingFrame {
-    identity: PlaybackIdentity,
-    sequence: u64,
-    jpeg: Bytes,
-}
+/// Encodes one RGBA frame into the provided (reused) buffer.
+pub(crate) type EncodeFn = fn(&DecodedFrame, &mut Vec<u8>) -> Result<(), String>;
 
-#[derive(Clone, Default)]
-struct PendingFrameStore(Arc<Mutex<Option<PendingFrame>>>);
+/// Receives each committed publication; production emits `playback_frame`.
+pub type PublishFn = Arc<dyn Fn(PlaybackFramePublication) + Send + Sync>;
 
 impl PreviewServer {
-    /// Start the MJPEG server on a random loopback port. Must run inside the
+    /// Start the frame server on a random loopback port. Must run inside the
     /// Tauri async runtime (call via `tauri::async_runtime::block_on` in setup).
     pub async fn start() -> Result<Arc<Self>, String> {
-        let (tx, _rx) = broadcast::channel::<Bytes>(FRAME_CHANNEL_DEPTH);
         let latest = LatestFrameStore::default();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .map_err(|e| format!("MJPEG bind: {e}"))?;
+            .map_err(|e| format!("preview server bind: {e}"))?;
         let port = listener
             .local_addr()
-            .map_err(|e| format!("MJPEG local_addr: {e}"))?
+            .map_err(|e| format!("preview server local_addr: {e}"))?
             .port();
 
         let state = ServerState {
-            tx: tx.clone(),
             latest: latest.clone(),
         };
         tauri::async_runtime::spawn(async move {
             let app = axum::Router::new()
-                .route("/stream", axum::routing::get(stream_handler))
-                .route("/ws", axum::routing::get(ws_handler))
                 .route("/frame", axum::routing::get(frame_handler))
+                .layer(axum::middleware::from_fn(
+                    move |request: Request, next: Next| async move {
+                        if !request_is_local(request.headers(), port) {
+                            return (StatusCode::FORBIDDEN, "non-loopback preview request denied")
+                                .into_response();
+                        }
+                        next.run(request).await
+                    },
+                ))
                 .with_state(state);
             if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("[mjpeg] server error: {e}");
+                eprintln!("[preview] server error: {e}");
             }
         });
 
-        Ok(Arc::new(Self { port, tx, latest }))
+        Ok(Arc::new(Self { port, latest }))
     }
 
-    /// The `<img>`-pointable MJPEG stream URL. Kept for debugging; the preview
-    /// canvas uses [`Self::endpoint_ws`] instead (WebKit only paints the first
-    /// part of a `multipart/x-mixed-replace` `<img>` — see the module note).
-    pub fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}/stream", self.port)
-    }
-
-    /// The WebSocket URL the preview canvas connects to for binary JPEG frames.
-    /// WebKit/WKWebView renders these reliably (WebSocket + `createImageBitmap` +
-    /// canvas), which the MJPEG `<img>` path does not.
-    pub fn endpoint_ws(&self) -> String {
-        format!("ws://127.0.0.1:{}/ws", self.port)
-    }
-
-    /// The single-frame poll URL (`GET /frame` -> latest JPEG). This is what the
-    /// preview `<img>` actually uses: WKWebView's secure `tauri://` context
-    /// blocks plain-`ws://` WebSockets to loopback as mixed content (silently —
-    /// no TCP connect ever happens), while a passive `<img>` load over loopback
-    /// http is allowed. The playhead's `playback_frame` event drives one `<img>`
-    /// reload per rendered frame.
+    /// The single-frame poll URL (`GET /frame` -> latest JPEG). WKWebView's
+    /// secure `tauri://` context blocks plain `ws://` to loopback as mixed
+    /// content, while a passive `<img>` load over loopback http is allowed. The
+    /// `playback_frame` event drives one `<img>` reload per published frame.
     pub fn endpoint_frame(&self) -> String {
         format!("http://127.0.0.1:{}/frame", self.port)
     }
 
-    /// A frame sink that JPEG-encodes composited frames into this server's stream.
-    pub fn sink(&self, identity: PlaybackIdentity, gate: PublicationGate) -> MjpegSink {
-        MjpegSink {
-            tx: self.tx.clone(),
-            publication: EncodedFramePublication {
+    /// A frame sink for one playback session. Frames are encoded on a
+    /// dedicated thread; each committed frame is handed to `on_publish`.
+    pub fn sink(
+        &self,
+        identity: PlaybackIdentity,
+        gate: PublicationGate,
+        last_frame: i32,
+        on_publish: PublishFn,
+    ) -> MjpegSink {
+        self.sink_with_encoder(
+            identity,
+            gate,
+            last_frame,
+            on_publish,
+            crate::jpeg::encode_rgba_jpeg,
+        )
+    }
+
+    pub(crate) fn sink_with_encoder(
+        &self,
+        identity: PlaybackIdentity,
+        gate: PublicationGate,
+        last_frame: i32,
+        on_publish: PublishFn,
+        encode: EncodeFn,
+    ) -> MjpegSink {
+        MjpegSink::spawn(
+            EncodedFramePublication {
                 identity,
                 gate,
-                pending: PendingFrameStore::default(),
                 latest: self.latest.clone(),
                 sequence: Arc::new(AtomicU64::new(0)),
+                last_frame,
             },
-        }
+            on_publish,
+            encode,
+        )
     }
 
     pub fn clear_session(&self, identity: &PlaybackIdentity) {
         self.latest.clear_session(identity);
     }
+}
+
+/// `Host` guard against DNS rebinding: the request must name the loopback
+/// interface and this server's port, exactly as the WebView's `<img>` does.
+fn host_is_local(host: &str, port: u16) -> bool {
+    let Some((name, host_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    host_port.parse::<u16>().ok() == Some(port)
+        && (name == "127.0.0.1" || name == "[::1]" || name.eq_ignore_ascii_case("localhost"))
+}
+
+fn request_is_local(headers: &HeaderMap, port: u16) -> bool {
+    let host_ok = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| host_is_local(host, port));
+    host_ok && origin_is_allowed(headers)
 }
 
 /// `Origin` defence-in-depth: allow requests with no `Origin` (a plain `<img>`
@@ -337,76 +360,6 @@ fn origin_value_is_allowed(origin: &str) -> bool {
     )
 }
 
-/// `/stream`: relay each broadcast JPEG as a `multipart/x-mixed-replace` part.
-async fn stream_handler(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    if !origin_is_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "cross-origin preview stream denied").into_response();
-    }
-
-    let mut rx = state.tx.subscribe();
-    // Bridge the broadcast receiver to an axum body stream via a BOUNDED mpsc: a
-    // slow client drops frames (live preview) instead of growing memory without
-    // limit.
-    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(4);
-
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(jpeg) => {
-                    // Pack header + body into ONE multipart part: a part must never
-                    // be split across sends, or a dropped half corrupts the stream.
-                    let header = format!(
-                        "\r\n--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                        jpeg.len()
-                    );
-                    let mut part = Vec::with_capacity(header.len() + jpeg.len());
-                    part.extend_from_slice(header.as_bytes());
-                    part.extend_from_slice(&jpeg);
-                    match body_tx.try_send(Ok(Bytes::from(part))) {
-                        Ok(()) => {}
-                        // Client can't keep up: drop this frame, keep streaming.
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => continue,
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                    }
-                }
-                // Slow consumer: skip the dropped frames and keep going (live preview).
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-
-    let stream = futures::stream::unfold(body_rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-    let body = axum::body::Body::from_stream(stream);
-    (
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                format!("multipart/x-mixed-replace; boundary={BOUNDARY}"),
-            ),
-            (axum::http::header::CACHE_CONTROL, "no-cache".to_string()),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// `/ws`: push each broadcast JPEG to the preview canvas as a binary WebSocket
-/// message. WebKit/WKWebView consumes these reliably; the `/stream` MJPEG `<img>`
-/// path only ever paints the first frame there (see the module note).
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> Response {
-    if !origin_is_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "cross-origin preview stream denied").into_response();
-    }
-    ws.on_upgrade(move |socket| ws_stream(socket, state.tx.subscribe()))
-}
-
 /// `/frame`: one session-scoped composited JPEG. The preview requests the exact
 /// project epoch, timeline version, session id, frame, and publication sequence;
 /// a mismatch returns 204. WKWebView permits this passive loopback image request
@@ -414,11 +367,7 @@ async fn ws_handler(
 async fn frame_handler(
     State(state): State<ServerState>,
     Query(query): Query<FrameQuery>,
-    headers: HeaderMap,
 ) -> Response {
-    if !origin_is_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "cross-origin preview stream denied").into_response();
-    }
     if !query.valid() {
         return (StatusCode::NO_CONTENT, "").into_response();
     }
@@ -438,146 +387,245 @@ async fn frame_handler(
     }
 }
 
-/// Forward broadcast JPEG frames to one connected preview socket until it closes.
-/// A slow/dead socket drops frames (live preview never back-pressures the render
-/// thread) or ends the loop; encoding stops once the last subscriber is gone.
-async fn ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Bytes>) {
-    loop {
-        match rx.recv().await {
-            Ok(jpeg) => {
-                if socket.send(Message::Binary(jpeg)).await.is_err() {
-                    break;
-                }
-            }
-            // Slow consumer: skip the dropped frames and keep going (live preview).
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
-}
-
-/// A [`FrameSink`] that JPEG-encodes each composited frame and broadcasts it to
-/// the MJPEG stream. Dropping frames when no `<img>` is connected (or the channel
-/// is full) is intentional — playback never blocks on the transport.
-#[derive(Clone)]
-pub struct MjpegSink {
-    tx: broadcast::Sender<Bytes>,
-    publication: EncodedFramePublication,
-}
-
-/// The one commit coordinator shared by the encoded-frame sink, exact-frame
-/// HTTP store, and Tauri playhead event. A frame becomes observable only when
-/// its matching playhead tick commits the staged JPEG through this object.
+/// The commit coordinator shared by the encoder thread and the exact-frame HTTP
+/// store: a frame becomes observable (stored, then announced) in one step, and
+/// only while the session's publication gate is still open under the epoch the
+/// frame was queued in.
 #[derive(Clone)]
 pub struct EncodedFramePublication {
     identity: PlaybackIdentity,
     gate: PublicationGate,
-    pending: PendingFrameStore,
     latest: LatestFrameStore,
     sequence: Arc<AtomicU64>,
+    last_frame: i32,
 }
 
 impl EncodedFramePublication {
-    fn stage(&self, jpeg: Bytes) -> bool {
-        self.gate
-            .with_open(|| {
-                let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
-                *self
-                    .pending
-                    .0
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingFrame {
-                    identity: self.identity.clone(),
-                    sequence,
-                    jpeg,
-                });
-            })
-            .is_some()
-    }
-
-    /// Commit the most recently staged encoded frame to `/frame` and return the
-    /// exact event payload that must be emitted for that publication.
-    pub fn commit(&self, frame: i32, last_frame: i32) -> Option<PlaybackFramePublication> {
-        self.gate.with_open(|| {
-            let pending = self
-                .pending
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()?;
-            if pending.identity != self.identity {
-                return None;
+    /// Store `jpeg` (when present) as the session's latest frame and return the
+    /// event payload announcing it. `None` pixels announce a terminal tick that
+    /// has no new image: `/frame` keeps serving the last good frame and the
+    /// front end's exhausted-terminal path ends the transport.
+    fn commit(
+        &self,
+        epoch: u64,
+        frame: i32,
+        jpeg: Option<Bytes>,
+    ) -> Option<PlaybackFramePublication> {
+        self.gate.with_epoch(epoch, || {
+            let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            let terminal = frame >= self.last_frame;
+            if let Some(jpeg) = jpeg {
+                self.latest
+                    .publish(self.identity.clone(), frame, sequence, terminal, jpeg);
             }
-            let terminal = frame >= last_frame;
-            self.latest.publish(
-                self.identity.clone(),
-                frame,
-                pending.sequence,
-                terminal,
-                pending.jpeg,
-            );
-            Some(PlaybackFramePublication::new(
-                self.identity.clone(),
-                frame,
-                pending.sequence,
-                terminal,
-            ))
-        })?
+            PlaybackFramePublication::new(self.identity.clone(), frame, sequence, terminal)
+        })
     }
 }
 
+enum EncodeJob {
+    Frame { frame: i32, image: DecodedFrame },
+    Terminal { frame: i32 },
+}
+
+struct QueuedJob {
+    epoch: u64,
+    job: EncodeJob,
+}
+
+#[derive(Default)]
+struct EncoderSlot {
+    job: Option<QueuedJob>,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct EncoderMailbox {
+    slot: Mutex<EncoderSlot>,
+    ready: Condvar,
+}
+
+impl EncoderMailbox {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EncoderSlot> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Newest wins: an unencoded frame is replaced rather than queued, so a
+    /// slow encode never builds latency or back-pressures the render thread.
+    fn put(&self, job: QueuedJob) {
+        let mut slot = self.lock();
+        if slot.shutdown {
+            return;
+        }
+        slot.job = Some(job);
+        drop(slot);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Option<QueuedJob> {
+        let mut slot = self.lock();
+        loop {
+            if slot.shutdown {
+                return None;
+            }
+            if let Some(job) = slot.job.take() {
+                return Some(job);
+            }
+            slot = self
+                .ready
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn shutdown(&self) {
+        let mut slot = self.lock();
+        slot.shutdown = true;
+        slot.job = None;
+        drop(slot);
+        self.ready.notify_all();
+    }
+}
+
+/// Stops the encoder thread once the last sink clone is dropped.
+struct EncoderWorker {
+    mailbox: Arc<EncoderMailbox>,
+}
+
+impl Drop for EncoderWorker {
+    fn drop(&mut self) {
+        self.mailbox.shutdown();
+    }
+}
+
+/// Encodes and commits frames for one session. Runs on the encoder thread, or
+/// synchronously through [`MjpegSink::publish_now`].
+struct FramePublisher {
+    publication: EncodedFramePublication,
+    on_publish: PublishFn,
+    encode: EncodeFn,
+}
+
+impl FramePublisher {
+    fn publish(
+        &self,
+        queued: QueuedJob,
+        scratch: &mut Vec<u8>,
+    ) -> Option<PlaybackFramePublication> {
+        let (frame, jpeg) = match queued.job {
+            EncodeJob::Frame { frame, image } => {
+                scratch.clear();
+                if let Err(error) = (self.encode)(&image, scratch) {
+                    eprintln!("[preview] frame {frame} {error}");
+                    return None;
+                }
+                (frame, Some(Bytes::copy_from_slice(scratch)))
+            }
+            EncodeJob::Terminal { frame } => (frame, None),
+        };
+        let publication = self.publication.commit(queued.epoch, frame, jpeg)?;
+        (self.on_publish)(publication.clone());
+        Some(publication)
+    }
+}
+
+/// A [`FrameSink`] that JPEG-encodes composited frames off the render thread
+/// and publishes them to the loopback `/frame` route. Dropping an unencoded
+/// frame in favour of a newer one is intentional: playback never blocks on
+/// the transport.
+#[derive(Clone)]
+pub struct MjpegSink {
+    publisher: Arc<FramePublisher>,
+    mailbox: Arc<EncoderMailbox>,
+    _worker: Arc<EncoderWorker>,
+}
+
 impl MjpegSink {
-    pub fn publication(&self) -> EncodedFramePublication {
-        self.publication.clone()
+    fn spawn(
+        publication: EncodedFramePublication,
+        on_publish: PublishFn,
+        encode: EncodeFn,
+    ) -> Self {
+        let publisher = Arc::new(FramePublisher {
+            publication,
+            on_publish,
+            encode,
+        });
+        let mailbox = Arc::new(EncoderMailbox::default());
+        let worker_publisher = Arc::clone(&publisher);
+        let worker_mailbox = Arc::clone(&mailbox);
+        if let Err(error) = std::thread::Builder::new()
+            .name("opentake-playback-encode".to_string())
+            .spawn(move || {
+                let mut scratch = Vec::new();
+                while let Some(job) = worker_mailbox.take() {
+                    worker_publisher.publish(job, &mut scratch);
+                }
+            })
+        {
+            // Without an encoder no frame can be published; the session still
+            // runs and the preview keeps the idle still.
+            eprintln!("[preview] spawn frame encoder: {error}");
+            mailbox.shutdown();
+        }
+        Self {
+            publisher,
+            _worker: Arc::new(EncoderWorker {
+                mailbox: Arc::clone(&mailbox),
+            }),
+            mailbox,
+        }
+    }
+
+    /// Encode and commit `image` on the calling thread, bypassing the mailbox.
+    /// Integration tests use this to observe each publication deterministically.
+    pub fn publish_now(
+        &self,
+        frame: i32,
+        image: &DecodedFrame,
+    ) -> Option<PlaybackFramePublication> {
+        let epoch = self.publisher.publication.gate.open_epoch()?;
+        self.publisher.publish(
+            QueuedJob {
+                epoch,
+                job: EncodeJob::Frame {
+                    frame,
+                    image: image.clone(),
+                },
+            },
+            &mut Vec::new(),
+        )
+    }
+
+    fn enqueue(&self, job: EncodeJob) {
+        if let Some(epoch) = self.publisher.publication.gate.open_epoch() {
+            self.mailbox.put(QueuedJob { epoch, job });
+        }
     }
 }
 
 impl FrameSink for MjpegSink {
-    fn push_frame(&self, frame: &DecodedFrame) {
-        if !self.publication.gate.is_open() {
-            return;
-        }
-        // Always encode: the polling `/frame` route reads `latest` without ever
-        // subscribing to the broadcast channel, so receiver_count()==0 no longer
-        // means "nobody is watching". Playback always has exactly one consumer
-        // (the preview `<img>`), so the old idle-skip saved nothing real.
-        let Some(jpeg) = encode_jpeg(frame) else {
-            return;
-        };
-        let jpeg = Bytes::from(jpeg);
-        if self.publication.stage(jpeg.clone()) && self.tx.receiver_count() > 0 {
-            let _ = self.tx.send(jpeg);
-        }
+    fn push_frame(&self, frame: i32, image: DecodedFrame) {
+        self.enqueue(EncodeJob::Frame { frame, image });
     }
-}
 
-/// Encode an RGBA composite to JPEG (alpha dropped — the preview canvas is
-/// opaque). Returns `None` on an encode error (logged, frame skipped).
-fn encode_jpeg(frame: &DecodedFrame) -> Option<Vec<u8>> {
-    // JPEG has no alpha: pack RGBA → RGB.
-    let mut rgb = Vec::with_capacity((frame.width * frame.height * 3) as usize);
-    for px in frame.rgba.as_chunks::<4>().0.iter() {
-        rgb.extend_from_slice(&px[..3]);
+    fn push_terminal(&self, frame: i32) {
+        self.enqueue(EncodeJob::Terminal { frame });
     }
-    let mut out = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
-    match enc.encode(
-        &rgb,
-        frame.width,
-        frame.height,
-        image::ExtendedColorType::Rgb8,
-    ) {
-        Ok(()) => Some(out),
-        Err(e) => {
-            eprintln!("[mjpeg] jpeg encode failed: {e}");
-            None
-        }
+
+    fn invalidate(&self) {
+        // Called on the render thread, so it is ordered before that thread's
+        // next push: the frame in the mailbox and the one being encoded fail
+        // their epoch check at commit, the next pushed frame passes.
+        self.publisher.publication.gate.invalidate();
     }
 }
 
 /// Playhead frame number broadcast to the front end, so it can move the
-/// playhead / timecode while the pixels arrive over the MJPEG stream.
-#[derive(Clone, serde::Serialize)]
+/// playhead / timecode and request the matching JPEG from `/frame`.
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackFramePublication {
     project_epoch: u64,
@@ -599,38 +647,160 @@ impl PlaybackFramePublication {
             terminal,
         }
     }
+
+    pub fn frame(&self) -> i32 {
+        self.frame
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
 }
 
-/// A [`PlayheadEmitter`] that emits the current frame as a Tauri `playback_frame`
-/// event. Throttling is unnecessary: one small event per rendered frame.
-pub struct TauriPlayheadEmitter {
+/// Emits each committed publication as a Tauri `playback_frame` event.
+pub fn tauri_frame_publisher(app: AppHandle) -> PublishFn {
+    Arc::new(move |publication| {
+        let _ = app.emit("playback_frame", publication);
+    })
+}
+
+/// `playback_error` payload: which session failed, where, and why. Messages
+/// name media by asset id, never by absolute path.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackErrorEvent {
+    project_epoch: u64,
+    timeline_version: u64,
+    session_id: String,
+    frame: i32,
+    code: PlaybackFailureCode,
+    message: String,
+    fatal: bool,
+}
+
+impl PlaybackErrorEvent {
+    fn new(identity: &PlaybackIdentity, failure: PlaybackFailure) -> Self {
+        Self {
+            project_epoch: identity.project_epoch,
+            timeline_version: identity.timeline_version,
+            session_id: identity.session_id.clone(),
+            frame: failure.frame,
+            code: failure.code,
+            message: failure.message,
+            fatal: failure.fatal,
+        }
+    }
+}
+
+/// A [`PlaybackErrorSink`] that emits a Tauri `playback_error` event while
+/// the session's publication gate is open. A paused, stopped or replaced
+/// session reports nothing: its failures (for example a decode cancelled by
+/// the teardown itself) are not the running transport's to show.
+pub struct TauriPlaybackErrorEmitter {
     app: AppHandle,
-    publication: EncodedFramePublication,
-    last_frame: i32,
+    identity: PlaybackIdentity,
+    gate: PublicationGate,
 }
 
-impl TauriPlayheadEmitter {
-    pub fn new(app: AppHandle, sink: &MjpegSink, last_frame: i32) -> Self {
-        TauriPlayheadEmitter {
+impl TauriPlaybackErrorEmitter {
+    pub fn new(app: AppHandle, identity: PlaybackIdentity, gate: PublicationGate) -> Self {
+        Self {
             app,
-            publication: sink.publication(),
-            last_frame,
+            identity,
+            gate,
         }
     }
 }
 
-impl PlayheadEmitter for TauriPlayheadEmitter {
-    fn emit(&self, frame: i32) {
-        if let Some(publication) = self.publication.commit(frame, self.last_frame) {
-            let _ = self.app.emit("playback_frame", publication);
+impl PlaybackErrorSink for TauriPlaybackErrorEmitter {
+    fn report(&self, failure: PlaybackFailure) {
+        if let Some(event) = gated_error_event(&self.gate, &self.identity, failure) {
+            let _ = self.app.emit("playback_error", event);
         }
     }
+}
+
+/// The event for `failure`, or `None` once the session's gate is closed.
+fn gated_error_event(
+    gate: &PublicationGate,
+    identity: &PlaybackIdentity,
+    failure: PlaybackFailure,
+) -> Option<PlaybackErrorEvent> {
+    gate.is_open()
+        .then(|| PlaybackErrorEvent::new(identity, failure))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn identity(epoch: u64, version: u64, session: &str) -> PlaybackIdentity {
+        PlaybackIdentity::new(epoch, version, session).expect("valid identity")
+    }
+
+    fn recording_publisher() -> (PublishFn, mpsc::Receiver<PlaybackFramePublication>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        (
+            Arc::new(move |publication| {
+                let _ = tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .send(publication);
+            }),
+            rx,
+        )
+    }
+
+    fn test_sink(
+        latest: &LatestFrameStore,
+        identity: PlaybackIdentity,
+        gate: PublicationGate,
+        last_frame: i32,
+        on_publish: PublishFn,
+        encode: EncodeFn,
+    ) -> MjpegSink {
+        MjpegSink::spawn(
+            EncodedFramePublication {
+                identity,
+                gate,
+                latest: latest.clone(),
+                sequence: Arc::new(AtomicU64::new(0)),
+                last_frame,
+            },
+            on_publish,
+            encode,
+        )
+    }
+
+    fn solid(width: u32, height: u32) -> DecodedFrame {
+        DecodedFrame::new(
+            width,
+            height,
+            vec![200; (width * height * 4) as usize],
+            false,
+        )
+    }
+
+    fn slow_encode(frame: &DecodedFrame, out: &mut Vec<u8>) -> Result<(), String> {
+        std::thread::sleep(Duration::from_millis(150));
+        crate::jpeg::encode_rgba_jpeg(frame, out)
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
 
     #[test]
     fn origin_guard_allows_missing_and_loopback_origins() {
@@ -643,51 +813,54 @@ mod tests {
             "tauri://localhost",
             "http://tauri.localhost",
         ] {
-            let mut h = HeaderMap::new();
-            h.insert(
-                axum::http::header::ORIGIN,
-                HeaderValue::from_str(ok).unwrap(),
+            assert!(
+                origin_is_allowed(&headers(&[("origin", ok)])),
+                "{ok} should be allowed"
             );
-            assert!(origin_is_allowed(&h), "{ok} should be allowed");
         }
     }
 
     #[test]
     fn origin_guard_rejects_remote_origin() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::ORIGIN,
-            HeaderValue::from_static("http://evil.example.com"),
-        );
-        assert!(!origin_is_allowed(&h));
+        assert!(!origin_is_allowed(&headers(&[(
+            "origin",
+            "http://evil.example.com"
+        )])));
     }
 
     #[test]
-    fn jpeg_encode_produces_jpeg_magic() {
-        // 2x2 opaque RGBA → a valid JPEG starting with the SOI marker 0xFFD8.
-        let frame = DecodedFrame::new(2, 2, vec![255; 2 * 2 * 4], false);
-        let jpeg = encode_jpeg(&frame).expect("encode");
-        assert!(jpeg.len() > 2);
-        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "JPEG SOI marker");
-    }
-
-    #[test]
-    fn multipart_part_header_is_well_formed() {
-        // Sanity-check the boundary framing the handler emits.
-        let len = 1234;
-        let header = format!(
-            "\r\n--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len}\r\n\r\n"
-        );
-        assert!(header.starts_with("\r\n--opentake_mjpeg_boundary\r\n"));
-        assert!(header.contains("Content-Type: image/jpeg"));
-        assert!(header.ends_with("\r\n\r\n"));
+    fn host_guard_accepts_only_loopback_names_with_the_server_port() {
+        for ok in [
+            "127.0.0.1:4100",
+            "localhost:4100",
+            "LOCALHOST:4100",
+            "[::1]:4100",
+        ] {
+            assert!(request_is_local(&headers(&[("host", ok)]), 4100), "{ok}");
+        }
+        for bad in [
+            "attacker.example:4100",
+            "127.0.0.1.attacker.example:4100",
+            "127.0.0.1:4101",
+            "127.0.0.1",
+            "localhost",
+            "",
+        ] {
+            assert!(!request_is_local(&headers(&[("host", bad)]), 4100), "{bad}");
+        }
+        assert!(!request_is_local(&HeaderMap::new(), 4100), "missing Host");
+        assert!(!request_is_local(
+            &headers(&[
+                ("host", "127.0.0.1:4100"),
+                ("origin", "http://evil.example")
+            ]),
+            4100
+        ));
     }
 
     #[test]
     fn playhead_event_carries_session_revision_sequence_and_terminal() {
-        let identity = super::super::session::PlaybackIdentity::new(7, 11, "session-42")
-            .expect("valid identity");
-        let dto = PlaybackFramePublication::new(identity, 123, 9, true);
+        let dto = PlaybackFramePublication::new(identity(7, 11, "session-42"), 123, 9, true);
 
         assert_eq!(
             serde_json::to_value(dto).expect("serialize"),
@@ -703,10 +876,34 @@ mod tests {
     }
 
     #[test]
+    fn playback_error_event_is_camel_case_and_session_scoped() {
+        let event = PlaybackErrorEvent::new(
+            &identity(3, 4, "session-err"),
+            PlaybackFailure {
+                frame: 17,
+                code: PlaybackFailureCode::VideoDecode,
+                message: "clip-1 decode failed".to_string(),
+                fatal: true,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(event).expect("serialize"),
+            serde_json::json!({
+                "projectEpoch": 3,
+                "timelineVersion": 4,
+                "sessionId": "session-err",
+                "frame": 17,
+                "code": "videoDecode",
+                "message": "clip-1 decode failed",
+                "fatal": true,
+            })
+        );
+    }
+
+    #[test]
     fn frame_route_never_serves_another_session_latest() {
         let latest = LatestFrameStore::default();
-        let identity =
-            super::super::session::PlaybackIdentity::new(3, 5, "current").expect("valid identity");
+        let identity = identity(3, 5, "current");
         latest.publish(identity.clone(), 18, 4, false, Bytes::from_static(b"jpeg"));
 
         // Session, project epoch and timeline version stay hard boundaries.
@@ -747,8 +944,7 @@ mod tests {
         // request must still resolve to the current newest frame, otherwise the
         // preview freezes on the idle still (the reported bug).
         let latest = LatestFrameStore::default();
-        let identity = super::super::session::PlaybackIdentity::new(1, 2, "session-9")
-            .expect("valid identity");
+        let identity = identity(1, 2, "session-9");
         for frame in 0..60 {
             latest.publish(
                 identity.clone(),
@@ -775,5 +971,312 @@ mod tests {
         assert!(latest
             .lookup(&FrameQuery::new(1, 2, "session-9", 60, 61))
             .is_none());
+    }
+
+    #[test]
+    fn push_frame_hands_off_without_waiting_for_a_slow_encoder() {
+        let latest = LatestFrameStore::default();
+        let (on_publish, published) = recording_publisher();
+        let sink = test_sink(
+            &latest,
+            identity(1, 1, "slow-encoder"),
+            PublicationGate::open(),
+            1_000,
+            on_publish,
+            slow_encode,
+        );
+        let frames: Vec<DecodedFrame> = (0..8).map(|_| solid(1280, 720)).collect();
+        let mut handoffs = Vec::new();
+        for (index, image) in frames.into_iter().enumerate() {
+            let start = Instant::now();
+            sink.push_frame(index as i32, image);
+            handoffs.push(start.elapsed());
+        }
+        handoffs.sort();
+        // Each encode takes 150 ms; a synchronous encode would make every
+        // hand-off at least that long.
+        assert!(
+            handoffs[handoffs.len() / 2] < Duration::from_millis(1),
+            "median render-thread hand-off must stay under 1 ms: {handoffs:?}"
+        );
+        assert!(handoffs[handoffs.len() - 1] < Duration::from_millis(50));
+
+        // Newest wins: the last frame is always published, stale ones dropped.
+        let mut frames_seen = Vec::new();
+        while let Ok(publication) = published.recv_timeout(Duration::from_secs(2)) {
+            frames_seen.push(publication.frame());
+            if publication.frame() == 7 {
+                break;
+            }
+        }
+        assert_eq!(frames_seen.last(), Some(&7));
+        assert!(
+            frames_seen.len() < 8,
+            "stale frames are skipped: {frames_seen:?}"
+        );
+    }
+
+    #[test]
+    fn every_announced_frame_is_already_retrievable() {
+        let latest = LatestFrameStore::default();
+        let session = identity(4, 6, "announce-after-store");
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let lookup_store = latest.clone();
+        let sink = test_sink(
+            &latest,
+            session.clone(),
+            PublicationGate::open(),
+            40,
+            Arc::new(move |publication: PlaybackFramePublication| {
+                let served = lookup_store
+                    .lookup(&FrameQuery::new(
+                        4,
+                        6,
+                        "announce-after-store",
+                        publication.frame(),
+                        publication.sequence(),
+                    ))
+                    .is_some();
+                let _ = tx.lock().unwrap().send((publication.frame(), served));
+            }),
+            crate::jpeg::encode_rgba_jpeg,
+        );
+        for frame in 0..=40 {
+            sink.push_frame(frame, solid(8, 8));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut last = -1;
+        while last != 40 {
+            let (frame, served) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal frame is published");
+            assert!(served, "frame {frame} was announced before it was stored");
+            last = frame;
+        }
+    }
+
+    #[test]
+    fn frames_queued_before_a_pause_never_publish_after_resume() {
+        let latest = LatestFrameStore::default();
+        let (on_publish, published) = recording_publisher();
+        let gate = PublicationGate::open();
+        let sink = test_sink(
+            &latest,
+            identity(2, 2, "pause-epoch"),
+            gate.clone(),
+            1_000,
+            on_publish,
+            slow_encode,
+        );
+        // Frame 1 occupies the encoder; frame 2 waits in the mailbox.
+        sink.push_frame(1, solid(4, 4));
+        std::thread::sleep(Duration::from_millis(20));
+        sink.push_frame(2, solid(4, 4));
+        gate.close();
+        gate.reopen();
+        sink.push_frame(30, solid(4, 4));
+
+        let mut seen = Vec::new();
+        while let Ok(publication) = published.recv_timeout(Duration::from_millis(600)) {
+            seen.push(publication.frame());
+        }
+        assert_eq!(seen, vec![30], "pre-pause frames must not publish");
+    }
+
+    #[test]
+    fn frames_queued_before_a_seek_never_publish_after_it() {
+        let latest = LatestFrameStore::default();
+        let (on_publish, published) = recording_publisher();
+        let gate = PublicationGate::open();
+        let sink = test_sink(
+            &latest,
+            identity(2, 3, "seek-epoch"),
+            gate.clone(),
+            1_000,
+            on_publish,
+            slow_encode,
+        );
+        // Frame 100 occupies the encoder; frame 101 waits in the mailbox.
+        sink.push_frame(100, solid(4, 4));
+        std::thread::sleep(Duration::from_millis(20));
+        sink.push_frame(101, solid(4, 4));
+        // The render thread consumes a seek to 500 while playing.
+        sink.invalidate();
+        assert!(gate.is_open(), "a seek keeps publication open");
+        sink.push_frame(500, solid(4, 4));
+        sink.push_frame(501, solid(4, 4));
+
+        let mut seen = Vec::new();
+        while let Ok(publication) = published.recv_timeout(Duration::from_millis(600)) {
+            seen.push(publication.frame());
+        }
+        assert!(
+            seen.iter().all(|frame| *frame >= 500),
+            "pre-seek frames must not publish after the seek: {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&501));
+    }
+
+    #[test]
+    fn playback_errors_are_dropped_once_the_session_gate_closes() {
+        let gate = PublicationGate::open();
+        let session = identity(4, 9, "error-gate");
+        let failure = PlaybackFailure {
+            frame: 12,
+            code: PlaybackFailureCode::VideoDecode,
+            message: "clip-1 cancelled".to_string(),
+            fatal: true,
+        };
+        assert!(gated_error_event(&gate, &session, failure.clone()).is_some());
+        gate.close();
+        assert!(
+            gated_error_event(&gate, &session, failure.clone()).is_none(),
+            "a paused or torn-down session reports nothing"
+        );
+        gate.reopen();
+        assert!(gated_error_event(&gate, &session, failure).is_some());
+    }
+
+    #[test]
+    fn old_session_mailbox_frame_is_never_published_after_a_new_session_starts() {
+        let latest = LatestFrameStore::default();
+        let old_identity = identity(5, 1, "old-session");
+        let (old_publish, old_published) = recording_publisher();
+        let old_gate = PublicationGate::open();
+        let old_sink = test_sink(
+            &latest,
+            old_identity.clone(),
+            old_gate.clone(),
+            100,
+            old_publish,
+            slow_encode,
+        );
+        old_sink.push_frame(10, solid(4, 4));
+        std::thread::sleep(Duration::from_millis(20));
+        old_sink.push_frame(11, solid(4, 4));
+
+        // Session teardown closes the old gate before the replacement starts.
+        old_gate.close();
+        drop(old_sink);
+        let new_identity = identity(5, 1, "new-session");
+        let (new_publish, new_published) = recording_publisher();
+        let new_sink = test_sink(
+            &latest,
+            new_identity.clone(),
+            PublicationGate::open(),
+            100,
+            new_publish,
+            crate::jpeg::encode_rgba_jpeg,
+        );
+        new_sink.push_frame(3, solid(4, 4));
+        assert_eq!(
+            new_published
+                .recv_timeout(Duration::from_secs(2))
+                .expect("new session publishes")
+                .frame(),
+            3
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(old_published.try_recv().is_err());
+        assert!(latest
+            .lookup(&FrameQuery::new(5, 1, "old-session", 0, 0))
+            .is_none());
+        assert!(latest
+            .lookup(&FrameQuery::new(5, 1, "new-session", 3, 1))
+            .is_some());
+    }
+
+    #[test]
+    fn terminal_without_pixels_is_announced_but_keeps_the_last_good_jpeg() {
+        let latest = LatestFrameStore::default();
+        let (on_publish, published) = recording_publisher();
+        let sink = test_sink(
+            &latest,
+            identity(8, 8, "terminal-failed"),
+            PublicationGate::open(),
+            9,
+            on_publish,
+            crate::jpeg::encode_rgba_jpeg,
+        );
+        let first = sink
+            .publish_now(8, &solid(4, 4))
+            .expect("frame 8 published");
+        assert!(!first.terminal());
+        let _ = published.recv_timeout(Duration::from_secs(1));
+        sink.push_terminal(9);
+        let terminal = published
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminal tick published");
+        assert_eq!((terminal.frame(), terminal.terminal()), (9, true));
+        assert_eq!(terminal.sequence(), first.sequence() + 1);
+        // The terminal frame itself has no JPEG, so the front end's exhausted
+        // path runs; earlier frames still resolve to the last good JPEG.
+        assert!(latest
+            .lookup(&FrameQuery::new(
+                8,
+                8,
+                "terminal-failed",
+                9,
+                terminal.sequence()
+            ))
+            .is_none());
+        assert!(latest
+            .lookup(&FrameQuery::new(
+                8,
+                8,
+                "terminal-failed",
+                8,
+                first.sequence()
+            ))
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preview_server_rejects_rebinding_hosts_and_serves_no_stream_routes() {
+        use std::io::{Read, Write};
+
+        let server = PreviewServer::start().await.expect("start preview server");
+        let address = server
+            .endpoint_frame()
+            .strip_prefix("http://")
+            .and_then(|rest| rest.strip_suffix("/frame"))
+            .expect("loopback endpoint")
+            .to_string();
+        let status = |path: &str, host: &str, extra: &str| -> u16 {
+            let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"
+            )
+            .expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response");
+            String::from_utf8_lossy(&response)
+                .split_whitespace()
+                .nth(1)
+                .expect("status")
+                .parse()
+                .expect("numeric status")
+        };
+        let port = address.rsplit(':').next().unwrap();
+        let frame = "/frame?projectEpoch=1&timelineVersion=1&sessionId=s&frame=0&sequence=1";
+
+        assert_eq!(status(frame, &format!("attacker.example:{port}"), ""), 403);
+        assert_eq!(status(frame, &address, ""), 204);
+        assert_eq!(status(frame, &format!("localhost:{port}"), ""), 204);
+        assert_eq!(
+            status(frame, &address, "Origin: http://attacker.example\r\n"),
+            403
+        );
+        assert_eq!(status("/stream", &address, ""), 404);
+        assert_eq!(status("/ws", &address, ""), 404);
+        assert_eq!(
+            status("/stream", &format!("attacker.example:{port}"), ""),
+            403
+        );
     }
 }
