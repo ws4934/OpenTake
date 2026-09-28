@@ -1,7 +1,12 @@
 use super::*;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Written by a helper once it authenticated its parent and is ready for
+/// requests.
+pub(super) const HELPER_HANDSHAKE: &[u8] = b"OTAH\x00\x00\x00\x02";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct HelperRequest {
+    /// Random per-request token echoed by both replies.
     pub(super) token: String,
     pub(super) parent_pid: u32,
     pub(super) path: String,
@@ -28,6 +33,39 @@ impl HelperProjectAuthority {
     }
 }
 
+/// Parent-to-helper frames, each a big-endian `u32` length plus JSON.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) enum HelperFrame {
+    /// Open the requested file; `session` must equal the helper's process
+    /// secret from its environment.
+    Request {
+        session: String,
+        request: HelperRequest,
+    },
+    /// The opened identity is authorized: serve the request from it.
+    Proceed { token: String },
+    /// The opened identity is not authorized: read nothing and close it.
+    Abort { token: String },
+}
+
+/// Helper-to-parent frames: a big-endian `u32` metadata length, the JSON
+/// metadata and, for [`HelperReply::Served`], `body_length` body bytes.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) enum HelperReply {
+    Opened(OpenedMetadata),
+    Served(HelperResponseMetadata),
+}
+
+/// Identity of the file a helper opened, reported before it reads any byte.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct OpenedMetadata {
+    pub(super) token: String,
+    pub(super) final_path: Option<String>,
+    pub(super) etag: Option<String>,
+    pub(super) project_root_identity: Option<ProjectRootIdentity>,
+    pub(super) error_kind: Option<WireIoErrorKind>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct HelperResponseMetadata {
     pub(super) token: String,
@@ -47,6 +85,26 @@ pub(super) enum WireIoErrorKind {
     Other,
 }
 
+impl WireIoErrorKind {
+    fn from_error(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::InvalidInput => Self::InvalidInput,
+            _ => Self::Other,
+        }
+    }
+
+    pub(super) fn response(self) -> Response<Vec<u8>> {
+        let status = match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::PermissionDenied | Self::InvalidInput => StatusCode::FORBIDDEN,
+            Self::Other => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        error_response(status, "local asset is unavailable", None)
+    }
+}
+
 pub(super) struct IsolatedResponse {
     pub(super) metadata: HelperResponseMetadata,
     pub(super) body: Vec<u8>,
@@ -60,133 +118,143 @@ pub(super) enum IsolatedHelperError {
     InvalidResponse,
 }
 
-pub(super) async fn run_isolated_helper(
-    request: &HelperRequest,
-    process_slots: Arc<Semaphore>,
-) -> Result<IsolatedResponse, IsolatedHelperError> {
-    // Reserve the quarantine capacity before spawning. If this child cannot be
-    // reaped after kill, ownership of both the Child and this permit moves to
-    // the bounded background reaper. Once all four slots are quarantined no
-    // further process is created.
-    let process_slot = process_slots
-        .try_acquire_owned()
-        .map_err(|_| IsolatedHelperError::Degraded)?;
-    let executable = std::env::current_exe().map_err(|_| IsolatedHelperError::Io)?;
-    let mut child = Command::new(executable)
-        .arg(HELPER_ARG)
-        .env(HELPER_TOKEN_ENV, &request.token)
-        .env(HELPER_PARENT_ENV, request.parent_pid.to_string())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| IsolatedHelperError::Io)?;
-    let stdin = child.stdin.take().ok_or(IsolatedHelperError::Io)?;
-    let mut stdout = child.stdout.take().ok_or(IsolatedHelperError::Io)?;
-    let encoded = serde_json::to_vec(request).map_err(|_| IsolatedHelperError::InvalidResponse)?;
-    if encoded.len() > MAX_HELPER_REQUEST_BYTES {
-        terminate_or_quarantine(child, process_slot).await;
+pub(super) async fn write_helper_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &HelperFrame,
+) -> Result<(), IsolatedHelperError> {
+    let encoded = serde_json::to_vec(frame).map_err(|_| IsolatedHelperError::InvalidResponse)?;
+    if encoded.is_empty() || encoded.len() > MAX_HELPER_REQUEST_BYTES {
         return Err(IsolatedHelperError::InvalidResponse);
     }
-
-    let operation = write_helper_request_before_response(stdin, &encoded, async {
-        let mut metadata_length = [0_u8; 4];
-        stdout
-            .read_exact(&mut metadata_length)
-            .await
-            .map_err(|_| IsolatedHelperError::InvalidResponse)?;
-        let metadata_length = u32::from_be_bytes(metadata_length) as usize;
-        if metadata_length == 0 || metadata_length > MAX_HELPER_METADATA_BYTES {
-            return Err(IsolatedHelperError::InvalidResponse);
-        }
-        let mut metadata_bytes = vec![0_u8; metadata_length];
-        stdout
-            .read_exact(&mut metadata_bytes)
-            .await
-            .map_err(|_| IsolatedHelperError::InvalidResponse)?;
-        let metadata: HelperResponseMetadata = serde_json::from_slice(&metadata_bytes)
-            .map_err(|_| IsolatedHelperError::InvalidResponse)?;
-        let body_length = usize::try_from(metadata.body_length)
-            .map_err(|_| IsolatedHelperError::InvalidResponse)?;
-        if body_length > MAX_HELPER_BODY_BYTES {
-            return Err(IsolatedHelperError::InvalidResponse);
-        }
-        let mut body = vec![0_u8; body_length];
-        stdout
-            .read_exact(&mut body)
-            .await
-            .map_err(|_| IsolatedHelperError::InvalidResponse)?;
-        let status = child.wait().await.map_err(|_| IsolatedHelperError::Io)?;
-        if !status.success() {
-            return Err(IsolatedHelperError::InvalidResponse);
-        }
-        Ok(IsolatedResponse { metadata, body })
-    });
-
-    match tokio::time::timeout(IO_DEADLINE, operation).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => {
-            terminate_or_quarantine(child, process_slot).await;
-            Err(error)
-        }
-        Err(_) => {
-            terminate_or_quarantine(child, process_slot).await;
-            Err(IsolatedHelperError::TimedOut)
-        }
-    }
-}
-
-pub(super) async fn write_helper_request_before_response<T, F>(
-    mut stdin: tokio::process::ChildStdin,
-    encoded: &[u8],
-    response: F,
-) -> Result<T, IsolatedHelperError>
-where
-    F: std::future::Future<Output = Result<T, IsolatedHelperError>>,
-{
-    stdin
-        .write_all(encoded)
+    let mut framed = Vec::with_capacity(encoded.len() + 4);
+    framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&encoded);
+    writer
+        .write_all(&framed)
         .await
         .map_err(|_| IsolatedHelperError::Io)?;
-    // `AsyncWriteExt::shutdown()` is a no-op for Tokio's Unix child pipe.
-    // Drop the handle explicitly so the helper's blocking `read_to_end`
-    // observes EOF before this task starts waiting for the response.
-    drop(stdin);
-    response.await
+    writer.flush().await.map_err(|_| IsolatedHelperError::Io)
 }
 
-pub(super) async fn terminate_or_quarantine(
-    mut child: tokio::process::Child,
-    process_slot: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _ = child.start_kill();
-    // A process stuck in an uninterruptible kernel wait may not acknowledge
-    // termination promptly. Never turn the helper deadline into another
-    // unbounded wait; kill_on_drop remains armed if this bounded reap expires.
-    if bounded_reap(child.wait(), REAP_DEADLINE).await {
-        return;
+pub(super) async fn read_helper_reply<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(HelperReply, Vec<u8>), IsolatedHelperError> {
+    let mut metadata_length = [0_u8; 4];
+    reader
+        .read_exact(&mut metadata_length)
+        .await
+        .map_err(|_| IsolatedHelperError::InvalidResponse)?;
+    let metadata_length = u32::from_be_bytes(metadata_length) as usize;
+    if metadata_length == 0 || metadata_length > MAX_HELPER_METADATA_BYTES {
+        return Err(IsolatedHelperError::InvalidResponse);
     }
-    tauri::async_runtime::spawn(async move {
-        let _process_slot = process_slot;
-        let _ = child.wait().await;
-    });
+    let mut metadata_bytes = vec![0_u8; metadata_length];
+    reader
+        .read_exact(&mut metadata_bytes)
+        .await
+        .map_err(|_| IsolatedHelperError::InvalidResponse)?;
+    let reply: HelperReply = serde_json::from_slice(&metadata_bytes)
+        .map_err(|_| IsolatedHelperError::InvalidResponse)?;
+    let body_length = match &reply {
+        HelperReply::Opened(_) => 0,
+        HelperReply::Served(metadata) => usize::try_from(metadata.body_length)
+            .map_err(|_| IsolatedHelperError::InvalidResponse)?,
+    };
+    if body_length > MAX_HELPER_BODY_BYTES {
+        return Err(IsolatedHelperError::InvalidResponse);
+    }
+    let mut body = vec![0_u8; body_length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .map_err(|_| IsolatedHelperError::InvalidResponse)?;
+    Ok((reply, body))
 }
 
-pub(super) async fn bounded_reap<F>(wait: F, deadline: Duration) -> bool
-where
-    F: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
-{
-    tokio::time::timeout(deadline, wait).await.is_ok()
+/// Authorize the identity a helper opened before it reads any byte. Only
+/// in-memory state is consulted: the cached scope snapshot, the external media
+/// index and the retained project authority. The parent never opens the file.
+pub(super) fn authorize_opened_asset<R: Runtime>(
+    app: &AppHandle<R>,
+    core: &AppCore,
+    expected_project: Option<&ProjectAssetAuthority>,
+    expected_non_project: Option<&NonProjectAssetAuthority>,
+    token: &str,
+    opened: &OpenedMetadata,
+) -> Result<(), Box<Response<Vec<u8>>>> {
+    if opened.token != token {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_GATEWAY,
+            "local asset helper failed",
+            None,
+        )));
+    }
+    if let Some(kind) = opened.error_kind {
+        return Err(Box::new(kind.response()));
+    }
+    let (Some(final_path), Some(_)) = (opened.final_path.as_deref(), opened.etag.as_deref()) else {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_GATEWAY,
+            "local asset helper failed",
+            None,
+        )));
+    };
+    let final_path = Path::new(final_path);
+    if let Some(expected) = expected_project {
+        // The helper re-opened the bundle, required this exact retained root
+        // identity and opened every asset component no-follow beneath it, so
+        // the identity is the authority. The handle's final path is resolved
+        // by the OS (symlinked ancestors such as macOS `/tmp`, junctions and
+        // `subst` drives), so it cannot be compared with the opened path.
+        if opened.project_root_identity != Some(expected.root_identity)
+            || !core.project_asset_authority_matches(expected)
+        {
+            return Err(Box::new(error_response(
+                StatusCode::FORBIDDEN,
+                "project asset authority changed during the read",
+                None,
+            )));
+        }
+        return Ok(());
+    }
+    let Some(expected) = expected_non_project else {
+        return Err(Box::new(outside_scope()));
+    };
+    if opened.project_root_identity.is_some() {
+        return Err(Box::new(outside_scope()));
+    }
+    let scope = asset_scope_snapshot(app);
+    // Re-derive the requested path's authority from current in-memory state:
+    // a scope revocation, project switch or manifest removal since admission
+    // must not publish bytes under the admission-time decision.
+    if non_project_asset_authority(app, core, &scope, expected.requested_path()).as_ref()
+        != Some(expected)
+    {
+        return Err(Box::new(outside_scope()));
+    }
+    if !non_project_final_path_is_authorized(app, &scope, expected, final_path) {
+        return Err(Box::new(outside_scope()));
+    }
+    Ok(())
 }
 
+fn outside_scope() -> Response<Vec<u8>> {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "the opened asset resolves outside its approved scope",
+        None,
+    )
+}
+
+/// Publish a served helper response only if it is the identity that was
+/// authorized before the read and that authorization still holds.
 pub(super) fn isolated_response_to_http<R: Runtime>(
     app: &AppHandle<R>,
     core: &AppCore,
-    scope: &Scope,
     expected_project: Option<&ProjectAssetAuthority>,
-    expected_non_project: Option<NonProjectAssetAuthority>,
+    expected_non_project: Option<&NonProjectAssetAuthority>,
     token: &str,
+    opened: &OpenedMetadata,
     isolated: IsolatedResponse,
 ) -> Response<Vec<u8>> {
     let metadata = isolated.metadata;
@@ -194,79 +262,47 @@ pub(super) fn isolated_response_to_http<R: Runtime>(
         return error_response(StatusCode::BAD_GATEWAY, "local asset helper failed", None);
     }
     if let Some(kind) = metadata.error_kind {
-        let status = match kind {
-            WireIoErrorKind::NotFound => StatusCode::NOT_FOUND,
-            WireIoErrorKind::PermissionDenied | WireIoErrorKind::InvalidInput => {
-                StatusCode::FORBIDDEN
-            }
-            WireIoErrorKind::Other => StatusCode::UNPROCESSABLE_ENTITY,
-        };
-        return error_response(status, "local asset is unavailable", None);
+        return kind.response();
     }
-    let Some(final_path) = metadata.final_path.as_deref().map(PathBuf::from) else {
-        return error_response(StatusCode::BAD_GATEWAY, "local asset helper failed", None);
-    };
+    let response_etag = metadata
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value.as_str());
+    let success = (200..300).contains(&metadata.status);
+    // The served bytes must come from the identity reported before the read:
+    // same handle path, same root, and the same file identity (etag).
+    if metadata.final_path.is_none()
+        || metadata.final_path != opened.final_path
+        || metadata.project_root_identity != opened.project_root_identity
+        || (success && response_etag.is_none())
+        || response_etag.is_some_and(|etag| Some(etag) != opened.etag.as_deref())
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "local asset identity changed during the read",
+            None,
+        );
+    }
     // Acquire the project-transition lease before the final authorization
     // comparison. Once held, the current bundle/external-media authority cannot
-    // rotate between this check and byte publication.
+    // rotate between this check and byte publication. Only in-memory state is
+    // compared under the lease; no file is opened.
     let requires_project_lease = expected_project.is_some()
         || matches!(
             expected_non_project,
             Some(NonProjectAssetAuthority::ProjectMedia { .. })
         );
     let _identity_lease = requires_project_lease.then(|| core.lock_project_identity_workflow());
-    if expected_project.is_none() {
-        let response_etag = metadata
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
-            .map(|(_, value)| value.as_str());
-        let Some(expected) = expected_non_project.as_ref() else {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "the opened asset resolves outside its approved scope",
-                None,
-            );
-        };
-        let refreshed = non_project_asset_authority(app, core, scope, expected.requested_path());
-        if !non_project_response_matches_authority(
-            expected,
-            &final_path,
-            response_etag,
-            refreshed.as_ref(),
-        ) {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "the opened asset resolves outside its approved scope",
-                None,
-            );
-        }
-    }
-    match (expected_project, opentake_ancestor(&final_path)) {
-        // The helper re-opened the bundle, required this exact retained root
-        // identity and opened every asset component no-follow beneath it, so
-        // the identity is the authority. The handle's final path is resolved
-        // by the OS (symlinked ancestors such as macOS `/tmp`, junctions and
-        // `subst` drives), so it cannot be compared with the opened path.
-        (Some(expected), _) if metadata.project_root_identity == Some(expected.root_identity) => {}
-        (None, Some(bundle_path))
-            if is_home_thumbnail_exception(scope, &final_path, &bundle_path) => {}
-        (None, None) => {}
-        _ => {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "project asset authority changed during the read",
-                None,
-            );
-        }
-    }
-
-    if expected_project.is_some_and(|expected| !core.project_asset_authority_matches(expected)) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "project asset authority changed during the read",
-            None,
-        );
+    if let Err(response) = authorize_opened_asset(
+        app,
+        core,
+        expected_project,
+        expected_non_project,
+        token,
+        opened,
+    ) {
+        return *response;
     }
 
     let status = StatusCode::from_u16(metadata.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -285,8 +321,8 @@ pub(super) fn isolated_response_to_http<R: Runtime>(
     })
 }
 
-/// Run the undocumented, single-request asset reader mode before Tauri starts.
-/// The random token and actual parent PID must agree across env and stdin.
+/// Run the undocumented asset reader mode before Tauri starts. The random
+/// session secret and actual parent PID must agree across env and stdin.
 #[doc(hidden)]
 pub(crate) fn run_helper_if_requested() -> bool {
     if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new(HELPER_ARG)) {
@@ -296,8 +332,9 @@ pub(crate) fn run_helper_if_requested() -> bool {
     std::process::exit(exit_code);
 }
 
-fn run_helper_stdio() -> std::io::Result<()> {
-    let expected_token = std::env::var(HELPER_TOKEN_ENV)
+/// Authenticate the parent, then serve framed requests until stdin closes.
+pub(super) fn run_helper_stdio() -> std::io::Result<()> {
+    let expected_session = std::env::var(HELPER_TOKEN_ENV)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing token"))?;
     let expected_parent = std::env::var(HELPER_PARENT_ENV)
         .ok()
@@ -305,38 +342,103 @@ fn run_helper_stdio() -> std::io::Result<()> {
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing parent")
         })?;
-    if expected_parent != actual_parent_process_id()? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "helper parent mismatch",
-        ));
-    }
+    ensure_helper_parent(expected_parent)?;
     if !parent_is_same_executable(expected_parent)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "helper parent executable mismatch",
         ));
     }
-    let mut encoded = Vec::new();
-    std::io::stdin()
-        .take((MAX_HELPER_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut encoded)?;
-    if encoded.len() > MAX_HELPER_REQUEST_BYTES {
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(HELPER_HANDSHAKE)?;
+    stdout.flush()?;
+    loop {
+        // EOF at a frame boundary is the parent's normal way to retire us.
+        let Some(frame) = read_helper_frame(&mut stdin)? else {
+            return Ok(());
+        };
+        let HelperFrame::Request { session, request } = frame else {
+            return Err(protocol_error("expected a helper request"));
+        };
+        if session != expected_session || request.parent_pid != expected_parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "helper authentication failed",
+            ));
+        }
+        // A reparented helper no longer serves the process that started it.
+        ensure_helper_parent(expected_parent)?;
+        let opened = open_helper_asset(&request);
+        write_helper_reply(
+            &mut stdout,
+            &HelperReply::Opened(opened_metadata(&request, &opened)),
+            &[],
+        )?;
+        let Ok(opened) = opened else {
+            continue;
+        };
+        match read_helper_frame(&mut stdin)? {
+            Some(HelperFrame::Proceed { token }) if token == request.token => {
+                let response = serve_helper_asset(&request, opened);
+                write_helper_reply(
+                    &mut stdout,
+                    &HelperReply::Served(response.metadata),
+                    &response.body,
+                )?;
+            }
+            Some(HelperFrame::Abort { token }) if token == request.token => {}
+            _ => return Err(protocol_error("expected a decision for the open request")),
+        }
+    }
+}
+
+fn ensure_helper_parent(expected_parent: u32) -> std::io::Result<()> {
+    if expected_parent != actual_parent_process_id()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "helper parent mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn protocol_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+pub(super) fn read_helper_frame(input: &mut impl Read) -> std::io::Result<Option<HelperFrame>> {
+    let mut length = [0_u8; 4];
+    let mut filled = 0;
+    while filled < length.len() {
+        match input.read(&mut length[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => return Err(protocol_error("truncated helper frame")),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_HELPER_REQUEST_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "helper request is too large",
         ));
     }
-    let request: HelperRequest = serde_json::from_slice(&encoded)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    if request.token != expected_token || request.parent_pid != expected_parent {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "helper authentication failed",
-        ));
-    }
-    let response = helper_response(&request);
-    let metadata = serde_json::to_vec(&response.metadata)
+    let mut encoded = vec![0_u8; length];
+    input.read_exact(&mut encoded)?;
+    serde_json::from_slice(&encoded)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+pub(super) fn write_helper_reply(
+    output: &mut impl Write,
+    reply: &HelperReply,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let metadata = serde_json::to_vec(reply)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if metadata.len() > MAX_HELPER_METADATA_BYTES {
         return Err(std::io::Error::new(
@@ -344,11 +446,10 @@ fn run_helper_stdio() -> std::io::Result<()> {
             "helper metadata is too large",
         ));
     }
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&(metadata.len() as u32).to_be_bytes())?;
-    stdout.write_all(&metadata)?;
-    stdout.write_all(&response.body)?;
-    stdout.flush()
+    output.write_all(&(metadata.len() as u32).to_be_bytes())?;
+    output.write_all(&metadata)?;
+    output.write_all(body)?;
+    output.flush()
 }
 
 #[cfg(unix)]
@@ -490,65 +591,16 @@ pub(super) fn parent_is_same_executable(parent_pid: u32) -> std::io::Result<bool
     )
 }
 
-pub(super) fn helper_response(request: &HelperRequest) -> IsolatedResponse {
-    match read_helper_asset(request) {
-        Ok((response, final_path, project_root_identity)) => {
-            let (parts, body) = response.into_parts();
-            let headers = parts
-                .headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
-                })
-                .collect();
-            IsolatedResponse {
-                metadata: HelperResponseMetadata {
-                    token: request.token.clone(),
-                    final_path: final_path.to_str().map(str::to_owned),
-                    project_root_identity,
-                    status: parts.status.as_u16(),
-                    headers,
-                    body_length: body.len() as u64,
-                    error_kind: None,
-                },
-                body,
-            }
-        }
-        Err(error) => IsolatedResponse {
-            metadata: HelperResponseMetadata {
-                token: request.token.clone(),
-                final_path: None,
-                project_root_identity: None,
-                status: 0,
-                headers: Vec::new(),
-                body_length: 0,
-                error_kind: Some(match error.kind() {
-                    std::io::ErrorKind::NotFound => WireIoErrorKind::NotFound,
-                    std::io::ErrorKind::PermissionDenied => WireIoErrorKind::PermissionDenied,
-                    std::io::ErrorKind::InvalidInput => WireIoErrorKind::InvalidInput,
-                    _ => WireIoErrorKind::Other,
-                }),
-            },
-            body: Vec::new(),
-        },
-    }
+/// A file the helper opened and validated but has not read yet.
+pub(super) struct OpenedAsset {
+    file: File,
+    final_path: PathBuf,
+    etag: String,
+    project_root_identity: Option<ProjectRootIdentity>,
 }
 
-fn read_helper_asset(
-    request: &HelperRequest,
-) -> std::io::Result<(Response<Vec<u8>>, PathBuf, Option<ProjectRootIdentity>)> {
+pub(super) fn open_helper_asset(request: &HelperRequest) -> std::io::Result<OpenedAsset> {
     let path = PathBuf::from(&request.path);
-    let range = request
-        .range
-        .as_deref()
-        .and_then(|value| tauri::http::HeaderValue::from_str(value).ok());
-    let if_range = request
-        .if_range
-        .as_deref()
-        .and_then(|value| tauri::http::HeaderValue::from_str(value).ok());
     let (file, final_path, project_root_identity) = if let Some(project) = &request.project {
         let project_path = PathBuf::from(&project.project_path);
         let relative = relative_to_authority(&path, &project_path).ok_or_else(|| {
@@ -582,12 +634,101 @@ fn read_helper_asset(
         let (file, final_path) = open_retained_regular_file(&path)?;
         (file, final_path, None)
     };
-    let response = serve_opened_file(
+    let metadata = file.metadata()?;
+    let etag = retained_file_etag(&file, &metadata)?;
+    Ok(OpenedAsset {
+        file,
+        final_path,
+        etag,
+        project_root_identity,
+    })
+}
+
+pub(super) fn opened_metadata(
+    request: &HelperRequest,
+    opened: &std::io::Result<OpenedAsset>,
+) -> OpenedMetadata {
+    match opened {
+        Ok(opened) => OpenedMetadata {
+            token: request.token.clone(),
+            final_path: opened.final_path.to_str().map(str::to_owned),
+            etag: Some(opened.etag.clone()),
+            project_root_identity: opened.project_root_identity,
+            // A non-UTF-8 final path cannot be authorized lexically.
+            error_kind: opened
+                .final_path
+                .to_str()
+                .is_none()
+                .then_some(WireIoErrorKind::PermissionDenied),
+        },
+        Err(error) => OpenedMetadata {
+            token: request.token.clone(),
+            final_path: None,
+            etag: None,
+            project_root_identity: None,
+            error_kind: Some(WireIoErrorKind::from_error(error)),
+        },
+    }
+}
+
+pub(super) fn serve_helper_asset(request: &HelperRequest, opened: OpenedAsset) -> IsolatedResponse {
+    let range = request
+        .range
+        .as_deref()
+        .and_then(|value| tauri::http::HeaderValue::from_str(value).ok());
+    let if_range = request
+        .if_range
+        .as_deref()
+        .and_then(|value| tauri::http::HeaderValue::from_str(value).ok());
+    let OpenedAsset {
+        file,
+        final_path,
+        project_root_identity,
+        ..
+    } = opened;
+    match serve_opened_file(
         file,
         &final_path,
         request.head_only,
         range.as_ref(),
         if_range.as_ref(),
-    )?;
-    Ok((response, final_path, project_root_identity))
+    ) {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            let headers = parts
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect();
+            IsolatedResponse {
+                metadata: HelperResponseMetadata {
+                    token: request.token.clone(),
+                    final_path: final_path.to_str().map(str::to_owned),
+                    project_root_identity,
+                    status: parts.status.as_u16(),
+                    headers,
+                    body_length: body.len() as u64,
+                    error_kind: None,
+                },
+                body,
+            }
+        }
+        Err(error) => IsolatedResponse {
+            metadata: HelperResponseMetadata {
+                token: request.token.clone(),
+                final_path: None,
+                project_root_identity: None,
+                status: 0,
+                headers: Vec::new(),
+                body_length: 0,
+                error_kind: Some(WireIoErrorKind::from_error(&error)),
+            },
+            body: Vec::new(),
+        },
+    }
 }

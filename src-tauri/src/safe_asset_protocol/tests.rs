@@ -96,116 +96,6 @@ fn final_handle_path_authorization_rejects_a_symlinked_ancestor_escape() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn response_for_request_rejects_scope_only_alias_that_resolves_outside_scope() {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::symlink;
-    use tauri::Manager;
-
-    let app = tauri::test::mock_app();
-    app.manage(AppCore::new());
-    let cache_root = app.path().app_cache_dir().unwrap();
-    std::fs::create_dir_all(&cache_root).unwrap();
-    let cache_directory = tempfile::Builder::new()
-        .prefix("safe-asset-cache-alias-")
-        .tempdir_in(&cache_root)
-        .unwrap();
-    let outside = local_tempdir();
-    let final_path = outside.path().join("outside.jpg");
-    std::fs::write(&final_path, b"outside").unwrap();
-    let alias = cache_directory.path().join("alias");
-    symlink(outside.path(), &alias).unwrap();
-    let requested = alias.join("outside.jpg");
-
-    let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&requested).unwrap();
-    scope.forbid_file(&final_path).unwrap();
-    assert!(scope_allows_lexical_path(&scope, &requested));
-    assert!(!scope_allows_lexical_path(&scope, &final_path));
-
-    let encoded = percent_encoding::percent_encode(
-        requested.as_os_str().as_bytes(),
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!("http://opentake.local/{encoded}"))
-        .body(Vec::new())
-        .unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let response = runtime.block_on(response_for_request(
-        app.handle(),
-        &scope,
-        request,
-        Arc::new(Semaphore::new(0)),
-    ));
-
-    assert_eq!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "a ScopeOnly request must reject an out-of-scope retained final path before acquiring a helper slot"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn response_for_request_rejects_project_media_ancestor_symlink_escape() {
-    use opentake_core::ProbedMedia;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::symlink;
-    use tauri::Manager;
-
-    let approved = local_tempdir();
-    let outside = local_tempdir();
-    let final_path = outside.path().join("outside.mp4");
-    std::fs::write(&final_path, b"outside-project-media").unwrap();
-    let alias = approved.path().join("selected-source");
-    symlink(outside.path(), &alias).unwrap();
-    let requested = alias.join("outside.mp4");
-
-    let core = AppCore::new();
-    core.save_project(Some(approved.path().join("Escape.opentake")))
-        .unwrap();
-    core.import_media_file(&requested, "outside", &ProbedMedia::default())
-        .unwrap();
-    let app = tauri::test::mock_app();
-    app.manage(core);
-    let scope = app.handle().asset_protocol_scope();
-    scope.allow_directory(approved.path(), true).unwrap();
-    assert!(scope_allows_lexical_path(&scope, &requested));
-    assert!(!scope_allows_lexical_path(&scope, &final_path));
-
-    let encoded = percent_encoding::percent_encode(
-        requested.as_os_str().as_bytes(),
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!("http://opentake.local/{encoded}"))
-        .body(Vec::new())
-        .unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let response = runtime.block_on(response_for_request(
-        app.handle(),
-        &scope,
-        request,
-        Arc::new(Semaphore::new(0)),
-    ));
-
-    assert_eq!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "project media must not use a recursive lexical grant to escape through an ancestor symlink"
-    );
-}
-
 #[test]
 fn rejects_multi_range_and_oversized_full_body() {
     let directory = local_tempdir();
@@ -253,48 +143,6 @@ fn response_headers_are_origin_bound_and_inert() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn project_helper_rejects_an_ambient_bundle_replacement() {
-    let directory = local_tempdir();
-    let selected = directory.path().join("Selected.opentake");
-    std::fs::create_dir_all(selected.join("media")).unwrap();
-    std::fs::write(selected.join("media/clip.mp4"), b"project-a").unwrap();
-    let retained = ProjectRoot::open(&selected).unwrap();
-    let expected_identity = retained.stable_identity();
-
-    std::fs::rename(&selected, directory.path().join("Retained-A.opentake")).unwrap();
-    std::fs::create_dir_all(selected.join("media")).unwrap();
-    std::fs::write(selected.join("media/clip.mp4"), b"project-b").unwrap();
-
-    let request = HelperRequest {
-        token: "test-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: selected
-            .join("media/clip.mp4")
-            .to_string_lossy()
-            .into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: Some(HelperProjectAuthority {
-            project_epoch: 7,
-            project_path: selected.to_string_lossy().into_owned(),
-            root_identity: expected_identity,
-        }),
-    };
-
-    let response = helper_response(&request);
-    assert!(matches!(
-        response.metadata.error_kind,
-        Some(WireIoErrorKind::PermissionDenied)
-    ));
-    assert!(response.body.is_empty());
-}
-
-/// cap-std retains the bundle without FILE_SHARE_DELETE: on Windows the
-/// ambient replacement is rejected closed while retained (the helper's
-/// replacement rejection is Unix-verified above).
 #[cfg(target_os = "windows")]
 #[test]
 fn project_helper_blocks_an_ambient_bundle_replacement_while_retained() {
@@ -311,233 +159,6 @@ fn project_helper_blocks_an_ambient_bundle_replacement_while_retained() {
     assert_eq!(
         std::fs::read(directory.path().join("Retained-A.opentake/media/clip.mp4")).unwrap(),
         b"project-a"
-    );
-}
-
-#[test]
-fn current_project_authority_allows_nested_media_without_recursive_scope() {
-    use tauri::Manager;
-
-    let directory = local_tempdir();
-    let bundle = directory.path().join("ExactRootGrant.opentake");
-    let core = AppCore::new();
-    core.save_project(Some(bundle.clone())).unwrap();
-    std::fs::create_dir_all(bundle.join("media")).unwrap();
-    let media = bundle.join("media/clip.mp4");
-    std::fs::write(&media, b"project-media").unwrap();
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&bundle).unwrap();
-    assert!(!scope_allows_lexical_path(&scope, &media));
-
-    let authority = project_request_authority(&core, &scope, &media)
-        .unwrap()
-        .expect("current retained project is nested-media authority");
-    let request = HelperRequest {
-        token: "test-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: media.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: HelperProjectAuthority::from_core(&authority),
-    };
-    let response = helper_response(&request);
-    assert_eq!(response.metadata.status, StatusCode::OK.as_u16());
-    assert_eq!(response.body, b"project-media");
-}
-
-/// Build a project whose opened path runs through a symlinked ancestor
-/// (`link -> real`, like macOS `/tmp -> /private/tmp` or a linked volume) and
-/// return the pieces of one authorized project-asset read of `media/a.png`.
-#[cfg(unix)]
-fn symlinked_ancestor_project_read(
-    directory: &Path,
-) -> (
-    AppCore,
-    PathBuf,
-    PathBuf,
-    ProjectAssetAuthority,
-    HelperRequest,
-) {
-    use std::os::unix::fs::symlink;
-    use tauri::Manager;
-
-    let real = directory.join("real");
-    std::fs::create_dir(&real).unwrap();
-    let link = directory.join("link");
-    symlink(&real, &link).unwrap();
-    let bundle = link.join("P.opentake");
-    let core = AppCore::new();
-    core.save_project(Some(bundle.clone())).unwrap();
-    std::fs::create_dir_all(bundle.join("media")).unwrap();
-    let media = bundle.join("media/a.png");
-    std::fs::write(&media, b"png-bytes").unwrap();
-
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-    let authority = project_request_authority(&core, &scope, &media)
-        .unwrap()
-        .expect("the opened project path is the nested-media authority");
-    assert_eq!(authority.project_path, bundle);
-    let request = HelperRequest {
-        token: "symlinked-ancestor-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: media.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: HelperProjectAuthority::from_core(&authority),
-    };
-    (core, real, media, authority, request)
-}
-
-#[cfg(unix)]
-#[test]
-fn project_assets_behind_a_symlinked_ancestor_are_served() {
-    use tauri::Manager;
-
-    let directory = local_tempdir();
-    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
-    let isolated = helper_response(&request);
-    let final_path = PathBuf::from(isolated.metadata.final_path.clone().unwrap());
-    assert_eq!(
-        final_path,
-        real.join("P.opentake/media/a.png"),
-        "the retained handle reports the resolved path, not the opened alias"
-    );
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-
-    let response = isolated_response_to_http(
-        app.handle(),
-        &core,
-        &scope,
-        Some(&authority),
-        None,
-        &request.token,
-        isolated,
-    );
-
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "a symlinked ancestor must not turn the retained root into a 403"
-    );
-    assert_eq!(response.body(), b"png-bytes");
-}
-
-#[cfg(unix)]
-#[test]
-fn project_assets_require_the_retained_root_identity_after_the_read() {
-    use tauri::Manager;
-
-    let directory = local_tempdir();
-    let (core, _, _, authority, request) = symlinked_ancestor_project_read(directory.path());
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-
-    let mut other_root = helper_response(&request);
-    other_root.metadata.project_root_identity = Some(ProjectRootIdentity {
-        volume: authority.root_identity.volume,
-        file: authority.root_identity.file.wrapping_add(1),
-    });
-    let mut unrooted = helper_response(&request);
-    unrooted.metadata.project_root_identity = None;
-
-    for isolated in [other_root, unrooted] {
-        let response = isolated_response_to_http(
-            app.handle(),
-            &core,
-            &scope,
-            Some(&authority),
-            None,
-            &request.token,
-            isolated,
-        );
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "bytes read through any root other than the retained one must not be published"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn project_asset_read_rejects_a_bundle_replaced_behind_the_symlinked_ancestor() {
-    use tauri::Manager;
-
-    let directory = local_tempdir();
-    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
-    std::fs::rename(real.join("P.opentake"), real.join("Parked.opentake")).unwrap();
-    std::fs::create_dir_all(real.join("P.opentake/media")).unwrap();
-    std::fs::write(real.join("P.opentake/media/a.png"), b"replacement").unwrap();
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-
-    let isolated = helper_response(&request);
-    assert!(isolated.body.is_empty());
-    let response = isolated_response_to_http(
-        app.handle(),
-        &core,
-        &scope,
-        Some(&authority),
-        None,
-        &request.token,
-        isolated,
-    );
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert!(response.body() != b"replacement");
-}
-
-#[cfg(unix)]
-#[test]
-fn home_thumbnail_behind_a_symlinked_ancestor_is_authorized_exactly() {
-    use std::os::unix::fs::symlink;
-    use tauri::Manager;
-
-    let directory = local_tempdir();
-    let real = directory.path().join("real");
-    std::fs::create_dir_all(real.join("Recent.opentake")).unwrap();
-    let link = directory.path().join("link");
-    symlink(&real, &link).unwrap();
-    let thumbnail = link.join("Recent.opentake/thumbnail.jpg");
-    std::fs::write(&thumbnail, b"jpeg").unwrap();
-
-    let final_path = validate_resident_home_thumbnail(&thumbnail).unwrap();
-    assert_eq!(final_path, real.join("Recent.opentake/thumbnail.jpg"));
-
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&thumbnail).unwrap();
-    scope.allow_file(&final_path).unwrap();
-    let expected = non_project_asset_authority(app.handle(), &AppCore::new(), &scope, &thumbnail)
-        .expect("the exact thumbnail grants authorize the Home cover");
-    let request = HelperRequest {
-        token: "home-thumbnail-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: thumbnail.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: None,
-    };
-    let response = isolated_response_to_http(
-        app.handle(),
-        &AppCore::new(),
-        &scope,
-        None,
-        Some(expected),
-        &request.token,
-        helper_response(&request),
-    );
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.body(), b"jpeg");
-    assert!(
-        !scope_allows_lexical_path(&scope, &link.join("Recent.opentake/project.json")),
-        "the thumbnail grant must stay exact"
     );
 }
 
@@ -578,6 +199,557 @@ fn home_thumbnail_validation_rejects_symlinked_bundles_and_leaves() {
     assert!(validate_resident_home_thumbnail(&target.join("thumbnail.jpg")).is_ok());
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn helper_rejects_a_parent_that_is_not_the_same_executable() {
+    // The Rust test harness is launched by Cargo, so its live parent is a
+    // different executable. A self-issued token/PID pair is insufficient.
+    let parent_pid = actual_parent_process_id().unwrap();
+    assert!(!parent_is_same_executable(parent_pid).unwrap());
+}
+
+/// Run one request through the helper's open, parent authorization and serve
+/// steps in-process (the pooled path runs the same functions in a helper).
+fn helper_exchange(request: &HelperRequest) -> (OpenedMetadata, IsolatedResponse) {
+    let opened = open_helper_asset(request);
+    let metadata = opened_metadata(request, &opened);
+    let response = match opened {
+        Ok(opened) => serve_helper_asset(request, opened),
+        Err(_) => IsolatedResponse {
+            metadata: helper::HelperResponseMetadata {
+                token: request.token.clone(),
+                final_path: None,
+                project_root_identity: None,
+                status: 0,
+                headers: Vec::new(),
+                body_length: 0,
+                error_kind: metadata.error_kind,
+            },
+            body: Vec::new(),
+        },
+    };
+    (metadata, response)
+}
+
+fn external_request(token: &str, path: &Path) -> HelperRequest {
+    HelperRequest {
+        token: token.to_owned(),
+        parent_pid: std::process::id(),
+        path: path.to_string_lossy().into_owned(),
+        head_only: false,
+        range: None,
+        if_range: None,
+        project: None,
+    }
+}
+
+const TEST_HELPER_ENV: &str = "OPENTAKE_TEST_ASSET_HELPER";
+const TEST_HELPER_MARKER_ENV: &str = "OPENTAKE_TEST_ASSET_HELPER_MARKER";
+
+/// Child-process entry for the pool tests below: the test binary re-runs
+/// itself filtered to this test with `TEST_HELPER_ENV` set. In a normal test
+/// run the variable is absent and this returns immediately.
+#[test]
+fn pooled_helper_process_entry() {
+    let Ok(mode) = std::env::var(TEST_HELPER_ENV) else {
+        return;
+    };
+    let result = match mode.as_str() {
+        "serve" => helper::run_helper_stdio(),
+        "hang-once" => {
+            let marker = PathBuf::from(std::env::var_os(TEST_HELPER_MARKER_ENV).unwrap());
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .is_ok()
+            {
+                misbehaving_helper(|_, _| loop {
+                    std::thread::park();
+                })
+            } else {
+                helper::run_helper_stdio()
+            }
+        }
+        "wrong-token" => misbehaving_helper(|request, stdout| {
+            helper::write_helper_reply(
+                stdout,
+                &helper::HelperReply::Opened(OpenedMetadata {
+                    token: format!("{}-other", request.token),
+                    final_path: Some(request.path.clone()),
+                    etag: Some("\"forged\"".to_owned()),
+                    project_root_identity: None,
+                    error_kind: None,
+                }),
+                &[],
+            )
+        }),
+        _ => Err(std::io::Error::other("unknown test helper mode")),
+    };
+    std::process::exit(i32::from(result.is_err()));
+}
+
+/// Handshake, read one request, then misbehave with `respond`.
+fn misbehaving_helper(
+    respond: impl FnOnce(&HelperRequest, &mut std::io::StdoutLock<'static>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(helper::HELPER_HANDSHAKE)?;
+    stdout.flush()?;
+    let Some(helper::HelperFrame::Request { request, .. }) =
+        helper::read_helper_frame(&mut std::io::stdin().lock())?
+    else {
+        return Err(std::io::Error::other("expected a request"));
+    };
+    respond(&request, &mut stdout)?;
+    // Keep the pipe open so only the parent's deadline or kill ends this.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn test_pool(mode: &str, deadline: Duration, extra_env: &[(&str, &Path)]) -> Arc<HelperPool> {
+    let mut env = vec![(TEST_HELPER_ENV.into(), mode.into())];
+    env.extend(
+        extra_env
+            .iter()
+            .map(|(key, value)| ((*key).into(), value.as_os_str().to_owned())),
+    );
+    Arc::new(HelperPool::new(
+        pool::HelperLauncher {
+            program: Some(std::env::current_exe().unwrap()),
+            args: [
+                "--exact",
+                "safe_asset_protocol::tests::pooled_helper_process_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            env,
+            // libtest prints its banner before the entry runs.
+            max_preamble_bytes: 4096,
+        },
+        deadline,
+    ))
+}
+
+fn serving_pool() -> Arc<HelperPool> {
+    test_pool("serve", Duration::from_secs(30), &[])
+}
+
+fn multi_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn get_request_for(path: &Path) -> Request<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let encoded = percent_encoding::percent_encode(
+        path.as_os_str().as_bytes(),
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://opentake.local/{encoded}"))
+        .body(Vec::new())
+        .unwrap()
+}
+
+#[cfg(not(unix))]
+fn get_request_for(path: &Path) -> Request<Vec<u8>> {
+    let encoded = percent_encoding::percent_encode(
+        path.to_str().unwrap().as_bytes(),
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://opentake.local/{encoded}"))
+        .body(Vec::new())
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn response_for_request_rejects_scope_only_alias_that_resolves_outside_scope() {
+    use std::os::unix::fs::symlink;
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    app.manage(AppCore::new());
+    let cache_root = app.path().app_cache_dir().unwrap();
+    std::fs::create_dir_all(&cache_root).unwrap();
+    let cache_directory = tempfile::Builder::new()
+        .prefix("safe-asset-cache-alias-")
+        .tempdir_in(&cache_root)
+        .unwrap();
+    let outside = local_tempdir();
+    let final_path = outside.path().join("outside.jpg");
+    std::fs::write(&final_path, b"outside").unwrap();
+    let alias = cache_directory.path().join("alias");
+    symlink(outside.path(), &alias).unwrap();
+    let requested = alias.join("outside.jpg");
+
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_file(&requested).unwrap();
+    scope.forbid_file(&final_path).unwrap();
+    assert!(scope_allows_lexical_path(&scope, &requested));
+    assert!(!scope_allows_lexical_path(&scope, &final_path));
+
+    // The helper reports the out-of-scope final path before reading; the
+    // parent aborts the read.
+    let request = external_request("scope-only-alias", &requested);
+    let opened = opened_metadata(&request, &open_helper_asset(&request));
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &AppCore::new(),
+        &asset_scope_snapshot(app.handle()),
+        &requested,
+    )
+    .expect("the requested alias itself is lexically approved");
+    assert!(authorize_opened_asset(
+        app.handle(),
+        &AppCore::new(),
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+    )
+    .is_err());
+
+    let pool = serving_pool();
+    let response = multi_thread_runtime().block_on(response_for_request(
+        app.handle(),
+        get_request_for(&requested),
+        &pool,
+    ));
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a ScopeOnly request must reject an out-of-scope retained final path"
+    );
+    assert!(response.body() != b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn response_for_request_rejects_project_media_ancestor_symlink_escape() {
+    use opentake_core::ProbedMedia;
+    use std::os::unix::fs::symlink;
+    use tauri::Manager;
+
+    let approved = local_tempdir();
+    let outside = local_tempdir();
+    let final_path = outside.path().join("outside.mp4");
+    std::fs::write(&final_path, b"outside-project-media").unwrap();
+    let alias = approved.path().join("selected-source");
+    symlink(outside.path(), &alias).unwrap();
+    let requested = alias.join("outside.mp4");
+
+    let core = AppCore::new();
+    core.save_project(Some(approved.path().join("Escape.opentake")))
+        .unwrap();
+    core.import_media_file(&requested, "outside", &ProbedMedia::default())
+        .unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(core);
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_directory(approved.path(), true).unwrap();
+    assert!(scope_allows_lexical_path(&scope, &requested));
+    assert!(!scope_allows_lexical_path(&scope, &final_path));
+
+    let pool = serving_pool();
+    let response = multi_thread_runtime().block_on(response_for_request(
+        app.handle(),
+        get_request_for(&requested),
+        &pool,
+    ));
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "project media must not use a recursive lexical grant to escape through an ancestor symlink"
+    );
+    assert!(response.body() != b"outside-project-media");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_helper_rejects_an_ambient_bundle_replacement() {
+    let directory = local_tempdir();
+    let selected = directory.path().join("Selected.opentake");
+    std::fs::create_dir_all(selected.join("media")).unwrap();
+    std::fs::write(selected.join("media/clip.mp4"), b"project-a").unwrap();
+    let retained = ProjectRoot::open(&selected).unwrap();
+    let expected_identity = retained.stable_identity();
+
+    std::fs::rename(&selected, directory.path().join("Retained-A.opentake")).unwrap();
+    std::fs::create_dir_all(selected.join("media")).unwrap();
+    std::fs::write(selected.join("media/clip.mp4"), b"project-b").unwrap();
+
+    let request = HelperRequest {
+        project: Some(HelperProjectAuthority {
+            project_epoch: 7,
+            project_path: selected.to_string_lossy().into_owned(),
+            root_identity: expected_identity,
+        }),
+        ..external_request("test-token", &selected.join("media/clip.mp4"))
+    };
+
+    let (opened, response) = helper_exchange(&request);
+    assert!(matches!(
+        opened.error_kind,
+        Some(WireIoErrorKind::PermissionDenied)
+    ));
+    assert!(response.body.is_empty());
+}
+
+#[test]
+fn current_project_authority_allows_nested_media_without_recursive_scope() {
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let bundle = directory.path().join("ExactRootGrant.opentake");
+    let core = AppCore::new();
+    core.save_project(Some(bundle.clone())).unwrap();
+    std::fs::create_dir_all(bundle.join("media")).unwrap();
+    let media = bundle.join("media/clip.mp4");
+    std::fs::write(&media, b"project-media").unwrap();
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_file(&bundle).unwrap();
+    assert!(!scope_allows_lexical_path(&scope, &media));
+
+    let authority = project_request_authority(&core, &asset_scope_snapshot(app.handle()), &media)
+        .unwrap()
+        .expect("current retained project is nested-media authority");
+    let request = HelperRequest {
+        project: HelperProjectAuthority::from_core(&authority),
+        ..external_request("test-token", &media)
+    };
+    let (opened, response) = helper_exchange(&request);
+    assert!(authorize_opened_asset(
+        app.handle(),
+        &core,
+        Some(&authority),
+        None,
+        &request.token,
+        &opened
+    )
+    .is_ok());
+    assert_eq!(response.metadata.status, StatusCode::OK.as_u16());
+    assert_eq!(response.body, b"project-media");
+}
+
+/// Build a project whose opened path runs through a symlinked ancestor
+/// (`link -> real`, like macOS `/tmp -> /private/tmp` or a linked volume) and
+/// return the pieces of one authorized project-asset read of `media/a.png`.
+#[cfg(unix)]
+fn symlinked_ancestor_project_read(
+    directory: &Path,
+) -> (
+    AppCore,
+    PathBuf,
+    PathBuf,
+    ProjectAssetAuthority,
+    HelperRequest,
+) {
+    use std::os::unix::fs::symlink;
+
+    let real = directory.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = directory.join("link");
+    symlink(&real, &link).unwrap();
+    let bundle = link.join("P.opentake");
+    let core = AppCore::new();
+    core.save_project(Some(bundle.clone())).unwrap();
+    std::fs::create_dir_all(bundle.join("media")).unwrap();
+    let media = bundle.join("media/a.png");
+    std::fs::write(&media, b"png-bytes").unwrap();
+
+    let app = tauri::test::mock_app();
+    let authority = project_request_authority(&core, &asset_scope_snapshot(app.handle()), &media)
+        .unwrap()
+        .expect("the opened project path is the nested-media authority");
+    assert_eq!(authority.project_path, bundle);
+    let request = HelperRequest {
+        project: HelperProjectAuthority::from_core(&authority),
+        ..external_request("symlinked-ancestor-token", &media)
+    };
+    (core, real, media, authority, request)
+}
+
+#[cfg(unix)]
+#[test]
+fn project_assets_behind_a_symlinked_ancestor_are_served() {
+    let directory = local_tempdir();
+    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    let (opened, isolated) = helper_exchange(&request);
+    let final_path = PathBuf::from(isolated.metadata.final_path.clone().unwrap());
+    assert_eq!(
+        final_path,
+        real.join("P.opentake/media/a.png"),
+        "the retained handle reports the resolved path, not the opened alias"
+    );
+    let app = tauri::test::mock_app();
+
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        Some(&authority),
+        None,
+        &request.token,
+        &opened,
+        isolated,
+    );
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a symlinked ancestor must not turn the retained root into a 403"
+    );
+    assert_eq!(response.body(), b"png-bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_assets_require_the_retained_root_identity_after_the_read() {
+    let directory = local_tempdir();
+    let (core, _, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    let app = tauri::test::mock_app();
+    let other_identity = ProjectRootIdentity {
+        volume: authority.root_identity.volume,
+        file: authority.root_identity.file.wrapping_add(1),
+    };
+
+    for identity in [Some(other_identity), None] {
+        // A helper that reports a different root before the read is refused
+        // before any byte is read...
+        let (mut opened, _) = helper_exchange(&request);
+        opened.project_root_identity = identity;
+        assert!(authorize_opened_asset(
+            app.handle(),
+            &core,
+            Some(&authority),
+            None,
+            &request.token,
+            &opened
+        )
+        .is_err());
+
+        // ...and bytes served through any other root are never published,
+        // whether the helper reports it consistently or only after the read.
+        let (mut opened, mut consistent) = helper_exchange(&request);
+        opened.project_root_identity = identity;
+        consistent.metadata.project_root_identity = identity;
+        let (opened_honestly, mut switched) = helper_exchange(&request);
+        switched.metadata.project_root_identity = identity;
+        for (opened, isolated) in [(opened, consistent), (opened_honestly, switched)] {
+            let response = isolated_response_to_http(
+                app.handle(),
+                &core,
+                Some(&authority),
+                None,
+                &request.token,
+                &opened,
+                isolated,
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "bytes read through any root other than the retained one must not be published"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn project_asset_read_rejects_a_bundle_replaced_behind_the_symlinked_ancestor() {
+    let directory = local_tempdir();
+    let (core, real, _, authority, request) = symlinked_ancestor_project_read(directory.path());
+    std::fs::rename(real.join("P.opentake"), real.join("Parked.opentake")).unwrap();
+    std::fs::create_dir_all(real.join("P.opentake/media")).unwrap();
+    std::fs::write(real.join("P.opentake/media/a.png"), b"replacement").unwrap();
+    let app = tauri::test::mock_app();
+
+    let (opened, isolated) = helper_exchange(&request);
+    assert!(isolated.body.is_empty());
+    assert!(authorize_opened_asset(
+        app.handle(),
+        &core,
+        Some(&authority),
+        None,
+        &request.token,
+        &opened
+    )
+    .is_err());
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        Some(&authority),
+        None,
+        &request.token,
+        &opened,
+        isolated,
+    );
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.body() != b"replacement");
+}
+
+#[cfg(unix)]
+#[test]
+fn home_thumbnail_behind_a_symlinked_ancestor_is_authorized_exactly() {
+    use std::os::unix::fs::symlink;
+    use tauri::Manager;
+
+    let directory = local_tempdir();
+    let real = directory.path().join("real");
+    std::fs::create_dir_all(real.join("Recent.opentake")).unwrap();
+    let link = directory.path().join("link");
+    symlink(&real, &link).unwrap();
+    let thumbnail = link.join("Recent.opentake/thumbnail.jpg");
+    std::fs::write(&thumbnail, b"jpeg").unwrap();
+
+    let final_path = validate_resident_home_thumbnail(&thumbnail).unwrap();
+    assert_eq!(final_path, real.join("Recent.opentake/thumbnail.jpg"));
+
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_file(&thumbnail).unwrap();
+    scope.allow_file(&final_path).unwrap();
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &AppCore::new(),
+        &asset_scope_snapshot(app.handle()),
+        &thumbnail,
+    )
+    .expect("the exact thumbnail grants authorize the Home cover");
+    let request = external_request("home-thumbnail-token", &thumbnail);
+    let (opened, isolated) = helper_exchange(&request);
+    let response = isolated_response_to_http(
+        app.handle(),
+        &AppCore::new(),
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+        isolated,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body(), b"jpeg");
+    assert!(
+        !scope_allows_lexical_path(&scope, &link.join("Recent.opentake/project.json")),
+        "the thumbnail grant must stay exact"
+    );
+}
+
 #[test]
 fn home_thumbnail_exception_requires_an_exact_file_grant() {
     use tauri::Manager;
@@ -591,13 +763,20 @@ fn home_thumbnail_exception_requires_an_exact_file_grant() {
     let scope = app.handle().asset_protocol_scope();
 
     scope.allow_directory(&bundle, true).unwrap();
-    assert!(!is_home_thumbnail_exception(&scope, &thumbnail, &bundle));
+    assert!(!is_home_thumbnail_exception(
+        &asset_scope_snapshot(app.handle()),
+        &thumbnail,
+        &bundle
+    ));
     scope.allow_file(&thumbnail).unwrap();
-    assert!(is_home_thumbnail_exception(&scope, &thumbnail, &bundle));
+    let snapshot = asset_scope_snapshot(app.handle());
+    assert!(is_home_thumbnail_exception(&snapshot, &thumbnail, &bundle));
     assert!(matches!(
-        non_project_asset_authority(app.handle(), &AppCore::new(), &scope, &thumbnail),
-        Some(NonProjectAssetAuthority::ScopeOnly { requested_path, .. })
-            if requested_path == normalized_path(&thumbnail)
+        non_project_asset_authority(app.handle(), &AppCore::new(), &snapshot, &thumbnail),
+        Some(NonProjectAssetAuthority::ScopeOnly {
+            kind: ScopeOnlyKind::HomeThumbnail,
+            requested_path,
+        }) if requested_path == normalized_path(&thumbnail)
     ));
 }
 
@@ -630,28 +809,35 @@ fn exact_external_grants_follow_the_active_project_while_static_roots_remain_ava
     let app = tauri::test::mock_app();
     let scope = app.handle().asset_protocol_scope();
     scope.allow_directory(directory.path(), true).unwrap();
+    let authority = |path: &Path| {
+        non_project_asset_authority(
+            app.handle(),
+            &core,
+            &asset_scope_snapshot(app.handle()),
+            path,
+        )
+    };
     let epoch_a = core.project_revision().project_epoch;
     assert!(matches!(
-        non_project_asset_authority(app.handle(), &core, &scope, &source_a),
+        authority(&source_a),
         Some(NonProjectAssetAuthority::ProjectMedia {
             project_epoch,
             requested_path,
-            ..
         }) if project_epoch == epoch_a && requested_path == normalized_path(&source_a)
     ));
     let unreferenced_sibling = directory.path().join("unreferenced.mp4");
     std::fs::write(&unreferenced_sibling, b"unreferenced").unwrap();
     assert!(
-        non_project_asset_authority(app.handle(), &core, &scope, &unreferenced_sibling).is_none(),
+        authority(&unreferenced_sibling).is_none(),
         "a recursive dialog grant must not expose a sibling absent from the active manifest"
     );
 
     core.open_project(bundle_b).unwrap();
     assert!(
-        non_project_asset_authority(app.handle(), &core, &scope, &source_a).is_none(),
+        authority(&source_a).is_none(),
         "persisted exact grants from project A must not remain active after opening B"
     );
-    assert!(non_project_asset_authority(app.handle(), &core, &scope, &source_b).is_some());
+    assert!(authority(&source_b).is_some());
 
     let cache = app.path().app_cache_dir().unwrap();
     std::fs::create_dir_all(&cache).unwrap();
@@ -659,14 +845,36 @@ fn exact_external_grants_follow_the_active_project_while_static_roots_remain_ava
     std::fs::write(&derived, b"png").unwrap();
     scope.allow_directory(&cache, true).unwrap();
     assert!(
-        non_project_asset_authority(app.handle(), &core, &scope, &derived).is_some(),
+        authority(&derived).is_some(),
         "application cache/resource roots must not be coupled to the project media set"
     );
 }
 
+/// External project media shared by the identity tests below: `requested`
+/// is imported into a saved project and exactly granted.
+fn external_media_fixture(
+    directory: &Path,
+    requested: &Path,
+) -> (tauri::App<tauri::test::MockRuntime>, AppCore) {
+    use opentake_core::ProbedMedia;
+    use tauri::Manager;
+
+    let core = AppCore::new();
+    core.save_project(Some(directory.join("External.opentake")))
+        .unwrap();
+    core.import_media_file(requested, "selected", &ProbedMedia::default())
+        .unwrap();
+    let app = tauri::test::mock_app();
+    app.handle()
+        .asset_protocol_scope()
+        .allow_file(requested)
+        .unwrap();
+    (app, core)
+}
+
 #[cfg(unix)]
 #[test]
-fn external_authority_is_bound_to_the_exact_requested_path_across_ancestor_rebinding() {
+fn a_symlink_swapped_in_during_a_read_never_publishes_the_other_file() {
     use opentake_core::ProbedMedia;
     use std::os::unix::fs::symlink;
     use tauri::Manager;
@@ -689,58 +897,77 @@ fn external_authority_is_bound_to_the_exact_requested_path_across_ancestor_rebin
         .unwrap();
     core.import_media_file(&requested, "selected", &ProbedMedia::default())
         .unwrap();
-    // Keep the rebound target referenced by the same current project. An epoch-only
-    // token would otherwise treat the two distinct paths as interchangeable.
+    // Keep the rebound target referenced by the same current project, so
+    // only identity binding (not manifest membership) can reject it.
     core.import_media_file(&source_b, "other", &ProbedMedia::default())
         .unwrap();
-
     let app = tauri::test::mock_app();
     let scope = app.handle().asset_protocol_scope();
     scope.allow_directory(directory.path(), true).unwrap();
-    let expected = non_project_asset_authority(app.handle(), &core, &scope, &requested)
-        .expect("the selected source must be authorized before the race");
-    let request = HelperRequest {
-        token: "ancestor-swap-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: requested.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: None,
-    };
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &core,
+        &asset_scope_snapshot(app.handle()),
+        &requested,
+    )
+    .expect("the selected source is authorized");
+    let request = external_request("ancestor-swap-token", &requested);
 
+    // The helper opened A and the parent authorized that identity...
+    let opened_a = open_helper_asset(&request);
+    let opened = opened_metadata(&request, &opened_a);
+    let opened_a = opened_a.unwrap();
+    assert!(authorize_opened_asset(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        &request.token,
+        &opened
+    )
+    .is_ok());
+    // ...then the ancestor is rebound to B during the read.
     std::fs::remove_file(&alias).unwrap();
     symlink(&source_b_dir, &alias).unwrap();
-    let (_, final_path) = open_retained_regular_file(&requested).unwrap();
-    assert!(paths_equal_for_authority(&final_path, &source_b));
-    let rebound = non_project_asset_authority(app.handle(), &core, &scope, &final_path)
-        .expect("the other path is independently referenced by the same project");
 
-    assert_ne!(
-        expected, rebound,
-        "authorization must retain the exact requested path, not just project epoch"
-    );
+    // Serving from the retained handle still yields A's bytes.
     let response = isolated_response_to_http(
         app.handle(),
         &core,
-        &scope,
         None,
-        Some(expected),
+        Some(&expected),
         &request.token,
-        helper_response(&request),
+        &opened,
+        serve_helper_asset(&request, opened_a),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body(), b"project-a");
+
+    // A helper that answers with B after A was authorized is refused.
+    let (_, served_b) = helper_exchange(&request);
+    assert!(paths_equal_for_authority(
+        Path::new(served_b.metadata.final_path.as_deref().unwrap()),
+        &source_b
+    ));
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+        served_b,
     );
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "the helper must not publish B bytes under A's pre-race authorization"
+        "the helper must not publish B bytes under A's authorized identity"
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn response_for_request_rejects_an_exact_project_media_alias_rebound_before_authorization() {
-    use opentake_core::ProbedMedia;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use tauri::Manager;
 
@@ -755,15 +982,9 @@ fn response_for_request_rejects_an_exact_project_media_alias_rebound_before_auth
     symlink(source_a.path(), &alias).unwrap();
     let requested = alias.join("clip.mp4");
 
-    let core = AppCore::new();
-    core.save_project(Some(selected.path().join("Rebound.opentake")))
-        .unwrap();
-    core.import_media_file(&requested, "selected", &ProbedMedia::default())
-        .unwrap();
-    let app = tauri::test::mock_app();
+    let (app, core) = external_media_fixture(selected.path(), &requested);
     app.manage(core);
     let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&requested).unwrap();
 
     std::fs::remove_file(&alias).unwrap();
     symlink(source_b.path(), &alias).unwrap();
@@ -772,24 +993,11 @@ fn response_for_request_rejects_an_exact_project_media_alias_rebound_before_auth
     assert!(scope_allows_lexical_path(&scope, &requested));
     assert!(!scope_allows_lexical_path(&scope, &final_b));
 
-    let encoded = percent_encoding::percent_encode(
-        requested.as_os_str().as_bytes(),
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!("http://opentake.local/{encoded}"))
-        .body(Vec::new())
-        .unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let response = runtime.block_on(response_for_request(
+    let pool = serving_pool();
+    let response = multi_thread_runtime().block_on(response_for_request(
         app.handle(),
-        &scope,
-        request,
-        Arc::new(Semaphore::new(0)),
+        get_request_for(&requested),
+        &pool,
     ));
 
     assert_eq!(
@@ -797,14 +1005,13 @@ fn response_for_request_rejects_an_exact_project_media_alias_rebound_before_auth
         StatusCode::FORBIDDEN,
         "an exact grant for A must not authorize B after the alias is rebound before the request"
     );
+    assert!(response.body() != b"project-b");
 }
 
 #[cfg(unix)]
 #[test]
 fn stable_external_alias_remains_authorized_for_the_same_opened_file() {
-    use opentake_core::ProbedMedia;
     use std::os::unix::fs::symlink;
-    use tauri::Manager;
 
     let selected_directory = local_tempdir();
     let source_directory = local_tempdir();
@@ -814,160 +1021,539 @@ fn stable_external_alias_remains_authorized_for_the_same_opened_file() {
     symlink(source_directory.path(), &alias).unwrap();
     let requested = alias.join("clip.mp4");
 
-    let core = AppCore::new();
-    core.save_project(Some(selected_directory.path().join("Stable.opentake")))
-        .unwrap();
-    core.import_media_file(&requested, "selected", &ProbedMedia::default())
-        .unwrap();
-    let app = tauri::test::mock_app();
+    let (app, core) = external_media_fixture(selected_directory.path(), &requested);
     let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&requested).unwrap();
     assert!(scope_allows_lexical_path(&scope, &requested));
     assert!(scope_allows_lexical_path(&scope, &source));
-    let expected = non_project_asset_authority(app.handle(), &core, &scope, &requested)
-        .expect("stable alias is initially authorized");
-    let request = HelperRequest {
-        token: "stable-alias-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: requested.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: None,
-    };
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &core,
+        &asset_scope_snapshot(app.handle()),
+        &requested,
+    )
+    .expect("stable alias is initially authorized");
+    let request = external_request("stable-alias-token", &requested);
+    let (opened, isolated) = helper_exchange(&request);
 
     let response = isolated_response_to_http(
         app.handle(),
         &core,
-        &scope,
         None,
-        Some(expected),
+        Some(&expected),
         &request.token,
-        helper_response(&request),
+        &opened,
+        isolated,
     );
 
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "an unchanged alias to the initially retained file must remain valid"
+        "an unchanged alias to the retained file must remain valid"
     );
     assert_eq!(response.body(), b"stable-alias");
 }
 
 #[test]
 fn external_authority_rejects_same_path_identity_replacement() {
-    use opentake_core::ProbedMedia;
-    use tauri::Manager;
-
     let directory = local_tempdir();
     let requested = directory.path().join("selected.mp4");
     let parked = directory.path().join("selected-original.mp4");
     std::fs::write(&requested, b"original-file").unwrap();
 
-    let core = AppCore::new();
-    core.save_project(Some(directory.path().join("Replacement.opentake")))
-        .unwrap();
-    core.import_media_file(&requested, "selected", &ProbedMedia::default())
-        .unwrap();
-    let app = tauri::test::mock_app();
-    let scope = app.handle().asset_protocol_scope();
-    scope.allow_file(&requested).unwrap();
-    let expected = non_project_asset_authority(app.handle(), &core, &scope, &requested)
-        .expect("original path is initially authorized");
-    let request = HelperRequest {
-        token: "same-path-replacement-token".to_owned(),
-        parent_pid: std::process::id(),
-        path: requested.to_string_lossy().into_owned(),
-        head_only: false,
-        range: None,
-        if_range: None,
-        project: None,
-    };
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &core,
+        &asset_scope_snapshot(app.handle()),
+        &requested,
+    )
+    .expect("original path is initially authorized");
+    let request = external_request("same-path-replacement-token", &requested);
+    let (opened, _) = helper_exchange(&request);
 
     std::fs::rename(&requested, &parked).unwrap();
     std::fs::write(&requested, b"replacement-file").unwrap();
+    let (_, replacement) = helper_exchange(&request);
     let response = isolated_response_to_http(
         app.handle(),
         &core,
-        &scope,
         None,
-        Some(expected),
+        Some(&expected),
         &request.token,
-        helper_response(&request),
+        &opened,
+        replacement,
     );
 
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "the same pathname must not authorize a different retained file identity"
+        "the same pathname must not publish a different file identity than the one authorized"
     );
+}
+
+#[test]
+fn a_helper_answering_for_the_wrong_token_is_never_published() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let expected = non_project_asset_authority(
+        app.handle(),
+        &core,
+        &asset_scope_snapshot(app.handle()),
+        &requested,
+    )
+    .unwrap();
+    let request = external_request("the-right-token", &requested);
+    let (opened, isolated) = helper_exchange(&request);
+
+    assert!(authorize_opened_asset(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        "another-request",
+        &opened
+    )
+    .is_err());
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        "another-request",
+        &opened,
+        isolated,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[test]
+fn authorization_revoked_between_request_and_response_is_rejected() {
+    use opentake_core::ProbedMedia;
+
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let authorize = |app: &tauri::App<tauri::test::MockRuntime>, core: &AppCore| {
+        non_project_asset_authority(
+            app.handle(),
+            core,
+            &asset_scope_snapshot(app.handle()),
+            &requested,
+        )
+        .expect("authorized at request time")
+    };
+    let request = external_request("revocation-token", &requested);
+
+    // 1. The scope grant is revoked (deny precedence) during the read.
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let expected = authorize(&app, &core);
+    let (opened, isolated) = helper_exchange(&request);
+    app.handle()
+        .asset_protocol_scope()
+        .forbid_file(&requested)
+        .unwrap();
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+        isolated,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 2. The media is removed from the manifest during the read.
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let expected = authorize(&app, &core);
+    let (opened, isolated) = helper_exchange(&request);
+    let ids = core
+        .media()
+        .entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    core.apply(opentake_ops::command::EditCommand::DeleteMedia { asset_ids: ids })
+        .unwrap();
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+        isolated,
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 3. Another project that references the same file is opened.
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let expected = authorize(&app, &core);
+    let (opened, isolated) = helper_exchange(&request);
+    let other = AppCore::new();
+    let other_bundle = directory.path().join("Other.opentake");
+    other.save_project(Some(other_bundle.clone())).unwrap();
+    other
+        .import_media_file(&requested, "same", &ProbedMedia::default())
+        .unwrap();
+    other.save_project(None).unwrap();
+    core.open_project(other_bundle).unwrap();
+    let response = isolated_response_to_http(
+        app.handle(),
+        &core,
+        None,
+        Some(&expected),
+        &request.token,
+        &opened,
+        isolated,
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an authorization bound to the previous project epoch must not publish"
+    );
+}
+
+#[test]
+fn external_authorization_opens_nothing_and_reuses_one_index_per_revision() {
+    let directory = local_tempdir();
+    // The file does not exist: authorization is lexical, so it must still
+    // succeed without touching the file system. The helper reports NotFound.
+    let requested = directory.path().join("not-yet-on-disk.mp4");
+    let (app, core) = external_media_fixture(directory.path(), &requested);
+    let scope = asset_scope_snapshot(app.handle());
+
+    let expected = non_project_asset_authority(app.handle(), &core, &scope, &requested)
+        .expect("lexical authorization needs no file I/O");
+    let first = external_media_index(&core);
+    for _ in 0..100 {
+        assert_eq!(
+            non_project_asset_authority(app.handle(), &core, &scope, &requested).as_ref(),
+            Some(&expected)
+        );
+        assert!(Arc::ptr_eq(&first, &external_media_index(&core)));
+    }
+    let request = external_request("missing-token", &requested);
+    let (opened, _) = helper_exchange(&request);
+    assert!(matches!(opened.error_kind, Some(WireIoErrorKind::NotFound)));
 }
 
 #[cfg(target_os = "windows")]
 #[test]
-fn external_authority_accepts_windows_case_equivalent_final_paths() {
-    let expected = NonProjectAssetAuthority::ProjectMedia {
-        project_epoch: 7,
-        requested_path: PathBuf::from(r"C:\Media\Clip.mp4"),
-        initial_final_path: PathBuf::from(r"C:\Media\Clip.mp4"),
-        initial_etag: "\"volume-file-length-time\"".to_owned(),
-    };
-    let refreshed = expected.clone();
-
-    assert!(non_project_response_matches_authority(
-        &expected,
-        Path::new(r"c:\media\CLIP.MP4"),
-        Some("\"volume-file-length-time\""),
-        Some(&refreshed),
-    ));
+fn external_authority_accepts_windows_case_equivalent_paths() {
+    assert_eq!(
+        authority_key(Path::new(r"C:\Media\Clip.mp4")),
+        authority_key(Path::new(r"c:\media\CLIP.MP4"))
+    );
+    assert_eq!(
+        authority_key(Path::new(r"\\?\C:\Media\Clip.mp4")),
+        authority_key(Path::new(r"C:\Media\Clip.mp4"))
+    );
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    scope.allow_file(r"C:\Media\Clip.mp4").unwrap();
+    assert!(asset_scope_snapshot(app.handle()).allows(Path::new(r"c:\media\CLIP.MP4")));
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn helper_rejects_a_parent_that_is_not_the_same_executable() {
-    // The Rust test harness is launched by Cargo, so its live parent is a
-    // different executable. A self-issued token/PID pair is insufficient.
-    let parent_pid = actual_parent_process_id().unwrap();
-    assert!(!parent_is_same_executable(parent_pid).unwrap());
+fn pooled_helpers_are_reused_across_range_requests() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    let bytes = (0..=255_u8).cycle().take(64 * 1024).collect::<Vec<_>>();
+    std::fs::write(&requested, &bytes).unwrap();
+    let pool = serving_pool();
+
+    multi_thread_runtime().block_on(async {
+        for index in 0..100_usize {
+            let start = (index * 512) % (bytes.len() - 512);
+            let request = HelperRequest {
+                range: Some(format!("bytes={start}-{}", start + 511)),
+                ..external_request(&pool::random_token(), &requested)
+            };
+            let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await.unwrap();
+            let HelperOutcome::Served { response, .. } = outcome else {
+                panic!("the helper must serve an authorized range");
+            };
+            assert_eq!(
+                response.metadata.status,
+                StatusCode::PARTIAL_CONTENT.as_u16()
+            );
+            assert_eq!(response.body, bytes[start..start + 512]);
+        }
+    });
+    eprintln!(
+        "helper spawns per 100 sequential Range requests: {}",
+        pool.spawned()
+    );
+    assert!(pool.spawned() <= pool::HELPER_POOL_SIZE);
+    assert_eq!(pool.spawned(), 1, "sequential requests reuse one helper");
+}
+
+#[test]
+fn a_refused_identity_is_never_read_and_the_helper_stays_usable() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"secret").unwrap();
+    let pool = serving_pool();
+
+    multi_thread_runtime().block_on(async {
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool
+            .exchange(&request, |opened| {
+                assert!(opened.final_path.is_some() && opened.etag.is_some());
+                Err("refused")
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, HelperOutcome::Refused("refused")));
+
+        let missing = external_request(&pool::random_token(), &directory.path().join("gone.mp4"));
+        let outcome = pool.exchange(&missing, |_| Ok::<(), ()>(())).await.unwrap();
+        assert!(matches!(outcome, HelperOutcome::OpenFailed(_)));
+
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await.unwrap();
+        assert!(matches!(outcome, HelperOutcome::Served { .. }));
+    });
+    assert_eq!(pool.spawned(), 1);
+}
+
+#[test]
+fn a_hung_helper_is_killed_and_replaced() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let marker = directory.path().join("hung-once");
+    let pool = test_pool(
+        "hang-once",
+        Duration::from_secs(2),
+        &[(TEST_HELPER_MARKER_ENV, &marker)],
+    );
+
+    multi_thread_runtime().block_on(async {
+        let request = external_request(&pool::random_token(), &requested);
+        let error = pool
+            .exchange(&request, |_| Ok::<(), ()>(()))
+            .await
+            .err()
+            .expect("the hung helper must time out");
+        assert!(matches!(error, IsolatedHelperError::TimedOut));
+        assert!(marker.exists());
+        // The stuck helper was killed and reaped, returning its slot.
+        assert_eq!(pool.available_slots(), pool::HELPER_POOL_SIZE);
+
+        let request = external_request(&pool::random_token(), &requested);
+        let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await.unwrap();
+        let HelperOutcome::Served { response, .. } = outcome else {
+            panic!("the replacement helper must serve");
+        };
+        assert_eq!(response.body, b"clip");
+    });
+    assert_eq!(pool.spawned(), 2);
+}
+
+#[test]
+fn a_helper_answering_with_another_token_is_killed() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let pool = test_pool("wrong-token", Duration::from_secs(30), &[]);
+
+    multi_thread_runtime().block_on(async {
+        let request = external_request(&pool::random_token(), &requested);
+        let mut authorized = false;
+        let error = pool
+            .exchange(&request, |_| {
+                authorized = true;
+                Ok::<(), ()>(())
+            })
+            .await
+            .err()
+            .expect("a mismatched token is a protocol error");
+        assert!(matches!(error, IsolatedHelperError::InvalidResponse));
+        assert!(
+            !authorized,
+            "a forged identity must not reach authorization"
+        );
+        assert_eq!(pool.available_slots(), pool::HELPER_POOL_SIZE);
+        assert!(pool.idle_helper_ids().is_empty());
+    });
 }
 
 #[cfg(unix)]
 #[test]
-fn helper_request_pipe_reaches_eof_before_waiting_for_the_response() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("cat >/dev/null; printf ready")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+fn retiring_the_pool_reaps_every_helper_process() {
+    let directory = local_tempdir();
+    let requested = directory.path().join("clip.mp4");
+    std::fs::write(&requested, b"clip").unwrap();
+    let pool = serving_pool();
 
-        let exchange = write_helper_request_before_response(stdin, b"request", async {
-            let mut response = [0_u8; 5];
-            stdout
-                .read_exact(&mut response)
-                .await
-                .map_err(|_| IsolatedHelperError::Io)?;
-            Ok(response)
-        });
-        let response = tokio::time::timeout(Duration::from_millis(500), exchange)
-            .await
-            .expect("helper must observe request EOF before the parent waits for its response")
-            .unwrap();
-        assert_eq!(&response, b"ready");
-        assert!(child.wait().await.unwrap().success());
+    multi_thread_runtime().block_on(async {
+        let requests = (0..pool::HELPER_POOL_SIZE)
+            .map(|_| external_request(&pool::random_token(), &requested))
+            .collect::<Vec<_>>();
+        let exchanges = requests
+            .iter()
+            .map(|request| pool.exchange(request, |_| Ok::<(), ()>(())));
+        for outcome in futures_util::future::join_all(exchanges).await {
+            assert!(matches!(outcome, Ok(HelperOutcome::Served { .. })));
+        }
+        let helper_ids = pool.idle_helper_ids();
+        assert!(!helper_ids.is_empty() && helper_ids.len() <= pool::HELPER_POOL_SIZE);
+
+        pool.retire_idle_for_test().await;
+        assert!(pool.idle_helper_ids().is_empty());
+        assert_eq!(pool.available_slots(), pool::HELPER_POOL_SIZE);
+        for process_id in helper_ids {
+            // SAFETY: signal 0 only probes whether the reaped PID exists.
+            assert_eq!(unsafe { libc::kill(process_id as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
     });
 }
 
+#[test]
+fn quarantined_slots_fail_fast_without_spawning() {
+    let pool = Arc::new(HelperPool::with_slots(
+        pool::HelperLauncher {
+            program: Some(PathBuf::from("/nonexistent-helper")),
+            args: Vec::new(),
+            env: Vec::new(),
+            max_preamble_bytes: 0,
+        },
+        Duration::from_secs(1),
+        0,
+    ));
+    let request = external_request("degraded", Path::new("/nonexistent.mp4"));
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(pool.exchange(&request, |_| Ok::<(), ()>(())));
+    assert!(matches!(outcome, Err(IsolatedHelperError::Degraded)));
+    assert_eq!(pool.spawned(), 0);
+}
+
+#[test]
+fn a_burst_of_64_thumbnail_requests_waits_instead_of_failing() {
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    app.manage(AppCore::new());
+    let cache_root = app.path().app_cache_dir().unwrap();
+    std::fs::create_dir_all(&cache_root).unwrap();
+    let thumbnails = tempfile::Builder::new()
+        .prefix("safe-asset-burst-")
+        .tempdir_in(&cache_root)
+        .unwrap();
+    app.handle()
+        .asset_protocol_scope()
+        .allow_directory(thumbnails.path(), true)
+        .unwrap();
+    let paths = (0..64)
+        .map(|index| {
+            let path = thumbnails.path().join(format!("thumb-{index}.jpg"));
+            std::fs::write(&path, format!("jpeg-{index}")).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let protocol = SafeAssetProtocol::with_pool(serving_pool());
+    let handle = app.handle().clone();
+
+    let responses = multi_thread_runtime().block_on(async move {
+        let requests = paths.iter().map(|path| {
+            let protocol = protocol.clone();
+            let handle = handle.clone();
+            let request = get_request_for(path);
+            tokio::spawn(async move { protocol.serve(&handle, request).await })
+        });
+        let mut responses = Vec::new();
+        for response in futures_util::future::join_all(requests).await {
+            responses.push(response.unwrap());
+        }
+        (responses, protocol.pool.spawned())
+    });
+    let (responses, spawned) = responses;
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response.status(), StatusCode::OK, "request {index}");
+        assert_eq!(response.body(), format!("jpeg-{index}").as_bytes());
+    }
+    assert!(spawned <= pool::HELPER_POOL_SIZE);
+}
+
+#[test]
+fn media_ranges_are_capped_at_the_streaming_budget() {
+    let directory = local_tempdir();
+    let path = directory.path().join("clip.mp4");
+    let file = File::create(&path).unwrap();
+    file.set_len(MAX_RANGE_BYTES * 3).unwrap();
+    let open_ended = tauri::http::HeaderValue::from_static("bytes=0-");
+
+    let response = serve_open_file(&path, None, false, Some(&open_ended)).unwrap();
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body().len() as u64, MAX_RANGE_BYTES);
+    assert_eq!(
+        response.headers()[CONTENT_RANGE],
+        format!("bytes 0-{}/{}", MAX_RANGE_BYTES - 1, MAX_RANGE_BYTES * 3)
+    );
+}
+
+/// Measurement for the pull request (run with `--release --ignored`): lexical
+/// authorization cost with 5000 external manifest entries and 5000 exact
+/// scope grants.
+#[test]
+#[ignore = "benchmark; run explicitly in release mode"]
+fn benchmark_external_authorization_with_5000_entries() {
+    use opentake_core::ProbedMedia;
+
+    let directory = local_tempdir();
+    let core = AppCore::new();
+    core.save_project(Some(directory.path().join("Bench.opentake")))
+        .unwrap();
+    let app = tauri::test::mock_app();
+    let scope = app.handle().asset_protocol_scope();
+    let paths = (0..5000)
+        .map(|index| directory.path().join(format!("media/clip-{index:05}.mp4")))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        core.import_media_file(path, "clip", &ProbedMedia::default())
+            .unwrap();
+        scope.allow_file(path).unwrap();
+    }
+    // Warm the scope snapshot and index once, as the first request would.
+    let first = std::time::Instant::now();
+    assert!(non_project_asset_authority(
+        app.handle(),
+        &core,
+        &asset_scope_snapshot(app.handle()),
+        &paths[0]
+    )
+    .is_some());
+    let cold = first.elapsed();
+    let rounds = 10_000;
+    let started = std::time::Instant::now();
+    for index in 0..rounds {
+        let scope = asset_scope_snapshot(app.handle());
+        let path = &paths[(index * 7919) % paths.len()];
+        assert!(non_project_asset_authority(app.handle(), &core, &scope, path).is_some());
+    }
+    let warm = started.elapsed() / rounds as u32;
+    let snapshot_started = std::time::Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(core.runtime_snapshot());
+    }
+    let old_snapshot = snapshot_started.elapsed() / 100;
+    eprintln!(
+        "external authorization, 5000 entries: first {cold:?}, then {warm:?} per request \
+         (one runtime_snapshot() alone: {old_snapshot:?})"
+    );
+}
 #[cfg(unix)]
 #[test]
 fn timed_out_isolated_workers_are_killed_reaped_and_capacity_recovers() {
@@ -999,7 +1585,7 @@ fn timed_out_isolated_workers_are_killed_reaped_and_capacity_recovers() {
                         .await
                         .is_err()
                 );
-                terminate_or_quarantine(child, process_slot).await;
+                terminate_or_quarantine(child, None, process_slot).await;
                 process_id
             }));
         }

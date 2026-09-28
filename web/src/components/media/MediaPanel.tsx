@@ -2381,15 +2381,32 @@ export function FolderTile({
 
 /** A failed <img> does not recover when its cached file becomes readable later.
  * Retry only the asset read, not decoding or timeline work. */
+/** Retries after a failed thumbnail load before the card shows its type icon. */
+export const MEDIA_THUMBNAIL_MAX_RETRIES = 6;
+
+/**
+ * Exponential back-off (250 ms doubling to 8 s, about 16 s in total) before
+ * retry `attempt + 1`, or `null` once retries are exhausted. A burst of
+ * thumbnails queues behind playback in the native asset protocol, so a load
+ * can fail transiently (504 or 503 with Retry-After) well after the first
+ * second.
+ */
+export function mediaThumbnailRetryDelayMs(attempt: number): number | null {
+  if (attempt >= MEDIA_THUMBNAIL_MAX_RETRIES) return null;
+  return Math.min(250 * 2 ** attempt, 8000);
+}
+
 function MediaCardThumbnail({ src, name, type }: { src: string; name: string; type: MediaItem["type"] }) {
   const [attempt, setAttempt] = useState(0);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    if (!failed || attempt >= 2) return;
+    if (!failed) return;
+    const delay = mediaThumbnailRetryDelayMs(attempt);
+    if (delay === null) return;
     const timer = window.setTimeout(() => {
       setAttempt((previous) => previous + 1);
       setFailed(false);
-    }, attempt === 0 ? 250 : 1000);
+    }, delay);
     return () => window.clearTimeout(timer);
   }, [attempt, failed]);
 

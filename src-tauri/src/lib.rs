@@ -112,22 +112,12 @@ pub fn run() {
         // an accidental one-argument `convertFileSrc` call cannot reintroduce
         // main-thread File Provider I/O.
         .register_asynchronous_uri_scheme_protocol("asset", move |context, request, responder| {
-            legacy_asset_protocol.respond(
-                context.app_handle().clone(),
-                context.app_handle().asset_protocol_scope(),
-                request,
-                responder,
-            );
+            legacy_asset_protocol.respond(context.app_handle().clone(), request, responder);
         })
         .register_asynchronous_uri_scheme_protocol(
             "opentake-asset",
             move |context, request, responder| {
-                safe_asset_protocol.respond(
-                    context.app_handle().clone(),
-                    context.app_handle().asset_protocol_scope(),
-                    request,
-                    responder,
-                );
+                safe_asset_protocol.respond(context.app_handle().clone(), request, responder);
             },
         )
         .plugin(tauri_plugin_dialog::init())
@@ -349,6 +339,13 @@ pub fn run() {
                 });
             app.manage(media::StemSeparationState::new(install_admission.clone()));
             app.manage(media::MediaProxyState::new(install_admission.clone()));
+            // Pooled asset helpers never outlive the project they served.
+            app.state::<AppCore>()
+                .subscribe_project_identity_transition(|pending| {
+                    if !pending {
+                        safe_asset_protocol::retire_helper_pool();
+                    }
+                });
             let proxy_transition_handle = app.handle().clone();
             app.state::<AppCore>()
                 .subscribe_project_identity_transition(move |pending| {
@@ -550,6 +547,7 @@ pub fn run() {
                     motion.cancel_active();
                 }
                 opentake_motion::HeadlessChromiumRenderer::shutdown_all_pools();
+                safe_asset_protocol::shutdown_helper_pool();
             }
             // Programmatic exits (including updater restart and a successful
             // save barrier) bypass this handler to avoid recursive saves.

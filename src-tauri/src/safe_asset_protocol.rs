@@ -3,18 +3,22 @@
 //! Tauri's built-in asset protocol opens the path again after its scope check.
 //! A File Provider update or hostile local replacement can therefore turn a
 //! previously regular file into a FIFO, symlink, device, or cloud placeholder
-//! and block the WebView/AppKit thread. This protocol opens off-thread with
-//! no-recall/non-blocking platform flags, authorizes the retained handle's final
-//! path, and serves only bounded bodies.
+//! and block the WebView/AppKit thread. This protocol authorizes requests from
+//! in-memory state only and leaves every file operation to a pool of isolated
+//! helper processes: a helper opens with no-recall/non-blocking platform flags
+//! and reports the retained handle's final path and identity, the parent
+//! authorizes that identity before any byte is read, and only bounded bodies
+//! are served.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use http_range::HttpRange;
-use opentake_core::{AppCore, ProjectAssetAuthority};
+use opentake_core::{AppCore, MediaAuthorityRevision, ProjectAssetAuthority};
 use opentake_project::{ProjectRoot, ProjectRootIdentity};
 use percent_encoding::percent_decode;
 use serde::{Deserialize, Serialize};
@@ -36,11 +40,20 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::{fd::AsRawFd, macos::fs::MetadataExt};
 
 const MAX_CONCURRENT_READS: usize = 4;
-const MAX_PENDING_READS: usize = 32;
+/// Requests admitted to wait for a worker. A burst beyond the workers (a media
+/// panel full of thumbnails while a video streams) waits instead of failing.
+const MAX_QUEUED_READS: usize = 256;
+/// How long an admitted request may wait for a worker before a 504.
+const QUEUE_DEADLINE: Duration = Duration::from_secs(20);
 const MAX_PATH_BYTES: usize = 32_768;
 const MAX_FULL_BODY_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FULL_IMAGE_BODY_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_RANGE_BYTES: u64 = 1_000 * 1024;
+/// Largest body served for one Range request. Media elements stream with
+/// open-ended ranges, so this sets the request rate while playing: at 4 MiB a
+/// 50 Mbit/s source needs about 1.5 requests per second. Memory budget: at
+/// most `MAX_CONCURRENT_READS` range bodies are in flight, each held once by
+/// the helper and once by the parent, so 4 x 4 MiB x 2 = 32 MiB.
+const MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_DEADLINE: Duration = Duration::from_secs(1);
 const MAX_HELPER_REQUEST_BYTES: usize = 64 * 1024;
@@ -50,28 +63,39 @@ const HELPER_ARG: &str = "--opentake-internal-safe-asset-helper-v1";
 const HELPER_TOKEN_ENV: &str = "OPENTAKE_INTERNAL_ASSET_TOKEN";
 const HELPER_PARENT_ENV: &str = "OPENTAKE_INTERNAL_ASSET_PARENT_PID";
 
-static GLOBAL_PROCESS_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
 mod helper;
+mod pool;
+mod scope;
 
 pub(crate) use helper::run_helper_if_requested;
 use helper::{
-    isolated_response_to_http, run_isolated_helper, HelperProjectAuthority, HelperRequest,
-    IsolatedHelperError,
+    authorize_opened_asset, isolated_response_to_http, HelperProjectAuthority, HelperRequest,
+    IsolatedHelperError, IsolatedResponse,
 };
+pub(crate) use pool::{retire_helper_pool, shutdown_helper_pool};
+use pool::{HelperOutcome, HelperPool};
+#[cfg(test)]
+pub(crate) use scope::asset_scope_snapshot_captures;
+pub(crate) use scope::{asset_scope_snapshot, ScopeSnapshot};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeOnlyKind {
+    HomeThumbnail,
+    ApplicationOwned,
+}
+
+/// In-memory authorization of a requested path outside the current bundle.
+/// It is derived from the cached scope snapshot and external media index, and
+/// re-derived after the helper opened the file and again before publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NonProjectAssetAuthority {
     ScopeOnly {
+        kind: ScopeOnlyKind,
         requested_path: PathBuf,
-        initial_final_path: PathBuf,
-        initial_etag: String,
     },
     ProjectMedia {
         project_epoch: u64,
         requested_path: PathBuf,
-        initial_final_path: PathBuf,
-        initial_etag: String,
     },
 }
 
@@ -83,116 +107,93 @@ impl NonProjectAssetAuthority {
             }
         }
     }
-
-    fn initial_final_path(&self) -> &Path {
-        match self {
-            Self::ScopeOnly {
-                initial_final_path, ..
-            }
-            | Self::ProjectMedia {
-                initial_final_path, ..
-            } => initial_final_path,
-        }
-    }
-
-    fn initial_etag(&self) -> &str {
-        match self {
-            Self::ScopeOnly { initial_etag, .. } | Self::ProjectMedia { initial_etag, .. } => {
-                initial_etag
-            }
-        }
-    }
-}
-
-fn non_project_response_matches_authority(
-    expected: &NonProjectAssetAuthority,
-    final_path: &Path,
-    response_etag: Option<&str>,
-    refreshed: Option<&NonProjectAssetAuthority>,
-) -> bool {
-    paths_equal_for_authority(expected.initial_final_path(), final_path)
-        && response_etag == Some(expected.initial_etag())
-        && refreshed == Some(expected)
 }
 
 #[cfg(all(test, unix))]
+use helper::{actual_parent_process_id, parent_is_same_executable};
+#[cfg(test)]
 use helper::{
-    actual_parent_process_id, parent_is_same_executable, terminate_or_quarantine,
-    write_helper_request_before_response, WireIoErrorKind,
+    open_helper_asset, opened_metadata, serve_helper_asset, OpenedMetadata, WireIoErrorKind,
 };
 #[cfg(test)]
-use helper::{bounded_reap, helper_response};
+use pool::{bounded_reap, terminate_or_quarantine};
 
 #[derive(Clone)]
 pub(crate) struct SafeAssetProtocol {
     worker_permits: Arc<Semaphore>,
-    pending_permits: Arc<Semaphore>,
-    process_slots: Arc<Semaphore>,
+    queued_permits: Arc<Semaphore>,
+    pool: Arc<HelperPool>,
 }
 
 impl Default for SafeAssetProtocol {
     fn default() -> Self {
-        Self {
-            worker_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_READS)),
-            pending_permits: Arc::new(Semaphore::new(MAX_PENDING_READS)),
-            process_slots: GLOBAL_PROCESS_SLOTS
-                .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_READS)))
-                .clone(),
-        }
+        Self::with_pool(HelperPool::shared())
     }
 }
 
 impl SafeAssetProtocol {
-    pub(crate) fn respond(
+    fn with_pool(pool: Arc<HelperPool>) -> Self {
+        Self {
+            worker_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_READS)),
+            queued_permits: Arc::new(Semaphore::new(MAX_QUEUED_READS)),
+            pool,
+        }
+    }
+
+    pub(crate) fn respond<R: Runtime>(
         &self,
-        app: AppHandle,
-        scope: Scope,
+        app: AppHandle<R>,
         request: Request<Vec<u8>>,
         responder: UriSchemeResponder,
     ) {
-        let Ok(pending_permit) = self.pending_permits.clone().try_acquire_owned() else {
-            responder.respond(error_response(
+        let protocol = self.clone();
+        tauri::async_runtime::spawn(async move {
+            responder.respond(protocol.serve(&app, request).await);
+        });
+    }
+
+    /// Admission: up to `MAX_QUEUED_READS` requests wait (bounded by
+    /// `QUEUE_DEADLINE`) for one of `MAX_CONCURRENT_READS` workers.
+    async fn serve<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        request: Request<Vec<u8>>,
+    ) -> Response<Vec<u8>> {
+        let Ok(_queued_permit) = self.queued_permits.clone().try_acquire_owned() else {
+            return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "local asset workers are busy",
                 Some((RETRY_AFTER, "1")),
-            ));
-            return;
+            );
         };
-        let worker_permits = self.worker_permits.clone();
-        let process_slots = self.process_slots.clone();
-        tauri::async_runtime::spawn(async move {
-            let worker_permit =
-                match tokio::time::timeout(IO_DEADLINE, worker_permits.acquire_owned()).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => {
-                        responder.respond(error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "local asset service is shutting down",
-                            None,
-                        ));
-                        return;
-                    }
-                    Err(_) => {
-                        responder.respond(error_response(
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "local asset worker queue timed out",
-                            Some((RETRY_AFTER, "1")),
-                        ));
-                        return;
-                    }
-                };
-            let _pending_permit = pending_permit;
-            let _worker_permit = worker_permit;
-            responder.respond(response_for_request(&app, &scope, request, process_slots).await);
-        });
+        let _worker_permit =
+            match tokio::time::timeout(QUEUE_DEADLINE, self.worker_permits.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local asset service is shutting down",
+                        None,
+                    );
+                }
+                Err(_) => {
+                    return error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "local asset worker queue timed out",
+                        Some((RETRY_AFTER, "1")),
+                    );
+                }
+            };
+        response_for_request(app, request, &self.pool).await
     }
 }
 
 async fn response_for_request<R: Runtime>(
     app: &AppHandle<R>,
-    scope: &Scope,
     request: Request<Vec<u8>>,
-    process_slots: Arc<Semaphore>,
+    pool: &Arc<HelperPool>,
 ) -> Response<Vec<u8>> {
     if request.method() == Method::OPTIONS {
         return secure_response_builder(StatusCode::NO_CONTENT)
@@ -209,15 +210,16 @@ async fn response_for_request<R: Runtime>(
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message, None),
     };
     let core = app.state::<AppCore>();
-    let project_authority = match project_request_authority(&core, scope, &path) {
+    let scope = asset_scope_snapshot(app);
+    let project_authority = match project_request_authority(&core, &scope, &path) {
         Ok(authority) => authority,
         Err(response) => return *response,
     };
     // A retained current-project root is itself the authority for nested
     // relative assets. External files and the Home thumbnail exception still
-    // require an exact/runtime scope grant before any helper is spawned.
+    // require an exact/runtime scope grant before any helper is involved.
     let non_project_authority = if project_authority.is_none() {
-        match non_project_asset_authority(app, &core, scope, &path) {
+        match non_project_asset_authority(app, &core, &scope, &path) {
             Some(authority) => Some(authority),
             None => {
                 return error_response(
@@ -237,11 +239,7 @@ async fn response_for_request<R: Runtime>(
             None,
         );
     };
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    let token = pool::random_token();
     let helper_request = HelperRequest {
         token: token.clone(),
         parent_pid: std::process::id(),
@@ -261,44 +259,54 @@ async fn response_for_request<R: Runtime>(
             .as_ref()
             .and_then(HelperProjectAuthority::from_core),
     };
-    let isolated = match run_isolated_helper(&helper_request, process_slots).await {
-        Ok(response) => response,
-        Err(IsolatedHelperError::TimedOut) => {
-            return error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "local asset I/O timed out",
-                Some((RETRY_AFTER, "1")),
-            );
-        }
-        Err(IsolatedHelperError::Degraded) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "local asset isolation is degraded",
-                Some((RETRY_AFTER, "5")),
-            );
-        }
-        Err(IsolatedHelperError::Io | IsolatedHelperError::InvalidResponse) => {
-            return error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "local asset is unavailable",
-                None,
-            );
-        }
-    };
-    isolated_response_to_http(
-        app,
-        &core,
-        scope,
-        project_authority.as_ref(),
-        non_project_authority,
-        &token,
-        isolated,
-    )
+    let outcome = pool
+        .exchange(&helper_request, |opened| {
+            authorize_opened_asset(
+                app,
+                &core,
+                project_authority.as_ref(),
+                non_project_authority.as_ref(),
+                &token,
+                opened,
+            )
+        })
+        .await;
+    match outcome {
+        Ok(HelperOutcome::OpenFailed(opened)) => opened.error_kind.map_or_else(
+            || error_response(StatusCode::BAD_GATEWAY, "local asset helper failed", None),
+            |kind| kind.response(),
+        ),
+        Ok(HelperOutcome::Refused(response)) => *response,
+        Ok(HelperOutcome::Served { opened, response }) => isolated_response_to_http(
+            app,
+            &core,
+            project_authority.as_ref(),
+            non_project_authority.as_ref(),
+            &token,
+            &opened,
+            response,
+        ),
+        Err(IsolatedHelperError::TimedOut) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "local asset I/O timed out",
+            Some((RETRY_AFTER, "1")),
+        ),
+        Err(IsolatedHelperError::Degraded) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local asset isolation is degraded",
+            Some((RETRY_AFTER, "5")),
+        ),
+        Err(IsolatedHelperError::Io | IsolatedHelperError::InvalidResponse) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "local asset is unavailable",
+            None,
+        ),
+    }
 }
 
 fn project_request_authority(
     core: &AppCore,
-    scope: &Scope,
+    scope: &ScopeSnapshot,
     path: &Path,
 ) -> Result<Option<ProjectAssetAuthority>, Box<Response<Vec<u8>>>> {
     let Some(bundle_path) = opentake_ancestor(path) else {
@@ -394,23 +402,9 @@ fn relative_to_authority(path: &Path, root: &Path) -> Option<PathBuf> {
     })
 }
 
-fn is_home_thumbnail_exception(scope: &Scope, path: &Path, bundle_path: &Path) -> bool {
+fn is_home_thumbnail_exception(scope: &ScopeSnapshot, path: &Path, bundle_path: &Path) -> bool {
     paths_equal_for_authority(path, &bundle_path.join(HOME_THUMBNAIL_FILE))
-        && scope_has_exact_file_grant(scope, path)
-}
-
-fn scope_has_exact_file_grant(scope: &Scope, path: &Path) -> bool {
-    let escaped = glob::Pattern::escape(normalized_path(path).to_string_lossy().as_ref());
-    scope.allowed_patterns().iter().any(|pattern| {
-        #[cfg(target_os = "windows")]
-        {
-            pattern.as_str().eq_ignore_ascii_case(&escaped)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            pattern.as_str() == escaped
-        }
-    })
+        && scope.has_exact_file_grant(path)
 }
 
 /// Runtime dialog grants are persisted by Tauri. Keep the configured
@@ -418,89 +412,132 @@ fn scope_has_exact_file_grant(scope: &Scope, path: &Path) -> bool {
 /// other external media path to remain referenced by the current project.
 /// This also closes stale recursive directory grants from folder imports, not
 /// just exact file grants, without mutating persisted scope state.
+///
+/// Lexical only: no file is opened here. The helper reports the retained
+/// handle's final path, which [`non_project_final_path_is_authorized`] checks
+/// before any byte is read.
 fn non_project_asset_authority<R: Runtime>(
     app: &AppHandle<R>,
     core: &AppCore,
-    scope: &Scope,
+    scope: &ScopeSnapshot,
     path: &Path,
 ) -> Option<NonProjectAssetAuthority> {
     let normalized = normalized_path(path);
-    if !scope_allows_lexical_path(scope, &normalized) {
+    if !scope.allows(&normalized) {
         return None;
     }
-    enum ScopeOnlyKind {
-        HomeThumbnail,
-        ApplicationOwned,
-    }
-    enum AuthorityKind {
-        ScopeOnly(ScopeOnlyKind),
-        ProjectMedia(u64),
-    }
-    let application_owned_roots = application_owned_asset_roots(app);
-    let scope_only_kind = if opentake_ancestor(&normalized)
+    if opentake_ancestor(&normalized)
         .is_some_and(|bundle| is_home_thumbnail_exception(scope, &normalized, bundle.as_path()))
     {
-        Some(ScopeOnlyKind::HomeThumbnail)
-    } else if application_owned_roots
+        return Some(NonProjectAssetAuthority::ScopeOnly {
+            kind: ScopeOnlyKind::HomeThumbnail,
+            requested_path: normalized,
+        });
+    }
+    if application_owned_asset_roots(app)
         .iter()
         .any(|root| path_is_at_or_below(&normalized, root))
     {
-        Some(ScopeOnlyKind::ApplicationOwned)
-    } else {
-        None
-    };
-    let kind = if let Some(scope_only_kind) = scope_only_kind {
-        AuthorityKind::ScopeOnly(scope_only_kind)
-    } else {
-        let snapshot = core.runtime_snapshot();
-        if snapshot.project_dir.is_none()
-            || !snapshot.media.entries.iter().any(|entry| {
-                let opentake_domain::MediaSource::External { absolute_path } = &entry.source else {
-                    return false;
-                };
-                paths_equal_for_authority(Path::new(absolute_path), &normalized)
-            })
-        {
-            return None;
-        }
-        AuthorityKind::ProjectMedia(snapshot.project_epoch)
-    };
-    let (file, initial_final_path) = open_retained_regular_file(&normalized).ok()?;
-    let metadata = file.metadata().ok()?;
-    let initial_etag = retained_file_etag(&file, &metadata).ok()?;
-    match kind {
-        AuthorityKind::ScopeOnly(scope_only_kind) => {
-            let final_path_is_authorized = scope_allows_lexical_path(scope, &initial_final_path)
-                && match scope_only_kind {
-                    ScopeOnlyKind::HomeThumbnail => opentake_ancestor(&initial_final_path)
-                        .is_some_and(|bundle| {
-                            is_home_thumbnail_exception(
-                                scope,
-                                &initial_final_path,
-                                bundle.as_path(),
-                            )
-                        }),
-                    ScopeOnlyKind::ApplicationOwned => application_owned_roots
-                        .iter()
-                        .any(|root| path_is_at_or_below(&initial_final_path, root)),
-                };
-            final_path_is_authorized.then_some(NonProjectAssetAuthority::ScopeOnly {
-                requested_path: normalized,
-                initial_final_path,
-                initial_etag,
-            })
-        }
-        AuthorityKind::ProjectMedia(project_epoch) => {
-            scope_allows_lexical_path(scope, &initial_final_path).then_some(
-                NonProjectAssetAuthority::ProjectMedia {
-                    project_epoch,
-                    requested_path: normalized,
-                    initial_final_path,
-                    initial_etag,
-                },
-            )
-        }
+        return Some(NonProjectAssetAuthority::ScopeOnly {
+            kind: ScopeOnlyKind::ApplicationOwned,
+            requested_path: normalized,
+        });
     }
+    let index = external_media_index(core);
+    (index.revision.has_project_dir && index.paths.contains(&authority_key(&normalized))).then(
+        || NonProjectAssetAuthority::ProjectMedia {
+            project_epoch: index.revision.project_epoch,
+            requested_path: normalized,
+        },
+    )
+}
+
+/// Authorize the final path of the handle a helper opened for `expected`,
+/// exactly as the requested path was: in scope lexically, of the same kind,
+/// and never inside a `.opentake` bundle other than as its Home thumbnail.
+fn non_project_final_path_is_authorized<R: Runtime>(
+    app: &AppHandle<R>,
+    scope: &ScopeSnapshot,
+    expected: &NonProjectAssetAuthority,
+    final_path: &Path,
+) -> bool {
+    let bundle = opentake_ancestor(final_path);
+    let home_thumbnail = bundle
+        .as_deref()
+        .is_some_and(|bundle| is_home_thumbnail_exception(scope, final_path, bundle));
+    if !scope.allows(final_path) || (bundle.is_some() && !home_thumbnail) {
+        return false;
+    }
+    match expected {
+        NonProjectAssetAuthority::ScopeOnly {
+            kind: ScopeOnlyKind::HomeThumbnail,
+            ..
+        } => home_thumbnail,
+        NonProjectAssetAuthority::ScopeOnly {
+            kind: ScopeOnlyKind::ApplicationOwned,
+            ..
+        } => application_owned_asset_roots(app)
+            .iter()
+            .any(|root| path_is_at_or_below(final_path, root)),
+        NonProjectAssetAuthority::ProjectMedia { .. } => true,
+    }
+}
+
+#[cfg(target_os = "windows")]
+type AuthorityKey = String;
+#[cfg(not(target_os = "windows"))]
+type AuthorityKey = PathBuf;
+
+/// Hash key with the equality of [`paths_equal_for_authority`].
+#[cfg(target_os = "windows")]
+fn authority_key(path: &Path) -> AuthorityKey {
+    normalized_path(path).to_string_lossy().to_ascii_lowercase()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn authority_key(path: &Path) -> AuthorityKey {
+    normalized_path(path)
+}
+
+/// External media paths of one manifest revision, keyed for O(1) lookups.
+struct ExternalMediaIndex {
+    revision: MediaAuthorityRevision,
+    paths: HashSet<AuthorityKey>,
+}
+
+/// Recently built indexes. Editor generations are unique across every core
+/// in the process, so indexes of different cores never alias.
+static EXTERNAL_MEDIA_INDEXES: Mutex<Vec<Arc<ExternalMediaIndex>>> = Mutex::new(Vec::new());
+const EXTERNAL_MEDIA_INDEX_CACHE: usize = 4;
+
+/// The external media authorization index for the core's current manifest.
+/// Rebuilt only after the manifest (or project) changed; a request costs one
+/// session-lock revision read and one hash lookup instead of a deep runtime
+/// snapshot and a linear scan.
+fn external_media_index(core: &AppCore) -> Arc<ExternalMediaIndex> {
+    let revision = core.media_authority_revision();
+    if let Some(index) = EXTERNAL_MEDIA_INDEXES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|index| index.revision == revision)
+    {
+        return index.clone();
+    }
+    let (revision, paths) = core.external_media_paths();
+    let index = Arc::new(ExternalMediaIndex {
+        revision,
+        paths: paths.iter().map(|path| authority_key(path)).collect(),
+    });
+    let mut indexes = EXTERNAL_MEDIA_INDEXES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    indexes.retain(|cached| cached.revision != revision);
+    if indexes.len() >= EXTERNAL_MEDIA_INDEX_CACHE {
+        indexes.remove(0);
+    }
+    indexes.push(index.clone());
+    index
 }
 
 fn application_owned_asset_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
