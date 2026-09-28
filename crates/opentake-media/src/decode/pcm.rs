@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::cancel::MediaCancelToken;
 use crate::error::{MediaError, Result};
 use crate::ff;
+use crate::ff::SpawnCounted;
 use crate::probe;
 
 /// On-wire PCM sample format requested from ffmpeg.
@@ -624,7 +625,7 @@ fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
     let sink = make_sink(limit.expected / frame_bytes)?;
     let mut child = ff::ffmpeg()
         .args(args)
-        .spawn()
+        .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
     let stdout = match child.take_stdout() {
@@ -676,10 +677,10 @@ fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
 /// consumer. Each holds at most one stdout read, so this bounds the decoded
 /// audio held ahead of the consumer; FFmpeg then blocks on its full pipe.
 const PCM_STREAM_QUEUE_CHUNKS: usize = 4;
-const PCM_STREAM_SEND_POLL: Duration = Duration::from_millis(2);
 
 /// Hands converted f32 chunks to a [`PcmStream`] consumer through a bounded
-/// queue, waiting (cancellably) while the consumer is behind.
+/// queue, blocking while the consumer is behind. [`PcmStream::shutdown`]
+/// drops the receiver before joining, which fails a blocked send.
 struct QueueSink {
     format: PcmFormat,
     sender: SyncSender<Vec<f32>>,
@@ -699,20 +700,11 @@ impl PcmSink for QueueSink {
                 .chunks_exact(bps)
                 .map(|sample| self.format.sample(sample)),
         );
-        loop {
-            if self.stop.load(Ordering::Acquire) || self.cancel.is_cancelled() {
-                return Err(MediaError::Cancelled);
-            }
-            match self.sender.try_send(chunk) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) => {
-                    chunk = returned;
-                    thread::sleep(PCM_STREAM_SEND_POLL);
-                }
-                // The consumer dropped the stream.
-                Err(TrySendError::Disconnected(_)) => return Err(MediaError::Cancelled),
-            }
+        if self.stop.load(Ordering::Acquire) || self.cancel.is_cancelled() {
+            return Err(MediaError::Cancelled);
         }
+        // Fails only once the consumer has shut the stream down.
+        self.sender.send(chunk).map_err(|_| MediaError::Cancelled)
     }
 }
 
@@ -734,7 +726,8 @@ pub struct PcmStream {
     child: Option<ffmpeg_sidecar::child::FfmpegChild>,
     stdout_reader: Option<JoinHandle<Result<(bool, usize)>>>,
     stderr_reader: Option<JoinHandle<Result<Vec<u8>>>>,
-    receiver: Receiver<Vec<f32>>,
+    /// `None` once shut down, which unblocks the stdout reader's send.
+    receiver: Option<Receiver<Vec<f32>>>,
     pending: Vec<f32>,
     pending_offset: usize,
     reader_cap: usize,
@@ -771,7 +764,7 @@ impl PcmStream {
                 Some(range),
                 expected / frame_bytes,
             ))
-            .spawn()
+            .spawn_counted()
             .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
         cancel.child_spawned();
         let Some(stdout) = child.take_stdout() else {
@@ -826,7 +819,7 @@ impl PcmStream {
             child: Some(child),
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
-            receiver,
+            receiver: Some(receiver),
             pending: Vec::new(),
             pending_offset: 0,
             reader_cap: cap,
@@ -862,7 +855,16 @@ impl PcmStream {
             if self.ended {
                 break;
             }
-            match self.receiver.recv_timeout(CHILD_POLL_INTERVAL) {
+            // Checked before every chunk: a fast decoder keeps the queue full,
+            // so the timeout below may never fire.
+            if self.cancel.is_cancelled() {
+                self.shutdown();
+                return Err(MediaError::Cancelled);
+            }
+            let Some(receiver) = self.receiver.as_ref() else {
+                break;
+            };
+            match receiver.recv_timeout(CHILD_POLL_INTERVAL) {
                 Ok(chunk) => {
                     self.pending = chunk;
                     self.pending_offset = 0;
@@ -942,6 +944,8 @@ impl PcmStream {
     fn shutdown(&mut self) {
         self.ended = true;
         self.stop.store(true, Ordering::Release);
+        // Fails a send the stdout reader is blocked in.
+        self.receiver = None;
         if let Some(mut child) = self.child.take() {
             terminate_child(&mut child);
         }
