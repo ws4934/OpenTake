@@ -13,6 +13,7 @@ const core = vi.hoisted(() => ({
   opacity: 1,
   clipStart: 10,
   sentVersions: [] as number[],
+  calls: [] as string[],
   getTimelineCalls: 0,
   failGetTimeline: 0,
 }));
@@ -41,6 +42,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ) => {
       await Promise.resolve();
       check(expected);
+      core.calls.push(command.type);
       if (command.type === "setClipProperties") core.opacity = command.properties?.opacity ?? core.opacity;
       if (command.type === "moveClips") core.clipStart = command.moves?.[0]?.toFrame ?? core.clipStart;
       core.version += 1;
@@ -49,12 +51,14 @@ vi.mock("../lib/api", async (importOriginal) => {
     undo: async (expected: ProjectEditIdentity) => {
       await Promise.resolve();
       check(expected);
+      core.calls.push("undo");
       core.version += 1;
       return result("undo");
     },
     redo: async (expected: ProjectEditIdentity) => {
       await Promise.resolve();
       check(expected);
+      core.calls.push("redo");
       core.version += 1;
       return result("redo");
     },
@@ -126,6 +130,7 @@ function timelineAt(clipStart: number, opacity: number): Timeline {
 }
 
 import {
+  holdGestureCommit,
   moveClips,
   nudgeSelectedClips,
   redo,
@@ -145,6 +150,7 @@ beforeEach(() => {
   core.opacity = 1;
   core.clipStart = 10;
   core.sentVersions = [];
+  core.calls = [];
   core.getTimelineCalls = 0;
   core.failGetTimeline = 0;
   useProjectStore.getState().clearProjectSnapshot();
@@ -164,6 +170,23 @@ afterEach(() => {
 });
 
 describe("edit queue", () => {
+  it("queues a held gesture's commit ahead of undo and redo", async () => {
+    const hold = (opacity: number) => {
+      const release = holdGestureCommit(() => {
+        release();
+        runTimelineEdit(setClipProperties(["clip-1"], { opacity }));
+      });
+    };
+    hold(0.3);
+    await undo();
+    hold(0.7);
+    await redo();
+    await undo();
+
+    expect(core.calls).toEqual(["setClipProperties", "undo", "setClipProperties", "redo", "undo"]);
+    expect(core.opacity).toBe(0.7);
+  });
+
   it("applies two rapid undos in order (5 -> 6 -> 7)", async () => {
     await expect(Promise.all([undo(), undo()])).resolves.toEqual([undefined, undefined]);
     expect(core.sentVersions).toEqual([5, 6]);

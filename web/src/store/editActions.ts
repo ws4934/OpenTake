@@ -305,6 +305,24 @@ async function applyAndRefresh(
   );
 }
 
+/** Controls that preview a gesture locally and commit it when the gesture
+ *  ends (a held arrow key, a color picker's debounce) register a flush here
+ *  while that commit is pending. Undo and redo run the flushes first, so the
+ *  gesture's edit is queued ahead of the history command and undo reverts
+ *  it instead of an earlier edit. Returns the unregister function. */
+const pendingGestureCommits = new Set<() => void>();
+
+export function holdGestureCommit(flush: () => void): () => void {
+  pendingGestureCommits.add(flush);
+  return () => {
+    pendingGestureCommits.delete(flush);
+  };
+}
+
+function flushPendingGestureCommits(): void {
+  for (const flush of [...pendingGestureCommits]) flush();
+}
+
 /** Error exit for fire-and-forget edit gestures (keyboard, menus, drag
  *  commits): a rejected edit becomes a toast, never an unhandled rejection. */
 export function runTimelineEdit(operation: Promise<unknown>): void {
@@ -859,11 +877,13 @@ export async function tightenSilenceRanges(trackIndex: number, ranges: FrameRang
 // Undo/redo act on core history, not on the mirror's view, so re-sending one
 // after a stale rejection still does exactly what the user asked for.
 export async function undo() {
+  flushPendingGestureCommits();
   await enqueueEdit(() => commitEdit(api.undo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }
 
 export async function redo() {
+  flushPendingGestureCommits();
   await enqueueEdit(() => commitEdit(api.redo, { retryOnStale: true }));
   if (!isTauri) await forceRefresh();
 }

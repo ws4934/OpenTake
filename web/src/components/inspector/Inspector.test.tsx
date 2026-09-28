@@ -332,8 +332,13 @@ describe("Inspector completion surface", () => {
     const opacity = container.querySelector<HTMLElement>(
       '[role="spinbutton"][aria-label="不透明度"]',
     )!;
+    // Arrow keys preview locally and commit once the key is released.
     await act(async () => {
       opacity.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    });
+    expect(upsert).not.toHaveBeenCalled();
+    await act(async () => {
+      opacity.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowDown", bubbles: true }));
     });
     expect(upsert).toHaveBeenCalledWith(
       clip.id,
@@ -807,6 +812,8 @@ describe("Inspector completion surface", () => {
       }
       amount?.dispatchEvent(new InputEvent("input", { bubbles: true }));
     });
+    expect(setEffects.mock.calls.at(-1)?.[1][0]?.params.amount).not.toBe(0.35);
+    await act(async () => amount?.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));
     expect(setEffects.mock.calls.at(-1)?.[1][0]?.params.amount).toBe(0.35);
 
     const enabled = items[0]?.querySelector<HTMLInputElement>('input[type="checkbox"]');
@@ -819,5 +826,95 @@ describe("Inspector completion surface", () => {
 
     setEffects.mockRestore();
     await act(async () => root.unmount());
+  });
+  describe("generic effect amount slider", () => {
+    async function renderAmountSlider(setEffects: ReturnType<typeof vi.spyOn>) {
+      const clip = visualClip({ effects: [{ name: "grayscale", params: { amount: 0 }, enabled: true }] });
+      useProjectStore.setState({ timeline: timelineWith(clip), projectPath: "/tmp/demo.opentake" });
+      useEditorUiStore.setState({ selectedClipIds: new Set([clip.id]), inspectorTab: "video", toast: null });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<Inspector />));
+      const slider = container.querySelector<HTMLInputElement>(
+        '[data-testid="generic-effect-item"] input[type="range"]',
+      )!;
+      const setValue = (value: string, type: "input" | "change" = "input") => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(slider, value);
+        slider.dispatchEvent(new Event(type, { bubbles: true }));
+      };
+      return { clip, container, root, slider, setValue, setEffects };
+    }
+
+    it("previews a drag locally and commits the final amount once on release", async () => {
+      const { clip, container, root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockResolvedValue(),
+      );
+      await act(async () => {
+        for (let step = 1; step <= 20; step++) setValue(String(step / 20));
+      });
+      expect(setEffects).not.toHaveBeenCalled();
+      expect(container.querySelector('[data-testid="generic-effect-item"]')?.textContent).toContain("100%");
+
+      await act(async () => {
+        slider.dispatchEvent(new Event("change", { bubbles: true }));
+        slider.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      });
+      expect(setEffects).toHaveBeenCalledOnce();
+      expect(setEffects).toHaveBeenCalledWith([clip.id], [
+        expect.objectContaining({ name: "grayscale", params: { amount: 1 } }),
+      ]);
+
+      setEffects.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("commits a held arrow key once on key release instead of on every change", async () => {
+      const { root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockResolvedValue(),
+      );
+      await act(async () => {
+        for (let step = 1; step <= 5; step++) {
+          slider.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "ArrowRight", repeat: step > 1, bubbles: true }),
+          );
+          setValue(String(step / 100));
+          setValue(String(step / 100), "change");
+        }
+      });
+      expect(setEffects).not.toHaveBeenCalled();
+      await act(async () => {
+        slider.dispatchEvent(new KeyboardEvent("keyup", { key: "ArrowRight", bubbles: true }));
+      });
+      expect(setEffects).toHaveBeenCalledOnce();
+      expect(setEffects.mock.calls[0]?.[1][0]?.params.amount).toBe(0.05);
+
+      setEffects.mockRestore();
+      await act(async () => root.unmount());
+    });
+
+    it("reports a rejected commit and restores the committed amount", async () => {
+      const unhandled = vi.fn();
+      const onUnhandled = (event: PromiseRejectionEvent) => unhandled(event.reason);
+      window.addEventListener("unhandledrejection", onUnhandled);
+      const stale = Object.assign(new Error("project changed"), { code: "staleProject" });
+      const { container, root, slider, setValue, setEffects } = await renderAmountSlider(
+        vi.spyOn(edit, "setEffects").mockRejectedValue(stale),
+      );
+      try {
+        await act(async () => setValue("0.8"));
+        await act(async () => slider.dispatchEvent(new PointerEvent("pointerup", { bubbles: true })));
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+        expect(setEffects).toHaveBeenCalledOnce();
+        expect(useEditorUiStore.getState().toast?.message).toContain("project changed");
+        expect(container.querySelector('[data-testid="generic-effect-item"]')?.textContent).toContain("0%");
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        window.removeEventListener("unhandledrejection", onUnhandled);
+        setEffects.mockRestore();
+        await act(async () => root.unmount());
+      }
+    });
   });
 });
