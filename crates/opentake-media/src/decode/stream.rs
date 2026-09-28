@@ -21,6 +21,7 @@ use crate::cancel::MediaCancelToken;
 use crate::decode::source_color::{resolve_path_color, ColorHint};
 use crate::error::{MediaError, Result};
 use crate::ff;
+use crate::ff::SpawnCounted;
 use crate::frame::RgbaFrame;
 
 /// Default number of decoded frames buffered between the ffmpeg worker and the
@@ -226,7 +227,7 @@ fn run_video_stream(
         }
     };
     let args = video_stream_args_with_color(&req, color.as_ref());
-    let mut child = match ff::ffmpeg().args(args).spawn() {
+    let mut child = match ff::ffmpeg().args(args).spawn_counted() {
         Ok(child) => child,
         Err(e) => {
             let _ = send_with_backpressure(

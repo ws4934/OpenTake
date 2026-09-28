@@ -23,6 +23,7 @@ use std::time::Duration;
 use crate::cancel::MediaCancelToken;
 use crate::decode::pcm::{PcmBuffer, PcmFormat, PcmSpec};
 use crate::error::{MediaError, Result};
+use crate::ff::SpawnCounted;
 use crate::frame::RgbaFrame;
 
 /// Build the ffmpeg arg list for encoding a raw-RGBA frame stream (read from
@@ -198,7 +199,7 @@ impl VideoEncoder {
         let first_pass = workspace.path().join(format!("video.{extension}"));
         let mut child = crate::ff::ffmpeg()
             .args(encode_args(&first_pass, w, h, fps, preset))
-            .spawn()
+            .spawn_counted()
             .map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
         let stdin = child.take_stdin();
         let stdout = child.take_stdout().ok_or_else(|| {
@@ -536,7 +537,7 @@ impl VideoEncoder {
         );
         let mut child = crate::ff::ffmpeg()
             .args(args)
-            .spawn()
+            .spawn_counted()
             .map_err(|e| MediaError::Encode(format!("mux spawn: {e}")))?;
         let stdout = child.take_stdout().ok_or_else(|| {
             terminate_child(&mut child);

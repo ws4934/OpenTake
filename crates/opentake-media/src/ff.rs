@@ -64,6 +64,9 @@ struct ProbeSpec {
     cancel: crate::MediaCancelToken,
     operation_deadline: Instant,
     api_deadline: Instant,
+    /// The requesting thread's [`HelperProcessCount`]; the executor thread
+    /// counts the ffprobe once it has started.
+    helper_count: Option<Arc<AtomicUsize>>,
 }
 
 enum ProbeExecutorRequest {
@@ -360,6 +363,9 @@ async fn run_ffprobe_async(spec: ProbeSpec) -> crate::error::Result<FfprobeOutpu
         .spawn()
         .map_err(|error| crate::error::MediaError::Ffmpeg(format!("ffprobe spawn: {error}")))?;
     spec.cancel.child_spawned();
+    if let Some(counter) = spec.helper_count.as_ref() {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
     let child_id = child.id().ok_or_else(|| {
         crate::error::MediaError::Ffmpeg("ffprobe process id missing".to_string())
     })?;
@@ -649,7 +655,6 @@ fn run_ffprobe(
     if cancel.checkpoint() {
         return Err(crate::error::MediaError::Cancelled);
     }
-    record_helper_process();
     let queued_at = Instant::now();
     let _admission = if admission_wait.is_zero() {
         ProbeAdmission::acquire()?
@@ -679,6 +684,7 @@ fn run_ffprobe(
             cancel: cancel.clone(),
             operation_deadline,
             api_deadline,
+            helper_count: inherited_helper_process_count(),
         },
         response: response_tx,
     };
@@ -787,11 +793,25 @@ pub fn ffprobe_path() -> OsString {
     )
 }
 
-/// A fresh `FfmpegCommand` bound to [`ffmpeg_path`]. Every caller spawns the
-/// command it builds, so this is where FFmpeg helper processes are counted.
+/// A fresh `FfmpegCommand` bound to [`ffmpeg_path`]. Start it with
+/// [`SpawnCounted::spawn_counted`] so the process counts toward any active
+/// [`HelperProcessCount`].
 pub fn ffmpeg() -> FfmpegCommand {
-    record_helper_process();
     FfmpegCommand::new_with_path(ffmpeg_path())
+}
+
+/// Spawning that counts the started FFmpeg process toward the calling thread's
+/// [`HelperProcessCount`].
+pub(crate) trait SpawnCounted {
+    fn spawn_counted(&mut self) -> std::io::Result<ffmpeg_sidecar::child::FfmpegChild>;
+}
+
+impl SpawnCounted for FfmpegCommand {
+    fn spawn_counted(&mut self) -> std::io::Result<ffmpeg_sidecar::child::FfmpegChild> {
+        let child = self.spawn()?;
+        record_helper_process();
+        Ok(child)
+    }
 }
 
 thread_local! {
@@ -830,12 +850,14 @@ impl HelperProcessCount {
 impl Drop for HelperProcessCount {
     fn drop(&mut self) {
         let outer = self.outer.take();
-        HELPER_PROCESS_COUNT.with(|slot| *slot.borrow_mut() = outer);
+        let _ = HELPER_PROCESS_COUNT.try_with(|slot| *slot.borrow_mut() = outer);
     }
 }
 
-fn record_helper_process() {
-    HELPER_PROCESS_COUNT.with(|slot| {
+/// Count one started helper process. Never panics: a thread whose locals are
+/// being destroyed simply is not counted.
+pub(crate) fn record_helper_process() {
+    let _ = HELPER_PROCESS_COUNT.try_with(|slot| {
         if let Some(counter) = slot.borrow().as_ref() {
             counter.fetch_add(1, Ordering::AcqRel);
         }
@@ -845,12 +867,15 @@ fn record_helper_process() {
 /// The calling thread's active count, for a worker thread it spawns to adopt
 /// with [`adopt_helper_process_count`].
 pub(crate) fn inherited_helper_process_count() -> Option<Arc<AtomicUsize>> {
-    HELPER_PROCESS_COUNT.with(|slot| slot.borrow().clone())
+    HELPER_PROCESS_COUNT
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 /// Count this (worker) thread's helper processes toward its spawner's count.
 pub(crate) fn adopt_helper_process_count(counter: Option<Arc<AtomicUsize>>) {
-    HELPER_PROCESS_COUNT.with(|slot| *slot.borrow_mut() = counter);
+    let _ = HELPER_PROCESS_COUNT.try_with(|slot| *slot.borrow_mut() = counter);
 }
 
 /// Whether `ffmpeg` is runnable (`-version` exits 0). Used by tests/integration
@@ -1098,6 +1123,15 @@ pub(crate) mod test_seams {
 mod tests {
     use super::*;
 
+    /// Start `ffmpeg -version` through the counted spawn and reap it.
+    fn spawn_version() {
+        let mut child = ffmpeg()
+            .arg("-version")
+            .spawn_counted()
+            .expect("spawn ffmpeg -version");
+        child.wait().expect("reap ffmpeg -version");
+    }
+
     #[test]
     fn saturated_admission_queues_until_a_slot_frees() {
         test_seams::saturate_admission_attempts(3);
@@ -1141,27 +1175,27 @@ mod tests {
 
     #[test]
     fn helper_process_count_follows_the_thread_and_its_adopting_workers() {
+        assert!(ffmpeg_available(), "requires runnable FFmpeg");
         let outer = HelperProcessCount::start();
+        // Building a command without spawning it starts nothing.
         let _ = ffmpeg();
+        assert_eq!(outer.count(), 0);
+        spawn_version();
         {
             let inner = HelperProcessCount::start();
-            let _ = ffmpeg();
+            spawn_version();
             let inherited = inherited_helper_process_count();
             std::thread::spawn(move || {
                 adopt_helper_process_count(inherited);
-                let _ = ffmpeg();
+                spawn_version();
             })
             .join()
             .unwrap();
             // A thread that did not adopt the count is not counted.
-            std::thread::spawn(|| {
-                let _ = ffmpeg();
-            })
-            .join()
-            .unwrap();
+            std::thread::spawn(spawn_version).join().unwrap();
             assert_eq!(inner.count(), 2);
         }
-        let _ = ffmpeg();
+        spawn_version();
         assert_eq!(outer.count(), 2, "the outer count resumes after the inner");
         drop(outer);
         assert!(inherited_helper_process_count().is_none());

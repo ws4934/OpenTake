@@ -128,6 +128,7 @@ pub fn trim_video_range(
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| MediaError::Ffmpeg(format!("trim source spawn: {error}")))?;
+    ff::record_helper_process();
     loop {
         if cancel.is_cancelled() {
             let _ = child.kill();

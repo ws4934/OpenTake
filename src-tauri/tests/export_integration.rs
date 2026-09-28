@@ -1029,7 +1029,12 @@ fn export_starts_helper_processes_per_clip_not_per_frame() {
         eprintln!("skip: no GPU adapter available");
         return;
     };
-    assert!(single <= 1 + 6, "one silent clip started {single} helpers");
+    // Lower bounds too, so a count that silently stops counting fails: at
+    // least the preflight probe, one decoder, the encoder and the output probe.
+    assert!(
+        (4..=1 + 6).contains(&single),
+        "one silent clip started {single} helpers"
+    );
 
     let mut dual = timeline.clone();
     let mut overlay = Track::new("t2", ClipType::Video);
@@ -1039,14 +1044,15 @@ fn export_starts_helper_processes_per_clip_not_per_frame() {
     dual.tracks.push(overlay);
     let two = count_export(&dual, &silent_manifest, "dual.mp4").unwrap();
     assert!(
-        two <= 2 + 6,
+        (single..=2 + 6).contains(&two),
         "two silent video tracks started {two} helpers"
     );
 
     let voiced_manifest = build_manifest_with_audio(&voiced, 64, 64, 30.0, true);
     let audible = count_export(&timeline, &voiced_manifest, "voiced.mp4").unwrap();
+    // The audible clip adds its one PCM decoder and the audio mux.
     assert!(
-        audible <= 2 + 7,
+        (single + 2..=2 + 7).contains(&audible),
         "one audible clip over five audio windows started {audible} helpers"
     );
 }

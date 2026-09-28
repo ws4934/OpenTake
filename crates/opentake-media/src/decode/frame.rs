@@ -24,6 +24,7 @@ use crate::cancel::MediaCancelToken;
 use crate::decode::source_color::{resolve_file_color, resolve_path_color, ColorHint};
 use crate::error::{MediaError, Result};
 use crate::ff;
+use crate::ff::SpawnCounted;
 use crate::frame::RgbaFrame;
 
 const FRAME_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -691,7 +692,7 @@ pub fn decode_frame_at_with_color_cancellable(
     let color = resolve_path_color(path, color, cancel)?;
     let mut child = ff::ffmpeg()
         .args(frame_args_with_color(path, req, color.as_ref()))
-        .spawn()
+        .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
 
@@ -1115,7 +1116,7 @@ fn decode_grid_run(
     }
     let mut child = ff::ffmpeg()
         .args(grid_frame_args(path, base, color, run))
-        .spawn()
+        .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
     let iter = match child.iter() {
