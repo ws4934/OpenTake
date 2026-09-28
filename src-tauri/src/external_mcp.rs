@@ -457,6 +457,60 @@ struct ExternalMcpLifecycle {
     error: Option<String>,
     auth_failure: Option<String>,
     endpoint: Option<ManagedMcpEndpoint>,
+    listening_socket: Option<ListeningSocket>,
+}
+
+/// A second descriptor for the endpoint's listening socket, used to take the
+/// socket out of LISTEN once the endpoint has drained.
+///
+/// On Linux a child process spawned by any thread (an FFmpeg export, a CLI
+/// agent) holds a copy of every descriptor from its fork until its exec
+/// closes the close-on-exec ones. Closing our own descriptor while such a
+/// child is starting leaves the socket listening on the fixed port for that
+/// window, so an immediate re-enable reports a spurious port conflict.
+/// `shutdown` acts on the socket itself rather than on one descriptor, so the
+/// port is released before disable returns whoever else holds a copy.
+/// Windows sockets are not inheritable, and on macOS the standard library
+/// starts children with `posix_spawn`, which the kernel performs atomically,
+/// so neither platform has the window.
+struct ListeningSocket {
+    #[cfg(target_os = "linux")]
+    descriptor: std::os::fd::OwnedFd,
+}
+
+impl ListeningSocket {
+    fn duplicate(listener: &tokio::net::TcpListener) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+            Ok(Self {
+                descriptor: listener.as_fd().try_clone_to_owned()?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = listener;
+            Ok(Self {})
+        }
+    }
+
+    /// Stop listening on the port. Call only after the endpoint has drained:
+    /// shutting the socket down under a running accept loop makes it fail.
+    fn release(self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `descriptor` is an open socket owned by `self` for the
+            // whole call; shutdown only changes that socket's state.
+            if unsafe { libc::shutdown(self.descriptor.as_raw_fd(), libc::SHUT_RDWR) } != 0 {
+                return Err(format!(
+                    "release external MCP port {EXTERNAL_MCP_PORT}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -493,6 +547,7 @@ impl ExternalMcpState {
                 error: None,
                 auth_failure: None,
                 endpoint: None,
+                listening_socket: None,
             })),
             status: ExternalMcpStatusBroadcaster::new(),
             preference_parent_sync_on_call: std::sync::atomic::AtomicUsize::new(0),
@@ -527,6 +582,7 @@ impl ExternalMcpState {
                     error: None,
                     auth_failure: None,
                     endpoint: None,
+                    listening_socket: None,
                 }));
                 state
             }
@@ -545,6 +601,7 @@ impl ExternalMcpState {
                     error: Some(sanitize_auth_failure(&error)),
                     auth_failure: Some(error),
                     endpoint: None,
+                    listening_socket: None,
                 }));
                 state
             }
@@ -567,6 +624,7 @@ impl ExternalMcpState {
             error: Some(sanitize_auth_failure(&error)),
             auth_failure: Some(error),
             endpoint: None,
+            listening_socket: None,
         }));
         state
     }
@@ -755,6 +813,17 @@ impl ExternalMcpState {
                     return;
                 }
             };
+        let listening_socket = match ListeningSocket::duplicate(&listener) {
+            Ok(socket) => socket,
+            Err(error) => {
+                lifecycle.state = ExternalMcpListenerState::PortConflict;
+                lifecycle.error = Some(format!(
+                    "external MCP port {EXTERNAL_MCP_PORT} could not be retained: {error}"
+                ));
+                self.emit_status(lifecycle);
+                return;
+            }
+        };
         match bind_managed_gated_on(
             listener,
             self.components.dispatcher.clone(),
@@ -766,6 +835,7 @@ impl ExternalMcpState {
         {
             Ok(endpoint) => {
                 lifecycle.endpoint = Some(endpoint);
+                lifecycle.listening_socket = Some(listening_socket);
                 lifecycle.state = ExternalMcpListenerState::Listening;
                 lifecycle.error = None;
             }
@@ -791,6 +861,11 @@ impl ExternalMcpState {
         };
         endpoint.shutdown();
         let result = endpoint.wait().await.map_err(|error| error.to_string());
+        let released = lifecycle
+            .listening_socket
+            .take()
+            .map_or(Ok(()), ListeningSocket::release);
+        let result = result.and(released);
         if let Err(error) = &result {
             lifecycle.state = ExternalMcpListenerState::Paused;
             lifecycle.error = Some(error.clone());
@@ -2209,6 +2284,38 @@ mod tests {
             restarted.status().await.state,
             ExternalMcpListenerState::Disabled
         );
+    }
+
+    /// A child process spawned by another thread holds a copy of the listening
+    /// descriptor between its fork and its exec. Disable must release the port
+    /// while such a copy is still open.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn lifecycle_disable_releases_the_port_while_a_spawned_child_holds_the_socket() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let state = lifecycle_state(&root, Arc::new(MemoryMcpSecretStore::default()));
+        state.set_enabled(true).await.expect("enable endpoint");
+        state.pair("Cursor").await.expect("pair client");
+        let inherited = {
+            use std::os::fd::AsFd;
+            let lifecycle = state.lifecycle.lock().await;
+            assert_eq!(lifecycle.state, ExternalMcpListenerState::Listening);
+            lifecycle
+                .listening_socket
+                .as_ref()
+                .expect("listening socket")
+                .descriptor
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("copy the listening descriptor as a spawned child would")
+        };
+
+        let status = state.set_enabled(false).await.expect("disable endpoint");
+
+        assert_eq!(status.state, ExternalMcpListenerState::Disabled);
+        assert_fixed_port_available().await;
+        drop(inherited);
     }
 
     #[tokio::test]
