@@ -17,6 +17,7 @@ pub mod tracks;
 pub mod trim;
 
 pub use clear_region::clear_region;
+pub(crate) use clear_region::{clear_region_validated, remove_clips};
 pub use duplicate::duplicate_clips;
 pub use folders::{
     create_folder, delete_folder, delete_media, move_to_folder, rename_folder, rename_media,
@@ -26,6 +27,7 @@ pub use linking::{
     timing_propagation_partners,
 };
 pub use move_clips::{move_clips, ClipMove};
+pub(crate) use place::place_clip_validated;
 pub use place::{place_clip, sort_clips, PlaceSpec};
 pub use ripple::{
     apply_shifts, ripple_delete, ripple_delete_ranges_on_track, ripple_insert, validate_shifts,

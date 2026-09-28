@@ -9,7 +9,7 @@
 use opentake_domain::{Clip, ClipType, Timeline};
 
 use crate::id::IdGen;
-use crate::ops::clear_region::clear_region;
+use crate::ops::clear_region::clear_region_validated;
 use crate::ops::place::sort_clips;
 use crate::ops::tracks::prune_empty_tracks;
 
@@ -107,7 +107,7 @@ pub(crate) fn move_clips_from_plans(
             .iter()
             .position(|t| t.id == info.to_track_id)
         {
-            clear_region(timeline, idx, info.to_frame, info.to_end_frame, false, ids);
+            clear_region_validated(timeline, idx, info.to_frame, info.to_end_frame, false, ids);
         }
     }
 

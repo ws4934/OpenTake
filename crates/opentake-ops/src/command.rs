@@ -1696,7 +1696,7 @@ fn create_nested_sequence(
                 name,
                 timeline,
             ));
-            ops::clear_region(
+            ops::clear_region_validated(
                 &mut st.timeline,
                 track_index,
                 start_frame,
@@ -1841,7 +1841,7 @@ fn create_nested_sequence_from_clips(
                 name,
                 child,
             ));
-            ops::clear_region(
+            ops::clear_region_validated(
                 &mut st.timeline,
                 target_track,
                 start_frame,
@@ -2238,10 +2238,7 @@ fn transact(
     summarize: impl FnOnce(&[String]) -> String,
     work: impl FnOnce(&mut EditorState) -> Result<Vec<String>, EditError>,
 ) -> Result<EditResult, EditError> {
-    // Every edit eventually traverses the complete root/nested graph while
-    // pruning transitions. Reject malformed persisted arithmetic before any
-    // command work can mutate a track or consume an id.
-    validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
+    // `apply` validated the complete root/nested graph before dispatch.
     let before = state.snapshot();
     let affected = match work(state) {
         Ok(affected) => affected,
@@ -2621,17 +2618,21 @@ fn validate_clip_frame_arithmetic(clip: &Clip, label: &str) -> Result<i32, EditE
 fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Result<(), EditError> {
     for (track_index, track) in timeline.tracks.iter().enumerate() {
         for (clip_index, clip) in track.clips.iter().enumerate() {
-            validate_clip_frame_arithmetic(
-                clip,
-                &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
-            )?;
+            if validate_clip_frame_arithmetic(clip, "").is_err() {
+                validate_clip_frame_arithmetic(
+                    clip,
+                    &format!("{label}.tracks[{track_index}].clips[{clip_index}]"),
+                )?;
+            }
         }
     }
     for (sequence_index, sequence) in timeline.nested_sequences.iter().enumerate() {
-        validate_timeline_frame_arithmetic(
-            &sequence.timeline,
-            &format!("{label}.nestedSequences[{sequence_index}].timeline"),
-        )?;
+        if validate_timeline_frame_arithmetic(&sequence.timeline, "").is_err() {
+            validate_timeline_frame_arithmetic(
+                &sequence.timeline,
+                &format!("{label}.nestedSequences[{sequence_index}].timeline"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -2865,7 +2866,7 @@ fn place_media(
                 .media_type
                 .is_compatible(target_timeline.tracks[track_index].kind));
             let track_id = target_timeline.tracks[track_index].id.clone();
-            ops::clear_region(
+            ops::clear_region_validated(
                 target_timeline,
                 track_index,
                 resolved.start_frame,
@@ -2878,8 +2879,13 @@ fn place_media(
                 .iter()
                 .position(|track| track.id == track_id)
                 .expect("clear without pruning preserves the destination track");
-            let affected =
-                ops::place_clip(target_timeline, &resolved.to_spec(), track_index, None, ids);
+            let affected = ops::place_clip_validated(
+                target_timeline,
+                &resolved.to_spec(),
+                track_index,
+                None,
+                ids,
+            );
             debug_assert!(!affected.is_empty());
             ops::prune_empty_tracks(target_timeline);
             Ok(affected)
@@ -2917,10 +2923,18 @@ fn add_clips(
                 let track_id = st.timeline.tracks[e.track_index].id.clone();
                 // Pin by id: clearRegion may prune/shift indices.
                 if let Some(ti) = st.track_index(&track_id) {
-                    ops::clear_region(&mut st.timeline, ti, e.start_frame, *end_frame, false, ids);
+                    ops::clear_region_validated(
+                        &mut st.timeline,
+                        ti,
+                        e.start_frame,
+                        *end_frame,
+                        false,
+                        ids,
+                    );
                 }
                 if let Some(ti) = st.track_index(&track_id) {
-                    let placed = ops::place_clip(&mut st.timeline, &e.to_spec(), ti, None, ids);
+                    let placed =
+                        ops::place_clip_validated(&mut st.timeline, &e.to_spec(), ti, None, ids);
                     added.extend(placed);
                 }
             }
@@ -2982,7 +2996,7 @@ fn add_clips_auto_track(
                 entry.track_index = track_index;
                 let track_id = st.timeline.tracks[track_index].id.clone();
                 if let Some(ti) = st.track_index(&track_id) {
-                    ops::clear_region(
+                    ops::clear_region_validated(
                         &mut st.timeline,
                         ti,
                         entry.start_frame,
@@ -2992,7 +3006,7 @@ fn add_clips_auto_track(
                     );
                 }
                 if let Some(ti) = st.track_index(&track_id) {
-                    placed.extend(ops::place_clip(
+                    placed.extend(ops::place_clip_validated(
                         &mut st.timeline,
                         &entry.to_spec(),
                         ti,
@@ -3041,7 +3055,7 @@ fn add_clips_to_separate_auto_tracks(
                 let track_index = ops::insert_track(&mut current.timeline, at, kind, ids);
                 let mut entry = entry.clone();
                 entry.track_index = track_index;
-                placed.extend(ops::place_clip(
+                placed.extend(ops::place_clip_validated(
                     &mut current.timeline,
                     &entry.to_spec(),
                     track_index,
@@ -3886,7 +3900,7 @@ fn paste_clips(
                     .iter()
                     .position(|track| track.id == entry.target_track_id)
                     .expect("preflight pinned every paste destination track");
-                ops::clear_region(
+                ops::clear_region_validated(
                     &mut current.timeline,
                     track_index,
                     entry.start_frame,
@@ -3953,9 +3967,7 @@ fn remove_clips(state: &mut EditorState, clip_ids: Vec<String>) -> Result<EditRe
         "Remove Clip",
         move |_| format!("Removed {count} clip(s)"),
         |st| {
-            for id in &expanded {
-                ops::clear_region::remove_clip(&mut st.timeline, id);
-            }
+            ops::remove_clips(&mut st.timeline, &expanded);
             ops::prune_empty_tracks(&mut st.timeline);
             Ok(expanded.iter().cloned().collect())
         },
@@ -4204,6 +4216,14 @@ fn validate_clip_property_target(
         .find_clip(clip_id)
         .ok_or_else(|| EditError::Invalid(format!("Clip not found: {clip_id}")))?;
     let clip = &state.timeline.tracks[location.track_index].clips[location.clip_index];
+    validate_clip_property_target_for_clip(clip_id, clip, props)
+}
+
+fn validate_clip_property_target_for_clip(
+    clip_id: &str,
+    clip: &Clip,
+    props: &ClipProperties,
+) -> Result<(), EditError> {
     if clip.nested_sequence_id.is_some()
         && (props
             .speed
@@ -4267,6 +4287,18 @@ fn validate_text_overlay(
     transform
         .validate()
         .map_err(|message| EditError::Invalid(format!("{label}: {message}")))
+}
+
+fn clip_location_index(timeline: &Timeline) -> HashMap<&str, (usize, usize)> {
+    let mut locations = HashMap::new();
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            locations
+                .entry(clip.id.as_str())
+                .or_insert((track_index, clip_index));
+        }
+    }
+    locations
 }
 
 fn validate_effective_clip_timing(
@@ -4458,8 +4490,16 @@ fn set_clip_properties(
             "Missing or empty 'clipIds' array".into(),
         ));
     }
+    let locations = clip_location_index(&state.timeline);
+    let mut direct_locations = Vec::with_capacity(clip_ids.len());
     for id in &clip_ids {
-        validate_clip_property_target(state, id, &props)?;
+        validate_clip_property_values(&props, &format!("clip {id}"))?;
+        let &(track_index, clip_index) = locations
+            .get(id.as_str())
+            .ok_or_else(|| EditError::Invalid(format!("Clip not found: {id}")))?;
+        let clip = &state.timeline.tracks[track_index].clips[clip_index];
+        validate_clip_property_target_for_clip(id, clip, &props)?;
+        direct_locations.push((track_index, clip_index));
     }
     // Timing changes propagate to linked partners (trim/speed dropped for text).
     let propagates_timing = props.duration_frames.is_some()
@@ -4471,14 +4511,18 @@ fn set_clip_properties(
     } else {
         HashSet::new()
     };
+    let mut partner_locations = Vec::with_capacity(partners.len());
     for partner_id in &partners {
-        let location = state
-            .find_clip(partner_id)
+        let &(track_index, clip_index) = locations
+            .get(partner_id.as_str())
             .expect("timing propagation returned an existing clip");
-        let clip = &state.timeline.tracks[location.track_index].clips[location.clip_index];
-        let partner_props = timing_properties(&props, clip.media_type == ClipType::Text);
+        let clip = &state.timeline.tracks[track_index].clips[clip_index];
+        let is_text = clip.media_type == ClipType::Text;
+        let partner_props = timing_properties(&props, is_text);
         validate_effective_clip_timing(clip, &partner_props, &format!("linked clip {partner_id}"))?;
+        partner_locations.push((track_index, clip_index, is_text));
     }
+    drop(locations);
     let n = clip_ids.len();
     transact(
         state,
@@ -4488,18 +4532,19 @@ fn set_clip_properties(
             "Set Clip Properties"
         },
         move |_| format!("Updated {n} clip(s)"),
-        |st| {
-            for id in &clip_ids {
-                apply_property_changes(&mut st.timeline, id, &props, false);
+        move |st| {
+            for (track_index, clip_index) in direct_locations {
+                apply_property_changes_at(&mut st.timeline, track_index, clip_index, &props);
             }
-            for pid in &partners {
-                let is_text = st
-                    .find_clip(pid)
-                    .map(|l| st.timeline.tracks[l.track_index].clips[l.clip_index].media_type)
-                    == Some(ClipType::Text);
+            for (track_index, clip_index, is_text) in partner_locations {
                 // Partners receive only timing (and drop it when text).
                 let partner_props = timing_properties(&props, is_text);
-                apply_property_changes(&mut st.timeline, pid, &partner_props, true);
+                apply_property_changes_at(
+                    &mut st.timeline,
+                    track_index,
+                    clip_index,
+                    &partner_props,
+                );
             }
             Ok(clip_ids.clone())
         },
@@ -4721,7 +4766,16 @@ fn apply_property_changes(
     let Some((ti, ci)) = find(timeline, clip_id) else {
         return;
     };
-    let clip = &mut timeline.tracks[ti].clips[ci];
+    apply_property_changes_at(timeline, ti, ci, props);
+}
+
+fn apply_property_changes_at(
+    timeline: &mut Timeline,
+    track_index: usize,
+    clip_index: usize,
+    props: &ClipProperties,
+) {
+    let clip = &mut timeline.tracks[track_index].clips[clip_index];
 
     let previous_duration = clip.duration_frames;
     if props.duration_frames.is_some()
@@ -6222,7 +6276,6 @@ fn ripple_delete_ranges(
             "Track index out of range: {track_index}"
         )));
     }
-    validate_timeline_frame_arithmetic(&state.timeline, "timeline")?;
     ops::ripple::validate_ripple_delete_ranges(&state.timeline, track_index, &ranges)
         .map_err(EditError::Invalid)?;
     // Run the op outside transact so a refusal aborts before any snapshot/commit.
@@ -6371,7 +6424,14 @@ fn add_texts(
             for (e, end_frame) in entries.iter().zip(&entry_ends) {
                 let track_id = st.timeline.tracks[e.track_index].id.clone();
                 if let Some(ti) = st.track_index(&track_id) {
-                    ops::clear_region(&mut st.timeline, ti, e.start_frame, *end_frame, false, ids);
+                    ops::clear_region_validated(
+                        &mut st.timeline,
+                        ti,
+                        e.start_frame,
+                        *end_frame,
+                        false,
+                        ids,
+                    );
                 }
                 if let Some(ti) = st.track_index(&track_id) {
                     let mut clip = opentake_domain::Clip::new(
@@ -6453,7 +6513,14 @@ fn add_texts_auto_track(
             );
             let mut added = Vec::with_capacity(entries.len());
             for (e, end_frame) in entries.iter().zip(&entry_ends) {
-                ops::clear_region(&mut st.timeline, 0, e.start_frame, *end_frame, false, ids);
+                ops::clear_region_validated(
+                    &mut st.timeline,
+                    0,
+                    e.start_frame,
+                    *end_frame,
+                    false,
+                    ids,
+                );
                 let mut clip =
                     opentake_domain::Clip::new(ids.next_id(), "", e.start_frame, e.duration_frames);
                 clip.media_type = ClipType::Text;

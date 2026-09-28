@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use opentake_domain::{Clip, ClipType, Timeline};
 
 use crate::id::IdGen;
-use crate::ops::clear_region::clear_region;
+use crate::ops::clear_region::clear_region_validated;
 use crate::ops::place::sort_clips;
 use crate::ops::tracks::prune_empty_tracks;
 
@@ -124,7 +124,7 @@ pub(crate) fn duplicate_clips_from_plans(
             .iter()
             .position(|t| t.id == plan.to_track_id)
         {
-            clear_region(timeline, idx, plan.to_frame, plan.to_end_frame, false, ids);
+            clear_region_validated(timeline, idx, plan.to_frame, plan.to_end_frame, false, ids);
         }
     }
 

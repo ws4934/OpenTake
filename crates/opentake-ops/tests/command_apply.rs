@@ -1548,6 +1548,60 @@ fn set_clip_properties_propagates_timing_to_linked_partner() {
 }
 
 #[test]
+#[ignore = "release performance gate"]
+fn set_clip_properties_on_2000_linked_pairs_stays_under_50ms() {
+    use std::time::{Duration, Instant};
+
+    let mut videos = Vec::with_capacity(2_000);
+    let mut audios = Vec::with_capacity(2_000);
+    let mut video_ids = Vec::with_capacity(2_000);
+    for index in 0..2_000 {
+        let group = format!("pair-{index}");
+        let mut video = clip(&format!("video-{index}"), index * 100, 60);
+        video.trim_end_frame = 10;
+        video.link_group_id = Some(group.clone());
+        video_ids.push(video.id.clone());
+        videos.push(video);
+
+        let mut audio = clip(&format!("audio-{index}"), index * 100, 60);
+        audio.media_type = ClipType::Audio;
+        audio.trim_end_frame = 10;
+        audio.link_group_id = Some(group);
+        audios.push(audio);
+    }
+    let mut st = state(vec![
+        video_track("video", true, videos),
+        audio_track("audio", true, audios),
+    ]);
+
+    let started = Instant::now();
+    let result = apply(
+        &mut st,
+        EditCommand::SetClipProperties {
+            clip_ids: video_ids,
+            properties: Box::new(ClipProperties {
+                trim_end_frame: Some(0),
+                ..Default::default()
+            }),
+        },
+        &SeqIdGen::default(),
+    );
+    let elapsed = started.elapsed();
+
+    result.expect("setting linked clip properties should succeed");
+    assert!(st
+        .timeline
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .all(|clip| { clip.trim_end_frame == 0 }));
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "2000-pair property update took {elapsed:?}"
+    );
+}
+
+#[test]
 fn set_clip_properties_scalar_clears_keyframe_track() {
     let mut c = clip("c", 0, 60);
     c.opacity_track = Some(KeyframeTrack::from_keyframes(vec![Keyframe::new(0, 0.0)]));

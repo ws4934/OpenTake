@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use opentake_domain::{Clip, ClipType, Timeline};
 
 use crate::id::IdGen;
-use crate::ops::clear_region::clear_region_excluding;
+use crate::ops::clear_region::clear_region_excluding_validated;
 
 /// Which edge a trim drag grabs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,6 +139,7 @@ pub fn trim_clips(timeline: &mut Timeline, edits: &[TrimEdit], ids: &dyn IdGen) 
             return false;
         }
     }
+    let mut clear_ranges = Vec::new();
     for (id, ti, previous_start, previous_end) in previous_bounds {
         let clip = candidate.tracks[ti]
             .clips
@@ -146,30 +147,32 @@ pub fn trim_clips(timeline: &mut Timeline, edits: &[TrimEdit], ids: &dyn IdGen) 
             .find(|clip| clip.id == *id)
             .expect("trim preflight preserves its targets");
         let (start, end) = (clip.start_frame, clip.end_frame());
-        if start < previous_start
-            && !clear_region_excluding(
-                &mut candidate,
-                ti,
-                start,
-                previous_start,
-                false,
-                ids,
-                &protected,
-            )
-        {
-            return false;
+        if start < previous_start {
+            clear_ranges.push((ti, start, previous_start));
         }
-        if end > previous_end
-            && !clear_region_excluding(
-                &mut candidate,
-                ti,
-                previous_end,
-                end,
-                false,
-                ids,
-                &protected,
-            )
-        {
+        if end > previous_end {
+            clear_ranges.push((ti, previous_end, end));
+        }
+    }
+    if !clear_ranges.is_empty()
+        && candidate
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .any(|clip| !clip_arithmetic_is_safe(clip))
+    {
+        return false;
+    }
+    for (track_index, start, end) in clear_ranges {
+        if !clear_region_excluding_validated(
+            &mut candidate,
+            track_index,
+            start,
+            end,
+            false,
+            ids,
+            &protected,
+        ) {
             return false;
         }
     }

@@ -49,15 +49,46 @@ pub fn clear_region_excluding(
     ids: &dyn IdGen,
     excluding: &HashSet<String>,
 ) -> bool {
-    if track_index >= timeline.tracks.len()
-        || start < 0
-        || end < start
-        || timeline
-            .tracks
-            .iter()
-            .flat_map(|track| &track.clips)
-            .any(|clip| !clip_arithmetic_is_safe(clip))
+    if timeline
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .any(|clip| !clip_arithmetic_is_safe(clip))
     {
+        return false;
+    }
+    clear_region_excluding_validated(timeline, track_index, start, end, prune, ids, excluding)
+}
+
+pub(crate) fn clear_region_validated(
+    timeline: &mut Timeline,
+    track_index: usize,
+    start: i32,
+    end: i32,
+    prune: bool,
+    ids: &dyn IdGen,
+) -> bool {
+    clear_region_excluding_validated(
+        timeline,
+        track_index,
+        start,
+        end,
+        prune,
+        ids,
+        &HashSet::new(),
+    )
+}
+
+pub(crate) fn clear_region_excluding_validated(
+    timeline: &mut Timeline,
+    track_index: usize,
+    start: i32,
+    end: i32,
+    prune: bool,
+    ids: &dyn IdGen,
+    excluding: &HashSet<String>,
+) -> bool {
+    if track_index >= timeline.tracks.len() || start < 0 || end < start {
         return false;
     }
     let Some(actions) =
@@ -197,6 +228,12 @@ fn clip_arithmetic_is_safe(clip: &Clip) -> bool {
 pub(crate) fn remove_clip(timeline: &mut Timeline, clip_id: &str) {
     for t in &mut timeline.tracks {
         t.clips.retain(|c| c.id != clip_id);
+    }
+}
+
+pub(crate) fn remove_clips(timeline: &mut Timeline, clip_ids: &HashSet<String>) {
+    for track in &mut timeline.tracks {
+        track.clips.retain(|clip| !clip_ids.contains(&clip.id));
     }
 }
 
