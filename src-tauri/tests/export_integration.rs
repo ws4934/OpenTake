@@ -753,9 +753,10 @@ fn decoded_rgb_frames(path: &Path) -> Vec<u8> {
     output.stdout
 }
 
-/// A blank text clip (empty or whitespace-only content) draws nothing: the
-/// export succeeds and every frame matches the same timeline exported without
-/// the clip (#180). Blank text needs no fonts, so this runs on fontless hosts.
+/// A text clip with empty content, or whitespace-only content and no
+/// background or border, draws nothing: the export succeeds and every frame
+/// matches the same timeline exported without the clip (#180). Neither needs
+/// fonts, so this runs on fontless hosts.
 #[test]
 fn export_with_blank_text_clip_matches_export_without_it() {
     if !ffmpeg_ready() {

@@ -85,7 +85,7 @@ use opentake_render::{
     GpuLutTexture, GpuTexture, RenderDevice, RenderPlan, SourceMetrics, TextRasterRequest,
     TextRasterizer, TextureCache, TextureResolver, TextureSource,
 };
-use opentake_render::{is_blank_text, rasterize_text_layer, text_clip_raster_input};
+use opentake_render::{rasterize_text_layer, text_clip_raster_input, text_draws_glyphs};
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
 /// hit rate is low; a small cache still helps text/image layers re-used across
@@ -2565,9 +2565,9 @@ fn validate_export_probe(
 }
 
 /// Whether any text clip in `plan` has glyphs to draw at `render_box`. Blank
-/// text draws nothing (#180), so it never needs fonts; a text clip without a
-/// raster input counts as drawing so the font guard stays fail-closed (the
-/// resolver reports that clip later).
+/// text draws nothing (#180) and whitespace-only text draws only its box, so
+/// neither needs fonts; a text clip without a raster input counts as drawing
+/// so the font guard stays fail-closed (the resolver reports that clip later).
 fn plan_draws_text(
     plan: &RenderPlan,
     text: &HashMap<String, TextInfo>,
@@ -2575,7 +2575,7 @@ fn plan_draws_text(
 ) -> bool {
     plan.text_plans.iter().any(|clip_plan| {
         text.get(&clip_plan.clip_id).is_none_or(|info| {
-            !is_blank_text(&TextRasterRequest {
+            text_draws_glyphs(&TextRasterRequest {
                 clip_id: &clip_plan.clip_id,
                 content: &info.content,
                 style: &info.style,
@@ -6000,16 +6000,28 @@ mod tests {
         };
         assert!(!draws_text(None));
         assert!(!draws_text(Some("")));
+        // Whitespace paints only its box, which needs no fonts.
         assert!(!draws_text(Some("  \n ")));
         assert!(draws_text(Some("visible")));
 
         let headless = CosmicTextRasterizer::without_system_fonts();
-        assert!(ensure_text_export_fonts(draws_text(Some(" ")), &headless).is_ok());
+        for blank in [None, Some(""), Some("  \n ")] {
+            assert!(ensure_text_export_fonts(draws_text(blank), &headless).is_ok());
+        }
+        assert!(
+            ensure_text_export_fonts(draws_text(Some("visible")), &headless).is_err(),
+            "visible text without fonts still fails the export"
+        );
     }
 
     #[test]
     fn export_resolver_skips_blank_text_but_fails_a_missing_raster() {
         let Ok(dev) = RenderDevice::try_new() else {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "export resolver qualification requires a GPU adapter"
+            );
+            eprintln!("skip: no GPU adapter available");
             return;
         };
         let info = |content: &str, box_norm| TextInfo {
@@ -6020,8 +6032,8 @@ mod tests {
         let full = (0.0, 0.0, 1.0, 1.0);
         let text = HashMap::from([
             ("empty".to_string(), info("", full)),
+            ("flat".to_string(), info("hidden", (0.0, 0.0, 0.0, 1.0))),
             ("spaces".to_string(), info("   ", full)),
-            ("sliver".to_string(), info("hidden", (0.0, 0.0, 0.001, 1.0))),
             ("visible".to_string(), info("visible", full)),
         ]);
         let media = HashMap::new();
@@ -6049,19 +6061,22 @@ mod tests {
         let source = |clip_id: &str| TextureSource::Text {
             clip_id: clip_id.to_string(),
         };
-        for blank in ["empty", "spaces", "sliver"] {
+        for blank in ["empty", "flat"] {
             assert!(resolver.resolve(&source(blank), 0).is_none());
         }
         assert_eq!(resolver.materialization_error, None);
-        assert!(resolver.resolve(&source("visible"), 0).is_none());
-        let error = resolver
-            .materialization_error
-            .take()
-            .expect("a missing raster for visible text must fail the export");
-        assert!(
-            error.contains("text clip visible rasterization failed"),
-            "{error}"
-        );
+        // Whitespace still paints its box, so it reaches the rasterizer.
+        for drawn in ["spaces", "visible"] {
+            assert!(resolver.resolve(&source(drawn), 0).is_none());
+            let error = resolver
+                .materialization_error
+                .take()
+                .expect("a missing raster for drawn text must fail the export");
+            assert!(
+                error.contains(&format!("text clip {drawn} rasterization failed")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

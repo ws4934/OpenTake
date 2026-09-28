@@ -32,7 +32,10 @@ pub struct TextRasterRequest<'a> {
 pub(crate) const MAX_TEXT_BOX_SIDE: u32 = 8192;
 
 /// Box pixel size from the normalized box + canvas, clamped to sane bounds, or
-/// `None` when the box is under one pixel on either axis (or not finite).
+/// `None` when the box has no area (a side that is zero, negative or not
+/// finite). A box with area is at least one pixel per side at any canvas, so
+/// whether a box draws never depends on the canvas size: paused preview,
+/// playback and export agree.
 /// The box comes from `clip.transform` (top-left + width/height) — i.e. upstream
 /// `layer.frame = (tl.x*W, tl.y*H, transform.width*W, transform.height*H)` at
 /// `TextLayerController.applyStyle` L157-163 — **not** `TextLayout.naturalSize`
@@ -43,9 +46,9 @@ pub(crate) fn text_box_pixels(
     canvas: (u32, u32),
 ) -> Option<(u32, u32)> {
     let (_, _, bw, bh) = box_norm;
-    let w = (bw * canvas.0 as f64).round();
-    let h = (bh * canvas.1 as f64).round();
-    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+    let w = (bw * canvas.0 as f64).round().max(1.0);
+    let h = (bh * canvas.1 as f64).round().max(1.0);
+    if !(bw > 0.0 && bh > 0.0 && w.is_finite() && h.is_finite()) {
         return None;
     }
     Some((
@@ -54,16 +57,26 @@ pub(crate) fn text_box_pixels(
     ))
 }
 
-/// Whether a text request has nothing to draw: its content is empty or
-/// whitespace-only, or its box is under one pixel at the request canvas.
+/// Whether a text request has nothing to draw: its content is empty or its
+/// box has no area. Neither depends on the canvas size.
 ///
 /// A blank text clip is valid timeline content (clearing the Inspector's text
 /// field commits `textContent: ""`), so resolvers skip it like an invisible
-/// layer instead of treating it as a materialization failure. Every
-/// [`TextRasterizer`] may return `None` for a blank request; `None` for a
-/// request that is *not* blank means rasterization failed.
+/// layer instead of treating it as a materialization failure. As upstream
+/// (`TextFrameRenderer.image` returns no image for empty content), empty text
+/// draws nothing even with a background or border enabled, while
+/// whitespace-only text is not blank: it has no glyphs but still paints its
+/// background and border. Every [`TextRasterizer`] may return `None` for a
+/// blank request; `None` for a request that is *not* blank means
+/// rasterization failed.
 pub fn is_blank_text(request: &TextRasterRequest<'_>) -> bool {
-    request.content.trim().is_empty() || text_box_pixels(request.box_norm, request.canvas).is_none()
+    request.content.is_empty() || text_box_pixels(request.box_norm, request.canvas).is_none()
+}
+
+/// Whether a text request draws glyphs, and so needs fonts: it is not blank
+/// and has non-whitespace content.
+pub fn text_draws_glyphs(request: &TextRasterRequest<'_>) -> bool {
+    !request.content.trim().is_empty() && !is_blank_text(request)
 }
 
 /// The rasterizer input a text clip projects to: its content and style.
@@ -72,14 +85,14 @@ pub fn is_blank_text(request: &TextRasterRequest<'_>) -> bool {
 /// shows it as an empty field and the render plan already treats it as a
 /// source with nothing to draw. It projects to empty content, so resolvers skip
 /// it exactly like `""`. Blank text never reaches a rasterizer, so it needs no
-/// style either (the default stands in). A non-blank clip without a style has
+/// style either (the default stands in). A non-empty clip without a style has
 /// no raster input (`None`), which resolvers report as a materialization
 /// failure.
 pub fn text_clip_raster_input(clip: &Clip) -> Option<(&str, Cow<'_, TextStyle>)> {
     let content = clip.text_content.as_deref().unwrap_or_default();
     let style = match &clip.text_style {
         Some(style) => Cow::Borrowed(style),
-        None if content.trim().is_empty() => Cow::Owned(TextStyle::default()),
+        None if content.is_empty() => Cow::Owned(TextStyle::default()),
         None => return None,
     };
     Some((content, style))
@@ -178,29 +191,40 @@ mod tests {
     }
 
     #[test]
-    fn blank_text_covers_empty_whitespace_and_sub_pixel_boxes() {
+    fn blank_text_covers_empty_content_and_boxes_without_area() {
         let style = TextStyle::default();
         let full = (0.0, 0.0, 1.0, 1.0);
         assert!(is_blank_text(&request("", &style, full)));
-        assert!(is_blank_text(&request(" \t\n\u{3000}", &style, full)));
-        // 0.0002 * 1920 = 0.38 px rounds to no pixel at this canvas.
-        assert!(is_blank_text(&request(
-            "hi",
-            &style,
-            (0.0, 0.0, 0.0002, 0.5)
-        )));
-        assert!(is_blank_text(&request(
-            "hi",
-            &style,
-            (0.0, 0.0, 0.5, f64::NAN)
-        )));
+        for empty_box in [
+            (0.0, 0.0, 0.0, 0.5),
+            (0.0, 0.0, 0.5, -0.1),
+            (0.0, 0.0, 0.5, f64::NAN),
+            (0.0, 0.0, f64::INFINITY, 0.5),
+        ] {
+            assert!(is_blank_text(&request("hi", &style, empty_box)));
+        }
         assert!(!is_blank_text(&request("hi", &style, full)));
-        // 0.0006 * 1920 = 1.15 px rounds to one pixel and still draws.
-        assert!(!is_blank_text(&request(
-            "hi",
-            &style,
-            (0.0, 0.0, 0.0006, 0.5)
-        )));
+        // Whitespace has no glyphs but still paints its background and border.
+        let whitespace = request(" \t\n\u{3000}", &style, full);
+        assert!(!is_blank_text(&whitespace));
+        assert!(!text_draws_glyphs(&whitespace));
+        assert!(text_draws_glyphs(&request("hi", &style, full)));
+    }
+
+    #[test]
+    fn blankness_does_not_depend_on_the_canvas_size() {
+        let style = TextStyle::default();
+        // 0.0002 of the width is 0.38 px at 1920 and 0.03 px at a 160 px
+        // preview; either way the box draws as one pixel.
+        let sliver = (0.0, 0.0, 0.0002, 0.5);
+        for canvas in [(1920, 1080), (160, 90), (3840, 2160)] {
+            let request = TextRasterRequest {
+                canvas,
+                ..request("hi", &style, sliver)
+            };
+            assert!(!is_blank_text(&request), "{canvas:?}");
+            assert_eq!(text_box_pixels(sliver, canvas).map(|size| size.0), Some(1));
+        }
     }
 
     #[test]
@@ -210,12 +234,10 @@ mod tests {
             called: std::cell::Cell::new(false),
             frame: None,
         };
-        for content in ["", "   "] {
-            let blank = request(content, &style, (0.0, 0.0, 1.0, 1.0));
-            assert_eq!(rasterize_text_layer(&rasterizer, &blank), Ok(None));
-        }
-        let sliver = request("hi", &style, (0.0, 0.0, 0.0, 0.5));
-        assert_eq!(rasterize_text_layer(&rasterizer, &sliver), Ok(None));
+        let blank = request("", &style, (0.0, 0.0, 1.0, 1.0));
+        assert_eq!(rasterize_text_layer(&rasterizer, &blank), Ok(None));
+        let flat = request("hi", &style, (0.0, 0.0, 0.0, 0.5));
+        assert_eq!(rasterize_text_layer(&rasterizer, &flat), Ok(None));
         assert!(!rasterizer.called.get());
     }
 
@@ -247,18 +269,20 @@ mod tests {
         assert_eq!(content, "");
 
         clip.text_style = None;
-        for blank in [None, Some(String::new()), Some("  ".to_string())] {
+        for blank in [None, Some(String::new())] {
             clip.text_content = blank;
             let (content, style) = text_clip_raster_input(&clip).expect("blank text projects");
-            assert!(content.trim().is_empty());
+            assert!(content.is_empty());
             assert_eq!(*style, TextStyle::default());
         }
 
-        clip.text_content = Some("visible".to_string());
-        assert!(
-            text_clip_raster_input(&clip).is_none(),
-            "non-blank text without a style has no raster input"
-        );
+        for drawn in ["visible", "  "] {
+            clip.text_content = Some(drawn.to_string());
+            assert!(
+                text_clip_raster_input(&clip).is_none(),
+                "non-empty text without a style has no raster input"
+            );
+        }
     }
 
     #[test]

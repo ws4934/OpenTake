@@ -2837,10 +2837,24 @@ mod tests {
         let mut empty = text_timeline(None, None);
         empty.tracks.clear();
         let reference = composite(&empty).expect("empty timeline composites");
+        let boxed = TextStyle {
+            background: opentake_domain::Fill::new(
+                true,
+                opentake_domain::Rgba::new(1.0, 0.0, 0.0, 1.0),
+            ),
+            border: opentake_domain::Fill::new(
+                true,
+                opentake_domain::Rgba::new(0.0, 0.0, 1.0, 1.0),
+            ),
+            ..TextStyle::default()
+        };
+        // As upstream, empty text draws nothing even with a background box.
         for (content, style) in [
             (Some(""), Some(TextStyle::default())),
+            (Some(""), Some(boxed.clone())),
             (Some(" \n\t "), Some(TextStyle::default())),
             (None, Some(TextStyle::default())),
+            (None, Some(boxed.clone())),
             (None, None),
         ] {
             let frame = composite(&text_timeline(content, style.clone())).unwrap_or_else(|error| {
@@ -2851,11 +2865,22 @@ mod tests {
             });
             assert_eq!(frame, reference, "blank text {content:?} must draw nothing");
         }
+        // Whitespace-only text has no glyphs but paints its background box.
+        let mut spaces = text_timeline(Some("   "), Some(boxed));
+        spaces.tracks[0].clips[0].transform.width = 0.5;
+        spaces.tracks[0].clips[0].transform.height = 0.5;
+        let frame = composite(&spaces).expect("whitespace text composites");
+        assert_ne!(frame, reference, "whitespace text paints its background");
     }
 
     #[test]
     fn paused_preview_resolver_skips_blank_text_but_fails_a_missing_raster() {
         let Ok(dev) = RenderDevice::try_new() else {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "native preview qualification requires a GPU adapter"
+            );
+            eprintln!("skip: no GPU adapter available");
             return;
         };
         let style = TextStyle::default();
@@ -2863,17 +2888,25 @@ mod tests {
             (
                 "blank".to_string(),
                 TextInfo {
-                    content: "   ".to_string(),
+                    content: String::new(),
                     style: style.clone(),
                     box_norm: (0.0, 0.0, 1.0, 1.0),
                 },
             ),
             (
-                "sliver".to_string(),
+                "flat".to_string(),
                 TextInfo {
                     content: "hidden".to_string(),
                     style: style.clone(),
-                    box_norm: (0.0, 0.0, 0.001, 1.0),
+                    box_norm: (0.0, 0.0, 0.0, 1.0),
+                },
+            ),
+            (
+                "spaces".to_string(),
+                TextInfo {
+                    content: "   ".to_string(),
+                    style: style.clone(),
+                    box_norm: (0.0, 0.0, 1.0, 1.0),
                 },
             ),
             (
@@ -2917,17 +2950,20 @@ mod tests {
         };
 
         assert!(resolver.resolve(&text_source("blank"), 0).is_none());
-        assert!(resolver.resolve(&text_source("sliver"), 0).is_none());
+        assert!(resolver.resolve(&text_source("flat"), 0).is_none());
         assert_eq!(resolver.materialization_error, None);
-        assert!(resolver.resolve(&text_source("visible"), 0).is_none());
-        let error = resolver
-            .materialization_error
-            .take()
-            .expect("a missing raster for visible text must fail the preview");
-        assert!(
-            error.contains("text clip visible rasterization failed"),
-            "{error}"
-        );
+        // Whitespace still paints its box, so it reaches the rasterizer.
+        for drawn in ["spaces", "visible"] {
+            assert!(resolver.resolve(&text_source(drawn), 0).is_none());
+            let error = resolver
+                .materialization_error
+                .take()
+                .expect("a missing raster for drawn text must fail the preview");
+            assert!(
+                error.contains(&format!("text clip {drawn} rasterization failed")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

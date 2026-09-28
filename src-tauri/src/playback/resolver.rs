@@ -1256,6 +1256,11 @@ mod tests {
     #[test]
     fn blank_text_draws_nothing_while_a_missing_raster_still_fails_playback() {
         let Ok(dev) = RenderDevice::try_new() else {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "playback resolver qualification requires a GPU adapter"
+            );
+            eprintln!("skip: no GPU adapter available");
             return;
         };
         let text_info = |content: &str, box_norm| TextInfo {
@@ -1266,11 +1271,11 @@ mod tests {
         let full = (0.0, 0.0, 1.0, 1.0);
         let text = HashMap::from([
             ("empty".to_string(), text_info("", full)),
-            ("spaces".to_string(), text_info(" \t ", full)),
             (
-                "sliver".to_string(),
-                text_info("hidden", (0.0, 0.0, 0.001, 1.0)),
+                "flat".to_string(),
+                text_info("hidden", (0.0, 0.0, 1.0, 0.0)),
             ),
+            ("spaces".to_string(), text_info(" \t ", full)),
             ("visible".to_string(), text_info("visible", full)),
         ]);
         let mut state =
@@ -1281,22 +1286,25 @@ mod tests {
             clip_id: clip_id.to_string(),
         };
         let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
-        for blank in ["empty", "spaces", "sliver"] {
+        for blank in ["empty", "flat"] {
             assert!(resolver.resolve(&source(blank), 0).is_none());
         }
         drop(resolver);
         assert_eq!(state.take_materialization_error(), None);
 
-        let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
-        assert!(resolver.resolve(&source("visible"), 0).is_none());
-        drop(resolver);
-        let error = state
-            .take_materialization_error()
-            .expect("a missing raster for visible text must fail playback");
-        assert!(
-            error.contains("text clip visible rasterization failed"),
-            "{error}"
-        );
+        // Whitespace still paints its box, so it reaches the rasterizer.
+        for drawn in ["spaces", "visible"] {
+            let mut resolver = StreamingResolver::new(&dev.device, &dev.queue, &mut state);
+            assert!(resolver.resolve(&source(drawn), 0).is_none());
+            drop(resolver);
+            let error = state
+                .take_materialization_error()
+                .expect("a missing raster for drawn text must fail playback");
+            assert!(
+                error.contains(&format!("text clip {drawn} rasterization failed")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

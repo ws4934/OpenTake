@@ -164,7 +164,7 @@ fn ch8(v: f64) -> u8 {
 }
 
 /// Rasterize one text clip's box to premultiplied RGBA, or `None` for a blank
-/// request (empty content or a sub-pixel box, see [`is_blank_text`]).
+/// request (empty content or a box without area, see [`is_blank_text`]).
 fn rasterize_box(inner: &mut Inner, req: &TextRasterRequest<'_>) -> Option<DecodedFrame> {
     if is_blank_text(req) {
         return None;
@@ -407,7 +407,33 @@ mod tests {
     fn empty_content_is_none() {
         let r = CosmicTextRasterizer::new();
         let style = TextStyle::default();
-        assert!(r.rasterize(&req("   ", &style)).is_none());
+        assert!(r.rasterize(&req("", &style)).is_none());
+    }
+
+    #[test]
+    fn whitespace_content_paints_only_the_box() {
+        for r in [
+            CosmicTextRasterizer::new(),
+            CosmicTextRasterizer::without_system_fonts(),
+        ] {
+            let plain = TextStyle::default();
+            let frame = r.rasterize(&req(" \t ", &plain)).expect("whitespace box");
+            assert!(frame.rgba.iter().all(|byte| *byte == 0), "no glyphs");
+            let boxed = TextStyle {
+                background: opentake_domain::Fill::new(true, Rgba::new(0.0, 0.0, 0.0, 1.0)),
+                ..TextStyle::default()
+            };
+            let frame = r.rasterize(&req(" \t ", &boxed)).expect("whitespace box");
+            assert!(
+                frame
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255),
+                "the background fills the whole box"
+            );
+        }
     }
 
     #[test]
