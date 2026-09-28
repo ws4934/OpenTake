@@ -50,7 +50,8 @@ describe("project snapshot schema compatibility", () => {
     expect(state.projectEpoch).toBe(8);
     expect(state.timelineVersion).toBe(13);
     expect(state.timeline).toEqual(UNKNOWN_TIMELINE);
-    expect(state.timeline).not.toBe(UNKNOWN_TIMELINE);
+    // The snapshot is adopted and frozen in place, not copied.
+    expect(state.timeline).toBe(UNKNOWN_TIMELINE);
     expect(Object.isFrozen(state.timeline)).toBe(true);
     expect(state.projectPath).toBe("/Volumes/QA/unknown.opentake");
     expect(state.compatibilityReadOnly).toBe(true);

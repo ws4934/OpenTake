@@ -50,6 +50,8 @@ let observedFloorSequence = 0;
 let convergedFloorSequence = 0;
 let mirrorRefreshOwner: MirrorRefreshOwner | null = null;
 
+const TIMELINE_SYNC_FAILURE_LABEL = "时间线事件同步失败 / Timeline event sync failed";
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -155,6 +157,21 @@ function observeLifecycleFloor(
     failureLabel,
     sequence: observedFloorSequence,
   };
+}
+
+/** Record a timeline revision that core committed. Every commit is announced
+ *  twice, by its `timeline_changed` event and by the edit result the caller
+ *  awaits, so a notice at or below the floor the running convergence already
+ *  chases joins it instead of queuing a second fetch of the same revision. */
+function observeTimelineFloor(generation: number, floor: SnapshotFloor): void {
+  if (
+    lifecycleConvergence?.generation === generation &&
+    highestObservedFloor &&
+    !isNewerFloor(floor, highestObservedFloor.floor)
+  ) {
+    return;
+  }
+  observeLifecycleFloor(generation, floor, TIMELINE_SYNC_FAILURE_LABEL);
 }
 
 async function runMirrorRefresh(
@@ -398,11 +415,7 @@ export async function startSync(): Promise<void> {
       const current = useProjectStore.getState();
       if (projectEpoch < current.projectEpoch) return;
       if (projectEpoch === current.projectEpoch && version <= current.timelineVersion) return;
-      observeLifecycleFloor(
-        generation,
-        { projectEpoch, version },
-        "时间线事件同步失败 / Timeline event sync failed",
-      );
+      observeTimelineFloor(generation, { projectEpoch, version });
       return requestLifecycleConvergence(generation, lifecycleActive);
     });
     if (!lifecycleActive()) {
@@ -516,4 +529,22 @@ export function stopSync(): void {
 export async function forceRefresh(): Promise<void> {
   const outcome = await refreshMirror();
   if (outcome === "superseded") await waitForMirrorRefreshOwner();
+}
+
+/** Resolve once the mirror holds `floor`, the revision an edit just committed.
+ *  Core announces the commit with `timeline_changed`; this joins the refresh
+ *  that event starts (or starts it when the edit result arrives first or the
+ *  event is lost) instead of superseding it with a second `get_timeline`.
+ *  Without the event sync, or when that refresh fails, it falls back to
+ *  `forceRefresh`, which rejects on failure. */
+export async function awaitMirrorVersion(floor: SnapshotFloor): Promise<void> {
+  if (mirrorReachesFloor(floor)) return;
+  const generation = lifecycleGeneration;
+  const lifecycleActive = () => started && generation === lifecycleGeneration;
+  if (lifecycleActive()) {
+    observeTimelineFloor(generation, floor);
+    await requestLifecycleConvergence(generation, lifecycleActive);
+    if (mirrorReachesFloor(floor)) return;
+  }
+  await forceRefresh();
 }
