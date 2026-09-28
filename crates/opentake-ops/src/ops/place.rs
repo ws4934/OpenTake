@@ -87,6 +87,24 @@ pub fn place_clip(
     {
         return Vec::new();
     }
+    place_clip_validated(timeline, spec, track_index, linked_audio_track_index, ids)
+}
+
+pub(crate) fn place_clip_validated(
+    timeline: &mut Timeline,
+    spec: &PlaceSpec,
+    track_index: usize,
+    linked_audio_track_index: Option<usize>,
+    ids: &dyn IdGen,
+) -> Vec<String> {
+    if track_index >= timeline.tracks.len()
+        || !spec_arithmetic_is_safe(spec)
+        || !timeline.tracks[track_index]
+            .kind
+            .is_compatible(spec.media_type)
+    {
+        return Vec::new();
+    }
     let target_is_video = timeline.tracks[track_index].kind == ClipType::Video;
     let should_link = spec.add_linked_audio
         && target_is_video

@@ -148,8 +148,9 @@ fn cascade_remove_clips(timeline: &mut Timeline, asset_ids: &HashSet<String>) ->
         .map(|c| c.id.clone())
         .collect();
     let count = doomed.len();
-    for id in &doomed {
-        crate::ops::clear_region::remove_clip(timeline, id);
+    if count > 0 {
+        let doomed = doomed.into_iter().collect();
+        crate::ops::clear_region::remove_clips(timeline, &doomed);
     }
     if count > 0 {
         crate::ops::prune_empty_tracks(timeline);

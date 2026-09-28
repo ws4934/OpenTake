@@ -20,29 +20,64 @@ pub fn link_index(timeline: &Timeline) -> HashMap<String, Vec<String>> {
     m
 }
 
+pub(crate) struct BorrowedLinkIndex<'a> {
+    groups: HashMap<&'a str, Vec<&'a str>>,
+    clip_groups: HashMap<&'a str, &'a str>,
+}
+
+impl<'a> BorrowedLinkIndex<'a> {
+    pub(crate) fn new(timeline: &'a Timeline) -> Self {
+        let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut clip_groups = HashMap::new();
+        for track in &timeline.tracks {
+            for clip in &track.clips {
+                if let Some(group_id) = clip.link_group_id.as_deref() {
+                    groups.entry(group_id).or_default().push(&clip.id);
+                    clip_groups.insert(clip.id.as_str(), group_id);
+                }
+            }
+        }
+        Self {
+            groups,
+            clip_groups,
+        }
+    }
+
+    fn members(&self, clip_id: &str) -> &[&'a str] {
+        self.clip_groups
+            .get(clip_id)
+            .and_then(|group_id| self.groups.get(*group_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn partners<'b>(&'b self, clip_id: &'b str) -> impl Iterator<Item = &'a str> + 'b {
+        self.members(clip_id)
+            .iter()
+            .copied()
+            .filter(move |member_id| *member_id != clip_id)
+    }
+}
+
 /// Every clip id sharing a link group with any id in `ids`, including the inputs.
 /// 1:1 port of `expandToLinkGroup`.
 pub fn expand_to_link_group(timeline: &Timeline, ids: &HashSet<String>) -> HashSet<String> {
-    let idx = link_index(timeline);
-    let mut clip_to_group: HashMap<&str, &str> = HashMap::new();
-    for (gid, members) in &idx {
-        for id in members {
-            clip_to_group.insert(id.as_str(), gid.as_str());
-        }
-    }
-    let mut groups: HashSet<String> = HashSet::new();
+    let idx = BorrowedLinkIndex::new(timeline);
+    let mut groups = HashSet::new();
     for id in ids {
-        if let Some(g) = clip_to_group.get(id.as_str()) {
-            groups.insert((*g).to_string());
+        if let Some(group_id) = idx.clip_groups.get(id.as_str()) {
+            groups.insert(*group_id);
         }
     }
     if groups.is_empty() {
         return ids.clone();
     }
     let mut result = ids.clone();
-    for g in &groups {
-        if let Some(members) = idx.get(g) {
-            result.extend(members.iter().cloned());
+    for group_id in groups {
+        if let Some(members) = idx.groups.get(group_id) {
+            for member_id in members {
+                result.insert((*member_id).to_string());
+            }
         }
     }
     result
@@ -51,12 +86,10 @@ pub fn expand_to_link_group(timeline: &Timeline, ids: &HashSet<String>) -> HashS
 /// Ids of clips that share `clip_id`'s link group, excluding `clip_id` itself.
 /// 1:1 port of `linkedPartnerIds(of:)`.
 pub fn linked_partner_ids(timeline: &Timeline, clip_id: &str) -> Vec<String> {
-    for (_, members) in link_index(timeline) {
-        if members.iter().any(|m| m == clip_id) {
-            return members.into_iter().filter(|m| m != clip_id).collect();
-        }
-    }
-    Vec::new()
+    BorrowedLinkIndex::new(timeline)
+        .partners(clip_id)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Linked-partner ids that should receive a timing-style change (duration, trim,
@@ -66,10 +99,11 @@ pub fn timing_propagation_partners(
     clip_ids: &HashSet<String>,
 ) -> HashSet<String> {
     let mut out = HashSet::new();
+    let index = BorrowedLinkIndex::new(timeline);
     for id in clip_ids {
-        for pid in linked_partner_ids(timeline, id) {
-            if !clip_ids.contains(&pid) {
-                out.insert(pid);
+        for partner_id in index.partners(id) {
+            if !clip_ids.contains(partner_id) {
+                out.insert(partner_id.to_string());
             }
         }
     }

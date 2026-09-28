@@ -14,38 +14,57 @@ use opentake_domain::{Clip, ClipType, Timeline};
 
 use crate::engines::{ClipShift, FrameRange, RippleEngine};
 use crate::id::{IdGen, SeqIdGen};
-use crate::ops::clear_region::{clear_region, remove_clip};
-use crate::ops::linking::linked_partner_ids;
-use crate::ops::place::{place_clip, sort_clips, PlaceSpec};
+use crate::ops::clear_region::{clear_region_validated, remove_clips};
+use crate::ops::linking::BorrowedLinkIndex;
+use crate::ops::place::{place_clip_validated, sort_clips, PlaceSpec};
 use crate::ops::split::split_clip;
 use crate::ops::tracks::prune_empty_tracks;
 
 /// Apply each shift's new `start_frame` to its clip. Returns the count applied.
 /// 1:1 port of `applyShifts`.
 pub fn apply_shifts(timeline: &mut Timeline, shifts: &[ClipShift]) -> usize {
-    if validate_timeline_arithmetic(timeline).is_err()
-        || shifts.iter().any(|shift| {
-            let Some((track_index, clip_index)) = find(timeline, &shift.clip_id) else {
-                return false;
-            };
-            let clip = &timeline.tracks[track_index].clips[clip_index];
-            shift.new_start_frame < 0
-                || shift
-                    .new_start_frame
-                    .checked_add(clip.duration_frames)
-                    .is_none()
-        })
-    {
+    if validate_timeline_arithmetic(timeline).is_err() {
         return 0;
     }
-    let mut applied = 0;
+    let locations = clip_location_index(timeline);
+    let mut targets = Vec::with_capacity(shifts.len());
     for shift in shifts {
-        if let Some((ti, ci)) = find(timeline, &shift.clip_id) {
-            timeline.tracks[ti].clips[ci].start_frame = shift.new_start_frame;
+        let Some(&(track_index, clip_index)) = locations.get(shift.clip_id.as_str()) else {
+            targets.push(None);
+            continue;
+        };
+        let clip = &timeline.tracks[track_index].clips[clip_index];
+        if shift.new_start_frame < 0
+            || shift
+                .new_start_frame
+                .checked_add(clip.duration_frames)
+                .is_none()
+        {
+            return 0;
+        }
+        targets.push(Some((track_index, clip_index)));
+    }
+    drop(locations);
+    let mut applied = 0;
+    for (shift, target) in shifts.iter().zip(targets) {
+        if let Some((track_index, clip_index)) = target {
+            timeline.tracks[track_index].clips[clip_index].start_frame = shift.new_start_frame;
             applied += 1;
         }
     }
     applied
+}
+
+fn clip_location_index(timeline: &Timeline) -> HashMap<&str, (usize, usize)> {
+    let mut locations = HashMap::new();
+    for (track_index, track) in timeline.tracks.iter().enumerate() {
+        for (clip_index, clip) in track.clips.iter().enumerate() {
+            locations
+                .entry(clip.id.as_str())
+                .or_insert((track_index, clip_index));
+        }
+    }
+    locations
 }
 
 /// Dry-run a shift set against a track: returns a blocking reason (collision or
@@ -165,9 +184,7 @@ pub fn ripple_delete(
     }
 
     // Remove, then apply the precomputed shifts.
-    for id in ids {
-        remove_clip(timeline, id);
-    }
+    remove_clips(timeline, ids);
     for shifts in shifts_by_track.values() {
         apply_shifts(timeline, shifts);
     }
@@ -189,37 +206,95 @@ pub fn ripple_delete_ranges_on_track(
     if let Err(reason) = validate_ripple_delete_ranges(timeline, track_index, ranges) {
         return RippleOutcome::Refused(reason);
     }
-    // Exercise the complete clear/split/shift path on a disposable timeline
-    // with a private id stream. This establishes that the real mutation cannot
-    // encounter a late arithmetic refusal after consuming caller ids.
-    let mut preflight = timeline.clone();
+    // Run the fallible mutation on one disposable copy. Caller ids are only
+    // consumed after success, then substituted for the private ids it minted.
+    let mut candidate = timeline.clone();
     let mut preflight_prefix = "__ripple-preflight-".to_string();
-    while timeline
-        .tracks
-        .iter()
-        .flat_map(|track| &track.clips)
-        .any(|clip| clip.id.starts_with(&preflight_prefix))
-    {
+    while timeline_has_id_prefix(timeline, &preflight_prefix) {
         preflight_prefix.push('_');
     }
-    let preflight_ids = SeqIdGen::new(preflight_prefix);
-    if let RippleOutcome::Refused(reason) = ripple_delete_ranges_validated(
-        &mut preflight,
+    let preflight_ids = SeqIdGen::new(preflight_prefix.clone());
+    let outcome = ripple_delete_ranges_validated(
+        &mut candidate,
         track_index,
         ranges,
         track_label,
         &preflight_ids,
-    ) {
-        return RippleOutcome::Refused(reason);
-    }
+    );
+    let RippleOutcome::Ok(mut report) = outcome else {
+        return outcome;
+    };
 
-    let mut candidate = timeline.clone();
-    let outcome =
-        ripple_delete_ranges_validated(&mut candidate, track_index, ranges, track_label, id_gen);
-    if matches!(outcome, RippleOutcome::Ok(_)) {
-        *timeline = candidate;
+    let id_map = remap_preflight_ids(
+        &mut candidate,
+        &preflight_prefix,
+        preflight_ids.count(),
+        id_gen,
+    );
+    for (clip_id, _, _) in &mut report.resulting_fragments {
+        remap_id(clip_id, &id_map);
     }
-    outcome
+    for clip_id in &mut report.removed_clip_ids {
+        remap_id(clip_id, &id_map);
+    }
+    *timeline = candidate;
+    RippleOutcome::Ok(report)
+}
+
+fn timeline_has_id_prefix(timeline: &Timeline, prefix: &str) -> bool {
+    timeline.tracks.iter().any(|track| {
+        track.id.starts_with(prefix)
+            || track.clips.iter().any(|clip| {
+                clip.id.starts_with(prefix)
+                    || clip
+                        .link_group_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(prefix))
+                    || clip.transition_out.as_ref().is_some_and(|transition| {
+                        transition.from_clip_id.starts_with(prefix)
+                            || transition.to_clip_id.starts_with(prefix)
+                    })
+            })
+    }) || timeline.nested_sequences.iter().any(|sequence| {
+        sequence.id.starts_with(prefix) || timeline_has_id_prefix(&sequence.timeline, prefix)
+    })
+}
+
+fn remap_preflight_ids(
+    timeline: &mut Timeline,
+    prefix: &str,
+    count: u64,
+    ids: &dyn IdGen,
+) -> HashMap<String, String> {
+    let replacements: HashMap<String, String> = (1..=count)
+        .map(|index| (format!("{prefix}{index}"), ids.next_id()))
+        .collect();
+    remap_timeline_ids(timeline, &replacements);
+    replacements
+}
+
+fn remap_timeline_ids(timeline: &mut Timeline, replacements: &HashMap<String, String>) {
+    for track in &mut timeline.tracks {
+        for clip in &mut track.clips {
+            remap_id(&mut clip.id, replacements);
+            if let Some(group_id) = &mut clip.link_group_id {
+                remap_id(group_id, replacements);
+            }
+            if let Some(transition) = &mut clip.transition_out {
+                remap_id(&mut transition.from_clip_id, replacements);
+                remap_id(&mut transition.to_clip_id, replacements);
+            }
+        }
+    }
+    for sequence in &mut timeline.nested_sequences {
+        remap_timeline_ids(&mut sequence.timeline, replacements);
+    }
+}
+
+fn remap_id(id: &mut String, replacements: &HashMap<String, String>) {
+    if let Some(replacement) = replacements.get(id) {
+        *id = replacement.clone();
+    }
 }
 
 fn ripple_delete_ranges_validated(
@@ -260,13 +335,15 @@ fn ripple_delete_ranges_validated(
         })
         .map(|c| c.id.clone())
         .collect();
+    let link_index = BorrowedLinkIndex::new(timeline);
     for cid in touched_partner_ids {
-        for pid in linked_partner_ids(timeline, &cid) {
-            if let Some((ti, _)) = find(timeline, &pid) {
+        for pid in link_index.partners(&cid) {
+            if let Some((ti, _)) = find(timeline, pid) {
                 clear_track_ids.insert(timeline.tracks[ti].id.clone());
             }
         }
     }
+    drop(link_index);
 
     // Refuse up front if a sync-locked follower can't absorb the shift. These
     // tracks aren't cleared, so their clips are unchanged when the shift applies.
@@ -293,7 +370,7 @@ fn ripple_delete_ranges_validated(
     for tid in &clear_ids_snapshot {
         if let Some(ti) = timeline.tracks.iter().position(|t| &t.id == tid) {
             for r in &merged {
-                clear_region(timeline, ti, r.start, r.end, false, id_gen);
+                clear_region_validated(timeline, ti, r.start, r.end, false, id_gen);
             }
         }
     }
@@ -468,7 +545,7 @@ pub fn ripple_insert(
     for spec in specs {
         let mut s = spec.clone();
         s.start_frame = cursor;
-        created.extend(place_clip(
+        created.extend(place_clip_validated(
             timeline,
             &s,
             track_index,
@@ -878,6 +955,33 @@ mod tests {
         assert!(matches!(out, RippleOutcome::Refused(_)));
         // unchanged
         assert_eq!(tl.tracks[0].clips[0].duration_frames, 200);
+        assert_eq!(g.count(), 0);
+    }
+
+    #[test]
+    fn ripple_delete_ranges_remaps_private_split_ids_after_success() {
+        let mut tl = Timeline::new();
+        tl.tracks
+            .push(one_track(vec![clip("spanning", 0, 100)], true));
+        let ids = SeqIdGen::new("caller-");
+
+        let RippleOutcome::Ok(report) =
+            ripple_delete_ranges_on_track(&mut tl, 0, &[FrameRange::new(40, 60)], &label, &ids)
+        else {
+            panic!("range delete should succeed");
+        };
+
+        assert_eq!(ids.count(), 2);
+        assert!(tl.tracks[0].clips.iter().any(|clip| clip.id == "caller-2"));
+        assert!(tl
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .all(|clip| !clip.id.starts_with("__ripple-preflight-")));
+        assert!(report
+            .resulting_fragments
+            .iter()
+            .any(|(id, start, duration)| id == "caller-2" && *start == 40 && *duration == 40));
     }
 
     #[test]
@@ -941,5 +1045,111 @@ mod tests {
         assert!(insert_result.unwrap().is_empty());
         assert_eq!(tl, before);
         assert_eq!(ids.count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod bulk_performance_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    use opentake_domain::{Clip, Track};
+
+    #[test]
+    #[ignore = "release performance gate"]
+    fn ripple_delete_ranges_on_8000_sync_locked_clips_stays_under_20ms() {
+        let mut timeline = Timeline::new();
+        let mut anchor = Track::new("video", ClipType::Video);
+        anchor.clips.push(Clip::new("cut", "asset", 0, 1));
+
+        let mut follower = Track::new("captions", ClipType::Text);
+        follower.sync_locked = true;
+        follower.clips.reserve(8_000);
+        for index in 0..8_000 {
+            let mut clip = Clip::new(format!("caption-{index}"), "asset", 2 + index * 2, 1);
+            clip.media_type = ClipType::Text;
+            follower.clips.push(clip);
+        }
+        timeline.tracks.extend([anchor, follower]);
+
+        let ids = SeqIdGen::new("perf-");
+        let label = |_: &Timeline, index| format!("track-{index}");
+        let started = Instant::now();
+        let outcome =
+            ripple_delete_ranges_on_track(&mut timeline, 0, &[FrameRange::new(0, 1)], &label, &ids);
+        let elapsed = started.elapsed();
+
+        let RippleOutcome::Ok(report) = outcome else {
+            panic!("expected ripple delete to succeed, got {outcome:?}");
+        };
+        assert_eq!(report.shifted_clips, 8_000);
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "8000-clip range delete took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "release performance gate"]
+    fn ripple_delete_on_8000_sync_locked_clips_stays_under_20ms() {
+        let mut timeline = Timeline::new();
+        let mut anchor = Track::new("video", ClipType::Video);
+        anchor.clips.push(Clip::new("cut", "asset", 0, 1));
+
+        let mut follower = Track::new("captions", ClipType::Text);
+        follower.sync_locked = true;
+        follower.clips.reserve(8_000);
+        for index in 0..8_000 {
+            let mut clip = Clip::new(format!("caption-{index}"), "asset", 2 + index * 2, 1);
+            clip.media_type = ClipType::Text;
+            follower.clips.push(clip);
+        }
+        timeline.tracks.extend([anchor, follower]);
+
+        let ids = ["cut".to_string()].into_iter().collect();
+        let label = |_: &Timeline, index| format!("track-{index}");
+        let started = Instant::now();
+        ripple_delete(&mut timeline, &ids, &label).expect("ripple delete should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(timeline.tracks.len(), 1);
+        assert_eq!(timeline.tracks[0].id, "captions");
+        assert_eq!(timeline.tracks[0].clips.len(), 8_000);
+        assert_eq!(timeline.tracks[0].clips[0].start_frame, 1);
+        assert_eq!(timeline.tracks[0].clips[7_999].start_frame, 15_999);
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "8000-clip ripple delete took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "release performance gate"]
+    fn ripple_delete_4000_of_8000_clips_stays_under_20ms() {
+        let mut timeline = Timeline::new();
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.reserve(8_000);
+        let mut selected = HashSet::with_capacity(4_000);
+        for index in 0..8_000 {
+            let id = format!("clip-{index}");
+            track.clips.push(Clip::new(&id, "asset", index * 2, 1));
+            if index % 2 == 0 {
+                selected.insert(id);
+            }
+        }
+        timeline.tracks.push(track);
+
+        let started = Instant::now();
+        ripple_delete(&mut timeline, &selected, &|_, index| {
+            format!("track-{index}")
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(timeline.tracks[0].clips.len(), 4_000);
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "8000-clip ripple delete took {elapsed:?}"
+        );
     }
 }
