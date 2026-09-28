@@ -91,7 +91,18 @@ impl ReplicateAdapter {
                 }
                 input
             }
-            GenerationParams::Upscale(p) => json!({ "video": p.source_url }),
+            GenerationParams::Upscale(p) => {
+                // https://replicate.com/topazlabs/video-upscale/api/schema has
+                // no scale factor: without a target it renders 1080p at 30 fps.
+                let mut input = json!({ "video": p.source_url });
+                if let Some(resolution) = &p.target_resolution {
+                    input["target_resolution"] = json!(resolution);
+                }
+                if let Some(fps) = p.target_fps {
+                    input["target_fps"] = json!(fps);
+                }
+                input
+            }
         }
     }
 

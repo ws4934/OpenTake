@@ -23,6 +23,7 @@ pub mod params;
 pub mod provider;
 pub mod stems;
 pub mod transport;
+pub mod upscale;
 
 // Public API surface.
 pub use build_params::{
@@ -47,6 +48,10 @@ pub use provider::{
 pub use stems::{resolve_stem_execution, StemExecutionPlan, StemProviderSelection};
 pub use transport::{
     Body, HttpRequest, HttpResponse, HttpTransport, Method, MockTransport, ReqwestTransport,
+};
+pub use upscale::{
+    expected_upscale_size, plan_video_upscale, upscale_result_matches, video_upscale_resolution,
+    UpscaleResolution, VideoUpscaleError, VideoUpscalePlan,
 };
 
 // Re-export the domain input type assembled by `build_params` for downstream use.

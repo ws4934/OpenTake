@@ -139,6 +139,9 @@ pub fn build_audio_params(input: &GenerationInput, uploaded: &[String]) -> Audio
 }
 
 /// Build params for an upscale submission. `sourceURL` is the first uploaded URL.
+/// A resolution-targeted upscaler records its requested output size in
+/// `input.resolution` (see [`crate::upscale`]); the frame rate is not part of
+/// the persisted input, so the caller sets `target_fps` when it has one.
 pub fn build_upscale_params(input: &GenerationInput, uploaded: &[String]) -> UpscaleParams {
     UpscaleParams {
         source_url: uploaded
@@ -147,6 +150,8 @@ pub fn build_upscale_params(input: &GenerationInput, uploaded: &[String]) -> Ups
             .or_else(|| input.image_urls.as_ref().and_then(|v| v.first().cloned()))
             .unwrap_or_default(),
         duration_seconds: input.duration.max(0) as u32,
+        target_resolution: input.resolution.clone(),
+        target_fps: None,
     }
 }
 
@@ -331,6 +336,15 @@ mod tests {
         let p = build_upscale_params(&base_input(), &uploaded);
         assert_eq!(p.source_url, "in.mp4");
         assert_eq!(p.duration_seconds, 5);
+        assert_eq!(p.target_resolution, None);
+        let mut targeted = base_input();
+        targeted.resolution = Some("4k".into());
+        assert_eq!(
+            build_upscale_params(&targeted, &uploaded)
+                .target_resolution
+                .as_deref(),
+            Some("4k")
+        );
     }
 
     #[test]

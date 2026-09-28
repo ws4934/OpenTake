@@ -25,10 +25,12 @@ use opentake_core::{
 };
 use opentake_domain::{ClipType, GenerationInput, GenerationJobStatus, MediaResolver, Timeline};
 use opentake_gen::catalog::cost::cost_for_input;
+use opentake_gen::upscale::VIDEO_UPSCALE_DEFAULT_RESOLUTION;
 use opentake_gen::{
-    build_params, Catalog, CatalogEntry, ElevenLabsAdapter, FalAdapter, GenClient, GenError,
-    JobStatus, KeyStore, KeyringStore, ModelKind, ModelRoute, OpenAiAdapter, ProviderKey,
-    ProviderRegistry, ReplicateAdapter, ReqwestTransport, StaticToken, UiCapabilities,
+    build_params, plan_video_upscale, upscale_result_matches, video_upscale_resolution, Catalog,
+    CatalogEntry, ElevenLabsAdapter, FalAdapter, GenClient, GenError, GenerationParams, JobStatus,
+    KeyStore, KeyringStore, ModelKind, ModelRoute, OpenAiAdapter, ProviderKey, ProviderRegistry,
+    ReplicateAdapter, ReqwestTransport, StaticToken, UiCapabilities,
 };
 use opentake_media::{MediaCancelToken, MediaEngine};
 
@@ -105,6 +107,11 @@ struct PreparedDispatch {
     requires_source_video: bool,
     model_kind: ModelKind,
     managed: bool,
+    /// Output frame rate for a resolution-targeted upscale. The persisted input
+    /// has no frame-rate field, so it travels with the dispatch only.
+    upscale_target_fps: Option<u32>,
+    /// Notes returned with the accepted submission.
+    warnings: Vec<String>,
 }
 
 struct PreparedTimelineSpan {
@@ -705,6 +712,8 @@ impl TauriGenerationBridge {
                     requires_source_video: caps.requires_source_video,
                     model_kind: ModelKind::Video,
                     managed: !configured.contains(&provider) && managed_available,
+                    upscale_target_fps: None,
+                    warnings: Vec::new(),
                 })
             }
             GenerationRequest::Image(args) => {
@@ -783,6 +792,8 @@ impl TauriGenerationBridge {
                     requires_source_video: false,
                     model_kind: ModelKind::Image,
                     managed: !configured.contains(&provider) && managed_available,
+                    upscale_target_fps: None,
+                    warnings: Vec::new(),
                 })
             }
             GenerationRequest::Audio(args) => {
@@ -906,6 +917,8 @@ impl TauriGenerationBridge {
                     requires_source_video: false,
                     model_kind: ModelKind::Audio,
                     managed: !configured.contains(&provider) && managed_available,
+                    upscale_target_fps: None,
+                    warnings: Vec::new(),
                 })
             }
             GenerationRequest::Upscale(args) => {
@@ -941,6 +954,27 @@ impl TauriGenerationBridge {
                 if !caps.supported_types.iter().any(|kind| kind == source_kind) {
                     return Err("selected upscaler does not support the source type".to_string());
                 }
+                // Video upscalers take an output size, not a scale factor:
+                // ask for the smallest target above the source and keep its
+                // frame rate (refusing before anything is paid for when no
+                // larger target exists).
+                let (resolution, upscale_target_fps, warnings, size_label) =
+                    if source.kind == ClipType::Video {
+                        let plan = plan_video_upscale(
+                            positive_dimension(source.source_width),
+                            positive_dimension(source.source_height),
+                            source.source_fps,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        (
+                            Some(plan.resolution.value.to_string()),
+                            plan.fps,
+                            plan.fps_warning.into_iter().collect(),
+                            plan.resolution.label,
+                        )
+                    } else {
+                        (None, None, Vec::new(), "2x")
+                    };
                 let source_path = resolve_media(&snapshot, &args.media_ref, source.kind)?;
                 let provider = provider_prefix(&entry.id)?;
                 let input = GenerationInput {
@@ -948,6 +982,7 @@ impl TauriGenerationBridge {
                     model: entry.id.clone(),
                     duration: source.duration.max(0.0).round() as i32,
                     aspect_ratio: String::new(),
+                    resolution,
                     source_asset_id: Some(args.media_ref.clone()),
                     source_clip_id: args.source_clip_id.clone(),
                     ..Default::default()
@@ -955,7 +990,7 @@ impl TauriGenerationBridge {
                 let estimated_cost_credits = cost_for_input(entry, &input);
                 Ok(PreparedDispatch {
                     plan: PreparedGenerationJob {
-                        name: format!("{} 2x", source.name),
+                        name: format!("{} {size_label}", source.name),
                         kind: source.kind,
                         folder_id: source.folder_id.clone(),
                         provider: provider.clone(),
@@ -975,6 +1010,8 @@ impl TauriGenerationBridge {
                     requires_source_video: false,
                     model_kind: ModelKind::Upscale,
                     managed: !configured.contains(&provider) && managed_available,
+                    upscale_target_fps,
+                    warnings,
                 })
             }
         }
@@ -1120,12 +1157,15 @@ impl TauriGenerationBridge {
         }
         drop(timeline_cleanup);
         cancelled(cancel)?;
-        let params = build_params(
+        let mut params = build_params(
             &prepared.plan.input,
             &uploaded,
             prepared.model_kind,
             prepared.requires_source_video,
         );
+        if let GenerationParams::Upscale(upscale) = &mut params {
+            upscale.target_fps = prepared.upscale_target_fps;
+        }
         let provider_job_id = if prepared.managed {
             client
                 .submit(&prepared.plan.input.model, params, Some(local_job_id))
@@ -1346,6 +1386,7 @@ impl GenerationBridge for TauriGenerationBridge {
         let bridge = self.clone();
         let job_id = committed.job_id.clone();
         let placeholder_ids = committed.placeholder_asset_ids.clone();
+        let warnings = prepared.warnings.clone();
         tauri::async_runtime::spawn(async move {
             bridge
                 .run_job(
@@ -1362,6 +1403,7 @@ impl GenerationBridge for TauriGenerationBridge {
             job_id: committed.job_id,
             placeholder_asset_ids: committed.placeholder_asset_ids,
             status: "queued".to_string(),
+            warnings,
         })
     }
 }
@@ -1435,31 +1477,12 @@ impl GenerationFinalizationStore for TauriFinalizationStore {
         if actual_kind != entry.kind {
             return Err("downloaded generation result has the wrong media type".to_string());
         }
-        if let Some(source_id) = entry
-            .generation_input
-            .as_ref()
-            .and_then(|input| input.source_asset_id.as_deref())
-        {
-            let source = snapshot
-                .media
-                .entries
-                .iter()
-                .find(|source| source.id == source_id)
-                .ok_or_else(|| "upscale source disappeared".to_string())?;
-            if let (Some(source_width), Some(source_height), Some(width), Some(height)) = (
-                source.source_width,
-                source.source_height,
-                probe.width,
-                probe.height,
-            ) {
-                if width as i32 != source_width.saturating_mul(2)
-                    || height as i32 != source_height.saturating_mul(2)
-                {
-                    return Err(
-                        "upscale result is not exactly 2x the source dimensions".to_string()
-                    );
-                }
-            }
+        if let Some(input) = entry.generation_input.as_ref().filter(|input| {
+            Catalog::builtin()
+                .by_id(&input.model)
+                .is_some_and(|model| model.kind == ModelKind::Upscale)
+        }) {
+            validate_upscale_result(&snapshot.media, input, probe.width, probe.height)?;
         }
         let extension = result_extension(
             &artifact.media_type,
@@ -1880,6 +1903,64 @@ fn provider_prefix(model: &str) -> Result<String, String> {
         .map_err(|_| "generation model id is invalid".to_string())
 }
 
+fn positive_dimension(value: Option<i32>) -> u32 {
+    value
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+/// Accept an upscale only at the size its request asked for. Video upscalers
+/// render a target resolution (the source aspect ratio with the target short
+/// side); a job persisted without one got the provider default. Image
+/// upscales keep the exact 2x contract.
+fn validate_upscale_result(
+    media: &opentake_domain::MediaManifest,
+    input: &GenerationInput,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<(), String> {
+    let source_id = input
+        .source_asset_id
+        .as_deref()
+        .ok_or_else(|| "upscale source provenance is missing".to_string())?;
+    let source = media
+        .entries
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| "upscale source disappeared".to_string())?;
+    let (Some(source_width), Some(source_height), Some(width), Some(height)) = (
+        source
+            .source_width
+            .and_then(|value| u32::try_from(value).ok()),
+        source
+            .source_height
+            .and_then(|value| u32::try_from(value).ok()),
+        width,
+        height,
+    ) else {
+        return Ok(());
+    };
+    if source.kind == ClipType::Video {
+        let requested = input
+            .resolution
+            .as_deref()
+            .unwrap_or(VIDEO_UPSCALE_DEFAULT_RESOLUTION);
+        let target = video_upscale_resolution(requested)
+            .ok_or_else(|| "upscale target resolution is not supported".to_string())?;
+        if !upscale_result_matches(source_width, source_height, target, width, height) {
+            return Err(format!(
+                "upscale result {width}x{height} is not the requested {} size",
+                target.label
+            ));
+        }
+    } else if u64::from(width) != u64::from(source_width) * 2
+        || u64::from(height) != u64::from(source_height) * 2
+    {
+        return Err("upscale result is not exactly 2x the source dimensions".to_string());
+    }
+    Ok(())
+}
+
 fn display_name(requested: Option<&str>, prompt: &str, fallback: &str) -> String {
     requested
         .map(str::trim)
@@ -2280,39 +2361,48 @@ mod tests {
     }
 
     fn saved_core_with_source_video() -> (tempfile::TempDir, PathBuf, AppCore) {
+        saved_core_with_source_videos(&[("source-video", 16, 16, 10.0)])
+    }
+
+    /// Source videos are tiny real files; the manifest carries the probed
+    /// size and frame rate that upscale planning reads.
+    fn saved_core_with_source_videos(
+        sources: &[(&str, i32, i32, f64)],
+    ) -> (tempfile::TempDir, PathBuf, AppCore) {
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("Upscale.opentake");
         let mut project = Project::new(&bundle);
         project.generation_log = Some(GenerationLog::new());
-        project
-            .manifest
-            .entries
-            .push(opentake_domain::MediaManifestEntry {
-                id: "source-video".to_string(),
-                name: "source.mp4".to_string(),
-                kind: ClipType::Video,
-                source: opentake_domain::MediaSource::Project {
-                    relative_path: "media/source.mp4".to_string(),
-                },
-                duration: 0.1,
-                generation_input: None,
-                source_width: Some(16),
-                source_height: Some(16),
-                source_fps: Some(10.0),
-                has_audio: Some(false),
-                color: None,
-                proxy: None,
-                folder_id: None,
-                cached_remote_url: None,
-                cached_remote_url_expires_at: None,
-            });
-        project.save().unwrap();
         std::fs::create_dir_all(bundle.join("media")).unwrap();
-        std::fs::write(
-            bundle.join("media/source.mp4"),
-            mp4_bytes(temp.path(), 16, 16),
-        )
-        .unwrap();
+        for (id, width, height, fps) in sources {
+            project
+                .manifest
+                .entries
+                .push(opentake_domain::MediaManifestEntry {
+                    id: id.to_string(),
+                    name: format!("{id}.mp4"),
+                    kind: ClipType::Video,
+                    source: opentake_domain::MediaSource::Project {
+                        relative_path: format!("media/{id}.mp4"),
+                    },
+                    duration: 0.1,
+                    generation_input: None,
+                    source_width: Some(*width),
+                    source_height: Some(*height),
+                    source_fps: Some(*fps),
+                    has_audio: Some(false),
+                    color: None,
+                    proxy: None,
+                    folder_id: None,
+                    cached_remote_url: None,
+                    cached_remote_url_expires_at: None,
+                });
+        }
+        project.save().unwrap();
+        let fixture = mp4_bytes(temp.path(), 16, 16);
+        for (id, ..) in sources {
+            std::fs::write(bundle.join(format!("media/{id}.mp4")), &fixture).unwrap();
+        }
         let core = AppCore::new();
         core.open_project(&bundle).unwrap();
         (temp, bundle, core)
@@ -2801,10 +2891,10 @@ mod tests {
         assert_eq!(audio.has_audio, Some(true));
         assert!(audio.duration > 0.0);
 
-        // The catalog's upscaler only accepts video, and results must be
-        // exactly twice the source size.
+        // The catalog's upscaler only accepts video and renders a target
+        // resolution: a 16x16 source asks for 720p, so the result is 720x720.
         let (upscale_temp, upscale_bundle, upscale_core) = saved_core_with_source_video();
-        let source_before = std::fs::read(upscale_bundle.join("media/source.mp4")).unwrap();
+        let source_before = std::fs::read(upscale_bundle.join("media/source-video.mp4")).unwrap();
         let upscale_mock = MockTransport::new();
         upscale_mock.on(
             Method::Post,
@@ -2825,7 +2915,7 @@ mod tests {
             json!({
                 "id": "upscale-1",
                 "status": "succeeded",
-                "output": mp4_data_url_for(upscale_temp.path(), 32, 32)
+                "output": mp4_data_url_for(upscale_temp.path(), 720, 720)
             }),
         );
         let (cache, models) = runtime_dirs(&upscale_bundle);
@@ -2854,10 +2944,11 @@ mod tests {
         assert!(!upscale_result.is_error, "{}", upscale_result.text_joined());
         let upscale = wait_for_ready_model(&upscale_core, "replicate:topaz-upscale").await;
         assert_eq!(upscale.kind, ClipType::Video);
-        assert_eq!(upscale.source_width, Some(32));
-        assert_eq!(upscale.source_height, Some(32));
+        assert_eq!(upscale.name, "source-video.mp4 720p");
+        assert_eq!(upscale.source_width, Some(720));
+        assert_eq!(upscale.source_height, Some(720));
         assert_eq!(
-            std::fs::read(upscale_bundle.join("media/source.mp4")).unwrap(),
+            std::fs::read(upscale_bundle.join("media/source-video.mp4")).unwrap(),
             source_before
         );
     }
@@ -3076,6 +3167,264 @@ mod tests {
             std::fs::read(bundle.join("media/source.png")).unwrap(),
             source_bytes
         );
+    }
+
+    async fn wait_for_job_status(
+        core: &AppCore,
+        job_id: &str,
+        expected: GenerationJobStatus,
+    ) -> opentake_domain::GenerationInput {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(input) = core
+                .media()
+                .entries
+                .into_iter()
+                .filter_map(|entry| entry.generation_input)
+                .find(|input| input.job_id.as_deref() == Some(job_id))
+                .filter(|input| input.status == Some(expected))
+            {
+                return input;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job_id} never reached {expected:?}: {:?}",
+                core.media().entries
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn topaz_upscale_requests_the_next_target_at_the_source_frame_rate() {
+        let (_temp, bundle, core) = saved_core_with_source_videos(&[
+            ("hd-24", 1280, 720, 24.0),
+            ("full-hd-60", 1920, 1080, 60.0),
+        ]);
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            "https://mockrep/v1/files",
+            200,
+            json!({"urls": {"get": "https://fixtures.invalid/source.mp4"}}),
+        );
+        mock.on_sequence(
+            Method::Post,
+            "https://mockrep/v1/models/topazlabs/video-upscale/predictions",
+            vec![
+                (201, json!({"id": "upscale-hd", "status": "starting"})),
+                (201, json!({"id": "upscale-full-hd", "status": "starting"})),
+            ],
+        );
+        for id in ["upscale-hd", "upscale-full-hd"] {
+            mock.on(
+                Method::Get,
+                format!("https://mockrep/v1/predictions/{id}"),
+                200,
+                json!({"id": id, "status": "failed", "error": "fixture stop"}),
+            );
+        }
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client(&mock),
+            }),
+        );
+        let mut placeholders = Vec::new();
+        for source in ["hd-24", "full-hd-60"] {
+            let submitted = bridge
+                .submit(
+                    GenerationRequest::Upscale(UpscaleMediaArgs {
+                        cost_authorized: Some(true),
+                        media_ref: source.to_string(),
+                        model: Some("replicate:topaz-upscale".to_string()),
+                        source_clip_id: None,
+                    }),
+                    &MediaCancelToken::new(),
+                )
+                .unwrap();
+            assert!(submitted.warnings.is_empty(), "{:?}", submitted.warnings);
+            let failed =
+                wait_for_job_status(&core, &submitted.job_id, GenerationJobStatus::Failed).await;
+            assert_eq!(
+                failed.error_code.as_deref(),
+                Some("GENERATION_PROVIDER_FAILED")
+            );
+            placeholders.push(submitted.placeholder_asset_ids[0].clone());
+        }
+        let inputs = mock
+            .calls()
+            .into_iter()
+            .filter(|call| call.url.ends_with("/topazlabs/video-upscale/predictions"))
+            .map(|call| match call.body {
+                opentake_gen::Body::Json(body) => body["input"].clone(),
+                other => panic!("expected a JSON prediction, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inputs,
+            vec![
+                json!({
+                    "video": "https://fixtures.invalid/source.mp4",
+                    "target_resolution": "1080p",
+                    "target_fps": 24
+                }),
+                json!({
+                    "video": "https://fixtures.invalid/source.mp4",
+                    "target_resolution": "4k",
+                    "target_fps": 60
+                }),
+            ]
+        );
+        let media = core.media();
+        let named = |asset_id: &str| {
+            let entry = media
+                .entries
+                .iter()
+                .find(|entry| entry.id == asset_id)
+                .unwrap();
+            (
+                entry.name.clone(),
+                entry
+                    .generation_input
+                    .as_ref()
+                    .and_then(|input| input.resolution.clone()),
+            )
+        };
+        assert_eq!(
+            named(&placeholders[0]),
+            ("hd-24.mp4 1080p".to_string(), Some("1080p".to_string()))
+        );
+        assert_eq!(
+            named(&placeholders[1]),
+            ("full-hd-60.mp4 4K".to_string(), Some("4k".to_string()))
+        );
+    }
+
+    #[test]
+    fn topaz_upscale_refuses_sources_without_a_larger_target_before_paying() {
+        let (_temp, bundle, core) = saved_core_with_source_videos(&[("uhd", 3840, 2160, 30.0)]);
+        let mock = MockTransport::new();
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core.clone(),
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client(&mock),
+            }),
+        );
+        let error = bridge
+            .submit(
+                GenerationRequest::Upscale(UpscaleMediaArgs {
+                    cost_authorized: Some(true),
+                    media_ref: "uhd".to_string(),
+                    model: Some("replicate:topaz-upscale".to_string()),
+                    source_clip_id: None,
+                }),
+                &MediaCancelToken::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("largest upscale target"), "{error}");
+        assert!(mock.calls().is_empty());
+        assert!(core
+            .media()
+            .entries
+            .iter()
+            .all(|entry| entry.generation_input.is_none()));
+    }
+
+    #[test]
+    fn topaz_upscale_warns_when_the_frame_rate_is_clamped() {
+        let (_temp, bundle, core) = saved_core_with_source_videos(&[("fast", 1280, 720, 120.0)]);
+        let mock = MockTransport::new();
+        let (cache, models) = runtime_dirs(&bundle);
+        let bridge = build_bridge_with_clients(
+            core,
+            cache,
+            models,
+            Arc::new(FixtureClients {
+                client: fixture_client(&mock),
+            }),
+        );
+        let prepared = bridge
+            .prepare(GenerationRequest::Upscale(UpscaleMediaArgs {
+                cost_authorized: Some(true),
+                media_ref: "fast".to_string(),
+                model: Some("replicate:topaz-upscale".to_string()),
+                source_clip_id: None,
+            }))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(prepared.upscale_target_fps, Some(60));
+        assert_eq!(prepared.plan.input.resolution.as_deref(), Some("1080p"));
+        assert_eq!(
+            prepared.warnings,
+            vec![
+                "the source is 120 fps but the upscaler accepts 15-60 fps, so the result will be 60 fps"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn upscale_finalization_accepts_only_the_requested_target_size() {
+        let source = |id: &str, kind: ClipType, width: i32, height: i32| {
+            opentake_domain::MediaManifestEntry {
+                id: id.to_string(),
+                name: id.to_string(),
+                kind,
+                source: opentake_domain::MediaSource::Project {
+                    relative_path: format!("media/{id}"),
+                },
+                duration: 1.0,
+                generation_input: None,
+                source_width: Some(width),
+                source_height: Some(height),
+                source_fps: Some(30.0),
+                has_audio: Some(false),
+                color: None,
+                proxy: None,
+                folder_id: None,
+                cached_remote_url: None,
+                cached_remote_url_expires_at: None,
+            }
+        };
+        let media = opentake_domain::MediaManifest {
+            entries: vec![
+                source("hd", ClipType::Video, 1280, 720),
+                source("portrait", ClipType::Video, 1080, 1920),
+                source("still", ClipType::Image, 3, 2),
+            ],
+            ..Default::default()
+        };
+        let input = |source: &str, resolution: Option<&str>| GenerationInput {
+            model: "replicate:topaz-upscale".to_string(),
+            source_asset_id: Some(source.to_string()),
+            resolution: resolution.map(str::to_string),
+            ..Default::default()
+        };
+        let check = |input: &GenerationInput, width: u32, height: u32| {
+            validate_upscale_result(&media, input, Some(width), Some(height))
+        };
+        let full_hd = input("hd", Some("1080p"));
+        assert!(check(&full_hd, 1920, 1080).is_ok());
+        for (width, height) in [(2560, 1440), (1280, 720), (1920, 1088), (1080, 1920)] {
+            assert!(check(&full_hd, width, height).is_err(), "{width}x{height}");
+        }
+        let uhd_portrait = input("portrait", Some("4k"));
+        assert!(check(&uhd_portrait, 2160, 3840).is_ok());
+        assert!(check(&uhd_portrait, 3840, 2160).is_err());
+        // Jobs submitted before targets were sent got the provider default.
+        let legacy = input("hd", None);
+        assert!(check(&legacy, 1920, 1080).is_ok());
+        assert!(check(&legacy, 2560, 1440).is_err());
+        assert!(check(&input("hd", Some("8k")), 1920, 1080).is_err());
+        let still = input("still", None);
+        assert!(check(&still, 6, 4).is_ok());
+        assert!(check(&still, 9, 6).is_err());
     }
 
     async fn assert_submit_failure(status: u16, body: serde_json::Value, expected_code: &str) {

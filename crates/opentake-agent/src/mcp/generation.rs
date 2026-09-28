@@ -43,6 +43,10 @@ pub struct GenerationSubmission {
     pub job_id: String,
     pub placeholder_asset_ids: Vec<String>,
     pub status: String,
+    /// User-facing notes about how the accepted request differs from what was
+    /// asked (for example a frame rate the provider cannot keep).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Host boundary for production generation. Implementations must return only

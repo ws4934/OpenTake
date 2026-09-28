@@ -447,6 +447,8 @@ mod tests {
                 GenerationParams::Upscale(UpscaleParams {
                     source_url: "https://x/video.mp4".into(),
                     duration_seconds: 5,
+                    target_resolution: Some("4k".into()),
+                    target_fps: Some(60),
                 }),
             ),
         ] {
@@ -464,7 +466,14 @@ mod tests {
             };
             assert!(body.get("version").is_none());
             if id == "replicate:topaz-upscale" {
-                assert_eq!(body["input"], json!({"video":"https://x/video.mp4"}));
+                assert_eq!(
+                    body["input"],
+                    json!({
+                        "video": "https://x/video.mp4",
+                        "target_resolution": "4k",
+                        "target_fps": 60
+                    })
+                );
             }
         }
     }

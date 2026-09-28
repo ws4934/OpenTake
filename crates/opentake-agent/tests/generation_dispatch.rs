@@ -122,6 +122,7 @@ impl GenerationBridge for RecordingGenerationBridge {
             job_id: "job-dispatch".to_string(),
             placeholder_asset_ids: vec!["asset-placeholder".to_string()],
             status: "queued".to_string(),
+            warnings: Vec::new(),
         })
     }
 }

@@ -305,6 +305,8 @@ mod tests {
         let params = GenerationParams::Upscale(UpscaleParams {
             source_url: "u".into(),
             duration_seconds: 1,
+            target_resolution: None,
+            target_fps: None,
         });
         assert!(a.submit(&route, &params).await.is_err());
     }
