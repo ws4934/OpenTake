@@ -10,7 +10,6 @@
 //! ffmpeg invocation requires the binary and is covered by ignore-by-default
 //! integration tests.
 
-use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -449,6 +448,45 @@ fn frame_args_with_color(
     req: &FrameRequest,
     color: Option<&MediaColorMetadata>,
 ) -> Vec<String> {
+    single_frame_args(path, req, color, FrameOutput::RawVideo)
+}
+
+/// Arguments for the retained-handle decoder: the handle is ffmpeg's stdin
+/// and is read through `fd:`, which keeps normal file seek semantics, so the
+/// keyframe seek stays an input option exactly as for a pathname. The frame
+/// is written as a self-describing PAM image because this path parses
+/// ffmpeg's output itself instead of through the sidecar event stream.
+pub(super) fn retained_frame_args(
+    req: &FrameRequest,
+    color: Option<&MediaColorMetadata>,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["-hide_banner", "-nostats", "-loglevel", "info"]
+        .map(String::from)
+        .to_vec();
+    args.extend(single_frame_args(
+        Path::new("fd:"),
+        req,
+        color,
+        FrameOutput::Pam,
+    ));
+    args
+}
+
+/// Encoding of the RGBA frame(s) written to stdout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameOutput {
+    /// Headerless RGBA, sized from the sidecar's parsed output metadata.
+    RawVideo,
+    /// Netpbm PAM (`P7`, `RGB_ALPHA`): the header carries the dimensions.
+    Pam,
+}
+
+fn single_frame_args(
+    path: &Path,
+    req: &FrameRequest,
+    color: Option<&MediaColorMetadata>,
+    output: FrameOutput,
+) -> Vec<String> {
     let time_secs = req.time_secs.max(0.0);
     let target_us = target_micros(req);
     let mut args = seek_input_args(path, time_secs, color);
@@ -467,7 +505,7 @@ fn frame_args_with_color(
         "fps=fps=1:start_time=0:round=up".to_string(),
     ];
     push_conversion_filters(&mut filters, req, color);
-    push_rgba_output_args(&mut args, &filters);
+    push_rgba_output_args(&mut args, &filters, output);
     args
 }
 
@@ -521,38 +559,62 @@ fn push_conversion_filters(
     }
 }
 
-fn push_rgba_output_args(args: &mut Vec<String>, filters: &[String]) {
+fn push_rgba_output_args(args: &mut Vec<String>, filters: &[String], output: FrameOutput) {
     args.push("-vf".into());
     args.push(filters.join(","));
     args.push("-fps_mode".into());
     args.push("passthrough".into());
     args.push("-pix_fmt".into());
     args.push("rgba".into());
-    args.push("-f".into());
-    args.push("rawvideo".into());
+    match output {
+        FrameOutput::RawVideo => args.extend(["-f", "rawvideo"].map(String::from)),
+        FrameOutput::Pam => args.extend(["-c:v", "pam", "-f", "image2pipe"].map(String::from)),
+    }
     args.push("-".into());
 }
 
-fn frame_args_for_input(
-    input: &str,
-    req: &FrameRequest,
-    color: Option<&opentake_domain::MediaColorMetadata>,
-) -> Vec<String> {
-    let mut args = frame_args_with_color(Path::new(input), req, color);
-    // A pipe cannot seek: decode from the start and let the display-frame
-    // filters select the target.
-    let seek_index = args
-        .iter()
-        .position(|argument| argument == "-ss")
-        .expect("frame args always contain seek");
-    args.drain(seek_index..seek_index + 2);
-    args
+pub(super) const MICROS_PER_SEC: i64 = 1_000_000;
+
+/// Real pts of the frame the display-frame filters select for a target: the
+/// last logged pts `<= target_us`, else the first one after it (the padded
+/// first frame), else the target itself.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DisplayedPts {
+    target_us: i64,
+    at_or_before: Option<i64>,
+    after: Option<i64>,
 }
 
-const MICROS_PER_SEC: i64 = 1_000_000;
+impl DisplayedPts {
+    pub(super) fn new(target_us: i64) -> Self {
+        DisplayedPts {
+            target_us,
+            at_or_before: None,
+            after: None,
+        }
+    }
+
+    pub(super) fn observe(&mut self, pts: i64) {
+        if pts <= self.target_us {
+            self.at_or_before = Some(self.at_or_before.map_or(pts, |seen| seen.max(pts)));
+        } else {
+            self.after = Some(self.after.map_or(pts, |seen| seen.min(pts)));
+        }
+    }
+
+    /// Log lines are ordered, so once a frame after the target has been
+    /// logged the selection cannot change.
+    fn is_final(&self) -> bool {
+        self.after.is_some()
+    }
+
+    pub(super) fn secs(&self) -> f64 {
+        self.at_or_before.or(self.after).unwrap_or(self.target_us) as f64 / MICROS_PER_SEC as f64
+    }
+}
 
 /// Microsecond pts from a `showinfo` frame line (`... n:   3 pts:1200000 ...`).
-fn showinfo_pts(line: &str) -> Option<i64> {
+pub(super) fn showinfo_pts(line: &str) -> Option<i64> {
     if !line.contains("Parsed_showinfo_") {
         return None;
     }
@@ -572,8 +634,7 @@ fn read_displayed_frame(
     target_us: i64,
 ) -> Option<(f64, RgbaFrame)> {
     let mut frame = None;
-    let mut at_or_before: Option<i64> = None;
-    let mut after: Option<i64> = None;
+    let mut selection = DisplayedPts::new(target_us);
     for event in events {
         match event {
             FfmpegEvent::OutputFrame(output)
@@ -581,24 +642,21 @@ fn read_displayed_frame(
             {
                 frame = Some(RgbaFrame::new(output.width, output.height, output.data));
             }
-            FfmpegEvent::Log(_, line) => match showinfo_pts(&line) {
-                Some(pts) if pts <= target_us => {
-                    at_or_before = Some(at_or_before.map_or(pts, |seen| seen.max(pts)));
+            FfmpegEvent::Log(_, line) => {
+                if let Some(pts) = showinfo_pts(&line) {
+                    selection.observe(pts);
                 }
-                Some(pts) => after = Some(after.map_or(pts, |seen| seen.min(pts))),
-                None => {}
-            },
+            }
             _ => {}
         }
-        if frame.is_some() && after.is_some() {
+        if frame.is_some() && selection.is_final() {
             break;
         }
     }
-    let pts = at_or_before.or(after).unwrap_or(target_us);
-    frame.map(|frame| (pts as f64 / MICROS_PER_SEC as f64, frame))
+    frame.map(|frame| (selection.secs(), frame))
 }
 
-fn target_micros(req: &FrameRequest) -> i64 {
+pub(super) fn target_micros(req: &FrameRequest) -> i64 {
     (req.time_secs.max(0.0) * MICROS_PER_SEC as f64).round() as i64
 }
 
@@ -722,6 +780,11 @@ pub fn decode_frame_file_at_cancellable(
 
 /// [`decode_frame_file_at_cancellable`] with the caller's color hint; see
 /// [`decode_frame_at_with_color_cancellable`].
+///
+/// The handle itself (not a pipe fed from it) is ffmpeg's stdin, so the
+/// decoder can seek: MP4/MOV files whose `moov` index follows the media data
+/// decode like any path, and the keyframe seek happens on input instead of
+/// decoding from the start of the file.
 pub fn decode_frame_file_at_with_color_cancellable(
     file: &std::fs::File,
     req: &FrameRequest,
@@ -732,98 +795,7 @@ pub fn decode_frame_file_at_with_color_cancellable(
         return Err(MediaError::Cancelled);
     }
     let color = resolve_file_color(file, color, cancel)?;
-    let mut input = file.try_clone()?;
-    input.seek(SeekFrom::Start(0))?;
-    let mut child = ff::ffmpeg()
-        .args(frame_args_for_input("fd:", req, color.as_ref()))
-        .spawn()
-        .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
-    cancel.child_spawned();
-    let mut stdin = child
-        .take_stdin()
-        .ok_or_else(|| MediaError::Ffmpeg("retained frame stdin missing".to_string()))?;
-    let feeder = thread::Builder::new()
-        .name("opentake-retained-frame-input".to_string())
-        .spawn(move || std::io::copy(&mut input, &mut stdin))
-        .map_err(MediaError::Io)?;
-    let result = decode_first_child_frame(&mut child, req, cancel);
-    match feeder.join() {
-        Ok(Ok(_)) => result,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => result,
-        Ok(Err(error)) => Err(MediaError::Io(error)),
-        Err(_) => Err(MediaError::Ffmpeg(
-            "retained frame input feeder panicked".to_string(),
-        )),
-    }
-}
-
-fn decode_first_child_frame(
-    child: &mut ffmpeg_sidecar::child::FfmpegChild,
-    req: &FrameRequest,
-    cancel: &MediaCancelToken,
-) -> Result<(f64, RgbaFrame)> {
-    let requested_time = req.time_secs;
-    let iter = match child.iter() {
-        Ok(iter) => iter,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(MediaError::Ffmpeg(format!("iter: {error}")));
-        }
-    };
-    let reader_cancel = cancel.clone();
-    let target_us = target_micros(req);
-    let reader = match thread::Builder::new()
-        .name("opentake-retained-frame-events".to_string())
-        .spawn(move || {
-            reader_cancel.reader_started();
-            let result = read_displayed_frame(iter, target_us);
-            reader_cancel.reader_finished();
-            result
-        }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(MediaError::Ffmpeg(format!(
-                "spawn frame event reader: {error}"
-            )));
-        }
-    };
-    loop {
-        if cancel.checkpoint() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(MediaError::Cancelled);
-        }
-        if reader.is_finished() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let result = reader
-                .join()
-                .map_err(|_| MediaError::Ffmpeg("frame event reader panicked".to_string()))?;
-            return result
-                .ok_or_else(|| MediaError::Decode(format!("no frame at {requested_time:.3}s")));
-        }
-        match child.as_inner_mut().try_wait() {
-            Ok(Some(_)) => {
-                let result = reader
-                    .join()
-                    .map_err(|_| MediaError::Ffmpeg("frame event reader panicked".to_string()))?;
-                return result.ok_or_else(|| {
-                    MediaError::Decode(format!("no frame at {requested_time:.3}s"))
-                });
-            }
-            Ok(None) => thread::sleep(FRAME_CHILD_POLL_INTERVAL),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(MediaError::Io(error));
-            }
-        }
-    }
+    super::retained::decode_retained_frame(file, req, color.as_ref(), cancel)
 }
 
 /// Decode one cancellable frame and encode it as PNG bytes without publishing
@@ -1097,7 +1069,7 @@ fn grid_frame_args(
     ];
     filters.extend(grid_selection(&run.slots));
     push_conversion_filters(&mut filters, base, color);
-    push_rgba_output_args(&mut args, &filters);
+    push_rgba_output_args(&mut args, &filters, FrameOutput::RawVideo);
     args
 }
 
@@ -1418,18 +1390,23 @@ mod tests {
     }
 
     #[test]
-    fn retained_input_args_drop_the_seek_but_keep_selection() {
-        let args = frame_args_for_input(
-            "fd:",
+    fn retained_input_args_seek_on_input_and_emit_a_pam_frame() {
+        let args = retained_frame_args(
             &FrameRequest {
                 time_secs: 2.0,
                 ..Default::default()
             },
             None,
         );
-        assert!(!args.iter().any(|a| a == "-ss"));
-        assert!(args.windows(2).any(|w| w == ["-i", "fd:"]));
+        let ss = args.iter().position(|a| a == "-ss").unwrap();
+        let input = args.windows(2).position(|w| w == ["-i", "fd:"]).unwrap();
+        assert!(ss < input, "the retained handle seeks like a pathname");
+        assert_eq!(args[ss + 1], "2.000000");
         assert!(args.iter().any(|a| a.contains("setpts=PTS-2000000")));
+        assert!(args.windows(2).any(|w| w == ["-c:v", "pam"]));
+        assert!(args.windows(2).any(|w| w == ["-f", "image2pipe"]));
+        assert!(!args.iter().any(|a| a == "rawvideo"));
+        assert_eq!(args.last().unwrap(), "-");
     }
 
     #[test]

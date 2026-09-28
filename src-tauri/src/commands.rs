@@ -3320,6 +3320,91 @@ mod project_open_async_tests {
             "{text_background:?}"
         );
     }
+
+    #[test]
+    fn thumbnail_authoritative_composite_decodes_a_video_indexed_at_its_end() {
+        use opentake_domain::{Clip, ClipType, MediaManifestEntry, MediaSource, Track};
+        use opentake_media::ffmpeg_status::{ffmpeg_available, ffmpeg_path};
+
+        if !ffmpeg_available() || opentake_render::RenderDevice::try_new().is_err() {
+            eprintln!("skip: authoritative cover fixture needs ffmpeg and a GPU adapter");
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        // A non-faststart MP4 (moov after mdat) too large for ffmpeg to rewind
+        // within a pipe, as camera and screen recordings commonly are.
+        let video = fixture.path().join("camera.mp4");
+        let generated = std::process::Command::new(ffmpeg_path())
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=320x180:rate=30", "-t", "2"])
+            .args(["-c:v", "mpeg4", "-q:v", "1"])
+            .arg(&video)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(generated.success(), "generate index-at-end video");
+        let bytes = std::fs::read(&video).expect("read fixture");
+        let mdat = bytes.windows(4).position(|tag| tag == b"mdat");
+        let moov = bytes.windows(4).position(|tag| tag == b"moov");
+        assert!(mdat < moov, "fixture must keep its index at the end");
+
+        let mut track = Track::new("camera", ClipType::Video);
+        track.clips.push(Clip::new("camera", "camera", 0, 60));
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.width = 320;
+        timeline.height = 180;
+        timeline.tracks = vec![track];
+        let mut project = opentake_project::Project::new(fixture.path().join("Camera.opentake"));
+        project.timeline = timeline;
+        project.manifest.entries = vec![MediaManifestEntry {
+            id: "camera".into(),
+            name: "camera".into(),
+            kind: ClipType::Video,
+            source: MediaSource::External {
+                absolute_path: video.to_string_lossy().into_owned(),
+            },
+            duration: 2.0,
+            generation_input: None,
+            source_width: Some(320),
+            source_height: Some(180),
+            source_fps: Some(30.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        }];
+        project.save().expect("save camera fixture");
+        let core = AppCore::new();
+        core.open_project(&project.bundle_path)
+            .expect("open camera fixture");
+        let app = tauri::test::mock_app();
+        app.handle()
+            .asset_protocol_scope()
+            .allow_file(&video)
+            .expect("authorize camera fixture");
+
+        let capture = capture_composite_project_thumbnail(
+            app.handle(),
+            &core,
+            &core.runtime_snapshot(),
+            &crate::render::RenderState::new(),
+            &opentake_media::MediaCancelToken::new(),
+        );
+
+        let ProjectCoverCapture::Captured(bytes) = capture else {
+            panic!("capture a cover from an index-at-end video: {capture:?}");
+        };
+        let cover = image::load_from_memory(&bytes)
+            .expect("decode cover")
+            .to_rgb8();
+        assert!(
+            cover
+                .pixels()
+                .any(|pixel| pixel.0.iter().any(|value| *value > 96)),
+            "the video frame is drawn, not an empty canvas"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "playback-engine"))]

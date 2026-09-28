@@ -661,8 +661,8 @@ fn decode_frame_returns_the_displayed_frame_and_its_real_pts() {
     assert_eq!((batch[0].1, batch[1].1), (0, 30));
     assert!((batch[1].0 - 1.0).abs() < 1e-5);
 
-    // The retained-handle path pipes the file and cannot seek; it must select
-    // the same frame.
+    // The retained-handle path decodes from the open file instead of the
+    // pathname; it must select the same frame.
     let file = std::fs::File::open(&clip).unwrap();
     let (actual, frame) = decode_frame_file_at_cancellable(
         &file,

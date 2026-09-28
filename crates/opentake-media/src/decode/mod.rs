@@ -4,6 +4,7 @@
 pub mod audio_stream;
 pub mod frame;
 pub mod pcm;
+mod retained;
 pub mod source_color;
 pub mod stream;
 

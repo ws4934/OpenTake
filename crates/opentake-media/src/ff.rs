@@ -752,6 +752,10 @@ fn resolve_cli_path(
 
 /// Path to `ffmpeg`: explicit development override, packaged sidecar, then PATH.
 pub fn ffmpeg_path() -> OsString {
+    #[cfg(test)]
+    if let Some(path) = test_seams::ffmpeg_override() {
+        return path;
+    }
     let executable = std::env::current_exe().ok();
     resolve_cli_path(
         std::env::var_os("OPENTAKE_FFMPEG"),
@@ -916,7 +920,7 @@ pub fn ffprobe_json_file_cancellable(
         .map_err(|e| crate::error::MediaError::Ffmpeg(format!("ffprobe json: {e}")))
 }
 
-/// Per-thread fault and observation seams for probe tests. The admission
+/// Per-thread fault and observation seams for helper tests. The admission
 /// counter, probe runtime, and caches are process-wide and tests run in
 /// parallel, so every seam applies only to the calling thread (admission,
 /// executable resolution, and request accounting all happen on the thread
@@ -932,6 +936,7 @@ pub(crate) mod test_seams {
         static ADMISSION_WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
         static PROBE_REQUESTS: Cell<usize> = const { Cell::new(0) };
         static FFPROBE_OVERRIDE: RefCell<Option<OsString>> = const { RefCell::new(None) };
+        static FFMPEG_OVERRIDE: RefCell<Option<OsString>> = const { RefCell::new(None) };
     }
 
     /// Make every admission attempt on this thread behave as if all slots
@@ -969,6 +974,15 @@ pub(crate) mod test_seams {
 
     pub(crate) fn ffprobe_override() -> Option<OsString> {
         FFPROBE_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+
+    /// Resolve `ffmpeg` to `path` for commands built on this thread.
+    pub(crate) fn override_ffmpeg(path: Option<OsString>) {
+        FFMPEG_OVERRIDE.with(|cell| *cell.borrow_mut() = path);
+    }
+
+    pub(crate) fn ffmpeg_override() -> Option<OsString> {
+        FFMPEG_OVERRIDE.with(|cell| cell.borrow().clone())
     }
 }
 
