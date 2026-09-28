@@ -6,9 +6,12 @@ static LIVE_CHROMIUM_TEST_GATE: std::sync::OnceLock<std::sync::Mutex<()>> =
 fn test_gate_guard(
     gate: &'static std::sync::OnceLock<std::sync::Mutex<()>>,
 ) -> std::sync::MutexGuard<'static, ()> {
+    // A failing live test poisons the gate while it holds the guard. The gate
+    // only serializes browser launches and protects no data, so later tests
+    // take it over instead of failing behind the first failure.
     gate.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .expect("live Chromium test gate was poisoned by an earlier test failure")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(feature = "chromium")]
@@ -116,6 +119,27 @@ mod live {
             .recv_timeout(Duration::from_secs(1))
             .expect("second gate caller did not enter after the first guard was released");
         second.join().unwrap();
+    }
+
+    pub(super) fn assert_gate_recovers_after_a_failed_test() {
+        static PROBE_GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let failed = thread::spawn(|| {
+            let _guard = super::test_gate_guard(&PROBE_GATE);
+            panic!("simulated live Chromium test failure while holding the gate");
+        });
+        assert!(failed.join().is_err());
+        assert!(PROBE_GATE.get().unwrap().is_poisoned());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let next = thread::spawn(move || {
+            let _guard = super::test_gate_guard(&PROBE_GATE);
+            entered_tx.send(()).unwrap();
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a later live test must enter a gate poisoned by an earlier failure");
+        next.join()
+            .expect("a poisoned gate must not fail later live tests");
     }
 
     pub(super) fn wrapper_probe() {
@@ -1308,6 +1332,7 @@ mod live {
 #[test]
 fn host_wrapper_context_csp_and_guard_probe() {
     live::assert_gate_serializes_concurrent_callers();
+    live::assert_gate_recovers_after_a_failed_test();
     let _live_test_guard = live_test_guard();
     live::wrapper_probe();
 }
