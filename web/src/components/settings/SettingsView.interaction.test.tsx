@@ -11,6 +11,11 @@ const codex = vi.hoisted(() => ({
   logout: vi.fn(),
 }));
 
+const voiceRemovals = vi.hoisted(() => ({
+  pending: vi.fn(),
+  retry: vi.fn(),
+}));
+
 const mcp = vi.hoisted(() => ({
   status: vi.fn(),
   setEnabled: vi.fn(),
@@ -33,6 +38,8 @@ vi.mock("../../lib/api", async (importOriginal) => ({
   externalMcpRegenerate: mcp.regenerate,
   externalMcpRevoke: mcp.revoke,
   onExternalMcpStatusChanged: mcp.subscribe,
+  voiceRevocationsPending: voiceRemovals.pending,
+  voiceRevocationRetry: voiceRemovals.retry,
 }));
 
 import { useEditorUiStore } from "../../store/uiStore";
@@ -120,6 +127,7 @@ beforeEach(() => {
     handler(initialMcpStatus);
     return mcp.unlisten;
   });
+  voiceRemovals.pending.mockResolvedValue([]);
   useEditorUiStore.setState({ settingsOpen: false, settingsPane: "general" });
   useSettingsStore.setState({ byokProvider: "anthropic", windowSize: "standard" });
   container = document.createElement("div");
@@ -530,4 +538,48 @@ it("surfaces official Codex status failures without exposing an API-key field", 
     t("settings.codexActionFailed", { error: "status exploded" }),
   );
   expect(container.querySelector('input[type="password"]')).toBeNull();
+});
+
+it("lists abandoned voice clones whose removal failed and retries the removal", async () => {
+  const queued = {
+    provider: "elevenlabs",
+    providerVoiceId: "voice-abc123",
+    voiceName: "Narrator",
+    recordedAt: 1_700_000_000,
+    lastError: "voice revocation request failed",
+  };
+  voiceRemovals.pending.mockResolvedValue([queued]);
+  voiceRemovals.retry
+    .mockRejectedValueOnce("voice provider returned HTTP 503")
+    .mockResolvedValueOnce([]);
+  useEditorUiStore.setState({ settingsPane: "ai" });
+  useSettingsStore.setState({ byokProvider: "elevenlabs" });
+
+  await act(async () => root.render(<Harness />));
+  await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+  await act(async () => undefined);
+  expect(container.textContent).toContain(t("settings.voiceRemovalTitle"));
+  expect(container.textContent).toContain("Narrator");
+  expect(container.textContent).toContain("voice-abc123 · voice revocation request failed");
+
+  await act(async () => button(t("settings.voiceRemovalRetry")).click());
+  expect(voiceRemovals.retry).toHaveBeenCalledWith("voice-abc123");
+  expect(container.textContent).toContain(
+    t("settings.voiceRemovalFailed", { error: "voice provider returned HTTP 503" }),
+  );
+  expect(container.textContent).toContain("Narrator");
+
+  await act(async () => button(t("settings.voiceRemovalRetry")).click());
+  expect(voiceRemovals.retry).toHaveBeenCalledTimes(2);
+  expect(container.textContent).not.toContain(t("settings.voiceRemovalTitle"));
+  expect(container.textContent).not.toContain("Narrator");
+});
+
+it("hides the voice removal list when nothing is waiting", async () => {
+  useEditorUiStore.setState({ settingsPane: "ai" });
+  await act(async () => root.render(<Harness />));
+  await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+  await act(async () => undefined);
+  expect(voiceRemovals.pending).toHaveBeenCalled();
+  expect(container.textContent).not.toContain(t("settings.voiceRemovalTitle"));
 });

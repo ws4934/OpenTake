@@ -263,6 +263,17 @@ fn validate_generation_update(update: &GenerationStateUpdate) -> Result<()> {
     Ok(())
 }
 
+fn is_terminal_generation_status(status: Option<GenerationJobStatus>) -> bool {
+    matches!(
+        status,
+        Some(
+            GenerationJobStatus::Ready
+                | GenerationJobStatus::Failed
+                | GenerationJobStatus::Cancelled
+        )
+    )
+}
+
 fn valid_generation_transition(
     current: Option<GenerationJobStatus>,
     next: GenerationJobStatus,
@@ -1052,13 +1063,31 @@ impl EditorSession {
         } else {
             GenerationChange::Unchanged
         };
+        // A job resumed after some outputs were finalized or failed (a
+        // multi-output job interrupted during finalization) moves only its
+        // pending outputs; the terminal ones keep their own result.
+        let skips_terminal_outputs = update.status != GenerationJobStatus::Queued
+            && self
+                .state
+                .manifest
+                .entries
+                .iter()
+                .filter_map(|entry| entry.generation_input.as_ref())
+                .any(|input| {
+                    input.job_id.as_deref() == Some(job_id)
+                        && !is_terminal_generation_status(input.status)
+                });
+        let updates = |input: &GenerationInput| {
+            input.job_id.as_deref() == Some(job_id)
+                && !(skips_terminal_outputs && is_terminal_generation_status(input.status))
+        };
         for input in self
             .state
             .manifest
             .entries
             .iter()
             .filter_map(|entry| entry.generation_input.as_ref())
-            .filter(|input| input.job_id.as_deref() == Some(job_id))
+            .filter(|input| updates(input))
         {
             if !valid_generation_transition(input.status, update.status) {
                 return Err(CoreError::Media(format!(
@@ -1090,7 +1119,7 @@ impl EditorSession {
             let Some(input) = entry.generation_input.as_mut() else {
                 continue;
             };
-            if input.job_id.as_deref() != Some(job_id) {
+            if !updates(input) {
                 continue;
             }
             input.status = Some(update.status);

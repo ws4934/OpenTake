@@ -116,6 +116,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 opentake-media = { workspace = true, features = ["test-faults"] }
+opentake-project = { workspace = true, features = ["test-hooks"] }
 tauri = { version = "2", features = ["protocol-asset", "test"] }
 tokio = { version = "1", features = ["test-util"] }
 rmcp = { version = "2.2.0", features = [

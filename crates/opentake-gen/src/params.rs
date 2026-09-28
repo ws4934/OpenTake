@@ -144,12 +144,20 @@ impl AudioParams {
 }
 
 /// `kind="upscale"` — port of `UpscaleGenerationParams` (`UpscaleModelConfig.swift:3-15`).
+///
+/// `target_resolution` / `target_fps` are OpenTake additions for upscalers
+/// that take an output size instead of a scale factor (see
+/// [`crate::upscale`]); both are omitted from the wire when unset.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpscaleParams {
     #[serde(rename = "sourceURL")]
     pub source_url: String,
     pub duration_seconds: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fps: Option<u32>,
 }
 
 #[cfg(test)]
@@ -287,13 +295,27 @@ mod tests {
 
     #[test]
     fn upscale_params_wire_shape() {
-        let p = GenerationParams::Upscale(UpscaleParams {
+        let mut upscale = UpscaleParams {
             source_url: "https://x/in.mp4".into(),
             duration_seconds: 10,
-        });
+            target_resolution: None,
+            target_fps: None,
+        };
         assert_eq!(
-            serde_json::to_value(&p).unwrap(),
+            serde_json::to_value(GenerationParams::Upscale(upscale.clone())).unwrap(),
             json!({"kind":"upscale","sourceURL":"https://x/in.mp4","durationSeconds":10})
+        );
+        upscale.target_resolution = Some("4k".into());
+        upscale.target_fps = Some(24);
+        assert_eq!(
+            serde_json::to_value(GenerationParams::Upscale(upscale)).unwrap(),
+            json!({
+                "kind": "upscale",
+                "sourceURL": "https://x/in.mp4",
+                "durationSeconds": 10,
+                "targetResolution": "4k",
+                "targetFps": 24
+            })
         );
     }
 
@@ -314,7 +336,9 @@ mod tests {
         assert_eq!(
             GenerationParams::Upscale(UpscaleParams {
                 source_url: "u".into(),
-                duration_seconds: 1
+                duration_seconds: 1,
+                target_resolution: None,
+                target_fps: None,
             })
             .kind_str(),
             "upscale"

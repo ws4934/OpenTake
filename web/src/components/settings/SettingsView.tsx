@@ -42,9 +42,11 @@ import {
   secretSave,
   secretLoad,
   secretDelete,
+  voiceRevocationRetry,
+  voiceRevocationsPending,
   type CodexAuthStatus,
 } from "../../lib/api";
-import type { SecretStatus } from "../../lib/types";
+import type { PendingVoiceRevocation, SecretStatus } from "../../lib/types";
 import { useImeComposition } from "../../hooks/useImeComposition";
 import { AccountPane } from "./AccountPane";
 import { ExternalMcpPane } from "./ExternalMcpPane";
@@ -937,7 +939,114 @@ function AiPane() {
         )}
       </div>
       )}
+      <PendingVoiceRemovals />
     </Section>
+  );
+}
+
+/** Voice clones the user abandoned (the enrollment was cancelled or could not
+ *  be saved to a project) whose removal from the provider failed. No project
+ *  record is left to revoke them from, so this is where the user retries. */
+function PendingVoiceRemovals() {
+  const t = useT();
+  const [pending, setPending] = useState<PendingVoiceRevocation[]>([]);
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void voiceRevocationsPending().then(
+      (next) => {
+        if (alive) setPending(next);
+      },
+      (reason) => {
+        if (alive) setError(t("settings.voiceRemovalFailed", { error: errorMessage(reason) }));
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, [t]);
+
+  const retry = async (providerVoiceId: string) => {
+    if (retrying !== null) return;
+    setRetrying(providerVoiceId);
+    setError(null);
+    try {
+      setPending(await voiceRevocationRetry(providerVoiceId));
+    } catch (reason) {
+      setError(t("settings.voiceRemovalFailed", { error: errorMessage(reason) }));
+      // Show the failure the backend recorded for the next retry.
+      void voiceRevocationsPending().then(setPending, () => undefined);
+    } finally {
+      setRetrying(null);
+    }
+  };
+
+  if (pending.length === 0 && error === null) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-xs)" }}>
+      <div style={{ fontSize: "var(--fs-md)", color: "var(--text-primary)" }}>
+        {t("settings.voiceRemovalTitle")}
+      </div>
+      <div style={{ fontSize: "var(--fs-xs)", color: "var(--text-tertiary)" }}>
+        {t("settings.voiceRemovalDesc")}
+      </div>
+      {pending.map((entry) => (
+        <div
+          key={`${entry.provider}:${entry.providerVoiceId}`}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "var(--space-sm)",
+            minHeight: 34,
+            padding: "var(--space-xs) var(--space-sm)",
+            borderRadius: "var(--radius-sm)",
+            ...settingsControlStyle,
+          }}
+        >
+          <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+            <span style={{ fontSize: "var(--fs-sm)", color: "var(--text-primary)" }}>
+              {entry.voiceName || entry.providerVoiceId}
+            </span>
+            <span
+              className="tabular"
+              style={{
+                fontSize: "var(--fs-xs)",
+                color: "var(--text-tertiary)",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {`${entry.providerVoiceId} · ${entry.lastError}`}
+            </span>
+          </div>
+          <button
+            type="button"
+            disabled={retrying !== null}
+            onClick={() => void retry(entry.providerVoiceId)}
+            className="hover-area"
+            style={{
+              flexShrink: 0,
+              height: 28,
+              padding: "0 var(--space-lg)",
+              borderRadius: "var(--radius-sm)",
+              ...settingsControlStyle,
+              color: "var(--text-primary)",
+              fontSize: "var(--fs-sm)",
+              opacity: retrying !== null ? 0.4 : 1,
+            }}
+          >
+            {retrying === entry.providerVoiceId
+              ? t("settings.voiceRemovalRetrying")
+              : t("settings.voiceRemovalRetry")}
+          </button>
+        </div>
+      ))}
+      {error && (
+        <div style={{ fontSize: "var(--fs-xs)", color: "var(--status-error)" }}>{error}</div>
+      )}
+    </div>
   );
 }
 

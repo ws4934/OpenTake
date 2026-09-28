@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use opentake_agent::mcp::core_handle::AppCoreHandle;
 use opentake_agent::mcp::dispatch::Dispatcher;
 use opentake_agent::mcp::generation::{
-    finalize_terminal_outputs, DownloadedGenerationArtifact, GenerationArtifactDownloader,
-    GenerationBridge, GenerationFinalizationStore, GenerationRequest, GenerationSubmission,
+    finalize_terminal_outputs, DownloadedGenerationArtifact, FinishedOutput,
+    GenerationArtifactDownloader, GenerationBridge, GenerationFinalizationStore, GenerationRequest,
+    GenerationSubmission,
 };
 use opentake_agent::plugin::registry::PluginRegistry;
 use opentake_core::AppCore;
@@ -21,6 +22,9 @@ struct RecordingStore {
     failed: Mutex<BTreeMap<String, String>>,
     completions: Mutex<Vec<(String, usize, usize)>>,
     output_write_failures_remaining: Mutex<usize>,
+    /// Outputs finished by an earlier, interrupted finalization.
+    finished: BTreeMap<String, FinishedOutput>,
+    downloads: Mutex<Vec<String>>,
 }
 
 impl GenerationFinalizationStore for RecordingStore {
@@ -76,6 +80,10 @@ impl GenerationFinalizationStore for RecordingStore {
             .push((job_id.to_string(), succeeded, failed));
         Ok(())
     }
+
+    fn finished_output(&self, asset_id: &str) -> Result<Option<FinishedOutput>, String> {
+        Ok(self.finished.get(asset_id).copied())
+    }
 }
 
 struct FixtureDownloader;
@@ -122,6 +130,7 @@ impl GenerationBridge for RecordingGenerationBridge {
             job_id: "job-dispatch".to_string(),
             placeholder_asset_ids: vec!["asset-placeholder".to_string()],
             status: "queued".to_string(),
+            warnings: Vec::new(),
         })
     }
 }
@@ -245,6 +254,56 @@ fn placeholder_persists_and_every_terminal_result_finalizes_once() {
     assert!(recovered.claimed);
     assert_eq!((recovered.succeeded, recovered.failed), (1, 0));
     assert_eq!(retryable.completions.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_resumed_finalization_keeps_outputs_an_earlier_attempt_finished() {
+    struct CountingDownloader<'a>(&'a RecordingStore);
+    impl GenerationArtifactDownloader for CountingDownloader<'_> {
+        fn download(
+            &self,
+            asset_id: &str,
+            url: &str,
+        ) -> Result<DownloadedGenerationArtifact, String> {
+            self.0.downloads.lock().unwrap().push(asset_id.to_string());
+            FixtureDownloader.download(asset_id, url)
+        }
+    }
+
+    let store = RecordingStore {
+        finished: BTreeMap::from([
+            ("asset-ready".to_string(), FinishedOutput::Succeeded),
+            ("asset-failed".to_string(), FinishedOutput::Failed),
+        ]),
+        ..Default::default()
+    };
+    let placeholders = ["asset-ready", "asset-failed", "asset-pending"].map(String::from);
+    let urls = [
+        "https://results.test/0.png",
+        "https://results.test/1.png",
+        "https://results.test/2.png",
+    ]
+    .map(String::from);
+    let summary = finalize_terminal_outputs(
+        &store,
+        &CountingDownloader(&store),
+        "job-resumed",
+        &placeholders,
+        &urls,
+    )
+    .unwrap();
+
+    assert_eq!((summary.succeeded, summary.failed), (2, 1));
+    assert_eq!(*store.downloads.lock().unwrap(), vec!["asset-pending"]);
+    assert_eq!(
+        store.finalized.lock().unwrap().keys().collect::<Vec<_>>(),
+        vec!["asset-pending"]
+    );
+    assert!(store.failed.lock().unwrap().is_empty());
+    assert_eq!(
+        *store.completions.lock().unwrap(),
+        vec![("job-resumed".to_string(), 2, 1)]
+    );
 }
 
 #[test]

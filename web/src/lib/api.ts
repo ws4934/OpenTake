@@ -60,6 +60,7 @@ import type {
   LoudnessNormalization,
   DenoiseMode,
   ModelStatus,
+  PendingVoiceRevocation,
   PlaybackCommandError,
   PlaybackErrorEvent,
   PlaybackFrameEvent,
@@ -2149,6 +2150,29 @@ export async function secretDelete(provider: string): Promise<SecretStatus> {
   await ensureTauri();
   if (invokeImpl) return invokeImpl<SecretStatus>("secret_delete", { provider });
   return NO_SECRET;
+}
+
+/** Voice clones whose provider removal failed after the user abandoned them.
+ *  Outside Tauri there is no provider account, so the list is empty. */
+export async function voiceRevocationsPending(): Promise<PendingVoiceRevocation[]> {
+  await ensureTauri();
+  if (invokeImpl) {
+    return invokeImpl<PendingVoiceRevocation[]>("voice_revocations_pending");
+  }
+  return [];
+}
+
+/** Retry removing one queued voice clone; resolves with the remaining queue. */
+export async function voiceRevocationRetry(
+  providerVoiceId: string,
+): Promise<PendingVoiceRevocation[]> {
+  await ensureTauri();
+  if (invokeImpl) {
+    return invokeImpl<PendingVoiceRevocation[]>("voice_revocation_retry", {
+      providerVoiceId,
+    });
+  }
+  throw new Error("Voice clone removal is available only in the desktop app");
 }
 
 // MARK: - Official Codex / ChatGPT authentication
