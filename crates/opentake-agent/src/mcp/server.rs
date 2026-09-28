@@ -34,13 +34,14 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::ChatTurnGate;
-use crate::mcp::advanced::AdvancedWorkflowBridge;
 use crate::mcp::convert::to_call_tool_result;
-use crate::mcp::core_handle::CoreHandle;
 use crate::mcp::dispatch::{dispatch_admission_class, DispatchAdmissionClass, Dispatcher};
-use crate::mcp::generation::GenerationBridge;
-use crate::mcp::media_bridge::{MediaBridge, MCP_REQUEST_BODY_MAX};
-use crate::mcp::motion::MotionBridge;
+use crate::mcp::media_bridge::MCP_REQUEST_BODY_MAX;
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
+use crate::mcp::{
+    advanced::AdvancedWorkflowBridge, core_handle::CoreHandle, generation::GenerationBridge,
+    media_bridge::MediaBridge, motion::MotionBridge,
+};
 use crate::plugin::registry::PluginRegistry;
 use crate::prompt::assemble::assemble_system_prompt;
 use crate::tools::descriptions::{description, input_schema};
@@ -77,6 +78,8 @@ fn turn_inactive_error() -> McpError {
 
 #[derive(Clone)]
 enum DispatchAuthority {
+    /// Unauthenticated sessions of the legacy routers.
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     Direct,
     Gated {
         gate: Arc<dyn ChatTurnGate>,
@@ -92,6 +95,7 @@ impl DispatchAuthority {
         client: Option<AuthenticatedMcpClient>,
     ) -> Result<Option<DispatchPermit>, McpError> {
         match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
             Self::Direct => Ok(None),
             Self::Gated { activity, .. } => activity
                 .try_enter(request_cancel, client)
@@ -108,6 +112,7 @@ impl DispatchAuthority {
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<crate::tools::result::ToolResult> {
         match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
             Self::Direct => Some(dispatcher.dispatch_cancellable(name, args, request_cancel)),
             Self::Gated {
                 gate, undo_scope, ..
@@ -118,8 +123,10 @@ impl DispatchAuthority {
     }
 
     fn request_cancel(&self) {
-        if let Self::Gated { gate, .. } = self {
-            gate.request_cancel();
+        match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
+            Self::Direct => {}
+            Self::Gated { gate, .. } => gate.request_cancel(),
         }
     }
 }
@@ -383,12 +390,14 @@ pub struct McpServer {
 impl McpServer {
     /// Build a session server over the shared document handle + plugin registry,
     /// with no media bridge (render/import tools then report "not available").
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn new(handle: Arc<dyn CoreHandle>, registry: Arc<RwLock<PluginRegistry>>) -> Self {
         Self::with_bridge(handle, registry, None)
     }
 
     /// Build a session server with an optional [`MediaBridge`] injected, so
     /// `inspect_timeline` / `import_media` reach the real GPU + import paths.
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_bridge(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -397,6 +406,7 @@ impl McpServer {
         Self::with_bridges(handle, registry, bridge, None)
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -406,6 +416,7 @@ impl McpServer {
         Self::with_capability_bridges(handle, registry, bridge, generation_bridge, None)
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_capability_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -423,6 +434,7 @@ impl McpServer {
         )
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_all_capability_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -442,6 +454,7 @@ impl McpServer {
         )
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     fn with_all_capability_bridges_and_admission(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -1311,26 +1324,29 @@ fn build_gated_router_for_port(
 
     let metadata =
         ProtectedResourceMetadata::for_addr(transport.addr, transport.authorization.is_some());
-    let router = axum::Router::new()
+    // Only the MCP route needs the Bearer credential: the RFC 9728 metadata is
+    // what a client reads to learn that it needs one.
+    let mcp = axum::Router::new().route_service("/mcp", service);
+    let mcp = match transport.authorization {
+        Some(authorization) => mcp.layer(axum::middleware::from_fn_with_state(
+            authorization,
+            bearer_authorization_guard,
+        )),
+        None => mcp,
+    };
+    axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(oauth_protected_resource).with_state(metadata),
         )
-        .route_service("/mcp", service)
+        .merge(mcp)
         .layer(axum::middleware::from_fn(finite_number_guard))
         .layer(axum::middleware::from_fn(content_type_guard))
         .layer(axum::middleware::from_fn(protocol_version_guard))
         .layer(axum::middleware::from_fn_with_state(
             transport.addr.port(),
             localhost_guard,
-        ));
-    match transport.authorization {
-        Some(authorization) => router.layer(axum::middleware::from_fn_with_state(
-            authorization,
-            bearer_authorization_guard,
-        )),
-        None => router,
-    }
+        ))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3295,17 +3311,26 @@ mod tests {
             endpoint.addr()
         );
         let client = reqwest::Client::new();
-        let anonymous = client.get(&url).send().await.expect("anonymous metadata");
-        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+        // Discovery needs no credential; the MCP route itself still does.
         let metadata: Value = client
             .get(&url)
-            .bearer_auth(endpoint.bearer_token())
             .send()
             .await
             .expect("metadata request")
+            .error_for_status()
+            .expect("anonymous metadata is served")
             .json()
             .await
             .expect("metadata json");
+        let anonymous_mcp = client
+            .post(endpoint.url())
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .send()
+            .await
+            .expect("anonymous MCP request");
+        assert_eq!(anonymous_mcp.status(), reqwest::StatusCode::UNAUTHORIZED);
         assert_eq!(metadata["resource"], endpoint.url());
         assert!(metadata["resource"]
             .as_str()
