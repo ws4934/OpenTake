@@ -22,6 +22,17 @@ pub(crate) fn invalidate() {
     CREDENTIALS_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Calls [`invalidate`] when dropped. Credential writers bind it first, so
+/// every return path, including errors after a partial keychain write,
+/// invalidates once the writer is done.
+pub(crate) struct InvalidateOnExit;
+
+impl Drop for InvalidateOnExit {
+    fn drop(&mut self) {
+        invalidate();
+    }
+}
+
 pub(crate) struct GenerationAvailabilityCache {
     epoch: &'static AtomicU64,
     ttl: Duration,
@@ -37,6 +48,13 @@ struct CachedAvailability {
 impl GenerationAvailabilityCache {
     pub(crate) fn new() -> Self {
         Self::with_epoch(&CREDENTIALS_EPOCH, AVAILABILITY_TTL)
+    }
+
+    /// A cache on the production epoch with a custom TTL, so tests can check
+    /// that the real credential writers invalidate it.
+    #[cfg(test)]
+    pub(crate) fn new_with_ttl(ttl: Duration) -> Self {
+        Self::with_epoch(&CREDENTIALS_EPOCH, ttl)
     }
 
     pub(crate) fn with_epoch(epoch: &'static AtomicU64, ttl: Duration) -> Self {
