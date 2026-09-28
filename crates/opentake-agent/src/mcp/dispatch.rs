@@ -1561,20 +1561,20 @@ impl Dispatcher {
             style.font_name = n;
         }
         if let Some(s) = a.font_size {
+            validate_font_size(s, "add_captions.fontSize")?;
             style.font_size = s;
         }
         if let Some(hex) = a.color.as_deref() {
-            let c = Rgba::from_hex(hex).ok_or_else(|| {
-                ToolError::new(format!(
-                    "add_captions: invalid color '{hex}' (want #RRGGBB)"
-                ))
-            })?;
-            style.color = c;
+            style.color = parse_text_color(hex, "add_captions.color")?;
         }
+        style
+            .validate()
+            .map_err(|message| ToolError::new(format!("add_captions: {message}")))?;
 
         // Placement center (AppTheme.Caption.defaultCenter = (0.5, 0.9)).
         let center_x = a.center_x.unwrap_or(CAPTION_DEFAULT_CENTER_X);
         let center_y = a.center_y.unwrap_or(CAPTION_DEFAULT_CENTER_Y);
+        validate_transform_center(center_x, center_y, "add_captions")?;
 
         // Letter case (default auto).
         let case = match a.text_case.as_deref() {
@@ -1793,10 +1793,20 @@ impl Dispatcher {
         manifest: &MediaManifest,
     ) -> Result<ToolResult, ToolError> {
         let a: InsertClipsArgs = decode_tool_args(args, "")?;
+        if a.at_frame < 0 {
+            return Err(ToolError::new("atFrame must be non-negative"));
+        }
         let fps = timeline_fps(before);
         let mut entries = Vec::with_capacity(a.entries.len());
         for (i, raw) in a.entries.iter().enumerate() {
             let e: InsertClipEntry = decode_tool_args(raw, &format!("entries[{i}]"))?;
+            if e.trim_start_frame.is_some_and(|frame| frame < 0)
+                || e.trim_end_frame.is_some_and(|frame| frame < 0)
+            {
+                return Err(ToolError::new(format!(
+                    "entries[{i}]: trimStartFrame and trimEndFrame must be non-negative"
+                )));
+            }
             if let Some(entry) = manifest
                 .entries
                 .iter()
@@ -1808,20 +1818,33 @@ impl Dispatcher {
             let duration_frames = match e.duration_frames {
                 Some(d) => d,
                 None => {
-                    let full = manifest
+                    let full_frames = manifest
                         .entries
                         .iter()
                         .find(|entry| entry.id == e.media_ref)
                         .filter(|entry| entry.duration > 0.0)
-                        .map(|entry| (entry.duration * fps) as i32)
+                        .map(|entry| entry.duration * fps)
                         .ok_or_else(|| {
                             ToolError::new(format!(
                                 "entries[{i}]: durationFrames omitted and mediaRef '{}' has no known duration",
                                 e.media_ref
                             ))
                         })?;
-                    let remaining =
-                        full - e.trim_start_frame.unwrap_or(0) - e.trim_end_frame.unwrap_or(0);
+                    if !full_frames.is_finite()
+                        || full_frames < 1.0
+                        || full_frames > i32::MAX as f64
+                    {
+                        return Err(ToolError::new(format!(
+                            "entries[{i}]: source duration is outside the supported frame range"
+                        )));
+                    }
+                    let full = full_frames as i32;
+                    let remaining = full
+                        .checked_sub(e.trim_start_frame.unwrap_or(0))
+                        .and_then(|frames| frames.checked_sub(e.trim_end_frame.unwrap_or(0)))
+                        .ok_or_else(|| {
+                            ToolError::new(format!("entries[{i}]: trim frame arithmetic overflow"))
+                        })?;
                     if remaining < 1 {
                         return Err(ToolError::new(format!(
                             "entries[{i}]: durationFrames omitted and the trimmed source duration is empty (source {full} frame(s), trimStartFrame {}, trimEndFrame {})",
@@ -2103,6 +2126,24 @@ impl Dispatcher {
     fn tighten_silences(&self, args: &Value, before: &Timeline) -> Result<ToolResult, ToolError> {
         let a: TightenSilencesArgs = decode_tool_args(args, "")?;
         let targets = silence_targets(before, &a)?;
+        let padding = a.padding_frames.unwrap_or(3);
+        if padding < 0 {
+            return Err(ToolError::new("paddingFrames must be non-negative"));
+        }
+        if a.min_silence_frames.is_some_and(|frames| frames < 1) {
+            return Err(ToolError::new("minSilenceFrames must be at least 1"));
+        }
+        // Clips no longer than the padding keep all their audio and are
+        // skipped; only a padding that leaves nothing to tighten is an error.
+        if !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| padding >= target.clip.duration_frames)
+        {
+            return Err(ToolError::new(
+                "paddingFrames must be shorter than at least one target clip",
+            ));
+        }
         let spec = analysis_pcm_spec();
         let fps = timeline_fps(before);
         let mut config = SilenceDetectionConfig::with_window(
@@ -2112,8 +2153,6 @@ impl Dispatcher {
         );
         config.rms_threshold = threshold_db_to_rms(a.threshold_db.unwrap_or(-40.0));
         config.min_silence_frames = a.min_silence_frames.unwrap_or(12).max(1) as u64;
-        let padding = a.padding_frames.unwrap_or(3).max(0);
-
         let mut by_track: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
         let mut clip_payloads = Vec::new();
         let mut warnings = Vec::new();
@@ -2152,10 +2191,15 @@ impl Dispatcher {
                     target.clip,
                     start_seconds,
                     before.fps,
-                ) + padding;
+                )
+                .checked_add(padding)
+                .ok_or_else(|| ToolError::new("paddingFrames overflows the silence start frame"))?;
                 let end =
                     source_seconds_to_timeline_frame_clamped(target.clip, end_seconds, before.fps)
-                        - padding;
+                        .checked_sub(padding)
+                        .ok_or_else(|| {
+                            ToolError::new("paddingFrames overflows the silence end frame")
+                        })?;
                 if end <= start {
                     continue;
                 }
@@ -2413,11 +2457,14 @@ impl Dispatcher {
         config.min_onset_strength = sensitivity_to_onset_threshold(request.sensitivity);
         let beats = detect_beats(&pcm.samples_f32, config)
             .into_iter()
-            .map(|beat| BeatHint {
-                frame: target.map_relative_frame(beat.frame as i32, timeline.fps),
-                strength: beat.strength,
+            .map(|beat| {
+                Ok(BeatHint {
+                    frame: target
+                        .map_relative_frame(beat_frame_to_i32(beat.frame)?, timeline.fps)?,
+                    strength: beat.strength,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ToolError>>()?;
         Ok(beats)
     }
 
@@ -2502,7 +2549,7 @@ impl Dispatcher {
                 e.font_size,
                 e.color.as_deref(),
                 e.alignment.as_deref(),
-            );
+            )?;
             let transform =
                 resolve_text_transform(e.transform, &e.content, &text_style, canvas_w, canvas_h)?;
             parsed.push(Parsed {
@@ -2703,6 +2750,17 @@ impl Dispatcher {
         manifest: &MediaManifest,
     ) -> Result<ToolResult, ToolError> {
         let a: SetClipPropertiesArgs = decode_tool_args(args, "")?;
+        if let Some(volume) = a.volume {
+            validate_finite_range(
+                volume,
+                "volume",
+                0.0,
+                VolumeScale::linear_from_db(VolumeScale::CEILING_DB),
+            )?;
+        }
+        if let Some(opacity) = a.opacity {
+            validate_finite_range(opacity, "opacity", 0.0, 1.0)?;
+        }
         let clip_ids = a.clip_ids.clone();
         let properties = ClipProperties {
             duration_frames: a.duration_frames,
@@ -2747,7 +2805,7 @@ impl Dispatcher {
                     clip.transform,
                     transform_patch.clone(),
                     aspect,
-                ));
+                )?);
             }
             if let Some(patch) = &style_patch {
                 clip_properties.text_style =
@@ -3765,15 +3823,27 @@ struct AnalysisTarget<'a> {
     project_start_frame: i32,
 }
 
+fn beat_frame_to_i32(frame: u64) -> Result<i32, ToolError> {
+    i32::try_from(frame)
+        .map_err(|_| ToolError::new("beat frame exceeds the supported timeline range"))
+}
+
 impl AnalysisTarget<'_> {
-    fn map_relative_frame(&self, frame: i32, timeline_fps: i32) -> i32 {
+    fn map_relative_frame(&self, frame: i32, timeline_fps: i32) -> Result<i32, ToolError> {
         match self.clip {
             Some(clip) => {
                 let fps = timeline_fps.max(1) as f64;
                 let seconds = self.source_start_seconds + frame as f64 / fps;
-                source_seconds_to_timeline_frame_clamped(clip, seconds, timeline_fps)
+                Ok(source_seconds_to_timeline_frame_clamped(
+                    clip,
+                    seconds,
+                    timeline_fps,
+                ))
             }
-            None => self.project_start_frame + frame,
+            None => self
+                .project_start_frame
+                .checked_add(frame)
+                .ok_or_else(|| ToolError::new("beat frame mapping overflow")),
         }
     }
 }
@@ -4219,20 +4289,20 @@ fn resolve_text_transform(
     canvas_h: f64,
 ) -> Result<Transform, ToolError> {
     let Some(t) = arg else {
-        return Ok(auto_fit_text_transform(
-            0.5, 0.5, content, style, canvas_w, canvas_h,
-        ));
+        let transform = auto_fit_text_transform(0.5, 0.5, content, style, canvas_w, canvas_h);
+        validate_transform(transform, "transform")?;
+        return Ok(transform);
     };
     let bad_shape = || {
         ToolError::new(
             "transform must be either {centerX, centerY} for auto-fit, or all four of {centerX, centerY, width, height}",
         )
     };
-    match (t.center_x, t.center_y, t.width, t.height) {
-        (None, None, None, None) => Ok(auto_fit_text_transform(
-            0.5, 0.5, content, style, canvas_w, canvas_h,
-        )),
-        (Some(cx), Some(cy), Some(width), Some(height)) => Ok(Transform {
+    let transform = match (t.center_x, t.center_y, t.width, t.height) {
+        (None, None, None, None) => {
+            auto_fit_text_transform(0.5, 0.5, content, style, canvas_w, canvas_h)
+        }
+        (Some(cx), Some(cy), Some(width), Some(height)) => Transform {
             center_x: cx,
             center_y: cy,
             width,
@@ -4240,12 +4310,14 @@ fn resolve_text_transform(
             rotation: Transform::default().rotation,
             flip_horizontal: t.flip_horizontal.unwrap_or(false),
             flip_vertical: t.flip_vertical.unwrap_or(false),
-        }),
-        (Some(cx), Some(cy), None, None) => Ok(auto_fit_text_transform(
-            cx, cy, content, style, canvas_w, canvas_h,
-        )),
-        _ => Err(bad_shape()),
-    }
+        },
+        (Some(cx), Some(cy), None, None) => {
+            auto_fit_text_transform(cx, cy, content, style, canvas_w, canvas_h)
+        }
+        _ => return Err(bad_shape()),
+    };
+    validate_transform(transform, "transform")?;
+    Ok(transform)
 }
 
 /// Auto-fit a text box centered at `(center_x, center_y)` to the natural size
@@ -4276,7 +4348,7 @@ fn merge_transform_arg(
     base: Transform,
     patch: args::TransformArg,
     media_canvas_aspect: Option<f64>,
-) -> Transform {
+) -> Result<Transform, ToolError> {
     let aspect = media_canvas_aspect
         .filter(|a| a.is_finite() && *a > 0.0)
         .unwrap_or_else(|| current_transform_aspect(base).unwrap_or(1.0));
@@ -4286,7 +4358,7 @@ fn merge_transform_arg(
         (None, Some(h)) => (h * aspect, h),
         (None, None) => (base.width, base.height),
     };
-    Transform {
+    let transform = Transform {
         center_x: patch.center_x.unwrap_or(base.center_x),
         center_y: patch.center_y.unwrap_or(base.center_y),
         width,
@@ -4294,7 +4366,9 @@ fn merge_transform_arg(
         rotation: base.rotation,
         flip_horizontal: patch.flip_horizontal.unwrap_or(base.flip_horizontal),
         flip_vertical: patch.flip_vertical.unwrap_or(base.flip_vertical),
-    }
+    };
+    validate_transform(transform, "transform")?;
+    Ok(transform)
 }
 
 fn current_transform_aspect(t: Transform) -> Option<f64> {
@@ -4339,21 +4413,73 @@ fn build_text_style(
     font_size: Option<f64>,
     color: Option<&str>,
     alignment: Option<&str>,
-) -> TextStyle {
+) -> Result<TextStyle, ToolError> {
     let mut style = TextStyle::default();
     if let Some(n) = font_name {
         style.font_name = n;
     }
     if let Some(s) = font_size {
+        validate_font_size(s, "fontSize")?;
         style.font_size = s;
     }
-    if let Some(c) = color.and_then(Rgba::from_hex) {
-        style.color = c;
+    if let Some(hex) = color {
+        style.color = parse_text_color(hex, "color")?;
     }
-    if let Some(a) = alignment.and_then(parse_alignment) {
-        style.alignment = a;
+    if let Some(value) = alignment {
+        style.alignment = parse_alignment(value).ok_or_else(|| {
+            ToolError::new(format!(
+                "alignment must be left, center, or right (got '{value}')"
+            ))
+        })?;
     }
-    style
+    style.validate().map_err(ToolError::new)?;
+    Ok(style)
+}
+
+fn validate_finite_range(value: f64, path: &str, min: f64, max: f64) -> Result<(), ToolError> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(ToolError::new(format!(
+            "{path} must be finite and between {min} and {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_font_size(value: f64, path: &str) -> Result<(), ToolError> {
+    validate_finite_range(
+        value,
+        path,
+        TextStyle::MIN_FONT_SIZE,
+        TextStyle::MAX_FONT_SIZE,
+    )
+}
+
+fn parse_text_color(hex: &str, path: &str) -> Result<Rgba, ToolError> {
+    Rgba::from_hex(hex).ok_or_else(|| {
+        ToolError::new(format!(
+            "{path} has invalid color '{hex}' (want #RRGGBB or #RRGGBBAA)"
+        ))
+    })
+}
+
+fn validate_transform_center(center_x: f64, center_y: f64, path: &str) -> Result<(), ToolError> {
+    let limit = Transform::MAX_NORMALIZED_CENTER;
+    if !center_x.is_finite()
+        || !center_y.is_finite()
+        || center_x.abs() > limit
+        || center_y.abs() > limit
+    {
+        return Err(ToolError::new(format!(
+            "{path}: transform centers must be finite and between -{limit} and {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_transform(transform: Transform, path: &str) -> Result<(), ToolError> {
+    transform
+        .validate()
+        .map_err(|message| ToolError::new(format!("{path}: {message}")))
 }
 
 /// The `set_clip_properties` text-style fields, validated up front and merged
@@ -9306,6 +9432,196 @@ mod tests {
     /// Keep this as an executable roll-up of the owning MCP boundary tests so the
     /// audit command proves validation, mutation, undo, and bridge fail-closed
     /// behavior together rather than merely matching a test name.
+    #[test]
+    fn set_clip_properties_validates_audio_and_opacity_ranges() {
+        for properties in [
+            serde_json::json!({"volume": 1000.0}),
+            serde_json::json!({"volume": -1.0}),
+            serde_json::json!({"opacity": 2.0}),
+            serde_json::json!({"transform": {"width": 0.0, "height": 1.0}}),
+            serde_json::json!({"transform": {"centerX": 1e308}}),
+        ] {
+            let dispatcher = add_texts_dispatcher();
+            let before = dispatcher.handle.timeline();
+            let mut args = serde_json::json!({"clipIds": ["existing-clip"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(properties.as_object().unwrap().clone());
+            let result = dispatcher.dispatch("set_clip_properties", args);
+            assert!(result.is_error, "{}", result.text_joined());
+            assert_eq!(dispatcher.handle.timeline(), before);
+        }
+
+        let dispatcher = add_texts_dispatcher();
+        let result = dispatcher.dispatch(
+            "set_clip_properties",
+            serde_json::json!({
+                "clipIds": ["existing-clip"],
+                "volume": 1.0,
+                "opacity": 0.5
+            }),
+        );
+        assert!(!result.is_error, "{}", result.text_joined());
+    }
+
+    #[test]
+    fn add_texts_rejects_invalid_font_color_alignment_and_transform() {
+        for (field, value) in [
+            ("fontSize", serde_json::json!(1e308)),
+            ("fontSize", serde_json::json!(0.0)),
+            ("fontSize", serde_json::json!(-5.0)),
+            ("fontSize", serde_json::json!(3.99)),
+            ("fontSize", serde_json::json!(512.01)),
+            ("color", serde_json::json!("red")),
+            ("alignment", serde_json::json!("middle")),
+            (
+                "transform",
+                serde_json::json!({"centerX": 0.5, "centerY": 0.5, "width": 0, "height": 1}),
+            ),
+        ] {
+            let dispatcher = add_texts_dispatcher();
+            let before = dispatcher.handle.timeline();
+            let mut entry = serde_json::json!({
+                "startFrame": 0,
+                "durationFrames": 30,
+                "content": "Hi"
+            });
+            entry.as_object_mut().unwrap().insert(field.into(), value);
+            let result = dispatcher.dispatch("add_texts", serde_json::json!({"entries": [entry]}));
+            assert!(result.is_error, "{}", result.text_joined());
+            assert_eq!(dispatcher.handle.timeline(), before);
+        }
+
+        for font_size in [TextStyle::MIN_FONT_SIZE, TextStyle::MAX_FONT_SIZE] {
+            let dispatcher = add_texts_dispatcher();
+            let result = dispatcher.dispatch(
+                "add_texts",
+                serde_json::json!({
+                    "entries": [{
+                        "startFrame": 0,
+                        "durationFrames": 30,
+                        "content": "Hi",
+                        "fontSize": font_size
+                    }]
+                }),
+            );
+            assert!(!result.is_error, "{}", result.text_joined());
+        }
+    }
+
+    #[test]
+    fn add_captions_rejects_invalid_font_color_and_center() {
+        for (field, value) in [
+            ("fontSize", serde_json::json!(1e308)),
+            ("fontSize", serde_json::json!(0.0)),
+            ("fontSize", serde_json::json!(-5.0)),
+            ("color", serde_json::json!("red")),
+            ("centerX", serde_json::json!(1e308)),
+        ] {
+            let (dispatcher, _bridge) = caption_dispatcher(caption_transcript(
+                vec![word("hi", 0.0, 0.5)],
+                vec![segment("Hi", 0.0, 0.5)],
+            ));
+            let before = dispatcher.handle.timeline();
+            let mut args = serde_json::json!({});
+            args.as_object_mut().unwrap().insert(field.into(), value);
+            let result = dispatcher.dispatch("add_captions", args);
+            assert!(result.is_error, "{}", result.text_joined());
+            assert_eq!(dispatcher.handle.timeline(), before);
+        }
+    }
+
+    #[test]
+    fn insert_clips_rejects_extreme_trim_without_panicking_or_mutating() {
+        let handle = one_video_track_handle(vec![entry("asset-1", "A")]);
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "insert_clips",
+            serde_json::json!({
+                "trackIndex": 0,
+                "atFrame": 0,
+                "entries": [{
+                    "mediaRef": "asset-1",
+                    "trimStartFrame": 2147483647
+                }]
+            }),
+        );
+        assert!(result.is_error, "{}", result.text_joined());
+        assert_eq!(handle.timeline(), before);
+    }
+
+    #[test]
+    fn tighten_silences_rejects_padding_larger_than_the_target_clip() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 10;
+        let mut track = Track::new("audio-track", ClipType::Audio);
+        track.clips.push(Clip::new("clip-a", "asset-1", 0, 10));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("asset-1", "Voice"));
+        let handle = Arc::new(AnalysisHandle {
+            timeline,
+            manifest,
+            pcm: pcm(vec![0.5f32; 1_000], 1_000),
+            extract_error: None,
+        });
+        let dispatcher = dispatcher_with(handle.clone());
+        let before = handle.timeline();
+        let result = dispatcher.dispatch(
+            "tighten_silences",
+            serde_json::json!({
+                "clipIds": ["clip-a"],
+                "paddingFrames": 2147483647
+            }),
+        );
+        assert!(result.is_error, "{}", result.text_joined());
+        assert!(result.text_joined().contains("paddingFrames"));
+        assert_eq!(handle.timeline(), before);
+    }
+
+    #[test]
+    fn tighten_silences_skips_clips_shorter_than_the_padding() {
+        let mut timeline = Timeline::new();
+        timeline.fps = 10;
+        let mut track = Track::new("audio-track", ClipType::Audio);
+        track.clips.push(Clip::new("tiny", "asset-1", 0, 2));
+        track.clips.push(Clip::new("long", "asset-1", 2, 10));
+        timeline.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        manifest.entries.push(audio_entry("asset-1", "Voice"));
+        let handle = Arc::new(AnalysisHandle {
+            timeline,
+            manifest,
+            pcm: pcm(vec![0.5f32; 1_000], 1_000),
+            extract_error: None,
+        });
+        let dispatcher = dispatcher_with(handle);
+        let result = dispatcher.dispatch(
+            "tighten_silences",
+            serde_json::json!({"clipIds": ["tiny", "long"]}),
+        );
+        assert!(!result.is_error, "{}", result.text_joined());
+    }
+
+    #[test]
+    fn relative_frame_mapping_reports_i32_overflow() {
+        let target = AnalysisTarget {
+            media_ref: "asset".into(),
+            clip: None,
+            source_range: None,
+            source_start_seconds: 0.0,
+            project_start_frame: i32::MAX,
+        };
+        assert!(target.map_relative_frame(1, 30).is_err());
+    }
+
+    #[test]
+    fn beat_frame_conversion_rejects_u64_values_outside_i32_range() {
+        assert_eq!(beat_frame_to_i32(i32::MAX as u64).unwrap(), i32::MAX);
+        assert!(beat_frame_to_i32(i32::MAX as u64 + 1).is_err());
+    }
+
     #[test]
     fn cross_cutting_mcp_acceptance() {
         precise_path_arg_error_mentions_field();

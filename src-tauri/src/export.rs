@@ -534,7 +534,7 @@ struct MediaResolver<'d> {
     /// Decode/raster box for source frames (matches the export render size).
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
-    lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
+    lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
     materialization_error: Option<String>,
 }
 
@@ -765,7 +765,7 @@ impl TextureResolver for MediaResolver<'_> {
     fn resolve_lut(
         &mut self,
         reference: &LutReference,
-    ) -> Result<Option<Rc<GpuLutTexture>>, opentake_render::RenderError> {
+    ) -> Result<Option<Arc<GpuLutTexture>>, opentake_render::RenderError> {
         if let Some(cached) = self.lut_cache.get(&reference.id) {
             return Ok(Some(cached.clone()));
         }
@@ -1628,12 +1628,10 @@ pub(crate) struct ExportRunOptions<'a> {
     pub(crate) defer_completion: bool,
 }
 
-/// Best-effort cleanup for a normal video export's partial output. The parent
-/// directory is opened before the output file is created and the output handle
-/// is retained by the guard, so even encoder initialization failures clean the
-/// same inode through the identity-safe removal path. Reserved project-media
-/// outputs stay owned by `ProjectMediaOutput`, whose descriptor/identity-safe
-/// Drop path performs the stronger cleanup contract.
+/// Write an ordinary export to a private file in the destination directory.
+/// Only a completely encoded and validated file replaces the user's target.
+/// The guard removes its own temporary inode on failure or cancellation;
+/// reserved project-media outputs retain their separate owner.
 struct ExportOutputCleanup {
     path: PathBuf,
     enabled: bool,
@@ -1642,6 +1640,8 @@ struct ExportOutputCleanup {
     directory: Option<File>,
     file: Option<File>,
     final_name: Option<OsString>,
+    partial_name: Option<OsString>,
+    target_identity: Option<ExportTargetIdentity>,
 }
 
 impl ExportOutputCleanup {
@@ -1655,6 +1655,8 @@ impl ExportOutputCleanup {
                 directory: None,
                 file: None,
                 final_name: None,
+                partial_name: None,
+                target_identity: None,
             });
         }
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1663,6 +1665,7 @@ impl ExportOutputCleanup {
             .ok_or_else(|| "export output has no file name".to_string())?
             .to_os_string();
         let directory = open_media_directory_nofollow(parent)?;
+        let target_identity = inspect_export_target(&path)?;
         Ok(Self {
             path,
             enabled,
@@ -1671,6 +1674,8 @@ impl ExportOutputCleanup {
             directory: Some(directory),
             file: None,
             final_name: Some(final_name),
+            partial_name: None,
+            target_identity,
         })
     }
 
@@ -1680,12 +1685,29 @@ impl ExportOutputCleanup {
         self.file = Some(output);
     }
 
-    fn open_output_file(&self) -> Result<File, String> {
+    fn open_output_file(&mut self) -> Result<File, String> {
         let directory = self
             .directory
             .as_ref()
             .ok_or_else(|| "export cleanup directory handle is missing".to_string())?;
-        open_output_file_in_parent(&self.path, directory)
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        loop {
+            let number = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = OsString::from(format!(
+                ".opentake-export-{:x}-{number:x}.partial",
+                std::process::id()
+            ));
+            let partial_path = parent.join(&name);
+            match reserve_output_file(&partial_path, directory) {
+                Ok(file) => {
+                    self.partial_name = Some(name);
+                    return Ok(file);
+                }
+                Err(_) if partial_path.exists() => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn encoder_file(&self) -> Result<File, String> {
@@ -1694,6 +1716,14 @@ impl ExportOutputCleanup {
             .ok_or_else(|| "export cleanup output handle is not attached".to_string())?
             .try_clone()
             .map_err(|error| format!("clone export output for encoder: {error}"))
+    }
+
+    fn partial_path(&self) -> Result<PathBuf, String> {
+        Ok(self.path.parent().unwrap_or_else(|| Path::new(".")).join(
+            self.partial_name
+                .as_ref()
+                .ok_or_else(|| "export partial name is missing".to_string())?,
+        ))
     }
 
     fn probe_output(&self) -> Result<opentake_media::MediaProbe, String> {
@@ -1707,8 +1737,39 @@ impl ExportOutputCleanup {
             .map_err(|error| format!("output validation failed: {error}"))
     }
 
-    fn mark_success(&mut self) {
-        self.succeeded = true;
+    fn publish(&mut self) -> Result<(), String> {
+        if self.enabled {
+            self.verify_visible_identity()?;
+            let directory = self
+                .directory
+                .as_ref()
+                .expect("enabled export has a directory");
+            let file = self.file.as_ref().expect("enabled export has an output");
+            file.sync_all()
+                .map_err(|error| format!("sync completed export: {error}"))?;
+            replace_export_file(
+                directory,
+                file,
+                self.partial_name
+                    .as_ref()
+                    .expect("enabled export has a partial name"),
+                self.final_name
+                    .as_ref()
+                    .expect("enabled export has a target name"),
+                &self.path,
+            )
+            .map_err(|error| format!("publish completed export: {error}"))?;
+            // Rename is the commit point. A directory sync failure cannot turn
+            // a complete published file back into a cancelled export.
+            self.succeeded = true;
+            #[cfg(unix)]
+            if let Err(error) = directory.sync_all() {
+                eprintln!("[export] failed to sync published export directory: {error}");
+            }
+        } else {
+            self.succeeded = true;
+        }
+        Ok(())
     }
 
     fn verify_visible_identity(&self) -> Result<(), String> {
@@ -1741,15 +1802,17 @@ impl ExportOutputCleanup {
         if visible_directory != retained_directory {
             return Err("export output parent changed during export".to_string());
         }
-        let visible_file_metadata = std::fs::symlink_metadata(&self.path)
-            .map_err(|error| format!("identify visible export output: {error}"))?;
+        self.verify_target_identity()?;
+        let partial_path = self.partial_path()?;
+        let visible_file_metadata = std::fs::symlink_metadata(&partial_path)
+            .map_err(|error| format!("identify visible export partial: {error}"))?;
         if metadata_is_symlink_or_reparse(&visible_file_metadata)
             || !visible_file_metadata.is_file()
         {
             return Err("export output must remain a real file".to_string());
         }
-        let visible_file = FileIdentity::from_path(&self.path)
-            .map_err(|error| format!("identify visible export output: {error}"))?;
+        let visible_file = FileIdentity::from_path(&partial_path)
+            .map_err(|error| format!("identify visible export partial: {error}"))?;
         let retained_file = FileIdentity::from_file(
             file.try_clone()
                 .map_err(|error| format!("clone retained export output: {error}"))?,
@@ -1760,15 +1823,23 @@ impl ExportOutputCleanup {
         }
         Ok(())
     }
+
+    fn verify_target_identity(&self) -> Result<(), String> {
+        if self.enabled && inspect_export_target(&self.path)? != self.target_identity {
+            return Err("export target changed during export".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ExportOutputCleanup {
     fn drop(&mut self) {
         if self.enabled && self.active && !self.succeeded {
-            if let (Some(directory), Some(file), Some(final_name)) =
-                (&self.directory, &self.file, &self.final_name)
+            if let (Some(directory), Some(file), Some(partial_name)) =
+                (&self.directory, &self.file, &self.partial_name)
             {
-                if let Err(error) = destroy_and_remove_reserved_output(directory, file, final_name)
+                if let Err(error) =
+                    destroy_and_remove_reserved_output(directory, file, partial_name)
                 {
                     eprintln!("[export] failed to clean ordinary partial output: {error}");
                 }
@@ -1787,8 +1858,8 @@ pub(crate) fn run_export_with_control(
     let control = options.control;
     let external_cancel = options.external_cancel.clone();
     validate_export_cancel_sources(control, external_cancel.as_ref())?;
-    // A queued cancellation must win before GPU setup or opening/truncating
-    // an existing output. Later frame/audio checks still cover running work.
+    // A queued cancellation must win before GPU setup or reserving an output.
+    // Later frame/audio checks still cover running work.
     check_audio_cancel_with_external(control, external_cancel.as_ref())?;
     let on_progress = options.on_progress;
     let defer_completion = options.defer_completion;
@@ -2051,7 +2122,7 @@ pub(crate) fn run_export_with_control(
     // replacement in either side of the final linearization fails closed and
     // leaves the retained original for the cleanup guard.
     output_cleanup.verify_visible_identity()?;
-    output_cleanup.mark_success();
+    output_cleanup.publish()?;
     if let Some(emit) = &on_progress {
         emit(completion_progress(defer_completion), AUDIO_PROGRESS_TOTAL);
     }
@@ -2402,71 +2473,260 @@ fn open_media_directory_nofollow(path: &Path) -> Result<File, String> {
     Ok(directory)
 }
 
-/// Create/truncate a normal export output relative to the retained parent
-/// directory. Unix uses `openat` so a parent rename between directory capture
-/// and file creation cannot redirect the output into a replacement directory;
-/// Windows keeps the retained directory handle open with delete sharing denied.
-#[cfg(unix)]
-fn open_output_file_in_parent(path: &Path, parent: &File) -> Result<File, String> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = path
-        .file_name()
-        .ok_or_else(|| "export output has no file name".to_string())?;
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| "export output contains a NUL byte".to_string())?;
-    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o600) };
-    if fd < 0 {
-        return Err(format!(
-            "open export output relative to retained parent: {}",
-            io::Error::last_os_error()
-        ));
+/// Reject links and directories at the final name without opening it for
+/// writing. Preserve the original identity until the single rename commit.
+fn inspect_export_target(path: &Path) -> Result<Option<ExportTargetIdentity>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_file() {
+                return Err("export output must be a real regular file".to_string());
+            }
+            identify_export_target(path)
+                .map(Some)
+                .map_err(|error| format!("identify existing export target: {error}"))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect existing export target: {error}")),
     }
-    // SAFETY: `fd` is a fresh descriptor returned by openat and is now owned by
-    // the File constructed below.
-    let file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect export output: {error}"))?;
-    if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_file() {
-        return Err("export output must be a regular file".to_string());
-    }
-    Ok(file)
 }
 
-#[cfg(not(unix))]
-fn open_output_file_in_parent(path: &Path, _parent: &File) -> Result<File, String> {
+/// Identity of an existing export target, kept until the rename commit.
+///
+/// Unix keeps the target open: renaming over an open file is allowed, and the
+/// retained descriptor stops the inode number from being reused by a file
+/// written in its place. Windows must not keep a handle, because the classic
+/// replace (FAT, exFAT, network shares, older Windows) fails while any handle
+/// to the old file is open; NTFS file indexes carry a sequence number, so a
+/// file written in its place never repeats the key.
+#[cfg(not(windows))]
+type ExportTargetIdentity = FileIdentity;
+#[cfg(windows)]
+type ExportTargetIdentity = ExportFileKey;
+
+/// Identify `path` without following a final link and without blocking on a
+/// special file swapped in after the metadata check.
+fn identify_export_target(path: &Path) -> io::Result<ExportTargetIdentity> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const DELETE: u32 = 0x0001_0000;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
         const FILE_SHARE_READ: u32 = 0x1;
         const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        // Attribute-only access with full sharing never conflicts with other
+        // openers of the target, and the handle is closed before returning.
         options
-            // Our retained handle performs deletion on cancellation; denying
-            // delete sharing still prevents other handles replacing the name.
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("open export output: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect export output: {error}"))?;
+    #[cfg(not(any(unix, windows)))]
+    options.read(true);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
     if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_file() {
-        return Err("export output must be a regular file".to_string());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export target is not a regular file",
+        ));
     }
-    Ok(file)
+    #[cfg(windows)]
+    {
+        ExportFileKey::from_file(&file)
+    }
+    #[cfg(not(windows))]
+    {
+        FileIdentity::from_file(file)
+    }
+}
+
+/// Volume and file index of a file, read without retaining its handle.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportFileKey {
+    volume: u64,
+    index: u64,
+}
+
+#[cfg(windows)]
+impl ExportFileKey {
+    fn from_file(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn replace_export_file(
+    directory: &File,
+    _file: &File,
+    temporary: &std::ffi::OsStr,
+    final_name: &std::ffi::OsStr,
+    _final_path: &Path,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let temporary = CString::new(temporary.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "partial name contains NUL"))?;
+    let final_name = CString::new(final_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name contains NUL"))?;
+    // Both names are single components of the retained no-follow directory.
+    let replaced = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            directory.as_raw_fd(),
+            final_name.as_ptr(),
+        )
+    };
+    if replaced == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn replace_export_file(
+    directory: &File,
+    file: &File,
+    _temporary: &std::ffi::OsStr,
+    final_name: &std::ffi::OsStr,
+    _final_path: &Path,
+) -> io::Result<()> {
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, FileRenameInformationEx, FILE_RENAME_POSIX_SEMANTICS,
+        FILE_RENAME_REPLACE_IF_EXISTS,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+        STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
+    };
+
+    // POSIX semantics replace a target that another process still holds open
+    // with delete sharing (a media player, the search indexer or an antivirus
+    // scan). Windows versions and file systems without the extended class
+    // fall back to the classic replace, which needs the old target closed.
+    let mut status = rename_retained_file(
+        directory,
+        file,
+        final_name,
+        FileRenameInformationEx,
+        FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+    )?;
+    if matches!(
+        status,
+        STATUS_INVALID_INFO_CLASS
+            | STATUS_INVALID_PARAMETER
+            | STATUS_NOT_IMPLEMENTED
+            | STATUS_NOT_SUPPORTED
+    ) {
+        // The classic class reads the same header; its first byte is the
+        // ReplaceIfExists BOOLEAN.
+        status = rename_retained_file(directory, file, final_name, FileRenameInformation, 1)?;
+    }
+    if status < 0 {
+        // SAFETY: converting an NTSTATUS reads no memory and consumes no handle.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(error as i32))
+    } else {
+        Ok(())
+    }
+}
+
+/// Rename the retained `file` to `final_name` inside the retained `directory`
+/// through `NtSetInformationFile`, returning the raw NTSTATUS.
+#[cfg(windows)]
+fn rename_retained_file(
+    directory: &File,
+    file: &File,
+    final_name: &std::ffi::OsStr,
+    class: windows_sys::Wdk::Storage::FileSystem::FILE_INFORMATION_CLASS,
+    flags: u32,
+) -> io::Result<windows_sys::Win32::Foundation::NTSTATUS> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtSetInformationFile, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let wide = final_name.encode_wide().collect::<Vec<_>>();
+    if wide.is_empty() || wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid export target name",
+        ));
+    }
+    let name_bytes = wide
+        .len()
+        .checked_mul(2)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "export target too long"))?;
+    let size = std::mem::size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer too large"))?;
+    let size_u32 = u32::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer too large"))?;
+    const _: () =
+        assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFORMATION>());
+    let mut storage = vec![0_usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `storage` is pointer-aligned and holds the header plus every
+    // UTF-16 unit of the name. Both handles stay open for this synchronous call
+    // (neither is opened for overlapped I/O), so `io_status` outlives it.
+    let status = unsafe {
+        (*info).Anonymous = FILE_RENAME_INFORMATION_0 { Flags: flags };
+        (*info).RootDirectory = directory.as_raw_handle();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+        let mut io_status = IO_STATUS_BLOCK::default();
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            info.cast(),
+            size_u32,
+            class,
+        )
+    };
+    Ok(status)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_export_file(
+    _directory: &File,
+    _file: &File,
+    temporary: &std::ffi::OsStr,
+    _final_name: &std::ffi::OsStr,
+    final_path: &Path,
+) -> io::Result<()> {
+    std::fs::rename(final_path.with_file_name(temporary), final_path)
 }
 
 #[cfg(unix)]
@@ -4082,11 +4342,15 @@ mod tests {
     fn export_output_cleanup_removes_active_partial_output_on_drop() {
         let project = tempfile::tempdir().expect("project");
         let output = project.path().join("partial.mp4");
+        fs::write(&output, b"previous complete export").unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).expect("create cleanup");
         let mut output_file = cleanup
             .open_output_file()
             .expect("production output handle");
         output_file.write_all(b"partial").expect("partial output");
+        let partial_path = cleanup.partial_path().unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
         cleanup.attach_output(output_file);
         let encoder_file = cleanup.encoder_file().expect("clone encoder file");
         drop(cleanup);
@@ -4094,7 +4358,71 @@ mod tests {
         // Windows finalizes delete disposition after the last duplicated
         // encoder handle closes; the payload must already have been destroyed.
         drop(encoder_file);
-        assert!(!output.exists());
+        assert!(!partial_path.exists());
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
+        assert_eq!(identify_export_target(&output).unwrap(), previous_identity);
+    }
+
+    #[test]
+    fn cancelled_native_encoder_preserves_the_previous_movie() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous complete export").unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let file = cleanup.open_output_file().unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        cleanup.attach_output(file);
+        let preset = resolve_preset(ExportCodec::H264, ExportQuality::P720, &output).unwrap();
+        let mut encoder = VideoEncoder::new_with_file(
+            &output,
+            cleanup.encoder_file().unwrap(),
+            64,
+            64,
+            30,
+            &preset,
+        )
+        .unwrap();
+        encoder.push_frame(&RgbaFrame::black(64, 64)).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
+        encoder.abort();
+        drop(cleanup);
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
+        assert_eq!(identify_export_target(&output).unwrap(), previous_identity);
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn completed_native_encoder_replaces_previous_movie() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous complete export").unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let file = cleanup.open_output_file().unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        cleanup.attach_output(file);
+        let preset = resolve_preset(ExportCodec::H264, ExportQuality::P720, &output).unwrap();
+        let mut encoder = VideoEncoder::new_with_file(
+            &output,
+            cleanup.encoder_file().unwrap(),
+            64,
+            64,
+            30,
+            &preset,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            encoder.push_frame(&RgbaFrame::black(64, 64)).unwrap();
+        }
+        encoder.finish().unwrap();
+        let probe = cleanup.probe_output().unwrap();
+        assert!(probe.has_video);
+        cleanup.publish().unwrap();
+        drop(cleanup);
+        assert_ne!(identify_export_target(&output).unwrap(), previous_identity);
+        assert!(!partial.exists());
+        assert!(opentake_media::probe::probe(&output).unwrap().has_video);
     }
 
     #[test]
@@ -4103,6 +4431,7 @@ mod tests {
         let output = project.path().join("retained.wav");
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
         let mut file = cleanup.open_output_file().unwrap();
+        let partial_path = cleanup.partial_path().unwrap();
         write_wav_s16le_cancellable_to_file(
             &vec![0.0; 4800],
             48_000,
@@ -4120,6 +4449,7 @@ mod tests {
         assert!((parsed.duration_secs - 0.1).abs() < 0.01);
         drop(cleanup);
         assert!(!output.exists());
+        assert!(!partial_path.exists());
 
         let reserved = reserve_project_media_output(project.path(), "probe", "wav").unwrap();
         let reserved_path = reserved.path().to_path_buf();
@@ -4150,20 +4480,20 @@ mod tests {
     fn export_output_cleanup_keeps_successful_output_and_reserved_output() {
         let project = tempfile::tempdir().expect("project");
         let successful = project.path().join("successful.mp4");
-        fs::write(&successful, b"complete").expect("successful output");
-        let successful_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&successful)
-            .expect("open successful output");
+        fs::write(&successful, b"old complete export").expect("previous output");
+        let old_identity = identify_export_target(&successful).unwrap();
         let mut keep = ExportOutputCleanup::new(successful.clone(), true).expect("create cleanup");
-        keep.attach_output(successful_file);
-        let _encoder_file = keep.encoder_file().expect("clone encoder file");
+        let mut file = keep.open_output_file().unwrap();
+        file.write_all(b"new complete export").unwrap();
+        let partial_path = keep.partial_path().unwrap();
+        keep.attach_output(file);
         keep.verify_visible_identity()
             .expect("verify successful output");
-        keep.mark_success();
+        keep.publish().expect("publish verified export");
         drop(keep);
-        assert!(successful.exists());
+        assert_eq!(fs::read(&successful).unwrap(), b"new complete export");
+        assert_ne!(identify_export_target(&successful).unwrap(), old_identity);
+        assert!(!partial_path.exists());
 
         let reserved = project.path().join("reserved.mp4");
         fs::write(&reserved, b"reserved").expect("reserved output");
@@ -4179,25 +4509,83 @@ mod tests {
         assert!(reserved.exists());
     }
 
+    #[test]
+    fn publish_replaces_a_target_that_a_reader_still_holds_open() {
+        use std::io::Read as _;
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous export").unwrap();
+        // A media player keeps the previous movie open. Rust's default Windows
+        // sharing includes FILE_SHARE_DELETE, like most players and scanners.
+        let mut reader = fs::File::open(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let mut file = cleanup.open_output_file().unwrap();
+        file.write_all(b"new export").unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        cleanup.attach_output(file);
+
+        cleanup.publish().unwrap();
+        drop(cleanup);
+        assert_eq!(fs::read(&output).unwrap(), b"new export");
+        assert!(!partial.exists());
+        let mut previous = Vec::new();
+        reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, b"previous export");
+    }
+
+    #[test]
+    fn export_does_not_publish_over_a_target_replaced_during_encoding() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous export").unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let mut writer = cleanup.open_output_file().unwrap();
+        writer.write_all(b"completed replacement").unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        cleanup.attach_output(writer);
+        fs::remove_file(&output).unwrap();
+        fs::write(&output, b"other writer's export").unwrap();
+
+        assert!(cleanup.publish().is_err());
+        drop(cleanup);
+        assert_eq!(fs::read(&output).unwrap(), b"other writer's export");
+        assert!(!partial.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_an_existing_symlink_without_touching_its_destination() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = project.path().join("outside.mp4");
+        let output = project.path().join("final.mp4");
+        fs::write(&outside, b"existing other file").unwrap();
+        std::os::unix::fs::symlink(&outside, &output).unwrap();
+        assert!(ExportOutputCleanup::new(output, true).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"existing other file");
+        assert_eq!(fs::read_dir(project.path()).unwrap().count(), 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn export_output_cleanup_does_not_remove_a_replaced_visible_path() {
         let project = tempfile::tempdir().expect("project");
         let output = project.path().join("race.mp4");
-        let moved = project.path().join("race-original.mp4");
         fs::write(&output, b"original").expect("original output");
-        let output_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&output)
-            .expect("open original output");
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).expect("create cleanup");
+        let mut output_file = cleanup.open_output_file().unwrap();
+        output_file.write_all(b"partial").unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        let moved = project.path().join("moved-partial.mp4");
         cleanup.attach_output(output_file);
-        fs::rename(&output, &moved).expect("move original output");
-        fs::write(&output, b"replacement").expect("replacement output");
+        fs::rename(&partial, &moved).expect("move original partial");
+        fs::write(&partial, b"replacement").expect("replace partial name");
         drop(cleanup);
-
-        assert_eq!(fs::read(&output).expect("read replacement"), b"replacement");
+        assert_eq!(fs::read(&output).unwrap(), b"original");
+        assert_eq!(fs::read(&partial).unwrap(), b"replacement");
+        assert!(
+            fs::read(&moved).unwrap().is_empty(),
+            "retained partial was erased"
+        );
     }
 
     #[cfg(unix)]
@@ -4205,27 +4593,25 @@ mod tests {
     fn export_output_identity_rejects_a_symlinked_visible_path() {
         let project = tempfile::tempdir().expect("project");
         let output = project.path().join("race.mp4");
-        let moved = project.path().join("race-original.mp4");
         fs::write(&output, b"original").expect("original output");
-        let output_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&output)
-            .expect("open original output");
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).expect("create cleanup");
+        let output_file = cleanup.open_output_file().unwrap();
+        let partial = cleanup.partial_path().unwrap();
+        let moved = project.path().join("moved-partial.mp4");
         cleanup.attach_output(output_file);
-        fs::rename(&output, &moved).expect("move original output");
-        std::os::unix::fs::symlink(&moved, &output).expect("replace output with symlink");
+        fs::rename(&partial, &moved).expect("move original partial");
+        std::os::unix::fs::symlink(&moved, &partial).expect("replace partial with symlink");
 
         assert!(
             cleanup.verify_visible_identity().is_err(),
-            "a symlinked visible output must never be accepted as the retained file"
+            "a symlinked partial must never be accepted as the retained file"
         );
         drop(cleanup);
         assert!(
-            output.exists(),
+            partial.is_symlink(),
             "cleanup must not remove the replacement link"
         );
+        assert_eq!(fs::read(&output).unwrap(), b"original");
     }
 
     #[cfg(unix)]
@@ -4238,12 +4624,9 @@ mod tests {
         let output = parent.join("race.mp4");
         let moved_output = moved_parent.join("race.mp4");
         fs::write(&output, b"original").expect("original output");
-        let output_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&output)
-            .expect("open original output");
         let mut cleanup = ExportOutputCleanup::new(output.clone(), true).expect("create cleanup");
+        let output_file = cleanup.open_output_file().unwrap();
+        let partial_name = cleanup.partial_name.clone().unwrap();
         cleanup.attach_output(output_file);
         fs::rename(&parent, &moved_parent).expect("move original parent");
         fs::create_dir(&parent).expect("replacement parent");
@@ -4251,7 +4634,11 @@ mod tests {
         drop(cleanup);
 
         assert_eq!(fs::read(&output).expect("read replacement"), b"replacement");
-        assert!(!moved_output.exists(), "retained original must be cleaned");
+        assert_eq!(fs::read(&moved_output).unwrap(), b"original");
+        assert!(
+            !moved_parent.join(partial_name).exists(),
+            "retained partial cleaned"
+        );
     }
 
     #[cfg(unix)]
@@ -4267,11 +4654,10 @@ mod tests {
 
         fs::rename(&parent, &moved_parent).expect("move original parent");
         fs::create_dir(&parent).expect("replacement parent");
-        let output_file = cleanup
-            .open_output_file()
-            .expect("create output in retained parent");
-        cleanup.attach_output(output_file);
-        let _encoder_file = cleanup.encoder_file().expect("clone encoder file");
+        // The creation cannot pass visible identity validation after a parent
+        // swap; any newly reserved inode must be cleaned through the old dir.
+        let result = cleanup.open_output_file();
+        assert!(result.is_err());
         drop(cleanup);
 
         assert!(
@@ -4279,6 +4665,7 @@ mod tests {
             "replacement parent must not receive output"
         );
         assert!(!moved_output.exists(), "retained output must be cleaned");
+        assert_eq!(fs::read_dir(&moved_parent).unwrap().count(), 0);
     }
 
     #[test]
