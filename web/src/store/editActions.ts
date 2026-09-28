@@ -17,6 +17,7 @@ import { planNudge } from "../lib/timelineNudge";
 import { buildInsertPlan, type InsertPlan } from "../lib/timelineInsert";
 import { checkProjectSettings } from "../lib/projectSettings";
 import { roundHalfAwayFromZero } from "../lib/rounding";
+import { currentTimelineOf } from "../lib/timelineScope";
 import { expandLinkGroup } from "../components/timeline/hitTest";
 import { useClipboardStore } from "./clipboardStore";
 import { t } from "../i18n";
@@ -138,9 +139,10 @@ export const EDIT_GESTURE_COMMAND_MATRIX_IS_EXHAUSTIVE: [MissingEditRequestType]
   : never = true;
 
 export function currentTimeline(): Timeline {
-  const root = useProjectStore.getState().timeline;
-  const sequenceId = useEditorUiStore.getState().activeNestedSequenceId;
-  return root.nestedSequences?.find((sequence) => sequence.id === sequenceId)?.timeline ?? root;
+  return currentTimelineOf(
+    useProjectStore.getState().timeline,
+    useEditorUiStore.getState().activeNestedSequenceId,
+  );
 }
 
 /** End frame of the timeline currently shown in the editor. Nested timeline

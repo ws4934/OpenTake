@@ -704,6 +704,180 @@ describe("WebKit playback transport", () => {
   });
 });
 
+describe("nested sequence transport", () => {
+  const SEQUENCE_ID = "seq-1";
+
+  /** A 300-frame root timeline holding a compound clip whose sequence is 60
+   *  frames long. The root and nested clips use different media. */
+  function compoundProject(
+    root: Timeline = timeline([
+      track({
+        id: "root-v1",
+        type: "video",
+        clips: [clip({ id: "root-clip", mediaRef: "root-asset", mediaType: "video", durationFrames: 300 })],
+      }),
+    ]),
+    nested: Timeline = timeline([
+      track({
+        id: "nested-v1",
+        type: "video",
+        clips: [clip({ id: "nested-clip", mediaRef: "nested-asset", mediaType: "video", durationFrames: 60 })],
+      }),
+    ]),
+  ): Timeline {
+    return { ...root, nestedSequences: [{ id: SEQUENCE_ID, name: "Compound", timeline: nested }] };
+  }
+
+  function mediaElement() {
+    let paused = true;
+    return {
+      currentTime: 0,
+      muted: false,
+      volume: 1,
+      isConnected: true,
+      get paused() {
+        return paused;
+      },
+      play: vi.fn(async () => {
+        paused = false;
+      }),
+      pause: vi.fn(() => {
+        paused = true;
+      }),
+      load: vi.fn(),
+      removeAttribute: vi.fn(),
+    };
+  }
+
+  function elementKey(tl: Timeline, trackIndex = 0): string {
+    const active = { trackIndex, track: tl.tracks[trackIndex], clip: tl.tracks[trackIndex].clips[0] };
+    return previewElementKey(active as ActiveMedia);
+  }
+
+  function stubAnimationFrames(): Map<number, FrameRequestCallback> {
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let nextId = 1;
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextId++;
+        callbacks.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn((id: number) => callbacks.delete(id)));
+    return callbacks;
+  }
+
+  async function runNextFrame(callbacks: Map<number, FrameRequestCallback>, ts: number) {
+    const [id, callback] = callbacks.entries().next().value as [number, FrameRequestCallback];
+    callbacks.delete(id);
+    await act(async () => {
+      callback(ts);
+      await Promise.resolve();
+    });
+  }
+
+  async function playInside(project: Timeline, activeFrame: number): Promise<Root> {
+    useProjectStore.setState({ projectEpoch: 5, timelineVersion: 3, timeline: project });
+    useEditorUiStore.setState({
+      activeNestedSequenceId: SEQUENCE_ID,
+      activeFrame,
+      currentFrame: activeFrame,
+      isPlaying: true,
+      isScrubbing: false,
+      rustEngineFailed: false,
+      webkitPlaybackFailedRevision: null,
+    });
+    const root = await mountPlaybackHook();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return root;
+  }
+
+  afterEach(() => {
+    useEditorUiStore.setState({ activeNestedSequenceId: null, isPlaying: false });
+  });
+
+  it("stops at the last frame of the open sequence, not the root timeline", async () => {
+    const frames = stubAnimationFrames();
+    const root = await playInside(compoundProject(), 58);
+
+    await runNextFrame(frames, 1_000);
+    expect(useEditorUiStore.getState().isPlaying).toBe(true);
+    await runNextFrame(frames, 1_000 + (2 * 1_000) / 30);
+
+    expect(useEditorUiStore.getState()).toMatchObject({ isPlaying: false, currentFrame: 59 });
+    await unmountPlaybackHook(root);
+  });
+
+  it("plays and seeks the open sequence's media elements, not the root's", async () => {
+    const frames = stubAnimationFrames();
+    const project = compoundProject();
+    const nestedElement = mediaElement();
+    const rootElement = mediaElement();
+    const nestedKey = elementKey(project.nestedSequences![0]!.timeline);
+    const rootKey = elementKey(project);
+    previewEngine.previewElements.set(nestedKey, nestedElement as unknown as HTMLMediaElement);
+    previewEngine.previewElements.set(rootKey, rootElement as unknown as HTMLMediaElement);
+
+    const root = await playInside(project, 30);
+    await runNextFrame(frames, 1_000);
+
+    expect(nestedElement.play).toHaveBeenCalled();
+    expect(nestedElement.currentTime).toBeCloseTo(1, 5);
+    expect(rootElement.play).not.toHaveBeenCalled();
+
+    // An external seek while playing repositions the nested element.
+    await act(async () => useEditorUiStore.getState().setCurrentFrame(45));
+    await runNextFrame(frames, 1_050);
+    expect(nestedElement.currentTime).toBeCloseTo(1.5, 5);
+    expect(rootElement.currentTime).toBe(0);
+
+    await unmountPlaybackHook(root);
+    previewEngine.previewElements.remove(nestedKey);
+    previewEngine.previewElements.remove(rootKey);
+  });
+
+  it("plays a nested sequence on WebKit even when the root needs the native engine", async () => {
+    stubAnimationFrames();
+
+    const root = await playInside(compoundProject(temporalCompositorTimeline()), 0);
+
+    expect(nativeApiHarness.playbackStart).not.toHaveBeenCalled();
+    expect(useEditorUiStore.getState().isPlaying).toBe(true);
+    expect(requestAnimationFrame).toHaveBeenCalled();
+    await unmountPlaybackHook(root);
+  });
+
+  it("stops a nested sequence that only the native engine could play", async () => {
+    stubAnimationFrames();
+
+    const root = await playInside(compoundProject(undefined, temporalCompositorTimeline()), 0);
+
+    expect(nativeApiHarness.playbackStart).not.toHaveBeenCalled();
+    expect(useEditorUiStore.getState().isPlaying).toBe(false);
+    await unmountPlaybackHook(root);
+  });
+
+  it("resolves the route again when the nested sequence closes", async () => {
+    stubAnimationFrames();
+    const root = await playInside(compoundProject(temporalCompositorTimeline()), 0);
+    expect(nativeApiHarness.playbackStart).not.toHaveBeenCalled();
+
+    await act(async () => {
+      useEditorUiStore.setState({ activeNestedSequenceId: null });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(nativeApiHarness.playbackStart).toHaveBeenCalledTimes(1);
+    await unmountPlaybackHook(root);
+  });
+});
+
 describe("previewElements release", () => {
   // This suite runs without a DOM; the registry only needs the media API.
   function mediaElement(isConnected: boolean) {
@@ -837,7 +1011,7 @@ describe("playback engine subscription cost", () => {
 
   it("re-renders its host once per whole frame and resolves the route once per revision", async () => {
     const { root, renders } = await startNativePlayback();
-    const resolveRoute = vi.spyOn(playbackRoute, "resolveTimelinePlaybackRoute");
+    const resolveRoute = vi.spyOn(playbackRoute, "resolveTimelinePlaybackGate");
     const rendersBefore = renders();
 
     // 60 fractional playback ticks across two whole-frame boundaries (10 -> 12).

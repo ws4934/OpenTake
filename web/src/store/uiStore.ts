@@ -8,6 +8,7 @@ import { create } from "zustand";
 import { ZOOM } from "../lib/theme";
 import { useProjectStore } from "./projectStore";
 import { totalFrames } from "../lib/geometry";
+import { currentTimelineOf } from "../lib/timelineScope";
 import type { CropAspectLock } from "../lib/cropOverlay";
 import { withRangeStart, withRangeEnd, type TimelineRange } from "../lib/timelineRange";
 import type { GapSelection } from "../lib/timelineGap";
@@ -640,10 +641,10 @@ export const createEditorUiStore = () => create<UiState>((set, get) => ({
     // very first tick and stall play. Without media there's nothing to rewind.
     // Reset the Rust-engine fallback here too (both start-play paths clear it).
     // The end is the shown timeline's: an open nested sequence, else the root.
-    const root = useProjectStore.getState().timeline;
-    const shown =
-      root.nestedSequences?.find((sequence) => sequence.id === get().activeNestedSequenceId)
-        ?.timeline ?? root;
+    const shown = currentTimelineOf(
+      useProjectStore.getState().timeline,
+      get().activeNestedSequenceId,
+    );
     const last = Math.max(0, totalFrames(shown) - 1);
     if (activeFrame >= last) {
       set({ currentFrame: 0, activeFrame: 0, isPlaying: true, isScrubbing: false, rustEngineFailed: false });

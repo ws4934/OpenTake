@@ -6,6 +6,7 @@
 
 import * as api from "../lib/api";
 import { totalFrames } from "../lib/geometry";
+import { currentTimelineOf } from "../lib/timelineScope";
 import { useProjectStore } from "./projectStore";
 import { useEditorUiStore } from "./uiStore";
 import { stopNativePlaybackForProjectBoundary } from "../components/preview/nativePlaybackSession";
@@ -73,10 +74,7 @@ function reportSyncFailure(label: string, error: unknown): void {
 function reconcilePlayheadToTimeline(): void {
   const ui = useEditorUiStore.getState();
   const project = useProjectStore.getState();
-  const timeline =
-    project.timeline.nestedSequences?.find(
-      (sequence) => sequence.id === ui.activeNestedSequenceId,
-    )?.timeline ?? project.timeline;
+  const timeline = currentTimelineOf(project.timeline, ui.activeNestedSequenceId);
   const maxFrame = Math.max(0, totalFrames(timeline));
   const clamp = (frame: number) => Math.max(0, Math.min(maxFrame, frame));
   const currentFrame = clamp(

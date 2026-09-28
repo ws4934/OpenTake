@@ -172,9 +172,10 @@ export function runApplicationMenuCommand(id: string): void {
         ui.selectMediaAssets(new Set(useMediaStore.getState().items.map((item) => item.id)));
         useEditorUiStore.setState({ selectedFolderIds: new Set() });
       } else {
-        const ids = useProjectStore
-          .getState()
-          .timeline.tracks.flatMap((track) => track.clips.map((clip) => clip.id));
+        // The clips the timeline shows: an open nested sequence's, not the root's.
+        const ids = edit
+          .currentTimeline()
+          .tracks.flatMap((track) => track.clips.map((clip) => clip.id));
         ui.selectClips(new Set(ids));
       }
       return;
@@ -265,14 +266,16 @@ export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
   const clipboard = useClipboardStore.getState();
   const media = useMediaStore.getState();
   const editor = ui.view === "editor";
+  // Export renders the root timeline; the editing commands act on the shown one.
   const hasClips = project.timeline.tracks.some((track) => track.clips.length > 0);
+  const showsClips = edit.currentTimeline().tracks.some((track) => track.clips.length > 0);
   const clipSelection = ui.selectedClipIds.size > 0;
   const mediaSelection = ui.selectedMediaAssetIds.size > 0;
   const folderSelection = ui.selectedFolderIds.size > 0;
   const selection = ui.focusedPanel === "media" ? mediaSelection : clipSelection;
   const deleteSelection =
     ui.focusedPanel === "media" ? mediaSelection || folderSelection : clipSelection;
-  const anySelectable = ui.focusedPanel === "media" ? media.items.length > 0 : hasClips;
+  const anySelectable = ui.focusedPanel === "media" ? media.items.length > 0 : showsClips;
   const mutableProject = editor && Boolean(project.projectPath) && !project.compatibilityReadOnly;
   const actionsEnabled = !isUpdateInstallationBlocking(useUpdateStore.getState().phase);
 
@@ -292,7 +295,7 @@ export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
     copy: actionsEnabled && editor && selection,
     paste: actionsEnabled && editor && clipboard.hasContent,
     selectAll: actionsEnabled && editor && anySelectable,
-    split: actionsEnabled && editor && hasClips,
+    split: actionsEnabled && editor && showsClips,
     trimStart: actionsEnabled && editor && clipSelection,
     trimEnd: actionsEnabled && editor && clipSelection,
     delete: actionsEnabled && editor && deleteSelection,

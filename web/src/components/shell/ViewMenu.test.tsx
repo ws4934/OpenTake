@@ -131,6 +131,73 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("timeline commands inside a nested sequence", () => {
+  function compound(nestedClipIds: string[]) {
+    const root = videoClip();
+    return {
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      settingsConfigured: true,
+      tracks: [
+        { id: "root-v1", type: "video" as const, muted: false, hidden: false, syncLocked: false, clips: [root] },
+      ],
+      nestedSequences: [
+        {
+          id: "seq-1",
+          name: "Compound",
+          timeline: {
+            fps: 30,
+            width: 1920,
+            height: 1080,
+            settingsConfigured: true,
+            tracks: [
+              {
+                id: "nested-v1",
+                type: "video" as const,
+                muted: false,
+                hidden: false,
+                syncLocked: false,
+                clips: nestedClipIds.map((id, index) => ({ ...root, id, startFrame: index * 30 })),
+              },
+            ],
+          },
+        },
+      ],
+    };
+  }
+
+  afterEach(() => {
+    useEditorUiStore.setState({ activeNestedSequenceId: null });
+    useProjectStore.getState().clearProjectSnapshot();
+  });
+
+  it("selects every clip of the open sequence, not the root's", async () => {
+    await act(async () => {
+      useProjectStore.setState({ timeline: compound(["nested-a", "nested-b"]) });
+      useEditorUiStore.setState({ activeNestedSequenceId: "seq-1", focusedPanel: "timeline" });
+    });
+    expect(applicationMenuStateSnapshot().enabled.selectAll).toBe(true);
+
+    await act(async () => runApplicationMenuCommand("selectAll"));
+
+    expect(useEditorUiStore.getState().selectedClipIds).toEqual(new Set(["nested-a", "nested-b"]));
+  });
+
+  it("offers select all and split only when the open sequence has clips", async () => {
+    await act(async () => {
+      useProjectStore.setState({ timeline: compound([]) });
+      useEditorUiStore.setState({ activeNestedSequenceId: "seq-1", focusedPanel: "timeline" });
+    });
+
+    expect(applicationMenuStateSnapshot().enabled).toMatchObject({
+      selectAll: false,
+      split: false,
+      export: true,
+    });
+  });
+});
+
 describe("ViewMenu aggregate command contract", () => {
   it.each(["number", "date", "time"])(
     "blocks stale native editing commands while a %s input has focus",
