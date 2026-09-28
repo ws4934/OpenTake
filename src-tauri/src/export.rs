@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use same_file::Handle as FileIdentity;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::render::LottieMaterializer;
 
@@ -229,7 +229,7 @@ impl Drop for ExportGuard {
 impl ExportControl {
     /// Request cancellation only when the caller owns the active operation.
     /// A delayed cancel for a completed predecessor is an intentional no-op.
-    fn request_cancel(&self, operation_id: &str) -> bool {
+    pub(crate) fn request_cancel(&self, operation_id: &str) -> bool {
         let state = self
             .operation
             .lock()
@@ -3165,35 +3165,38 @@ pub struct SaveRangeAsMediaRequest {
 }
 
 #[tauri::command]
-pub fn save_range_as_media(
+pub async fn save_range_as_media(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,
-    media: State<'_, crate::media::MediaState>,
-    prewarm: State<'_, crate::media::prewarm::PrewarmScheduler>,
     request: SaveRangeAsMediaRequest,
 ) -> Result<crate::media::MediaListDto, String> {
-    let SaveRangeAsMediaRequest {
-        in_frame,
-        out_frame,
-        operation_id,
-    } = request;
-    save_range_as_media_impl(&core, || {
+    core.ensure_project_mutable()
+        .map_err(|error| error.to_string())?;
+    let guard = control.try_begin(&request.operation_id)?;
+    let snapshot = core.runtime_snapshot();
+    let owned_core = core.inner().clone();
+    let owned_control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let media = app.state::<crate::media::MediaState>();
+        let prewarm = app.state::<crate::media::prewarm::PrewarmScheduler>();
         save_range_as_media_workflow(
             &app,
-            &core,
-            &control,
+            &owned_core,
+            &owned_control,
             media.engine(),
             &prewarm,
-            SaveRangeAsMediaRequest {
-                in_frame,
-                out_frame,
-                operation_id,
-            },
+            snapshot,
+            request,
+            guard,
+            None,
         )
     })
+    .await
+    .map_err(|error| format!("save range worker failed: {error}"))?
 }
 
+#[cfg(test)]
 fn save_range_as_media_impl(
     core: &AppCore,
     workflow: impl FnOnce() -> Result<crate::media::MediaListDto, String>,
@@ -3202,20 +3205,23 @@ fn save_range_as_media_impl(
     workflow()
 }
 
-fn save_range_as_media_workflow(
-    app: &AppHandle,
+#[allow(clippy::too_many_arguments)]
+fn save_range_as_media_workflow<R: Runtime>(
+    app: &AppHandle<R>,
     core: &AppCore,
     control: &ExportControl,
     engine: &opentake_media::MediaEngine,
     prewarm: &crate::media::prewarm::PrewarmScheduler,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
     request: SaveRangeAsMediaRequest,
+    mut guard: ExportGuard,
+    progress_hook: Option<AudioExportProgress>,
 ) -> Result<crate::media::MediaListDto, String> {
     let SaveRangeAsMediaRequest {
         in_frame,
         out_frame,
-        operation_id,
+        operation_id: _,
     } = request;
-    let snapshot = core.runtime_snapshot();
     let project_dir = snapshot
         .project_dir
         .clone()
@@ -3223,7 +3229,6 @@ fn save_range_as_media_workflow(
     let total_frames = snapshot.timeline.total_frames();
     validate_save_range(total_frames, in_frame, out_frame)?;
 
-    let mut guard = control.try_begin(&operation_id)?;
     let output = reserve_project_media_output(
         &project_dir,
         &format!("range_{in_frame}_{out_frame}"),
@@ -3243,6 +3248,9 @@ fn save_range_as_media_workflow(
                 total,
             },
         );
+        if let Some(hook) = &progress_hook {
+            hook(done, total);
+        }
     });
     let req = ExportRequest {
         out_path: out_path.to_string_lossy().into_owned(),
@@ -3404,6 +3412,32 @@ mod tests {
     }
 
     #[test]
+    fn cancel_export_command_returns_while_save_worker_owns_lease() {
+        let app = tauri::test::mock_app();
+        app.manage(ExportControl::default());
+        let guard = app
+            .state::<ExportControl>()
+            .try_begin("save-as-worker")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            guard.checkpoint()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let started = Instant::now();
+        let cancelled = cancel_export(app.state::<ExportControl>(), "save-as-worker".into());
+        let elapsed = started.elapsed();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(CANCELLED_SENTINEL.to_string()));
+        assert_eq!(cancelled, Ok(true));
+        assert!(elapsed < Duration::from_millis(100));
+    }
+
+    #[test]
     fn pre_cancelled_export_leaves_existing_output_untouched() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("existing.mp4");
@@ -3521,6 +3555,136 @@ mod tests {
         assert!(!called.get());
         assert!(!sentinel.exists());
         assert_eq!(recursive_tree(&saves), before);
+    }
+
+    #[test]
+    fn ffmpeg_range_cancel_mid_render_leaves_no_output_or_manifest_change() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Mutex};
+
+        use opentake_domain::{MediaManifestEntry, Track};
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!(
+                "SKIP: ffmpeg sidecars are required for the 300-frame range cancellation test"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("CancelRange.opentake");
+        let source = tmp.path().join("scene.mp4");
+        let generated = std::process::Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=10:size=64x36:rate=30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .expect("generate range fixture with FFmpeg");
+        assert!(
+            generated.success(),
+            "FFmpeg must generate the range fixture"
+        );
+        let mut project = opentake_project::Project::new(&bundle);
+        project.timeline.fps = 30;
+        project.timeline.width = 64;
+        project.timeline.height = 36;
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("clip", "scene", 0, 300));
+        project.timeline.tracks.push(track);
+        project.manifest.entries.push(MediaManifestEntry {
+            id: "scene".into(),
+            name: "scene".into(),
+            kind: ClipType::Video,
+            source: MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: Some(64),
+            source_height: Some(36),
+            source_fps: Some(30.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        project.save().unwrap();
+        let core = AppCore::new();
+        core.open_project(bundle.clone()).unwrap();
+        let snapshot = core.runtime_snapshot();
+        let before = core.media();
+        let before_disk = fs::read(bundle.join("media.json")).unwrap();
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let control = ExportControl::default();
+        let guard = control.try_begin("save-as:range-cancel").unwrap();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let signalled = AtomicBool::new(false);
+        let hook: AudioExportProgress = Arc::new(move |done, total| {
+            if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
+                progress_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
+            }
+        });
+        let worker_core = core.clone();
+        let worker_control = control.clone();
+        let root = tmp.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let engine = opentake_media::MediaEngine::new(root.join("cache"), root.join("models"));
+            let scheduler = crate::media::prewarm::PrewarmScheduler::new(snapshot.project_epoch);
+            save_range_as_media_workflow(
+                &handle,
+                &worker_core,
+                &worker_control,
+                &engine,
+                &scheduler,
+                snapshot,
+                SaveRangeAsMediaRequest {
+                    in_frame: 0,
+                    out_frame: 300,
+                    operation_id: "save-as:range-cancel".into(),
+                },
+                guard,
+                Some(hook),
+            )
+        });
+        let reached_progress = progress_rx.recv_timeout(Duration::from_secs(45));
+        let cancelled = control.request_cancel("save-as:range-cancel");
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap();
+        reached_progress.expect("the 300-frame FFmpeg range worker must reach partial progress");
+        assert!(cancelled, "cancellation must reach the active worker");
+        assert_eq!(result.unwrap_err(), CANCELLED_SENTINEL);
+        assert_eq!(core.media(), before);
+        assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+        assert!(
+            !bundle.join("media").exists()
+                || fs::read_dir(bundle.join("media")).unwrap().next().is_none(),
+            "partial range MP4 must be removed"
+        );
     }
 
     #[test]

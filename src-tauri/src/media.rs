@@ -3562,33 +3562,43 @@ fn build_single_clip_export(
 /// extraction already exists via `extract_audio`). Requires a saved project —
 /// there must be a bundle `media/` dir to write into.
 #[tauri::command]
-pub fn save_clip_as_media(
+pub async fn save_clip_as_media(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, crate::export::ExportControl>,
-    media: State<'_, MediaState>,
-    prewarm: State<'_, prewarm::PrewarmScheduler>,
     clip_id: String,
     operation_id: String,
 ) -> Result<MediaListDto, String> {
+    core.ensure_project_mutable().map_err(|e| e.to_string())?;
+    let guard = control.try_begin(&operation_id)?;
+    let snapshot = core.runtime_snapshot();
+    let owned_core = core.inner().clone();
+    let owned_control = control.inner().clone();
     let progress_app = app.clone();
     let progress_operation_id = operation_id.clone();
     let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
         crate::export::emit_export_progress(&progress_app, &progress_operation_id, done, total);
     });
-    save_clip_as_media_impl(&core, || {
-        save_clip_as_media_workflow(
-            &core,
-            &control,
+    tauri::async_runtime::spawn_blocking(move || {
+        let media = app.state::<MediaState>();
+        let prewarm = app.state::<prewarm::PrewarmScheduler>();
+        save_clip_as_media_workflow_from_snapshot(
+            &owned_core,
+            &owned_control,
             media.engine(),
             &prewarm,
+            snapshot,
             &clip_id,
             &operation_id,
             on_progress,
+            Some(guard),
         )
     })
+    .await
+    .map_err(|error| format!("save clip worker failed: {error}"))?
 }
 
+#[cfg(test)]
 fn save_clip_as_media_impl(
     core: &AppCore,
     workflow: impl FnOnce() -> Result<MediaListDto, String>,
@@ -3597,6 +3607,8 @@ fn save_clip_as_media_impl(
     workflow()
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn save_clip_as_media_workflow(
     core: &AppCore,
     control: &crate::export::ExportControl,
@@ -3605,8 +3617,33 @@ fn save_clip_as_media_workflow(
     clip_id: &str,
     operation_id: &str,
     on_progress: crate::export::AudioExportProgress,
+    claimed_guard: Option<crate::export::ExportGuard>,
 ) -> Result<MediaListDto, String> {
-    let snapshot = core.runtime_snapshot();
+    save_clip_as_media_workflow_from_snapshot(
+        core,
+        control,
+        engine,
+        prewarm,
+        core.runtime_snapshot(),
+        clip_id,
+        operation_id,
+        on_progress,
+        claimed_guard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_clip_as_media_workflow_from_snapshot(
+    core: &AppCore,
+    control: &crate::export::ExportControl,
+    engine: &MediaEngine,
+    prewarm: &prewarm::PrewarmScheduler,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
+    clip_id: &str,
+    operation_id: &str,
+    on_progress: crate::export::AudioExportProgress,
+    claimed_guard: Option<crate::export::ExportGuard>,
+) -> Result<MediaListDto, String> {
     let project_dir = snapshot
         .project_dir
         .clone()
@@ -3614,7 +3651,10 @@ fn save_clip_as_media_workflow(
     let (single_timeline, subset, media_type) =
         build_single_clip_export(&snapshot.timeline, &snapshot.media, clip_id)?;
     let ext = save_clip_extension(media_type)?;
-    let mut guard = control.try_begin(operation_id)?;
+    let mut guard = match claimed_guard {
+        Some(guard) => guard,
+        None => control.try_begin(operation_id)?,
+    };
     let output =
         crate::export::reserve_project_media_output(&project_dir, &format!("clip_{clip_id}"), ext)?;
     let out_path = output.path().to_path_buf();
@@ -6523,6 +6563,7 @@ mod tests {
             "zero",
             "save-as:zero-duration",
             on_progress,
+            None,
         )
         .expect_err("zero-duration video save must fail");
 
@@ -6612,6 +6653,233 @@ mod tests {
 
         let _ = fs::remove_dir_all(engine.cache_root());
         assert!(bundle.join(relative_path).is_file());
+    }
+
+    #[test]
+    fn ffmpeg_audio_clip_cancel_mid_render_leaves_no_output_or_manifest_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+
+        use opentake_domain::{Clip, Track};
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!(
+                "SKIP: ffmpeg sidecars are required for the 300-frame audio cancellation test"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("CancelAudio.opentake");
+        let source = tmp.path().join("speech.wav");
+        fs::write(&source, b"").unwrap();
+        crate::export::write_wav_s16le(&vec![0.2; 48_000 * 10], 48_000, &source).unwrap();
+        let mut project = opentake_project::Project::new(&bundle);
+        project.timeline.fps = 30;
+        let mut track = Track::new("audio", ClipType::Audio);
+        track.clips.push(Clip::new("audio-clip", "speech", 0, 300));
+        project.timeline.tracks.push(track);
+        project.manifest.entries.push(MediaManifestEntry {
+            id: "speech".into(),
+            name: "speech".into(),
+            kind: ClipType::Audio,
+            source: MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        project.save().unwrap();
+        let core = AppCore::new();
+        core.open_project(bundle.clone()).unwrap();
+        let snapshot = core.runtime_snapshot();
+        let before = core.media();
+        let before_disk = fs::read(bundle.join("media.json")).unwrap();
+
+        let control = crate::export::ExportControl::default();
+        let guard = control.try_begin("save-as:audio-cancel").unwrap();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let signalled = AtomicBool::new(false);
+        let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
+            if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
+                progress_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        });
+        let worker_core = core.clone();
+        let worker_control = control.clone();
+        let temp_root = tmp.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let engine = engine_for(&temp_root);
+            let scheduler = prewarm::PrewarmScheduler::new(snapshot.project_epoch);
+            save_clip_as_media_workflow_from_snapshot(
+                &worker_core,
+                &worker_control,
+                &engine,
+                &scheduler,
+                snapshot,
+                "audio-clip",
+                "save-as:audio-cancel",
+                on_progress,
+                Some(guard),
+            )
+        });
+        let reached_progress = progress_rx.recv_timeout(Duration::from_secs(20));
+        let cancelled = control.request_cancel("save-as:audio-cancel");
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap();
+        reached_progress.expect("the 300-frame FFmpeg audio worker must reach partial progress");
+        assert!(cancelled, "cancellation must reach the active worker");
+        assert_eq!(result.unwrap_err(), crate::export::CANCELLED_SENTINEL);
+        assert_eq!(core.media(), before);
+        assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+        assert!(
+            !bundle.join("media").exists()
+                || fs::read_dir(bundle.join("media")).unwrap().next().is_none(),
+            "partial WAV output must be removed"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_video_clip_cancel_mid_render_leaves_no_output_or_manifest_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+
+        use opentake_domain::{Clip, Track};
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!(
+                "SKIP: ffmpeg sidecars are required for the 300-frame video cancellation test"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("CancelVideo.opentake");
+        let source = tmp.path().join("scene.mp4");
+        let generated = std::process::Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=10:size=64x36:rate=30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .expect("generate video fixture with FFmpeg");
+        assert!(
+            generated.success(),
+            "FFmpeg must generate the video fixture"
+        );
+        let mut project = opentake_project::Project::new(&bundle);
+        project.timeline.fps = 30;
+        project.timeline.width = 64;
+        project.timeline.height = 36;
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("video-clip", "scene", 0, 300));
+        project.timeline.tracks.push(track);
+        project.manifest.entries.push(MediaManifestEntry {
+            id: "scene".into(),
+            name: "scene".into(),
+            kind: ClipType::Video,
+            source: MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: 10.0,
+            generation_input: None,
+            source_width: Some(64),
+            source_height: Some(36),
+            source_fps: Some(30.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        project.save().unwrap();
+        let core = AppCore::new();
+        core.open_project(bundle.clone()).unwrap();
+        let snapshot = core.runtime_snapshot();
+        let before = core.media();
+        let before_disk = fs::read(bundle.join("media.json")).unwrap();
+
+        let control = crate::export::ExportControl::default();
+        let guard = control.try_begin("save-as:video-cancel").unwrap();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let signalled = AtomicBool::new(false);
+        let on_progress: crate::export::AudioExportProgress = Arc::new(move |done, total| {
+            if done > 0 && done < total && !signalled.swap(true, Ordering::AcqRel) {
+                progress_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
+            }
+        });
+        let worker_core = core.clone();
+        let worker_control = control.clone();
+        let temp_root = tmp.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let engine = engine_for(&temp_root);
+            let scheduler = prewarm::PrewarmScheduler::new(snapshot.project_epoch);
+            save_clip_as_media_workflow_from_snapshot(
+                &worker_core,
+                &worker_control,
+                &engine,
+                &scheduler,
+                snapshot,
+                "video-clip",
+                "save-as:video-cancel",
+                on_progress,
+                Some(guard),
+            )
+        });
+        let reached_progress = progress_rx.recv_timeout(Duration::from_secs(45));
+        let cancelled = control.request_cancel("save-as:video-cancel");
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap();
+        reached_progress.expect("the 300-frame FFmpeg video worker must reach partial progress");
+        assert!(cancelled, "cancellation must reach the active worker");
+        assert_eq!(result.unwrap_err(), crate::export::CANCELLED_SENTINEL);
+        assert_eq!(core.media(), before);
+        assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+        assert!(
+            !bundle.join("media").exists()
+                || fs::read_dir(bundle.join("media")).unwrap().next().is_none(),
+            "partial MP4 output must be removed"
+        );
     }
 
     #[test]
