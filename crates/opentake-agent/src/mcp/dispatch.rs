@@ -1401,7 +1401,14 @@ impl Dispatcher {
         }
 
         // Caption-eligible fragments in timeline order (mirrors `captionTargets`).
-        let frags = caption_target_fragments(before, manifest, a.clip_id.as_deref());
+        // A clipId scope falls back to the clip's linked audio (upstream
+        // `resolveTranscriptionScope`), so the rows carry the audio clip's id.
+        let frags = match a.clip_id.as_ref() {
+            Some(clip_id) => {
+                scoped_caption_target_fragments(before, manifest, std::slice::from_ref(clip_id))
+            }
+            None => caption_target_fragments(before, manifest),
+        };
         if a.clip_id.is_some() && frags.is_empty() {
             return Ok(ToolResult::error(format!(
                 "Clip {} not found, or it has no audio/video to transcribe.",
@@ -1598,19 +1605,15 @@ impl Dispatcher {
 
         // Caption-eligible clips (all, or restricted to clipIds). Reuses the same
         // eligibility as get_transcript (`captionTargets`), plus each clip's track id.
+        // A requested video whose linked audio is the caption target resolves to
+        // that audio (upstream `resolveTranscriptionScope`); an ineligible id
+        // without such a partner contributes nothing.
         let clip_ids = a.clip_ids.clone().unwrap_or_default();
         let auto_detect = clip_ids.is_empty();
         let frags = if auto_detect {
-            caption_target_fragments(before, manifest, None)
+            caption_target_fragments(before, manifest)
         } else {
-            // Restrict to the requested clips (each filtered individually so an
-            // ineligible id simply contributes nothing, as upstream).
-            let wanted: std::collections::BTreeSet<&str> =
-                clip_ids.iter().map(String::as_str).collect();
-            caption_target_fragments(before, manifest, None)
-                .into_iter()
-                .filter(|f| wanted.contains(f.clip.id.as_str()))
-                .collect()
+            scoped_caption_target_fragments(before, manifest, &clip_ids)
         };
         if frags.is_empty() {
             return Ok(ToolResult::error(
@@ -3527,12 +3530,10 @@ fn caption_can_transcribe(clip: &opentake_domain::Clip, manifest: &MediaManifest
 /// upstream `captionTargets(in:)`: keep audio/video clips that can be transcribed,
 /// but drop a **video** clip whose `linkGroupId` also has a linked **audio** clip
 /// (the audio partner is transcribed instead, so the video isn't double-counted).
-/// When `clip_filter` is set, restrict to that single clip id. Pure over the
-/// snapshot — unit-tested below.
+/// Pure over the snapshot — unit-tested below.
 fn caption_target_fragments<'a>(
     timeline: &'a Timeline,
     manifest: &MediaManifest,
-    clip_filter: Option<&str>,
 ) -> Vec<TranscriptFrag<'a>> {
     use opentake_domain::ClipType;
 
@@ -3548,11 +3549,6 @@ fn caption_target_fragments<'a>(
     let mut frags: Vec<TranscriptFrag<'a>> = Vec::new();
     for (track_index, track) in timeline.tracks.iter().enumerate() {
         for clip in &track.clips {
-            if let Some(filter) = clip_filter {
-                if clip.id != filter {
-                    continue;
-                }
-            }
             if !caption_can_transcribe(clip, manifest) {
                 continue;
             }
@@ -3581,6 +3577,38 @@ fn caption_target_fragments<'a>(
     }
     frags.sort_by_key(|f| f.clip.start_frame);
     frags
+}
+
+/// Caption-eligible fragments for an explicit clip scope, in `start_frame`
+/// order. Mirrors upstream `resolveTranscriptionScope` per requested id: a
+/// clip that is a caption target itself is kept; otherwise (typically a video
+/// whose linked audio partner is transcribed instead) its linked partners that
+/// are targets stand in for it (`linkedAudioScope`). Target selection is
+/// timeline-wide, so a video and its linked audio are never transcribed twice
+/// and an id listed alongside its partner resolves to one fragment.
+fn scoped_caption_target_fragments<'a>(
+    timeline: &'a Timeline,
+    manifest: &MediaManifest,
+    clip_ids: &[String],
+) -> Vec<TranscriptFrag<'a>> {
+    let targets = caption_target_fragments(timeline, manifest);
+    let target_ids: BTreeSet<&str> = targets.iter().map(|f| f.clip.id.as_str()).collect();
+    let mut selected: BTreeSet<String> = BTreeSet::new();
+    for id in clip_ids {
+        if target_ids.contains(id.as_str()) {
+            selected.insert(id.clone());
+            continue;
+        }
+        selected.extend(
+            opentake_ops::ops::linked_partner_ids(timeline, id)
+                .into_iter()
+                .filter(|partner| target_ids.contains(partner.as_str())),
+        );
+    }
+    targets
+        .into_iter()
+        .filter(|f| selected.contains(f.clip.id.as_str()))
+        .collect()
 }
 
 /// Caption style/placement defaults, 1:1 with upstream `AppTheme.Caption`
@@ -8963,6 +8991,72 @@ mod tests {
         assert!(r.is_error);
     }
 
+    #[test]
+    fn get_transcript_linked_video_clip_id_reads_its_linked_audio() {
+        let (d, bridge) = linked_talking_head_dispatcher(transcript(vec![
+            word("hello", 0.0, 0.5),
+            word("world", 0.5, 1.0),
+        ]));
+        for clip_id in ["clip-v", "clip-a"] {
+            let r = d.dispatch("get_transcript", serde_json::json!({ "clipId": clip_id }));
+            assert!(!r.is_error, "{clip_id}: {}", r.text_joined());
+            assert_eq!(
+                first_json(&r)["clips"],
+                serde_json::json!([{
+                    "clipId": "clip-a",
+                    "trackIndex": 1,
+                    "startFrame": 0,
+                    "endFrame": 900,
+                    "words": [["hello", 0, 15], ["world", 15, 30]]
+                }]),
+                "{clip_id}"
+            );
+        }
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["aud".to_string()], vec!["aud".to_string()]]
+        );
+    }
+
+    #[test]
+    fn get_transcript_unlinked_video_clip_id_transcribes_its_own_audio_track() {
+        let mut tl = Timeline::new();
+        tl.fps = 30;
+        let mut track = Track::new("track-v", ClipType::Video);
+        track.clips.push(Clip::new("clip-v", "vid", 0, 60));
+        tl.tracks.push(track);
+        let mut manifest = MediaManifest::new();
+        let mut video = entry("vid", "Camera");
+        video.has_audio = Some(true);
+        manifest.entries.push(video);
+
+        let frags = scoped_caption_target_fragments(&tl, &manifest, &["clip-v".to_string()]);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].clip.id, "clip-v");
+        assert!(
+            frags[0].is_video,
+            "audio is extracted from the video itself"
+        );
+
+        let bridge = Arc::new(
+            FakeBridge::default().with_transcript("vid", transcript(vec![word("hi", 0.0, 0.5)])),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(tl, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+        let r = d.dispatch("get_transcript", serde_json::json!({ "clipId": "clip-v" }));
+        assert!(!r.is_error, "{}", r.text_joined());
+        let v = first_json(&r);
+        assert_eq!(v["clips"][0]["clipId"], "clip-v");
+        assert_eq!(v["clips"][0]["words"], serde_json::json!([["hi", 0, 15]]));
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["vid".to_string()]]
+        );
+    }
+
     // MARK: - caption target selection (pure)
 
     #[test]
@@ -8985,7 +9079,7 @@ mod tests {
         m.entries.push(entry("vid_silent", "Silent")); // has_audio=false
         m.entries.push(audio_entry("aud", "A"));
 
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         let ids: Vec<&str> = frags.iter().map(|f| f.clip.id.as_str()).collect();
         assert!(ids.contains(&"v-with-audio"));
         assert!(ids.contains(&"a1"));
@@ -9015,10 +9109,58 @@ mod tests {
         m.entries.push(v_with);
         m.entries.push(audio_entry("aud", "A"));
 
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         let ids: Vec<&str> = frags.iter().map(|f| f.clip.id.as_str()).collect();
         assert!(!ids.contains(&"v1"), "linked video should be dropped");
         assert!(ids.contains(&"a1"));
+    }
+
+    #[test]
+    fn scoped_caption_targets_fall_back_only_to_transcribable_linked_partners() {
+        // v1 + a1: video with a linked audio clip. v2 + v3: two linked videos
+        // with their own audio and no audio clip. t1: a text clip.
+        let mut tl = Timeline::new();
+        let mut vt = Track::new("v", ClipType::Video);
+        let mut v1 = Clip::new("v1", "vid", 0, 60);
+        v1.link_group_id = Some("av".into());
+        vt.clips.push(v1);
+        let mut v2 = Clip::new("v2", "vid", 60, 60);
+        v2.link_group_id = Some("vv".into());
+        vt.clips.push(v2);
+        let mut t1 = Clip::new("t1", "", 120, 30);
+        t1.media_type = ClipType::Text;
+        vt.clips.push(t1);
+        tl.tracks.push(vt);
+        let mut vt2 = Track::new("v-2", ClipType::Video);
+        let mut v3 = Clip::new("v3", "vid", 60, 60);
+        v3.link_group_id = Some("vv".into());
+        vt2.clips.push(v3);
+        tl.tracks.push(vt2);
+        let mut at = Track::new("a", ClipType::Audio);
+        let mut a1 = audio_clip("a1", "vid", 0, 60);
+        a1.link_group_id = Some("av".into());
+        at.clips.push(a1);
+        tl.tracks.push(at);
+        let mut m = MediaManifest::new();
+        let mut video = entry("vid", "V");
+        video.has_audio = Some(true);
+        m.entries.push(video);
+
+        let ids = |requested: &[&str]| {
+            let requested: Vec<String> = requested.iter().map(|id| id.to_string()).collect();
+            scoped_caption_target_fragments(&tl, &m, &requested)
+                .iter()
+                .map(|f| f.clip.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&["v1"]), ["a1"]);
+        assert_eq!(ids(&["v1", "a1"]), ["a1"]);
+        assert_eq!(ids(&["a1"]), ["a1"]);
+        // A transcribable clip stays itself; its linked video is not pulled in.
+        assert_eq!(ids(&["v2"]), ["v2"]);
+        assert_eq!(ids(&["v1", "v3"]), ["a1", "v3"]);
+        assert!(ids(&["t1"]).is_empty());
+        assert!(ids(&["ghost"]).is_empty());
     }
 
     #[test]
@@ -9034,7 +9176,7 @@ mod tests {
         tl.tracks.push(at);
         let mut m = MediaManifest::new();
         m.entries.push(audio_entry("aud", "A"));
-        let frags = caption_target_fragments(&tl, &m, None);
+        let frags = caption_target_fragments(&tl, &m);
         assert_eq!(frags.len(), 2);
         let sources = unique_transcript_sources(&frags);
         assert_eq!(sources.len(), 1);
@@ -9245,6 +9387,76 @@ mod tests {
         ));
         let r = d.dispatch("add_captions", serde_json::json!({ "bogus": 1 }));
         assert!(r.is_error);
+    }
+
+    fn talking_head_caption_transcript() -> TranscriptionResult {
+        caption_transcript(
+            vec![word("hello", 0.0, 0.5), word("world", 0.5, 1.0)],
+            vec![segment("Hello world.", 0.0, 1.0)],
+        )
+    }
+
+    fn caption_texts(d: &Dispatcher) -> Vec<String> {
+        d.handle
+            .timeline()
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter(|clip| clip.media_type == ClipType::Text)
+            .filter_map(|clip| clip.text_content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn add_captions_linked_video_clip_id_captions_its_linked_audio_once() {
+        for clip_ids in [
+            serde_json::json!(["clip-v"]),
+            serde_json::json!(["clip-v", "clip-a"]),
+        ] {
+            let (d, bridge) = linked_talking_head_dispatcher(talking_head_caption_transcript());
+            let r = d.dispatch("add_captions", serde_json::json!({ "clipIds": clip_ids }));
+            assert!(!r.is_error, "{clip_ids}: {}", r.text_joined());
+            assert_eq!(caption_texts(&d), ["Hello world."], "{clip_ids}");
+            assert_eq!(
+                *bridge.transcribe_calls.lock().unwrap(),
+                vec![vec!["aud".to_string()]],
+                "{clip_ids}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_captions_linked_video_mixed_with_other_clips_is_not_skipped() {
+        let (d, bridge) = linked_talking_head_dispatcher(talking_head_caption_transcript());
+        let mut timeline = d.handle.timeline();
+        let mut narration = Track::new("track-n", ClipType::Audio);
+        narration
+            .clips
+            .push(audio_clip("clip-n", "narration", 900, 60));
+        timeline.tracks.push(narration);
+        let mut manifest = d.handle.media();
+        manifest.entries.push(audio_entry("narration", "Narration"));
+        bridge.transcripts.lock().unwrap().insert(
+            "narration".into(),
+            caption_transcript(vec![word("bye", 0.0, 0.5)], vec![segment("Bye.", 0.0, 0.5)]),
+        );
+        let d = Dispatcher::with_bridge(
+            Arc::new(StateHandle::new(timeline, manifest)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            Some(bridge.clone() as Arc<dyn MediaBridge>),
+        );
+
+        let r = d.dispatch(
+            "add_captions",
+            serde_json::json!({ "clipIds": ["clip-v", "clip-n"] }),
+        );
+
+        assert!(!r.is_error, "{}", r.text_joined());
+        assert_eq!(caption_texts(&d), ["Hello world.", "Bye."]);
+        assert_eq!(
+            *bridge.transcribe_calls.lock().unwrap(),
+            vec![vec!["aud".to_string(), "narration".to_string()]]
+        );
     }
 
     // MARK: - add_texts (#194 auto-track dispatch, #195 auto-fit)

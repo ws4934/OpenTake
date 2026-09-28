@@ -165,7 +165,7 @@ pub fn input_schema(tool: ToolName) -> Value {
             json!({
                 "startFrame": {"type": "integer", "description": "Optional. Only return words ending after this project frame. Use with the returned nextStartFrame to page a long timeline."},
                 "endFrame": {"type": "integer", "description": "Optional. Only return words starting before this project frame."},
-                "clipId": {"type": "string", "description": "Scope the transcript to a single clip — returns only what that clip says, in project frames. Answers \"what's in clip X?\" without scanning the whole timeline."},
+                "clipId": {"type": "string", "description": "Scope the transcript to a single clip — returns only what that clip says, in project frames. Answers \"what's in clip X?\" without scanning the whole timeline. A video clip whose sound is carried by a linked audio clip returns that audio clip's words, under the audio clip's id."},
                 "wordTimestamps": {"type": "boolean", "description": "Accepted for upstream validator parity. get_transcript always returns compact word rows."}
             }),
             &[],
@@ -365,7 +365,7 @@ pub fn input_schema(tool: ToolName) -> Value {
 
         ToolName::AddCaptions => object(
             json!({
-                "clipIds": {"type": "array", "items": {"type": "string"}, "description": "Optional. Audio/video clips to caption. Omit to auto-detect the primary spoken track."},
+                "clipIds": {"type": "array", "items": {"type": "string"}, "description": "Optional. Audio/video clips to caption; a video clip whose sound is carried by a linked audio clip is captioned from that audio. Omit to auto-detect the primary spoken track."},
                 "language": {"type": "string", "description": "Optional BCP-47 language of the speech (e.g. 'es', 'ja', 'en-GB'). Defaults to the system language — set this when the footage is in another language, or transcription will be garbage."},
                 "fontName": {"type": "string", "description": "Optional font PostScript or family name (default 'Helvetica-Bold'). Falls back to bold system font if not found."},
                 "fontSize": {"type": "number", "minimum": 4, "maximum": 512, "description": "Optional font size in canvas points (4-512, default 48)."},
