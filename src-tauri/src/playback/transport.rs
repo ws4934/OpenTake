@@ -153,11 +153,11 @@ struct GateState {
     /// older epoch (a frame queued before a pause or a seek) can never publish
     /// after a later reopen.
     epoch: u64,
-    /// The first failure reported while closed. A cancelled project
+    /// The first fatal failure (or first non-fatal report) while closed. A cancelled project
     /// transition reopens the gate of a session that kept running and
     /// reports it then; any other reopen (a resume, which retries the
     /// render) or the session's teardown drops it.
-    held: Option<HeldReport>,
+    held: Option<(bool, HeldReport)>,
 }
 
 #[derive(Clone, Default)]
@@ -202,19 +202,23 @@ impl PublicationGate {
             state.open = true;
             state.held.take()
         };
-        if let Some(report) = held {
+        if let Some((_, report)) = held {
             report();
         }
     }
 
     /// Run `report` now while publication is open; otherwise keep it (the
-    /// first one only) for [`Self::reopen_after_transition`].
-    pub(crate) fn report_or_hold(&self, report: HeldReport) {
+    /// first fatal one, otherwise the first report) for [`Self::reopen_after_transition`].
+    pub(crate) fn report_or_hold(&self, fatal: bool, report: HeldReport) {
         {
             let mut state = self.lock();
             if !state.open {
-                if state.held.is_none() {
-                    state.held = Some(report);
+                if state
+                    .held
+                    .as_ref()
+                    .is_none_or(|(held_fatal, _)| fatal && !held_fatal)
+                {
+                    state.held = Some((fatal, report));
                 }
                 return;
             }
@@ -757,11 +761,15 @@ impl TauriPlaybackErrorEmitter {
 
 impl PlaybackErrorSink for TauriPlaybackErrorEmitter {
     fn report(&self, failure: PlaybackFailure) {
+        let fatal = failure.fatal;
         let event = PlaybackErrorEvent::new(&self.identity, failure);
         let app = self.app.clone();
-        self.gate.report_or_hold(Box::new(move || {
-            let _ = app.emit("playback_error", event);
-        }));
+        self.gate.report_or_hold(
+            fatal,
+            Box::new(move || {
+                let _ = app.emit("playback_error", event);
+            }),
+        );
     }
 }
 
@@ -1168,10 +1176,10 @@ mod tests {
     fn playback_errors_are_dropped_once_the_session_gate_closes() {
         let gate = PublicationGate::open();
         let reports = Arc::new(Mutex::new(Vec::new()));
-        gate.report_or_hold(recording_report(&reports, "open"));
+        gate.report_or_hold(true, recording_report(&reports, "open"));
         assert_eq!(reported(&reports), ["open"]);
         gate.close();
-        gate.report_or_hold(recording_report(&reports, "while paused"));
+        gate.report_or_hold(true, recording_report(&reports, "while paused"));
         assert_eq!(
             reported(&reports),
             ["open"],
@@ -1180,7 +1188,7 @@ mod tests {
         // A resume retries the render instead of replaying the old failure.
         gate.reopen();
         assert_eq!(reported(&reports), ["open"]);
-        gate.report_or_hold(recording_report(&reports, "resumed"));
+        gate.report_or_hold(true, recording_report(&reports, "resumed"));
         assert_eq!(reported(&reports), ["open", "resumed"]);
     }
 
@@ -1191,13 +1199,25 @@ mod tests {
         // A project transition closes the gate without pausing the session,
         // whose render then genuinely fails.
         gate.close();
-        gate.report_or_hold(recording_report(&reports, "first failure"));
-        gate.report_or_hold(recording_report(&reports, "second failure"));
+        gate.report_or_hold(true, recording_report(&reports, "first failure"));
+        gate.report_or_hold(true, recording_report(&reports, "second failure"));
         assert!(reported(&reports).is_empty());
         gate.reopen_after_transition();
         assert_eq!(reported(&reports), ["first failure"]);
         gate.reopen_after_transition();
         assert_eq!(reported(&reports), ["first failure"], "reported once");
+    }
+
+    #[test]
+    fn a_held_fatal_failure_replaces_an_earlier_nonfatal_report() {
+        let gate = PublicationGate::open();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        gate.close();
+        gate.report_or_hold(false, recording_report(&reports, "audio warning"));
+        gate.report_or_hold(true, recording_report(&reports, "fatal render failure"));
+        gate.report_or_hold(false, recording_report(&reports, "later warning"));
+        gate.reopen_after_transition();
+        assert_eq!(reported(&reports), ["fatal render failure"]);
     }
 
     #[test]

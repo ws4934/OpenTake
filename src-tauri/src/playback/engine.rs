@@ -288,6 +288,16 @@ impl SeekMailbox {
             .generation
     }
 
+    /// A queued seek has not updated the clock yet. Sample it only after
+    /// that seek has been taken and applied by the control loop.
+    fn render_generation(&self) -> Option<u64> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending.is_none().then_some(state.generation)
+    }
+
     fn is_current(&self, generation: u64) -> bool {
         self.generation() == generation
     }
@@ -305,7 +315,7 @@ fn frame_at_elapsed(base_frame: i32, elapsed_secs: f64, fps: i32) -> i32 {
 /// reached the end. Returns `(target, done)`: `target` is the frame to render,
 /// `done` is true once the clock hits the last frame (→ auto-stop). Pure so the
 /// loop's termination boundary is unit-tested.
-fn loop_step(clock_frame: i32, total: i32) -> (i32, bool) {
+pub(super) fn loop_step(clock_frame: i32, total: i32) -> (i32, bool) {
     let last = total.max(1) - 1;
     (clock_frame.clamp(0, last), clock_frame >= last)
 }
@@ -1233,7 +1243,10 @@ fn run_render_loop<R: FrameRenderer>(
         // The seek generation is read before the clock: a seek submitted
         // after this read makes the frame stale however the clock read raced
         // it, so a frame picked from a pre-seek clock never publishes.
-        let render_generation = seek_mailbox.generation();
+        let Some(render_generation) = seek_mailbox.render_generation() else {
+            thread::yield_now();
+            continue;
+        };
         let (clamped, done) = loop_step(clock.frame(fps), total);
         if let Some(message) = clock.take_error() {
             errors.report(PlaybackFailure {
@@ -1874,6 +1887,20 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_seek_cannot_be_tagged_as_a_render_from_the_old_clock() {
+        let mailbox = SeekMailbox::default();
+        assert_eq!(mailbox.render_generation(), Some(0));
+        mailbox.submit(25);
+        mailbox.submit(40);
+        assert_eq!(mailbox.render_generation(), None);
+        let request = mailbox
+            .take()
+            .expect("the latest seek must be applied first");
+        assert_eq!(request.frame, 40);
+        assert_eq!(mailbox.render_generation(), Some(request.generation));
+    }
+
+    #[test]
     fn loop_step_clamps_and_flags_end() {
         assert_eq!(loop_step(5, 100), (5, false));
         assert_eq!(loop_step(99, 100), (99, true)); // last frame → done
@@ -1994,6 +2021,7 @@ mod tests {
             renders: Arc::clone(&renders),
             seeks: Arc::new(AtomicI32::new(0)),
             block_at: None,
+            hold_at: None,
         };
         let engine = PlaybackEngine::spawn_with(
             move || Ok(renderer),

@@ -1407,7 +1407,13 @@ where
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
                         silence(data);
-                        delay.store(latency, Ordering::Release);
+                        publish_output_delay(
+                            &delay,
+                            0,
+                            data.len() / channels,
+                            latency,
+                            device_rate,
+                        );
                         return;
                     }
                 };
@@ -1415,12 +1421,36 @@ where
                 // At this instant the first frame just written becomes audible
                 // after `latency`, so the audible frame is `pos` minus what was
                 // written and the latency.
-                delay.store((written as u64).saturating_add(latency), Ordering::Release);
+                publish_output_delay(&delay, written, data.len() / channels, latency, device_rate);
             },
             err_fn,
             None,
         )
         .map_err(|e| format!("build output stream: {e}"))
+}
+
+fn publish_output_delay(
+    delay: &AtomicU64,
+    written: usize,
+    block_frames: usize,
+    latency: u64,
+    rate: u32,
+) {
+    if written == 0 {
+        // Silence does not queue more timeline audio. The device still plays
+        // the prior tail, which drains by one callback block even at EOF,
+        // while muted, or while the consumer lock is busy.
+        let _ = delay.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+            Some(previous.saturating_sub(block_frames as u64))
+        });
+    } else {
+        delay.store(
+            (written as u64)
+                .saturating_add(latency)
+                .min(u64::from(rate)),
+            Ordering::Release,
+        );
+    }
 }
 
 /// Output frames between the start of a callback's block and its playback,
@@ -1431,7 +1461,7 @@ fn output_latency_frames(timestamp: cpal::OutputStreamTimestamp, rate: u32) -> u
 
 fn latency_frames(latency: Option<Duration>, rate: u32) -> u64 {
     latency.map_or(0, |latency| {
-        (latency.as_secs_f64() * f64::from(rate)) as u64
+        (latency.as_secs_f64().min(1.0) * f64::from(rate)) as u64
     })
 }
 
@@ -2002,7 +2032,9 @@ fn run_audio_producer(
             .active_decode
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(window_cancel.clone());
-        if control.generation.load(Ordering::Acquire) != generation {
+        if control.stopped.load(Ordering::Acquire)
+            || control.generation.load(Ordering::Acquire) != generation
+        {
             window_cancel.cancel();
             control
                 .active_decode
@@ -4058,6 +4090,11 @@ mod tests {
         let mut clip = audio_clip("fade", "half", 3, 40);
         clip.fade_in_frames = 12;
         clip.fade_out_frames = 9;
+        clip.volume_track = Some(opentake_domain::KeyframeTrack::from_keyframes(vec![
+            opentake_domain::Keyframe::new(0, -6.0),
+            opentake_domain::Keyframe::new(20, 0.0),
+            opentake_domain::Keyframe::new(39, -12.0),
+        ]));
         let timeline = audio_timeline(vec![clip.clone()]);
 
         let whole = preview_mono(&timeline, &paths, 64 * FRAME);
@@ -4390,12 +4427,57 @@ mod tests {
     }
 
     #[test]
+    fn an_underrunning_output_drains_its_tail_and_reaches_the_last_video_frame() {
+        const RATE: u32 = 48_000;
+        const BLOCK: usize = 1_200;
+        const END: u64 = 144_000;
+        let control = Arc::new(AudioStreamControl::new(0));
+        control.mark_buffered(0, END);
+        let (_sender, receiver) = bounded(STREAM_WINDOW_CAPACITY);
+        let (recycle_sender, _recycle) = bounded(RECYCLE_CAPACITY);
+        let mut consumer = AudioStreamConsumer::new(receiver, recycle_sender, control.clone());
+        let pos = Arc::new(AtomicU64::new(0));
+        let delay = Arc::new(AtomicU64::new(0));
+        let clock =
+            AudioClock::new(pos.clone(), RATE, 30, Some(control.clone())).delayed_by(delay.clone());
+        pos.store(END, Ordering::Release);
+        publish_output_delay(&delay, BLOCK, BLOCK, 3_600, RATE);
+        assert_eq!(clock.frame(30), 87);
+
+        let mut output = vec![1.0_f32; BLOCK * MIX_CHANNELS];
+        for _ in 0..4 {
+            let written = fill_output_block(
+                &mut consumer,
+                &pos,
+                &control.output,
+                &mut output,
+                MIX_CHANNELS,
+            );
+            assert_eq!(written, 0, "the live producer has no more queued content");
+            assert!(output.iter().all(|sample| *sample == 0.0));
+            publish_output_delay(&delay, written, BLOCK, 3_600, RATE);
+        }
+        assert_eq!(delay.load(Ordering::Acquire), 0);
+        let (last, done) = crate::playback::engine::loop_step(clock.frame(30), 90);
+        assert_eq!(last, 89);
+        assert!(
+            done,
+            "an output latency larger than one video frame cannot hold playback forever"
+        );
+        assert_eq!(pos.load(Ordering::Acquire), END);
+    }
+
+    #[test]
     fn output_latency_converts_the_callback_timestamps_to_frames() {
         assert_eq!(latency_frames(None, 48_000), 0);
         assert_eq!(latency_frames(Some(Duration::from_millis(20)), 48_000), 960);
         assert_eq!(
             latency_frames(Some(Duration::from_millis(200)), 44_100),
             8_820
+        );
+        assert_eq!(
+            latency_frames(Some(Duration::from_secs(60)), 48_000),
+            48_000
         );
     }
 

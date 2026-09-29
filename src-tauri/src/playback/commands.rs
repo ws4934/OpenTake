@@ -2883,7 +2883,7 @@ mod tests {
         let transition = state
             .begin_project_transition()
             .expect("begin project transition");
-        publication.report_or_hold(report("decode failed during transition"));
+        publication.report_or_hold(true, report("decode failed during transition"));
         assert!(reports.lock().unwrap().is_empty());
         state.cancel_project_transition(transition);
         assert_eq!(
@@ -2901,7 +2901,7 @@ mod tests {
         let transition = state
             .begin_project_transition()
             .expect("begin project transition");
-        publication.report_or_hold(report("old project failure"));
+        publication.report_or_hold(true, report("old project failure"));
         state.activate_project(transition, 10);
         assert_eq!(
             *reports.lock().unwrap(),

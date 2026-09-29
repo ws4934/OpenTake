@@ -38,7 +38,8 @@ use opentake_render::AudioClipPlan;
 /// or a leaf of a nested sequence flattened by the render plan
 /// ([`AudioClipPlan`]), whose volume multiplies its compound ancestors', whose
 /// true-peak ceiling is the strictest along the chain and whose denoise is the
-/// nearest setting. Export and preview mix through this one definition, so a
+/// leaf setting, then the first configured ancestor (outermost first).
+/// Export and preview mix through this one definition, so a
 /// compound clip sounds the same in both.
 pub(crate) trait AudioPlanLike {
     fn clip(&self) -> &Clip;
