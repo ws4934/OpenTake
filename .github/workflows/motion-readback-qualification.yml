@@ -1,6 +1,10 @@
 name: Motion readback qualification
 
 on:
+  pull_request:
+    paths:
+      - 'crates/opentake-motion/**'
+      - '.github/workflows/motion-readback-qualification.yml'
   push:
     branches: ['release/**']
     paths:
@@ -27,11 +31,14 @@ jobs:
         # listening CDP socket, no browser left after process::exit).
         include:
           - os: ubuntu-24.04
-            lib_tests: 115
-            chromium_tests: 12
+            lib_tests: 119
+            chromium_tests: 13
           - os: windows-2022
-            lib_tests: 113
-            chromium_tests: 10
+            lib_tests: 117
+            chromium_tests: 11
+          - os: macos-14
+            lib_tests: 118
+            chromium_tests: 12
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
