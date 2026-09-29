@@ -1936,6 +1936,14 @@ where
     let outcome_was_cancelled = matches!(&outcome, Err(CodexTurnError::Cancelled));
     let externally_cancelled = context.cancel.load(Ordering::Acquire);
     let requested_cleanup_cancel = outcome.is_err() || externally_cancelled;
+    // A descendant may keep a capture pipe open after the CLI exits. Bound
+    // every cleanup phase by the same grace, including reaping and stderr,
+    // so an internal failure cannot fall back to the full turn deadline.
+    let cleanup_deadline = endpoint_close_deadline(
+        deadline,
+        tokio::time::Instant::now(),
+        requested_cleanup_cancel,
+    );
     if requested_cleanup_cancel {
         if outcome_was_cancelled || externally_cancelled {
             context.gate.request_cancel();
@@ -1947,11 +1955,13 @@ where
     }
     let status = match status {
         Some(Ok(status)) => Ok(status),
-        Some(Err(_)) | None => terminate_and_reap_until(&mut child, &mut tree, deadline).await,
+        Some(Err(_)) | None => {
+            terminate_and_reap_until(&mut child, &mut tree, cleanup_deadline).await
+        }
     };
     let endpoint_result = endpoint
         .close_or_detach(endpoint_drain_give_up(
-            deadline,
+            cleanup_deadline,
             requested_cleanup_cancel,
             context.cancel.as_ref(),
         ))
@@ -1963,7 +1973,12 @@ where
     {
         outcome = Err(CodexTurnError::Timeout);
     }
-    let stderr = match join_capture_until(stderr_task, deadline).await {
+    let stderr_deadline = endpoint_close_deadline(
+        cleanup_deadline,
+        tokio::time::Instant::now(),
+        context.cancel.load(Ordering::Acquire),
+    );
+    let stderr = match join_capture_until(stderr_task, stderr_deadline).await {
         Ok(stderr) => stderr,
         Err(error) => {
             if outcome.is_ok() {
@@ -1982,7 +1997,7 @@ where
     }
     let status = match status {
         Ok(status) => status,
-        Err(error) => return Err(error),
+        Err(error) => return outcome.and(Err(error)),
     };
     if !status.success()
         && !matches!(
