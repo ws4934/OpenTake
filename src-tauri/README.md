@@ -48,6 +48,15 @@ pnpm -C web exec tauri dev     # or: cargo tauri dev  (if cargo-tauri installed)
 `:1420`, and window size to 1600×1000 / min 960×600 (SPEC §2.8). Icons live in
 `icons/`; `capabilities/default.json` grants the `dialog` plugin + event perms.
 
+## Crash reporting
+
+Crash reporting is enabled only by `OPENTAKE_SENTRY_DSN` or a build-time
+`OPENTAKE_PACKAGED_SENTRY_DSN`. Setting `OPENTAKE_SENTRY_DSN` to an empty value
+explicitly disables it, including a packaged DSN. The generic `SENTRY_DSN`
+variable is ignored. Reports omit request and user payloads and redact credentials
+and private paths before sending; a private path removes the rest of its message
+line so spaces and punctuation in filenames cannot reveal later components.
+
 ## Files
 
 - `Cargo.toml` — manifest (depends on `opentake-core`, `opentake-ops`, `opentake-domain`, `tauri-plugin-dialog`).

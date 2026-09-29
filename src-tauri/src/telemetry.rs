@@ -6,13 +6,13 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use regex::Regex;
 use sentry::protocol::{Event, Stacktrace};
 use sentry::types::Dsn;
 
 const ENV_DSN: &str = "OPENTAKE_SENTRY_DSN";
-const STANDARD_ENV_DSN: &str = "SENTRY_DSN";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TelemetrySource {
@@ -54,14 +54,12 @@ pub fn init_telemetry_with(
     environment_dsn: Option<&str>,
     start: impl FnOnce(&TelemetryOptions) -> Result<(), ()>,
 ) -> TelemetryInitStatus {
-    let candidate = environment_dsn
-        .and_then(non_empty)
-        .map(|dsn| (dsn, TelemetrySource::Environment))
-        .or_else(|| {
-            packaged_dsn
-                .and_then(non_empty)
-                .map(|dsn| (dsn, TelemetrySource::Packaged))
-        });
+    let candidate = match environment_dsn {
+        Some(value) => non_empty(value).map(|dsn| (dsn, TelemetrySource::Environment)),
+        None => packaged_dsn
+            .and_then(non_empty)
+            .map(|dsn| (dsn, TelemetrySource::Packaged)),
+    };
     let Some((raw_dsn, source)) = candidate else {
         return TelemetryInitStatus::Disabled;
     };
@@ -93,24 +91,33 @@ pub struct TelemetryRuntime {
 }
 
 pub fn init_telemetry() -> TelemetryRuntime {
-    let environment_dsn = std::env::var(ENV_DSN)
-        .ok()
-        .and_then(|value| non_empty(&value).map(str::to_owned))
-        .or_else(|| {
-            std::env::var(STANDARD_ENV_DSN)
-                .ok()
-                .and_then(|value| non_empty(&value).map(str::to_owned))
-        });
     let packaged_dsn = option_env!("OPENTAKE_PACKAGED_SENTRY_DSN");
     let mut guard = None;
-    let status = init_telemetry_with(packaged_dsn, environment_dsn.as_deref(), |options| {
-        guard = Some(start_sentry(options));
-        Ok(())
-    });
+    let status = init_telemetry_from_environment(
+        packaged_dsn,
+        |name| std::env::var(name),
+        |options| {
+            guard = Some(start_sentry(options));
+            Ok(())
+        },
+    );
     TelemetryRuntime {
         _guard: guard,
         status,
     }
+}
+
+fn init_telemetry_from_environment(
+    packaged_dsn: Option<&str>,
+    read: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+    start: impl FnOnce(&TelemetryOptions) -> Result<(), ()>,
+) -> TelemetryInitStatus {
+    let environment_dsn = match read(ENV_DSN) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return TelemetryInitStatus::InvalidConfiguration,
+    };
+    init_telemetry_with(packaged_dsn, environment_dsn.as_deref(), start)
 }
 
 fn start_sentry(options: &TelemetryOptions) -> sentry::ClientInitGuard {
@@ -207,62 +214,48 @@ fn scrub_stacktrace(stacktrace: Option<&mut Stacktrace>) {
 }
 
 pub fn redact_sensitive_text(input: &str) -> String {
-    let mut redact_next = false;
-    input
-        .split_whitespace()
-        .map(|word| {
-            if redact_next {
-                redact_next = false;
-                return "[REDACTED]".to_owned();
-            }
-            let trimmed = word.trim_matches(|character: char| {
-                matches!(character, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';')
-            });
-            let lower = trimmed.to_ascii_lowercase();
-            if lower == "bearer" {
-                redact_next = true;
-                return word.to_owned();
-            }
-            if is_sensitive_assignment(&lower) {
-                return format!(
-                    "{}=[REDACTED]",
-                    trimmed.split(['=', ':']).next().unwrap_or("secret")
-                );
-            }
-            if looks_like_private_path(trimmed) {
-                return "[PATH]".to_owned();
-            }
-            word.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn is_sensitive_assignment(lower: &str) -> bool {
-    ["api_key", "apikey", "token", "password", "passwd", "secret"]
-        .iter()
-        .any(|key| lower.starts_with(&format!("{key}=")) || lower.starts_with(&format!("{key}:")))
-}
-
-fn looks_like_private_path(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with("~/")
-        || value.contains("/Users/")
-        || value.contains("/home/")
-        || (value.len() > 3
-            && value.as_bytes()[1] == b':'
-            && matches!(value.as_bytes()[2], b'\\' | b'/'))
+    static REDACTORS: LazyLock<[(Regex, &str); 6]> = LazyLock::new(|| {
+        [
+            // Headers can contain schemes, whitespace and multiple attributes.
+            (r#"(?im)\b((?:proxy[-_])?authorization|x[-_][a-z0-9_-]*key)["']?(?:\s*[:=]\s*|\s+)[^\r\n]+"#, "${1}=[REDACTED]"),
+            (r"(?i)([?&][a-z0-9_.-]*(?:token|key|secret|sig|auth)[a-z0-9_.-]*=)[^&\s#]+", "${1}[REDACTED]"),
+            (r#"(?i)\b(?P<key>[a-z0-9_.-]*(?:api[_-]?key|token|secret|password|passwd|pwd|credential|auth)[a-z0-9_.-]*)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;&}]+)"#, "${key}=[REDACTED]"),
+            (r#"(?i)\b(bearer|basic)\s+[^\s"',;<>]+"#, "${1} [REDACTED]"),
+            (r"\b(?:sk-[A-Za-z0-9_-]+|r8_[A-Za-z0-9_-]+)\b", "[REDACTED]"),
+            // Paths may contain spaces, quotes and punctuation. Remove the
+            // line suffix rather than guessing where a private name ends.
+            (r#"(?im)(?:(?P<prefix>^|[\s"'(=,\[{])(?:[a-z]:[\\/]|\\\\|~/|/)|(?:\b[a-z]:[\\/]|\\\\|/(?:Users|home)/))[^\r\n]+"#, "${prefix}[PATH]"),
+        ].map(|(pattern, replacement)| (Regex::new(pattern).expect("valid telemetry redaction pattern"), replacement))
+    });
+    let mut output = input.to_owned();
+    for (pattern, replacement) in &*REDACTORS {
+        output = pattern.replace_all(&output, *replacement).into_owned();
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::redact_sensitive_text;
+    use super::{init_telemetry_from_environment, redact_sensitive_text, TelemetryInitStatus};
+
+    #[test]
+    fn generic_sentry_dsn_does_not_enable_reporting() {
+        let status = init_telemetry_from_environment(
+            None,
+            |name| match name {
+                "SENTRY_DSN" => Ok("https://other-project@example.com/1".into()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+            |_| panic!("generic SENTRY_DSN must not start telemetry"),
+        );
+        assert_eq!(status, TelemetryInitStatus::Disabled);
+    }
 
     #[test]
     fn redacts_unix_windows_and_credential_shapes() {
         let text = redact_sensitive_text(
             r#"/home/alice/project C:\Users\alice\project password:hunter2 Bearer token-value"#,
         );
-        assert_eq!(text, "[PATH] [PATH] password=[REDACTED] Bearer [REDACTED]");
+        assert_eq!(text, "[PATH]");
     }
 }
