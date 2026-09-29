@@ -5211,6 +5211,7 @@ fn apply_property_changes_at(
     let clip = &mut timeline.tracks[track_index].clips[clip_index];
 
     let previous_duration = clip.duration_frames;
+    let previous_speed = clip.speed;
     if props.duration_frames.is_some()
         || props.trim_start_frame.is_some()
         || props.trim_end_frame.is_some()
@@ -5239,7 +5240,10 @@ fn apply_property_changes_at(
         clip.speed = v;
     }
     if props.duration_frames.is_some() || props.speed.is_some() {
-        if previous_duration > 0 && clip.duration_frames != previous_duration {
+        if clip.speed != previous_speed
+            && previous_duration > 0
+            && clip.duration_frames != previous_duration
+        {
             clip.rescale_keyframes(clip.duration_frames as f64 / previous_duration as f64);
         }
         clip.clamp_keyframes_to_duration();
@@ -7466,8 +7470,8 @@ fn delete_folder(
 ///    same `media_ref`. Each one is updated to the new ref in the same
 ///    transaction, so a linked audio/video pair pointing at the same file
 ///    stays in sync (and `Undo` restores every old ref atomically).
-/// 3. **No** trim / duration / start rewrites — `resetTrim: false`; reject a
-///    candidate too short for any linked clip's current source interval.
+/// 3. **No** trim / duration / start rewrites — `resetTrim: false`. Shorter
+///    sources retain the existing timing and use the renderer's last-frame hold.
 /// 4. Same `media_ref` is a no-op (`changed = false`, no undo entry, no
 ///    version bump).
 fn swap_media(
@@ -7541,21 +7545,10 @@ fn swap_media(
 
     if matches!(new_asset.kind, ClipType::Video | ClipType::Audio) {
         let available_frames = new_asset.duration * f64::from(state.timeline.fps);
-        if state.timeline.fps <= 0 || !available_frames.is_finite() {
+        if state.timeline.fps <= 0 || !available_frames.is_finite() || available_frames < 0.0 {
             return Err(EditError::Refused(
                 "replacement media has no valid duration".into(),
             ));
-        }
-        for id in &targets {
-            let location = state.find_clip(id).expect("validated linked clip exists");
-            let clip = &state.timeline.tracks[location.track_index].clips[location.clip_index];
-            let required =
-                i64::from(clip.trim_start_frame) + i64::from(clip.source_frames_consumed());
-            if clip.trim_start_frame < 0 || required as f64 > available_frames + 0.001 {
-                return Err(EditError::Refused(format!(
-                    "replacement media is too short for clip {id}"
-                )));
-            }
         }
     }
 
