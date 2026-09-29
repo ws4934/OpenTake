@@ -138,8 +138,7 @@ pub const ENCODE_WORKSPACE_PREFIX: &str = ".opentake-encode-";
 pub type EncodeProgressCallback = dyn Fn(usize, usize);
 
 /// A streaming RGBA → video encoder. FFmpeg writes only inside a private
-/// owner-only workspace, created next to the output so it lives on the same
-/// volume, and never reopens the final pathname. The finished file is either
+/// private workspace and never reopens the final pathname. The finished file is either
 /// copied into the caller's retained output file ([`VideoEncoder::finish`])
 /// or handed over in place for the caller to publish by rename
 /// ([`VideoEncoder::finish_in_workspace`]).
@@ -164,13 +163,13 @@ pub struct VideoEncoder {
     child_reaped: bool,
 }
 
-/// The private directory an encode writes in: owner-only on Unix, next to
-/// the output, and removed with everything left in it when dropped.
+/// Cleanup uses retained directory handles so a replaced pathname is left alone.
 struct EncodeWorkspace {
     /// Retained no-follow handle of the directory.
     directory: File,
-    // Dropped after `directory`, so Windows can remove the directory.
-    dir: tempfile::TempDir,
+    path: PathBuf,
+    #[cfg(unix)]
+    parent: File,
 }
 
 impl EncodeWorkspace {
@@ -179,30 +178,149 @@ impl EncodeWorkspace {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
-        let dir = tempfile::Builder::new()
-            .prefix(ENCODE_WORKSPACE_PREFIX)
-            .tempdir_in(parent)
-            .map_err(MediaError::Io)?;
-        let directory = open_directory_nofollow(dir.path())?;
+        Self::in_directory(parent)
+    }
+
+    fn in_directory(parent: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        let parent_handle = open_directory_nofollow(parent)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(ENCODE_WORKSPACE_PREFIX);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            directory
-                .set_permissions(std::fs::Permissions::from_mode(0o700))
-                .map_err(MediaError::Io)?;
-            // SAFETY: `geteuid` has no preconditions.
-            let owner = unsafe { libc::geteuid() };
-            if directory.metadata().map_err(MediaError::Io)?.uid() != owner {
-                return Err(MediaError::Encode(
-                    "encode workspace is not owned by this user".to_string(),
-                ));
-            }
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        Ok(EncodeWorkspace { directory, dir })
+        // Exclusive mkdir establishes ownership; mount-specific uid mappings
+        // and chmod support must not decide whether encoding is permitted.
+        // Disable TempDir's recursive path cleanup before retaining the handle.
+        let path = builder.tempdir_in(parent).map_err(MediaError::Io)?.keep();
+        let directory = open_directory_nofollow(&path)?;
+        Ok(Self {
+            directory,
+            path,
+            #[cfg(unix)]
+            parent: parent_handle,
+        })
     }
 
     fn path(&self) -> &Path {
-        self.dir.path()
+        &self.path
+    }
+
+    fn remove_file(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        cap_std::fs::Dir::from_std_file(self.directory.try_clone()?).remove_file(name)
+    }
+
+    fn cleanup(&self) -> std::io::Result<()> {
+        // FFmpeg creates only these leaves. Never recurse into an unexpected
+        // directory or resolve the ambient workspace path during cleanup.
+        for name in [
+            "video.mp4",
+            "video.mov",
+            "audio.pcm",
+            "muxed.mp4",
+            "muxed.mov",
+        ] {
+            match self.remove_file(std::ffi::OsStr::new(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.remove_directory()
+    }
+}
+
+impl Drop for EncodeWorkspace {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            tracing::warn!(path = %self.path.display(), %error, "failed to clean encode workspace");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl EncodeWorkspace {
+    fn remove_directory(&self) -> std::io::Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = CString::new(self.path.file_name().expect("workspace leaf").as_bytes())?;
+        let mut visible = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained parent descriptor is live, and both buffers are
+        // valid. AT_SYMLINK_NOFOLLOW checks the named object itself.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                visible.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: successful fstatat initialized the complete stat buffer.
+        let visible = unsafe { visible.assume_init() };
+        let mut retained = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the descriptor and output buffer stay valid for the call.
+        if unsafe { libc::fstat(self.directory.as_raw_fd(), retained.as_mut_ptr()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful fstat initialized the complete stat buffer.
+        let retained = unsafe { retained.assume_init() };
+        if visible.st_dev != retained.st_dev || visible.st_ino != retained.st_ino {
+            return Ok(());
+        }
+        // SAFETY: the parent is retained and the single-component name still
+        // identifies the owned directory. Only an empty directory is removed.
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl EncodeWorkspace {
+    fn remove_directory(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        };
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the DELETE-capable directory handle and SDK buffer stay
+        // valid for the call. Deletion completes when the retained handle closes.
+        if unsafe {
+            SetFileInformationByHandle(
+                self.directory.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl EncodeWorkspace {
+    fn remove_directory(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "retained encode directory cleanup is unsupported",
+        ))
     }
 }
 
@@ -283,8 +401,8 @@ impl VideoEncoder {
     }
 
     /// Start an encoder whose finished bytes [`VideoEncoder::finish`] copies
-    /// into `output`, a retained handle to `out_hint`. The workspace is
-    /// created next to `out_hint`.
+    /// into `output`, a retained handle to `out_hint`. Intermediates stay in
+    /// system temporary storage, outside project bundles copied by Save As.
     pub fn new_with_file(
         out_hint: &Path,
         mut output: File,
@@ -306,7 +424,11 @@ impl VideoEncoder {
         fps: i32,
         preset: &ExportPreset,
     ) -> Result<Self> {
-        let workspace = EncodeWorkspace::next_to(out_hint)?;
+        let workspace = if output.is_some() {
+            EncodeWorkspace::in_directory(&std::env::temp_dir())?
+        } else {
+            EncodeWorkspace::next_to(out_hint)?
+        };
         let extension = if matches!(preset.codec, VideoCodec::ProRes422 | VideoCodec::ProRes4444) {
             "mov"
         } else {
@@ -589,8 +711,13 @@ impl VideoEncoder {
                 let muxed = self.mux_audio(&audio, cancel, progress, mux_wait_hook)?;
                 // Free the intermediate files before the result is copied or
                 // published, so the workspace holds one movie at a time.
-                let _ = std::fs::remove_file(&self.first_pass);
-                let _ = std::fs::remove_file(&audio.path);
+                let workspace = self.workspace.as_ref().expect("encoder workspace");
+                workspace
+                    .remove_file(self.first_pass.file_name().expect("first-pass leaf"))
+                    .map_err(MediaError::Io)?;
+                workspace
+                    .remove_file(audio.path.file_name().expect("audio leaf"))
+                    .map_err(MediaError::Io)?;
                 muxed
             }
             None => self.first_pass.clone(),
@@ -894,14 +1021,35 @@ fn drain_stderr(mut stderr: ChildStderr) -> Result<Vec<u8>> {
 fn with_stderr_tail(message: String, stderr_tail: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr_tail);
     let lines: Vec<&str> = text
-        .lines()
+        .split(['\r', '\n'])
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
     if lines.is_empty() {
         return message;
     }
-    let quoted = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
+    let diagnostic = |line: &str| {
+        ["[error]", "[fatal]", "[warning]"]
+            .iter()
+            .any(|level| line.contains(level))
+    };
+    let mut quoted: Vec<&str> = lines
+        .iter()
+        .rev()
+        .copied()
+        .filter(|line| diagnostic(line))
+        .take(STDERR_TAIL_LINES)
+        .collect();
+    quoted.reverse();
+    let mut context: Vec<&str> = lines
+        .iter()
+        .rev()
+        .copied()
+        .filter(|line| !diagnostic(line))
+        .take(STDERR_TAIL_LINES - quoted.len())
+        .collect();
+    context.reverse();
+    quoted.extend(context);
     format!("{message}: {}", quoted.join(" | "))
 }
 
@@ -941,11 +1089,14 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x1;
         const FILE_SHARE_WRITE: u32 = 0x2;
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         // Without delete sharing the workspace cannot be renamed or replaced
         // while it is retained.
         options
+            .access_mode(GENERIC_READ | DELETE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -1212,6 +1363,58 @@ mod tests {
         assert!(message.ends_with("line 499"));
         assert_eq!(message.matches(" | ").count(), STDERR_TAIL_LINES - 1);
         assert_eq!(with_stderr_tail("x".to_string(), b"\n \n"), "x");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_diagnostics_ahead_of_carriage_return_progress() {
+        let mut stderr = b"[error] cannot write movie\n[warning] disk is full\n".to_vec();
+        for frame in 0..30 {
+            stderr.extend(format!("[info] frame={frame}\r").bytes());
+        }
+        let message = with_stderr_tail("ffmpeg exited 1".into(), &stderr);
+        assert!(message.starts_with(
+            "ffmpeg exited 1: [error] cannot write movie | [warning] disk is full | "
+        ));
+        assert!(message.ends_with("[info] frame=29"));
+        assert_eq!(message.matches(" | ").count(), STDERR_TAIL_LINES - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cleanup_preserves_a_replacement_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = EncodeWorkspace::next_to(&temp.path().join("movie.mp4")).unwrap();
+        let path = workspace.path().to_path_buf();
+        std::fs::write(path.join("audio.pcm"), b"our spool").unwrap();
+        let moved = temp.path().join("moved-workspace");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("foreign.txt"), b"another writer").unwrap();
+        drop(workspace);
+
+        assert_eq!(
+            std::fs::read(path.join("foreign.txt")).unwrap(),
+            b"another writer"
+        );
+        assert!(!moved.join("audio.pcm").exists());
+    }
+
+    #[test]
+    fn copy_mode_keeps_encode_intermediates_outside_the_project_bundle() {
+        assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
+        let project = tempfile::tempdir().unwrap();
+        let media = project.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let output = media.join("range.mp4");
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut encoder = VideoEncoder::new(&output, 16, 16, 30, &preset).unwrap();
+        let workspace = encoder.workspace_path().unwrap().to_path_buf();
+        assert!(!workspace.starts_with(project.path()));
+        encoder.push_frame(&RgbaFrame::black(16, 16)).unwrap();
+        encoder.finish().unwrap();
+        assert!(!workspace.exists());
+        assert_eq!(workspace_entries(&media), ["range.mp4"]);
+        assert!(crate::probe::probe(&output).unwrap().has_video);
     }
 
     #[cfg(unix)]

@@ -186,7 +186,9 @@ fn break_on(text: &str, delimiters: &str) -> Option<Vec<String>> {
         let is_break = if c.is_ascii() {
             i >= chars.len() || chars[i] == ' '
         } else {
-            while i < chars.len() && is_closing_punctuation(chars[i]) {
+            while i < chars.len()
+                && (delimiters.contains(chars[i]) || is_closing_punctuation(chars[i]))
+            {
                 current.push(chars[i]);
                 i += 1;
             }
@@ -216,7 +218,7 @@ fn break_on(text: &str, delimiters: &str) -> Option<Vec<String>> {
 fn is_closing_punctuation(c: char) -> bool {
     matches!(
         c,
-        '」' | '』' | '）' | '】' | '〕' | '〉' | '》' | '”' | '’' | '"' | '\'' | ')'
+        '」' | '』' | '）' | '】' | '〕' | '〉' | '》' | '”' | '’' | ')'
     )
 }
 
@@ -805,6 +807,24 @@ mod tests {
             ["今天天气很好。", "我们去公园吧，", "然后一起吃饭。"]
         );
         assert!(out.iter().all(|p| fits(&p.text)));
+    }
+
+    #[test]
+    fn cjk_punctuation_runs_stay_with_the_preceding_caption() {
+        for (text, expected) in [
+            ("真的吗？！太好了", vec!["真的吗？！", "太好了"]),
+            ("等等。。。好的", vec!["等等。。。", "好的"]),
+        ] {
+            let out = phrases(
+                &seg(text, 0.0, 6.0),
+                &fits_chars(5),
+                MIN_DISPLAY_DURATION_SECS,
+            );
+            let texts: Vec<&str> = out.iter().map(|phrase| phrase.text.as_str()).collect();
+            assert_eq!(texts, expected);
+        }
+        assert_eq!(break_once("好了。\"下一句\""), ["好了。", "\"下一句\""]);
+        assert_eq!(break_once("好了。'下一句'"), ["好了。", "'下一句'"]);
     }
 
     #[test]

@@ -998,7 +998,7 @@ fn authorize_composite_sources<R: tauri::Runtime>(
         };
         files.insert(entry.id.clone(), retained);
     }
-    let luts = authorize_composite_luts(core, snapshot);
+    let luts = authorize_composite_luts(core, snapshot)?;
     if project_authority
         .as_ref()
         .is_some_and(|authority| !core.project_asset_authority_matches(authority))
@@ -1010,16 +1010,15 @@ fn authorize_composite_sources<R: tauri::Runtime>(
 }
 
 /// Read every LUT the snapshot's clips reference through the session's
-/// retained project root. A LUT that cannot be read is left out, so the strict
-/// compositor fails on it as missing; a LUT whose bytes do not match its
-/// content hash fails when it is resolved.
+/// retained project root. Read errors propagate to cover capture; a LUT whose
+/// bytes do not match its content hash fails when it is resolved.
 fn authorize_composite_luts(
     core: &AppCore,
     snapshot: &opentake_core::ProjectRuntimeSnapshot,
-) -> std::collections::HashMap<String, Vec<u8>> {
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
     let mut luts = std::collections::HashMap::new();
     if snapshot.project_dir.is_none() {
-        return luts;
+        return Ok(luts);
     }
     let references = std::iter::once(&snapshot.timeline)
         .chain(
@@ -1036,14 +1035,17 @@ fn authorize_composite_luts(
         if luts.contains_key(&reference.id) || reference.validate().is_err() {
             continue;
         }
-        if let Ok(Some(bytes)) = core.read_project_lut(
-            &crate::lut::managed_lut_filename(reference),
-            opentake_domain::CubeLut::MAX_BYTES,
-        ) {
+        if let Some(bytes) = core
+            .read_project_lut(
+                &crate::lut::managed_lut_filename(reference),
+                opentake_domain::CubeLut::MAX_BYTES,
+            )
+            .map_err(|error| format!("read managed LUT {}: {error}", reference.id))?
+        {
             luts.insert(reference.id.clone(), bytes);
         }
     }
-    luts
+    Ok(luts)
 }
 
 #[cfg(test)]
@@ -3892,6 +3894,32 @@ mod project_open_async_tests {
     }
 
     #[test]
+    fn composite_lut_authorization_exposes_read_failures() {
+        use opentake_domain::{Clip, ClipType, LutReference, Track};
+        let fixture = tempfile::tempdir().unwrap();
+        let bundle = fixture.path().join("Lut.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(bundle.clone())).unwrap();
+        let id = "a".repeat(64);
+        let mut clip = Clip::new("graded", "image", 0, 30);
+        clip.lut = Some(LutReference::new(id.clone(), "Unreadable", 1.0).unwrap());
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(clip);
+        let mut snapshot = core.runtime_snapshot();
+        snapshot.timeline.tracks.push(track);
+        std::fs::create_dir_all(bundle.join("media/luts").join(format!("{id}.cube"))).unwrap();
+        let app = tauri::test::mock_app();
+
+        let result =
+            authorize_composite_sources(app.handle(), &core, &snapshot, &Default::default());
+        assert!(
+            result.is_err(),
+            "LUT read failure must be reported directly"
+        );
+        assert!(result.err().unwrap().contains("read managed LUT"));
+    }
+
+    #[test]
     fn thumbnail_authoritative_composite_applies_a_managed_lut() {
         use opentake_domain::{
             Clip, ClipType, LutReference, MediaManifestEntry, MediaSource, Track,
@@ -3989,8 +4017,14 @@ mod project_open_async_tests {
 
         // The agent's timeline result goes through the same strict compositor.
         let snapshot = core.runtime_snapshot();
-        let authority =
-            authorize_composite_sources(app.handle(), &core, &snapshot).expect("authorize");
+        let media_refs = snapshot
+            .media
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let authority = authorize_composite_sources(app.handle(), &core, &snapshot, &media_refs)
+            .expect("authorize");
         let rendered = crate::render::render_timeline_result_png(
             &snapshot.timeline,
             &snapshot.media,

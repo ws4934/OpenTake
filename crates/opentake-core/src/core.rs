@@ -719,8 +719,8 @@ impl AppCore {
     /// Read a managed LUT of the open project through the session's retained
     /// bundle handle, never by reopening the project path.
     pub fn read_project_lut(&self, name: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
-        let session = self.lock();
-        session.editor.read_lut(name, max_bytes)
+        let root = self.lock().editor.project_root_for_read()?;
+        Ok(root.read_lut(name, max_bytes)?)
     }
 
     /// Return a mutable-project runtime snapshot only when the caller's IPC

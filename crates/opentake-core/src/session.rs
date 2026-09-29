@@ -1456,6 +1456,10 @@ impl EditorSession {
     /// large generated media without holding the session lock.
     pub(crate) fn project_root_clone(&self) -> Result<ProjectRoot> {
         self.ensure_mutable()?;
+        self.project_root_for_read()
+    }
+
+    pub(crate) fn project_root_for_read(&self) -> Result<ProjectRoot> {
         let root = self.project_root.as_ref().ok_or(CoreError::NoProjectOpen)?;
         Ok(root.try_clone()?)
     }

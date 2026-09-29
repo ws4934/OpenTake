@@ -5539,11 +5539,13 @@ mod tests {
         assert!(cleanup.probe_output().unwrap().has_video);
         cleanup.verify_visible_identity().unwrap();
         cleanup.publish().unwrap();
+        // Published by rename: the target is the inode FFmpeg wrote. Release
+        // the extra DELETE-capable Windows handle before the external probe.
+        assert_eq!(FileIdentity::from_path(&output).unwrap(), encoded_identity);
+        drop(encoded_identity);
         drop(cleanup);
 
         assert_ne!(identify_export_target(&output).unwrap(), previous_identity);
-        // Published by rename: the target is the inode FFmpeg wrote.
-        assert_eq!(FileIdentity::from_path(&output).unwrap(), encoded_identity);
         assert!(!workspace.exists());
         assert_eq!(directory_entries(project.path()), ["final.mp4"]);
         assert!(opentake_media::probe::probe(&output).unwrap().has_video);
@@ -5607,6 +5609,7 @@ mod tests {
             !moved.join(&name).exists(),
             "the retained encode was removed through its own directory"
         );
+        assert_eq!(fs::read(workspace.join(&name)).unwrap(), b"replacement");
     }
 
     #[test]
