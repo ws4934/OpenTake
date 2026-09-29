@@ -25,6 +25,11 @@ pub enum MediaError {
     #[error("decode failed: {0}")]
     Decode(String),
 
+    /// The source decoded without error but has no frame at `time_secs`
+    /// (for example a target at or past the end of its last frame).
+    #[error("decode failed: no frame at {time_secs:.3}s")]
+    NoFrameAt { time_secs: f64 },
+
     #[error("encode failed: {0}")]
     Encode(String),
 

@@ -111,6 +111,27 @@ fn decode_frame_returns_rgba_of_expected_size() {
 }
 
 #[test]
+fn decode_past_the_last_frame_is_a_typed_error() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let av = dir.path().join("av.mp4");
+    assert!(make_av(&av));
+    let request = FrameRequest {
+        time_secs: 30.0,
+        ..FrameRequest::default()
+    };
+    match decode_frame_at(&av, &request) {
+        Err(error @ opentake_media::MediaError::NoFrameAt { time_secs }) => {
+            assert_eq!(time_secs, 30.0);
+            assert_eq!(error.to_string(), "decode failed: no frame at 30.000s");
+        }
+        other => panic!("expected NoFrameAt, got {:?}", other.map(|(time, _)| time)),
+    }
+}
+
+#[test]
 fn decode_frame_scales_within_box() {
     if !ffmpeg_available() {
         return;
@@ -1040,4 +1061,79 @@ fn continuous_decode_reports_real_failures_with_the_log_tail() {
         assert!(errors[0].contains("ffmpeg exited with"), "{}", errors[0]);
         assert!(errors[0].contains("Error opening input"), "{}", errors[0]);
     }
+}
+
+/// A path that is not valid UTF-8 reaches ffmpeg byte for byte: the encoder
+/// writes it, and frame, stream and PCM decoding all read it back.
+/// A lossy conversion would replace `\xff` with U+FFFD and open another path.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_file_names_encode_and_decode() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    use opentake_media::{decode_pcm_interleaved, MediaCancelToken, PcmBuffer, PcmStream};
+
+    if !ffmpeg_available() || !ffprobe_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // The encoder's workspace is created next to the output, so its FFmpeg
+    // arguments carry the non-UTF-8 directory too.
+    let parent = dir.path().join(OsStr::from_bytes(b"dir-\xfe"));
+    std::fs::create_dir(&parent).unwrap();
+    let out = parent.join(OsStr::from_bytes(b"clip-\xff.mp4"));
+    assert!(out.to_str().is_none(), "fixture name must not be UTF-8");
+
+    let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+    let (w, h) = (64_u32, 48_u32);
+    let mut encoder = VideoEncoder::new(&out, w, h, 10, &preset).unwrap();
+    for index in 0..10_u8 {
+        let rgba = [index * 20, 100, 200, 255].repeat((w * h) as usize);
+        encoder.push_frame(&RgbaFrame::new(w, h, rgba)).unwrap();
+    }
+    let mono = PcmSpec {
+        sample_rate: 48_000,
+        channels: 1,
+        format: PcmFormat::F32,
+    };
+    encoder
+        .push_audio(PcmBuffer {
+            spec: mono,
+            samples_f32: (0..48_000)
+                .map(|index| (index as f32 * 0.0575).sin() * 0.5)
+                .collect(),
+        })
+        .unwrap();
+    encoder.finish().unwrap();
+    assert!(out.is_file());
+
+    let probed = probe(&out).unwrap();
+    assert!(probed.has_video && probed.has_audio);
+
+    let (_, frame) = decode_frame_at(&out, &FrameRequest::default()).unwrap();
+    assert_eq!((frame.width, frame.height), (w, h));
+
+    let stream = spawn_video_stream(VideoStreamRequest::new(out.clone(), 10)).unwrap();
+    let decoded = stream
+        .receiver()
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("stream frame")
+        .expect("stream decode");
+    assert_eq!((decoded.frame.width, decoded.frame.height), (w, h));
+    drop(stream);
+
+    let pcm = extract_pcm(&out, &mono, None).unwrap();
+    assert!(pcm.samples_f32.len() > 40_000);
+    let stereo = PcmSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        format: PcmFormat::F32,
+    };
+    let interleaved = decode_pcm_interleaved(&out, &stereo, Some((0.0, 0.5))).unwrap();
+    assert!(interleaved.len() > 40_000);
+    let mut pcm_stream =
+        PcmStream::open(&out, &stereo, (0.0, 0.5), &MediaCancelToken::new()).unwrap();
+    let mut streamed = Vec::new();
+    assert!(pcm_stream.read(1_024, &mut streamed).unwrap() > 0);
 }
