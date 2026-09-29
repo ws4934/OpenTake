@@ -67,6 +67,11 @@ impl ScopeSnapshot {
         !self.forbidden.matches(&normalized) && self.allowed.patterns.matches(&normalized)
     }
 
+    pub(crate) fn forbids(&self, path: &Path) -> bool {
+        let normalized: PathBuf = path.components().collect();
+        self.forbidden.matches(&normalized)
+    }
+
     /// Same decision as `scope_has_exact_file_grant`: an allowed pattern whose
     /// text is exactly the escaped normalized path, not a directory glob.
     pub(crate) fn has_exact_file_grant(&self, path: &Path) -> bool {

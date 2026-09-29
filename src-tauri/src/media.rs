@@ -517,6 +517,11 @@ impl MediaItemDto {
         let path = resolved
             .as_deref()
             .map(|path| path.to_string_lossy().into_owned());
+        let source_metadata = resolved.as_deref().and_then(|path| {
+            std::fs::symlink_metadata(path).ok().filter(|metadata| {
+                crate::fs_availability::is_materialized_regular_file_metadata(path, metadata)
+            })
+        });
         let resolved_proxy = entry
             .proxy
             .as_ref()
@@ -549,29 +554,21 @@ impl MediaItemDto {
         let missing = !generation_pending
             && resolved
                 .as_ref()
-                .map(|path| !crate::fs_availability::is_materialized_regular_file(path))
+                .map(|_| source_metadata.is_none())
                 .unwrap_or(false);
         let thumbnail = if missing {
             None
         } else {
-            resolved
-                .as_deref()
-                .and_then(|path| {
-                    cache_root.and_then(|root| cached_thumbnail_path_for_entry(root, entry, path))
-                })
-                .filter(|path| {
-                    crate::fs_availability::is_materialized_regular_file(Path::new(path))
-                })
+            resolved.as_deref().and_then(|path| {
+                cache_root.and_then(|root| cached_thumbnail_path_for_entry(root, entry, path))
+            })
         };
         // File size from the resolved source when it exists (upstream reads
         // FileManager attributes lazily). Skipped for missing/unresolvable sources.
         let file_size = if missing {
             None
         } else {
-            resolved
-                .as_deref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
+            source_metadata.as_ref().map(|metadata| metadata.len())
         };
         MediaItemDto {
             id: entry.id.clone(),
@@ -817,7 +814,9 @@ fn timed_poster_path_for(cache_root: &Path, key: &str, time_secs: f64) -> PathBu
 
 /// Complete PNGs are immutable at their content-keyed poster path. Invalid or
 /// non-regular targets are retained and reported, never silently replaced.
-fn cached_poster_dimensions(path: &Path) -> Result<Option<(u32, u32)>, String> {
+fn cached_poster_reader(
+    path: &Path,
+) -> Result<Option<image::ImageReader<std::io::BufReader<std::fs::File>>>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -834,10 +833,19 @@ fn cached_poster_dimensions(path: &Path) -> Result<Option<(u32, u32)>, String> {
     }
     let (file, _) = crate::safe_asset_protocol::open_retained_regular_file(path)
         .map_err(|error| format!("poster cache open: {error}"))?;
-    let image =
-        image::ImageReader::with_format(std::io::BufReader::new(file), image::ImageFormat::Png)
-            .decode()
-            .map_err(|error| format!("invalid poster cache PNG: {error}"))?;
+    Ok(Some(image::ImageReader::with_format(
+        std::io::BufReader::new(file),
+        image::ImageFormat::Png,
+    )))
+}
+
+fn cached_poster_dimensions(path: &Path) -> Result<Option<(u32, u32)>, String> {
+    let Some(reader) = cached_poster_reader(path)? else {
+        return Ok(None);
+    };
+    let image = reader
+        .decode()
+        .map_err(|error| format!("invalid poster cache PNG: {error}"))?;
     Ok(Some((image.width(), image.height())))
 }
 
@@ -920,10 +928,14 @@ fn cached_thumbnail_path_for_entry(
     }
     let key = cache_key_for(path).ok()?;
     let poster_path = poster_path_for(cache_root, &key);
-    cached_poster_dimensions(&poster_path)
+    // Catalog projection validates the PNG header without inflating pixels.
+    // Cache read/publication paths retain complete PNG integrity validation.
+    cached_poster_reader(&poster_path)
         .ok()
-        .flatten()
-        .map(|_| poster_path.to_string_lossy().into_owned())
+        .flatten()?
+        .into_dimensions()
+        .ok()?;
+    Some(poster_path.to_string_lossy().into_owned())
 }
 
 fn poster_target_time(time_secs: Option<f64>) -> f64 {
@@ -2952,24 +2964,43 @@ fn import_media_impl_with_options(
     ))
 }
 
-/// `get_media`: the current media catalog for the panel. Infallible.
+/// `get_media`: catalog filesystem work and scope persistence run off the UI thread.
+static MEDIA_CATALOG_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 #[tauri::command]
-pub fn get_media<R: Runtime>(
-    app: AppHandle<R>,
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-) -> MediaListDto {
-    let mut catalog = MediaListDto::from_core(&core, Some(media.engine().cache_root()));
+pub async fn get_media<R: Runtime>(app: AppHandle<R>) -> Result<MediaListDto, String> {
+    let permit = MEDIA_CATALOG_WORKERS
+        .acquire()
+        .await
+        .map_err(|error| format!("media catalog admission failed: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        get_media_blocking(&app, &app.state::<AppCore>(), &app.state::<MediaState>())
+    })
+    .await
+    .map_err(|error| format!("media catalog task failed: {error}"))?
+}
+
+fn get_media_blocking<R: Runtime>(
+    app: &AppHandle<R>,
+    core: &AppCore,
+    media: &MediaState,
+) -> Result<MediaListDto, String> {
+    let revision = core.project_revision();
+    let mut catalog = MediaListDto::from_core(core, Some(media.engine().cache_root()));
+    if core.project_revision().project_epoch != revision.project_epoch {
+        return Err("project changed while reading the media catalog".into());
+    }
     if catalog.items.iter().any(|item| item.proxy_path.is_some()) {
         if let Ok(_activity) = media.begin_cache_write() {
-            grant_catalog_proxy_asset_scope(&app, &mut catalog);
+            grant_catalog_proxy_asset_scope(app, &mut catalog);
         } else {
             for item in &mut catalog.items {
                 item.proxy_path = None;
             }
         }
     }
-    catalog
+    Ok(catalog)
 }
 
 /// Persist one project asset in the content-addressed global library and mirror
@@ -5170,12 +5201,27 @@ fn revoke_proxy_asset_file<R: Runtime>(app: &AppHandle<R>, path: &Path) {
 }
 
 fn grant_catalog_proxy_asset_scope<R: Runtime>(app: &AppHandle<R>, catalog: &mut MediaListDto) {
+    let snapshot = crate::safe_asset_protocol::asset_scope_snapshot(app);
+    let mut granted = std::collections::HashSet::new();
     for item in &mut catalog.items {
         let Some(path) = item.proxy_path.as_deref().map(Path::new) else {
             continue;
         };
-        if grant_proxy_asset_file(app, path).is_err() {
+        if snapshot.forbids(path) {
             item.proxy_path = None;
+            continue;
+        }
+        if snapshot.has_exact_file_grant(path) || granted.contains(path) {
+            continue;
+        }
+        match grant_proxy_asset_file(app, path) {
+            Ok(()) => {
+                granted.insert(path.to_path_buf());
+            }
+            Err(error) => {
+                eprintln!("[media] proxy catalog scope grant failed: {error}");
+                item.proxy_path = None;
+            }
         }
     }
 }
@@ -7859,6 +7905,71 @@ mod tests {
     }
 
     #[test]
+    fn catalog_poster_presence_does_not_decode_truncated_pixel_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        touch(&source);
+        let cache = temp.path().join("cache");
+        let target = poster_path_for(&cache, &cache_key_for(&source).unwrap());
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut bytes = encode_png(&RgbaFrame::black(2, 2)).unwrap();
+        bytes.truncate(41); // PNG signature, IHDR and IDAT header, no pixel data.
+        fs::write(&target, &bytes).unwrap();
+        assert!(image::load_from_memory(&bytes).is_err());
+        let entry: MediaManifestEntry = serde_json::from_value(serde_json::json!({
+            "id": "source", "name": "source", "type": "image", "duration": 1.0,
+            "source": {"external": {"absolutePath": source}}
+        }))
+        .unwrap();
+        assert_eq!(
+            MediaItemDto::from_entry(&entry, None, Some(&cache), false).thumbnail,
+            Some(target.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    #[ignore = "release catalog timing probe; run explicitly with --ignored --nocapture"]
+    fn benchmark_catalog_with_one_thousand_cached_posters() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(visual_cache_dir(&cache)).unwrap();
+        let png = encode_png(&RgbaFrame::black(512, 288)).unwrap();
+        let mut project = opentake_project::Project::new(temp.path().join("Catalog.opentake"));
+        for index in 0..1_000 {
+            let source = temp.path().join(format!("source-{index}.png"));
+            fs::write(&source, &png).unwrap();
+            let poster = poster_path_for(&cache, &cache_key_for(&source).unwrap());
+            fs::write(&poster, &png).unwrap();
+            project.manifest.entries.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("source-{index}"), "name": format!("source-{index}"),
+                    "type": "image", "duration": 1.0,
+                    "source": {"external": {"absolutePath": source}}
+                }))
+                .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        let core = AppCore::new();
+        core.open_project(&project.bundle_path).unwrap();
+        let mut timings = Vec::new();
+        for _ in 0..11 {
+            let started = std::time::Instant::now();
+            let catalog = MediaListDto::from_core(&core, Some(&cache));
+            let elapsed = started.elapsed();
+            assert_eq!(catalog.items.len(), 1_000);
+            assert!(catalog.items.iter().all(|item| item.thumbnail.is_some()));
+            timings.push(elapsed);
+            std::hint::black_box(catalog);
+        }
+        timings.sort();
+        println!(
+            "1000 cached-poster catalog: median={:?}, max={:?}",
+            timings[5], timings[10]
+        );
+    }
+
+    #[test]
     fn poster_publication_reuses_a_winner_that_arrives_after_staging() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("winner.thumb.png");
@@ -9056,6 +9167,54 @@ mod tests {
     }
 
     #[test]
+    fn catalog_proxy_scope_grants_only_new_exact_files_and_keeps_revocations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _bundle, _source, asset_id) = saved_core_with_media(temp.path());
+        let snapshot = core.runtime_snapshot();
+        let project_dir = snapshot.project_dir.as_ref().unwrap();
+        let proxy = project_dir.join("media/proxies/first.mp4");
+        fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+        fs::write(&proxy, b"proxy").unwrap();
+        let proxy_record = |leaf: &str| MediaProxy {
+            relative_path: format!("media/proxies/{leaf}"),
+            source_sha256: "a".repeat(64),
+            source_stamp: None,
+            width: 1280,
+            height: 720,
+        };
+        core.set_media_proxy_for_project(
+            snapshot.project_epoch,
+            project_dir,
+            &asset_id,
+            Some(proxy_record("first.mp4")),
+        )
+        .unwrap();
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        let grants = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = grants.clone();
+        scope.listen(move |event| {
+            if matches!(event, tauri::scope::fs::Event::PathAllowed(_)) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let mut catalog = MediaListDto::from_core(&core, None);
+        grant_catalog_proxy_asset_scope(app.handle(), &mut catalog);
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 1);
+        grant_catalog_proxy_asset_scope(app.handle(), &mut catalog);
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let second = project_dir.join("media/proxies/second.mp4");
+        fs::write(&second, b"proxy two").unwrap();
+        catalog.items[0].proxy_path = Some(second.to_string_lossy().into_owned());
+        grant_catalog_proxy_asset_scope(app.handle(), &mut catalog);
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 2);
+        scope.forbid_file(&second).unwrap();
+        grant_catalog_proxy_asset_scope(app.handle(), &mut catalog);
+        assert_eq!(catalog.items[0].proxy_path, None);
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn get_media_does_not_persist_proxy_scope_during_update_install() {
         let temp = tempfile::tempdir().unwrap();
         let (core, _bundle, _source, asset_id) = saved_core_with_media(temp.path());
@@ -9087,11 +9246,12 @@ mod tests {
         ));
         let install = admission.begin_install().expect("install starts");
 
-        let catalog = get_media(
-            app.handle().clone(),
-            app.state::<AppCore>(),
-            app.state::<MediaState>(),
-        );
+        let catalog = get_media_blocking(
+            app.handle(),
+            &app.state::<AppCore>(),
+            &app.state::<MediaState>(),
+        )
+        .unwrap();
 
         assert_eq!(catalog.items.len(), 1);
         assert_eq!(catalog.items[0].proxy_path, None);

@@ -154,6 +154,21 @@ describe("mediaStore", () => {
     expect(useMediaStore.getState().error).toBeNull();
   });
 
+  it("does not retry an event refresh superseded by a command-returned catalog", async () => {
+    await startMediaSync();
+    srv.getMedia.mockClear();
+    const pending = deferred<MediaList>();
+    srv.getMedia.mockImplementationOnce(() => pending.promise);
+    const event = srv.mediaChangedHandler?.();
+    await vi.waitFor(() => expect(srv.getMedia).toHaveBeenCalledTimes(1));
+    const project = { projectEpoch: 1, projectPath: "/tmp/project-a.opentake" };
+    applyMediaListForProject(project, { items: [item("imported", null)], folders: [] });
+    pending.resolve({ items: [item("older", null)], folders: [] });
+    await event;
+    expect(srv.getMedia).toHaveBeenCalledTimes(1);
+    expect(useMediaStore.getState().items.map(({id}) => id)).toEqual(["imported"]);
+  });
+
   it("reports a media event refresh that still fails after its bounded retry", async () => {
     await startMediaSync();
     srv.getMedia

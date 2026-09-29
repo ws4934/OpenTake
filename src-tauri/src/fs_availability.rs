@@ -181,11 +181,11 @@ fn path_is_unavailable(path: &Path, metadata: &Metadata) -> bool {
 pub(crate) fn is_materialized_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .ok()
-        .is_some_and(|metadata| {
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && !path_is_unavailable(path, &metadata)
-        })
+        .is_some_and(|metadata| is_materialized_regular_file_metadata(path, &metadata))
+}
+
+pub(crate) fn is_materialized_regular_file_metadata(path: &Path, metadata: &Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink() && !path_is_unavailable(path, metadata)
 }
 
 /// Whether an existing path is a macOS File Provider placeholder whose bytes
