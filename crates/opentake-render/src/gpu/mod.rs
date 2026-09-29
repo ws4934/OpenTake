@@ -13,7 +13,7 @@ pub mod text_raster;
 pub mod texture;
 
 pub use color::{linear_to_srgb, srgb_to_linear};
-pub use compositor::{Compositor, TextureResolver};
+pub use compositor::{Compositor, CompositorResourceStats, TextureResolver};
 pub use device::RenderDevice;
 pub use text_engine::CosmicTextRasterizer;
 pub use text_raster::{

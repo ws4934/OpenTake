@@ -4,9 +4,19 @@
 //!
 //! One render pipeline; per draw we swap a bind group (texture + uniform). The
 //! quad is 4 constant vertices — all geometry lives in the uniform affine.
+//!
+//! GPU resource lifetimes (issue #119): the render target and the readback
+//! buffer are cached per [`RenderSize`] and rebuilt only when the size changes;
+//! per-layer uniform buffers come from a pool that grows to the largest layer
+//! count seen and is rewritten with `queue.write_buffer`, one buffer per draw
+//! slot so no buffer is written twice within one submission. Bind groups are
+//! still created per frame: they reference the frame's source texture views,
+//! which are `Rc`-owned by the resolver and have no stable identity the
+//! compositor could key a cache on safely.
 
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -343,12 +353,128 @@ pub trait TextureResolver {
     }
 }
 
+/// Counts of GPU resources a [`Compositor`] has created since construction.
+/// With a warm cache these stay constant from frame to frame; they grow only
+/// when the canvas size changes, a frame has more layers than any before it, or
+/// a concurrent render had to use transient resources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositorResourceStats {
+    pub render_targets_created: usize,
+    pub readback_buffers_created: usize,
+    pub uniform_buffers_created: usize,
+}
+
+#[derive(Default)]
+struct ResourceCounters {
+    render_targets: AtomicUsize,
+    readback_buffers: AtomicUsize,
+    uniform_buffers: AtomicUsize,
+}
+
+/// Size-dependent per-frame resources: the canvas render target and the
+/// 256-byte-row-aligned readback buffer it is copied into.
+struct SizedTargets {
+    size: RenderSize,
+    target: wgpu::Texture,
+    target_view: wgpu::TextureView,
+    readback: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+}
+
+impl SizedTargets {
+    fn new(device: &wgpu::Device, size: RenderSize, counters: &ResourceCounters) -> Self {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("opentake-render target"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: RT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        counters.render_targets.fetch_add(1, Ordering::Relaxed);
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = (size.width * 4).div_ceil(align) * align;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("opentake-render readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(size.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        counters.readback_buffers.fetch_add(1, Ordering::Relaxed);
+
+        SizedTargets {
+            size,
+            target,
+            target_view,
+            readback,
+            padded_bytes_per_row,
+        }
+    }
+}
+
+/// Resources reused across frames. `targets` is keyed by the canvas size;
+/// `uniforms[i]` backs draw slot `i` of a frame and is independent of size.
+#[derive(Default)]
+struct FrameResources {
+    targets: Option<SizedTargets>,
+    uniforms: Vec<wgpu::Buffer>,
+}
+
+impl FrameResources {
+    /// Make the cached targets match `size` and the uniform pool hold at
+    /// least `layers` buffers, creating only what is missing.
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        size: RenderSize,
+        layers: usize,
+        counters: &ResourceCounters,
+    ) {
+        while self.uniforms.len() < layers {
+            self.uniforms
+                .push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("opentake-render uniform"),
+                    size: std::mem::size_of::<Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            counters.uniform_buffers.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            // Release the old size's resources before allocating the new ones.
+            self.targets = None;
+            self.targets = Some(SizedTargets::new(device, size, counters));
+        }
+    }
+}
+
+/// One resolved draw, ready for upload. Holds the Rc texture and LUT alive
+/// until the frame's pass has been submitted.
+struct PreparedDraw {
+    uniforms: Uniforms,
+    tex: Rc<GpuTexture>,
+    lut: Option<Arc<GpuLutTexture>>,
+}
+
 /// A textured-quad compositor bound to one device.
 pub struct Compositor {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     fallback_lut: GpuLutTexture,
+    /// Frame resources reused across renders. Taken with `try_lock`: a render
+    /// that finds it busy (another thread compositing with the same
+    /// compositor) uses transient resources instead of blocking.
+    frame_cache: Mutex<FrameResources>,
+    counters: ResourceCounters,
 }
 
 impl Compositor {
@@ -500,6 +626,33 @@ impl Compositor {
                 domain_min: [0.0; 3],
                 domain_max: [1.0; 3],
             },
+            frame_cache: Mutex::new(FrameResources::default()),
+            counters: ResourceCounters::default(),
+        }
+    }
+
+    /// Counts of the GPU resources this compositor has created so far.
+    pub fn resource_stats(&self) -> CompositorResourceStats {
+        CompositorResourceStats {
+            render_targets_created: self.counters.render_targets.load(Ordering::Relaxed),
+            readback_buffers_created: self.counters.readback_buffers.load(Ordering::Relaxed),
+            uniform_buffers_created: self.counters.uniform_buffers.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Lock the frame cache without blocking. `None` means another render
+    /// holds it. A poisoned cache is reset, since a render that panicked
+    /// midway may have left the readback buffer mapped or pending.
+    fn try_lock_frame_cache(&self) -> Option<MutexGuard<'_, FrameResources>> {
+        match self.frame_cache.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                *guard = FrameResources::default();
+                self.frame_cache.clear_poison();
+                Some(guard)
+            }
         }
     }
 
@@ -539,30 +692,9 @@ impl Compositor {
         resolver: &mut dyn TextureResolver,
         interpolation: TextureInterpolationConfig,
     ) -> Result<DecodedFrame, RenderError> {
-        let rt = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("opentake-render target"),
-            size: wgpu::Extent3d {
-                width: size.width,
-                height: size.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: RT_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let rt_view = rt.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Resolve textures + build uniforms/bind groups up front (keeps the
-        // render pass borrow-clean). Hold the Rc textures alive for the pass.
-        struct Prepared {
-            bind_group: wgpu::BindGroup,
-            _tex: Rc<GpuTexture>,
-            _lut: Option<Arc<GpuLutTexture>>,
-        }
-        let mut prepared: Vec<Prepared> = Vec::with_capacity(frame_plan.draws.len());
+        // Resolve textures + build uniforms up front, before touching the
+        // frame cache, so resolver callbacks never run while it is locked.
+        let mut prepared: Vec<PreparedDraw> = Vec::with_capacity(frame_plan.draws.len());
 
         for draw in &frame_plan.draws {
             // Reject invalid persisted data even when the source is offline;
@@ -682,19 +814,54 @@ impl Compositor {
                 effect_meta: [effect_count, 0.0, 0.0, 0.0],
                 effects,
             };
-            let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("opentake-render uniform"),
-                size: std::mem::size_of::<Uniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+            prepared.push(PreparedDraw {
+                uniforms: u,
+                tex,
+                lut: resolved_lut,
             });
-            queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&u));
+        }
 
-            let lut_view = resolved_lut
+        let mut cache = self.try_lock_frame_cache();
+        let mut transient = FrameResources::default();
+        let resources: &mut FrameResources = match cache.as_deref_mut() {
+            Some(cached) => cached,
+            None => &mut transient,
+        };
+        let result =
+            self.encode_and_read_back(device, queue, size, frame_plan, &prepared, resources);
+        if result.is_err() {
+            // A failed map can leave the readback buffer pending or mapped;
+            // never hand it to the next frame.
+            resources.targets = None;
+        }
+        result
+    }
+
+    /// Write the prepared uniforms into the pooled buffers, record the pass
+    /// and the target -> readback copy, submit, and read the frame back.
+    fn encode_and_read_back(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: RenderSize,
+        frame_plan: &FramePlan<'_>,
+        prepared: &[PreparedDraw],
+        resources: &mut FrameResources,
+    ) -> Result<DecodedFrame, RenderError> {
+        resources.prepare(device, size, prepared.len(), &self.counters);
+        let targets = resources.targets.as_ref().expect("targets prepared");
+
+        // Each draw owns one pooled uniform buffer for this submission, so
+        // every `write_buffer` lands before the submit that reads it and no
+        // buffer is written twice per frame.
+        let mut bind_groups = Vec::with_capacity(prepared.len());
+        for (draw, ubuf) in prepared.iter().zip(&resources.uniforms) {
+            queue.write_buffer(ubuf, 0, bytemuck::bytes_of(&draw.uniforms));
+            let lut_view = draw
+                .lut
                 .as_ref()
                 .map_or(&self.fallback_lut.view, |lut| &lut.view);
-
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("opentake-render bind group"),
                 layout: &self.bind_group_layout,
                 entries: &[
@@ -704,7 +871,7 @@ impl Compositor {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&tex.view),
+                        resource: wgpu::BindingResource::TextureView(&draw.tex.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -719,12 +886,7 @@ impl Compositor {
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
-            });
-            prepared.push(Prepared {
-                bind_group,
-                _tex: tex,
-                _lut: resolved_lut,
-            });
+            }));
         }
 
         let mut encoder =
@@ -734,7 +896,7 @@ impl Compositor {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opentake-render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &rt_view,
+                    view: &targets.target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
@@ -746,88 +908,33 @@ impl Compositor {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for p in &prepared {
-                pass.set_bind_group(0, &p.bind_group, &[]);
+            for bind_group in &bind_groups {
+                pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..4, 0..1);
             }
         }
 
-        let frame = read_back(device, queue, &mut encoder, &rt, size)?;
-        queue.submit(Some(encoder.finish()));
-        // `read_back` mapped the staging buffer after submit via poll; finalize.
-        frame.finish(device)
+        encode_read_back(&mut encoder, targets);
+        let submission = queue.submit(Some(encoder.finish()));
+        finish_read_back(device, submission, targets)
     }
 }
 
-/// Holds the staging buffer until its contents are mapped and copied out.
-struct PendingReadback {
-    buffer: wgpu::Buffer,
-    size: RenderSize,
-    padded_bytes_per_row: u32,
-}
-
-impl PendingReadback {
-    fn finish(self, device: &wgpu::Device) -> Result<DecodedFrame, RenderError> {
-        let slice = self.buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|_| RenderError::Readback("map channel closed".into()))?
-            .map_err(|e| RenderError::Readback(e.to_string()))?;
-
-        let data = slice.get_mapped_range();
-        let row_bytes = self.size.width as usize * 4;
-        let mut rgba = vec![0u8; row_bytes * self.size.height as usize];
-        for y in 0..self.size.height as usize {
-            let src = y * self.padded_bytes_per_row as usize;
-            let dst = y * row_bytes;
-            rgba[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
-        }
-        drop(data);
-        self.buffer.unmap();
-        Ok(DecodedFrame::new(
-            self.size.width,
-            self.size.height,
-            rgba,
-            // Compositor output is premultiplied (alpha-over result).
-            true,
-        ))
-    }
-}
-
-/// Encode the RT -> buffer copy (256-aligned rows) and return a pending readback
-/// to be finalized after `queue.submit`.
-fn read_back(
-    device: &wgpu::Device,
-    _queue: &wgpu::Queue,
-    encoder: &mut wgpu::CommandEncoder,
-    rt: &wgpu::Texture,
-    size: RenderSize,
-) -> Result<PendingReadback, RenderError> {
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let unpadded = size.width * 4;
-    let padded = unpadded.div_ceil(align) * align;
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("opentake-render readback"),
-        size: (padded * size.height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+/// Encode the target -> readback buffer copy (256-byte-aligned rows).
+fn encode_read_back(encoder: &mut wgpu::CommandEncoder, targets: &SizedTargets) {
+    let size = targets.size;
     encoder.copy_texture_to_buffer(
         wgpu::ImageCopyTexture {
-            texture: rt,
+            texture: &targets.target,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::ImageCopyBuffer {
-            buffer: &buffer,
+            buffer: &targets.readback,
             layout: wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(padded),
+                bytes_per_row: Some(targets.padded_bytes_per_row),
                 rows_per_image: Some(size.height),
             },
         },
@@ -837,9 +944,44 @@ fn read_back(
             depth_or_array_layers: 1,
         },
     );
-    Ok(PendingReadback {
-        buffer,
-        size,
-        padded_bytes_per_row: padded,
-    })
+}
+
+/// Map the readback buffer once `submission` completes, copy the tightly
+/// packed rows into the caller-owned frame, and unmap the buffer for reuse.
+fn finish_read_back(
+    device: &wgpu::Device,
+    submission: wgpu::SubmissionIndex,
+    targets: &SizedTargets,
+) -> Result<DecodedFrame, RenderError> {
+    let slice = targets.readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+    rx.recv()
+        .map_err(|_| RenderError::Readback("map channel closed".into()))?
+        .map_err(|e| RenderError::Readback(e.to_string()))?;
+
+    let size = targets.size;
+    let row_bytes = size.width as usize * 4;
+    let data = slice.get_mapped_range();
+    let rgba = if targets.padded_bytes_per_row as usize == row_bytes {
+        data[..row_bytes * size.height as usize].to_vec()
+    } else {
+        let mut rgba = Vec::with_capacity(row_bytes * size.height as usize);
+        for row in data.chunks(targets.padded_bytes_per_row as usize) {
+            rgba.extend_from_slice(&row[..row_bytes]);
+        }
+        rgba
+    };
+    drop(data);
+    targets.readback.unmap();
+    Ok(DecodedFrame::new(
+        size.width,
+        size.height,
+        rgba,
+        // Compositor output is premultiplied (alpha-over result).
+        true,
+    ))
 }

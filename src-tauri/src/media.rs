@@ -4199,7 +4199,7 @@ pub fn request_timeline_sprite(
                             image: frame,
                         });
                     }
-                    Ok(_) | Err(MediaError::Decode(_)) => continue,
+                    Ok(_) | Err(MediaError::Decode(_) | MediaError::NoFrameAt { .. }) => continue,
                     Err(MediaError::Cancelled) => {
                         context
                             .set_timeline_sprite_status(prewarm::TimelineSpriteStatus::Cancelled);

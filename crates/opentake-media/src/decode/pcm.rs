@@ -14,6 +14,7 @@
 //! The arg builder ([`pcm_args`]) and the sample conversions are pure and
 //! unit-tested; the extraction itself requires ffmpeg.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ExitStatus};
@@ -458,21 +459,21 @@ impl PcmBuffer {
 
 /// Build the ffmpeg arg list for decoding the first audio track to raw PCM on
 /// stdout, honoring an optional `[lo, hi)` absolute-seconds range.
-fn pcm_args(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+fn pcm_args(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
     if let Some((lo, hi)) = range {
         args.push("-ss".into());
-        args.push(format!("{:.6}", lo.max(0.0)));
+        args.push(format!("{:.6}", lo.max(0.0)).into());
         args.push("-to".into());
-        args.push(format!("{hi:.6}"));
+        args.push(format!("{hi:.6}").into());
     }
     args.push("-i".into());
-    args.push(path.to_string_lossy().into_owned());
+    args.push(path.as_os_str().to_owned());
     args.push("-vn".into()); // drop video
     args.push("-ac".into());
-    args.push(spec.channels.to_string());
+    args.push(spec.channels.to_string().into());
     args.push("-ar".into());
-    args.push(spec.sample_rate.to_string());
+    args.push(spec.sample_rate.to_string().into());
     args.push("-f".into());
     args.push(spec.format.ffmpeg_fmt().into());
     args.push("-".into());
@@ -484,18 +485,19 @@ fn bounded_pcm_args(
     spec: &PcmSpec,
     range: Option<(f64, f64)>,
     max_frames: usize,
-) -> Vec<String> {
+) -> Vec<OsString> {
     let mut args = pcm_args(path, spec, range);
     args.pop(); // stdout destination follows all output options
     args.extend([
-        "-af".into(),
+        OsString::from("-af"),
         // AAC decoders may retain a padded final packet beyond the container's
         // duration. Enforce the same frame budget as the stdout reader, after
         // conversion to the requested sample rate, without relaxing that cap.
         format!(
             "aresample={},atrim=end_sample={max_frames}",
             spec.sample_rate
-        ),
+        )
+        .into(),
         "-".into(),
     ]);
     args

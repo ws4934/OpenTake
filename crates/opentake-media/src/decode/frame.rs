@@ -10,6 +10,7 @@
 //! ffmpeg invocation requires the binary and is covered by ignore-by-default
 //! integration tests.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -440,7 +441,7 @@ pub fn fit_within(w: u32, h: u32, max: (u32, u32)) -> (u32, u32) {
 /// Build the ffmpeg arg list for decoding one frame to rawvideo RGBA on stdout.
 /// Pure so the exact CLI contract is testable.
 #[cfg(test)]
-fn frame_args(path: &Path, req: &FrameRequest) -> Vec<String> {
+fn frame_args(path: &Path, req: &FrameRequest) -> Vec<OsString> {
     frame_args_with_color(path, req, None)
 }
 
@@ -448,7 +449,7 @@ fn frame_args_with_color(
     path: &Path,
     req: &FrameRequest,
     color: Option<&MediaColorMetadata>,
-) -> Vec<String> {
+) -> Vec<OsString> {
     single_frame_args(path, req, color, FrameOutput::RawVideo)
 }
 
@@ -460,9 +461,9 @@ fn frame_args_with_color(
 pub(super) fn retained_frame_args(
     req: &FrameRequest,
     color: Option<&MediaColorMetadata>,
-) -> Vec<String> {
-    let mut args: Vec<String> = ["-hide_banner", "-nostats", "-loglevel", "info"]
-        .map(String::from)
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-hide_banner", "-nostats", "-loglevel", "info"]
+        .map(OsString::from)
         .to_vec();
     args.extend(single_frame_args(
         Path::new("fd:"),
@@ -487,7 +488,7 @@ fn single_frame_args(
     req: &FrameRequest,
     color: Option<&MediaColorMetadata>,
     output: FrameOutput,
-) -> Vec<String> {
+) -> Vec<OsString> {
     let time_secs = req.time_secs.max(0.0);
     let target_us = target_micros(req);
     let mut args = seek_input_args(path, time_secs, color);
@@ -514,15 +515,25 @@ fn single_frame_args(
 /// at/before `time_secs` with source timestamps kept (relative to the
 /// container start). Accurate seek is off because it drops every frame before
 /// the target, including the one still on screen at it.
-fn seek_input_args(path: &Path, time_secs: f64, color: Option<&MediaColorMetadata>) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+/// The path is passed as an `OsStr`, so a non-UTF-8 file name reaches ffmpeg
+/// byte for byte.
+fn seek_input_args(
+    path: &Path,
+    time_secs: f64,
+    color: Option<&MediaColorMetadata>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
     if let Some(color) = color {
-        args.extend(crate::color::hdr_decode_input_args(color));
+        args.extend(
+            crate::color::hdr_decode_input_args(color)
+                .into_iter()
+                .map(OsString::from),
+        );
     }
-    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(String::from));
-    args.push(format!("{time_secs:.6}"));
+    args.extend(["-noaccurate_seek", "-copyts", "-start_at_zero", "-ss"].map(OsString::from));
+    args.push(format!("{time_secs:.6}").into());
     args.push("-i".into());
-    args.push(path.to_string_lossy().into_owned());
+    args.push(path.as_os_str().to_owned());
     args
 }
 
@@ -560,16 +571,16 @@ fn push_conversion_filters(
     }
 }
 
-fn push_rgba_output_args(args: &mut Vec<String>, filters: &[String], output: FrameOutput) {
+fn push_rgba_output_args(args: &mut Vec<OsString>, filters: &[String], output: FrameOutput) {
     args.push("-vf".into());
-    args.push(filters.join(","));
+    args.push(filters.join(",").into());
     args.push("-fps_mode".into());
     args.push("passthrough".into());
     args.push("-pix_fmt".into());
     args.push("rgba".into());
     match output {
-        FrameOutput::RawVideo => args.extend(["-f", "rawvideo"].map(String::from)),
-        FrameOutput::Pam => args.extend(["-c:v", "pam", "-f", "image2pipe"].map(String::from)),
+        FrameOutput::RawVideo => args.extend(["-f", "rawvideo"].map(OsString::from)),
+        FrameOutput::Pam => args.extend(["-c:v", "pam", "-f", "image2pipe"].map(OsString::from)),
     }
     args.push("-".into());
 }
@@ -743,8 +754,9 @@ pub fn decode_frame_at_with_color_cancellable(
             if cancel.is_cancelled() {
                 return Err(MediaError::Cancelled);
             }
-            return result
-                .ok_or_else(|| MediaError::Decode(format!("no frame at {:.3}s", req.time_secs)));
+            return result.ok_or_else(|| MediaError::NoFrameAt {
+                time_secs: req.time_secs,
+            });
         }
         match child.as_inner_mut().try_wait() {
             Ok(Some(_)) => {
@@ -754,8 +766,8 @@ pub fn decode_frame_at_with_color_cancellable(
                 if cancel.is_cancelled() {
                     return Err(MediaError::Cancelled);
                 }
-                return result.ok_or_else(|| {
-                    MediaError::Decode(format!("no frame at {:.3}s", req.time_secs))
+                return result.ok_or_else(|| MediaError::NoFrameAt {
+                    time_secs: req.time_secs,
                 });
             }
             Ok(None) => thread::sleep(FRAME_CHILD_POLL_INTERVAL),
@@ -905,7 +917,7 @@ pub fn decode_frames_at_with_color_cancellable(
                 }
                 // A duplicate of an already-emitted frame, or an undecodable
                 // point: skip it.
-                Ok(_) | Err(MediaError::Decode(_)) => {}
+                Ok(_) | Err(MediaError::Decode(_) | MediaError::NoFrameAt { .. }) => {}
                 Err(MediaError::Cancelled) => {
                     out.push(Err(MediaError::Cancelled));
                     return out;
@@ -1054,11 +1066,11 @@ fn grid_frame_args(
     base: &FrameRequest,
     color: Option<&MediaColorMetadata>,
     run: &GridRun,
-) -> Vec<String> {
+) -> Vec<OsString> {
     let origin_secs = run.origin_us as f64 / MICROS_PER_SEC as f64;
     let mut args = seek_input_args(path, origin_secs, color);
     args.push("-frames:v".into());
-    args.push(run.slots.len().to_string());
+    args.push(run.slots.len().to_string().into());
     let mut filters: Vec<String> = vec![
         format!("settb=1/{MICROS_PER_SEC}"),
         "showinfo=checksum=0".to_string(),
@@ -1180,10 +1192,9 @@ fn decode_grid_run(
         return Err(MediaError::Cancelled);
     }
     if frames.is_empty() {
-        return Err(MediaError::Decode(format!(
-            "no frame at {:.3}s",
-            run.origin_us as f64 / MICROS_PER_SEC as f64
-        )));
+        return Err(MediaError::NoFrameAt {
+            time_secs: run.origin_us as f64 / MICROS_PER_SEC as f64,
+        });
     }
     pts.sort_unstable();
     Ok(frames
@@ -1373,7 +1384,7 @@ mod tests {
             assert!(at < ss, "{flag} must be an input option");
         }
         let vf = args.iter().position(|a| a == "-vf").unwrap();
-        assert!(args[vf + 1].starts_with(
+        assert!(args[vf + 1].to_str().unwrap().starts_with(
             "settb=1/1000000,showinfo=checksum=0,setpts=PTS-5000000,fps=fps=1:start_time=0:round=up"
         ));
         assert!(args.windows(2).any(|w| w == ["-fps_mode", "passthrough"]));
@@ -1387,7 +1398,9 @@ mod tests {
         );
         let ss0 = negative.iter().position(|a| a == "-ss").unwrap();
         assert_eq!(negative[ss0 + 1], "0.000000");
-        assert!(negative.iter().any(|a| a.contains("setpts=PTS-0,")));
+        assert!(negative
+            .iter()
+            .any(|a| a.to_str().unwrap().contains("setpts=PTS-0,")));
     }
 
     #[test]
@@ -1403,7 +1416,9 @@ mod tests {
         let input = args.windows(2).position(|w| w == ["-i", "fd:"]).unwrap();
         assert!(ss < input, "the retained handle seeks like a pathname");
         assert_eq!(args[ss + 1], "2.000000");
-        assert!(args.iter().any(|a| a.contains("setpts=PTS-2000000")));
+        assert!(args
+            .iter()
+            .any(|a| a.to_str().unwrap().contains("setpts=PTS-2000000")));
         assert!(args.windows(2).any(|w| w == ["-c:v", "pam"]));
         assert!(args.windows(2).any(|w| w == ["-f", "image2pipe"]));
         assert!(!args.iter().any(|a| a == "rawvideo"));
@@ -1486,7 +1501,7 @@ mod tests {
     #[test]
     fn frame_args_adds_scale_filter_only_when_boxed() {
         let plain = frame_args(Path::new("/x.mp4"), &FrameRequest::default());
-        assert!(!plain.iter().any(|a| a.contains("scale=")));
+        assert!(!plain.iter().any(|a| a.to_str().unwrap().contains("scale=")));
 
         let boxed = frame_args(
             Path::new("/x.mp4"),
@@ -1496,9 +1511,12 @@ mod tests {
             },
         );
         let vf = boxed.iter().position(|a| a == "-vf").unwrap();
-        assert!(boxed[vf + 1].contains("force_original_aspect_ratio=decrease"));
-        assert!(boxed[vf + 1].contains("w=120"));
-        assert!(boxed[vf + 1].contains("h=68"));
+        assert!(boxed[vf + 1]
+            .to_str()
+            .unwrap()
+            .contains("force_original_aspect_ratio=decrease"));
+        assert!(boxed[vf + 1].to_str().unwrap().contains("w=120"));
+        assert!(boxed[vf + 1].to_str().unwrap().contains("h=68"));
     }
 
     // --- batched decode planning ---

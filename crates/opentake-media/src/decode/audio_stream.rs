@@ -9,6 +9,8 @@
 //! This is the one-shot preload form (decode a clip's window up front); the
 //! chunked / background streaming form is the remaining half of #160.
 
+#[cfg(test)]
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::cancel::MediaCancelToken;
@@ -21,28 +23,28 @@ use crate::error::Result;
 /// on stdout, honoring an optional `[lo, hi)` absolute-seconds range. Mirrors
 /// `pcm::pcm_args` but is kept self-contained (no shared mono path).
 #[cfg(test)]
-fn interleaved_args(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+fn interleaved_args(path: &Path, spec: &PcmSpec, range: Option<(f64, f64)>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
     if let Some((lo, hi)) = range {
         args.push("-ss".into());
-        args.push(format!("{:.6}", lo.max(0.0)));
+        args.push(format!("{:.6}", lo.max(0.0)).into());
         args.push("-to".into());
-        args.push(format!("{hi:.6}"));
+        args.push(format!("{hi:.6}").into());
     }
     args.push("-i".into());
-    args.push(path.to_string_lossy().into_owned());
+    args.push(path.as_os_str().to_owned());
     args.push("-vn".into()); // drop video
     args.push("-ac".into());
-    args.push(spec.channels.to_string());
+    args.push(spec.channels.to_string().into());
     args.push("-ar".into());
-    args.push(spec.sample_rate.to_string());
+    args.push(spec.sample_rate.to_string().into());
     args.push("-f".into());
     args.push(
         match spec.format {
             PcmFormat::F32 => "f32le",
             PcmFormat::S16Le => "s16le",
         }
-        .to_string(),
+        .into(),
     );
     args.push("-".into());
     args

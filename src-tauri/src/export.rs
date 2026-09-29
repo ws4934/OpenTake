@@ -89,8 +89,20 @@ use opentake_render::{rasterize_text_layer, text_clip_raster_input, text_draws_g
 
 /// Per-frame texture cache size. Export advances monotonically, so video-frame
 /// hit rate is low; a small cache still helps text/image layers re-used across
-/// frames. Bounds VRAM during the export loop.
+/// frames. Bounds VRAM during the export loop together with
+/// [`TEXTURE_CACHE_BYTE_BUDGET`].
 const TEXTURE_CACHE_CAP: usize = 64;
+/// Texture bytes the export cache may hold. The entry cap alone let 64 4K
+/// video frames (about 2.1 GB) accumulate; this keeps 16 of them, still
+/// enough for slow motion and freeze frames to reuse recent source frames.
+const TEXTURE_CACHE_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Peak texture-cache bytes of the last export run on this thread.
+    static LAST_EXPORT_TEXTURE_PEAK: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
 const AUDIO_STREAM_WINDOW_SAMPLES: usize = MIX_SAMPLE_RATE as usize * 2;
 
 /// Requested output codec, projected from the front-end.
@@ -822,9 +834,7 @@ impl MediaResolver<'_> {
             // dropping the whole layer to black.
             match decode(next_index) {
                 Ok(frame) => frame,
-                Err(opentake_media::MediaError::Decode(message))
-                    if message.starts_with("no frame at ") && info.path.is_file() =>
-                {
+                Err(opentake_media::MediaError::NoFrameAt { .. }) if info.path.is_file() => {
                     first.clone()
                 }
                 Err(error) => {
@@ -1057,6 +1067,10 @@ fn project_media(
 /// or acquiring a GPU. A missing silent video must fail just as early as a
 /// missing video with an audio track. The resolver still reports failures that
 /// happen later (including a source removed during export).
+///
+/// Every probe and frame decode is one step of `on_progress(done, total)`,
+/// so a project with many sources shows progress instead of sitting at 0%.
+#[allow(clippy::too_many_arguments)]
 fn preflight_export_sources(
     plan: &RenderPlan,
     manifest: &opentake_domain::MediaManifest,
@@ -1065,6 +1079,7 @@ fn preflight_export_sources(
     end_frame: i32,
     control: Option<&ExportControl>,
     external_cancel: Option<&MediaCancelToken>,
+    on_progress: &dyn Fn(usize, usize),
 ) -> Result<(), String> {
     let names: HashMap<&str, &str> = manifest
         .entries
@@ -1099,10 +1114,24 @@ fn preflight_export_sources(
                 })
                 .map(|audio| (audio.clip.media_ref.as_str(), ClipType::Audio, None)),
         );
+    let sources: Vec<_> = sources
+        .filter(|(media_ref, _, _)| checked.insert(*media_ref))
+        .collect();
+    // A probe per source, plus a frame decode per visual source.
+    let total = sources
+        .iter()
+        .map(|(_, kind, _)| match kind {
+            ClipType::Lottie => 0,
+            ClipType::Audio => 1,
+            _ => 2,
+        })
+        .sum::<usize>();
+    let mut done = 0;
+    let mut step = || {
+        done += 1;
+        on_progress(done, total);
+    };
     for (media_ref, kind, first_frame) in sources {
-        if !checked.insert(media_ref) {
-            continue;
-        }
         check_audio_cancel_with_external(control, external_cancel)?;
         let label = match names.get(media_ref) {
             Some(name) => format!("{name} ({media_ref})"),
@@ -1124,6 +1153,7 @@ fn preflight_export_sources(
         }
         let probe = opentake_media::probe::probe(&info.path)
             .map_err(|error| format!("export source {label} cannot be probed: {error}"))?;
+        step();
         if kind == ClipType::Audio {
             if !probe.has_audio {
                 return Err(format!("export audio source {label} has no audio stream"));
@@ -1142,6 +1172,7 @@ fn preflight_export_sources(
         };
         decode_frame_at(&info.path, &request)
             .map_err(|error| format!("export source {label} cannot be decoded: {error}"))?;
+        step();
     }
     Ok(())
 }
@@ -1164,6 +1195,9 @@ const AUDIO_MIX_END: i32 = 980;
 const AUDIO_WAV_START: i32 = AUDIO_MIX_END;
 const AUDIO_WAV_END: i32 = 990;
 const AUDIO_CANCEL_CHUNK_SAMPLES: usize = 8 * 1024;
+/// Progress reached when every export source has been probed and decoded
+/// once; frame rendering starts here.
+const PREFLIGHT_END: i32 = 20;
 const VIDEO_RENDER_END: i32 = 550;
 const VIDEO_AUDIO_END: i32 = 800;
 const VIDEO_FINALIZE_END: i32 = 980;
@@ -1491,6 +1525,37 @@ impl ProgressThrottle {
             self.reported = Some((now, value));
         }
         admit
+    }
+}
+
+/// Maps the encoder's finalize progress (first pass, mux, copy) onto the
+/// export's `VIDEO_AUDIO_END..VIDEO_FINALIZE_END` span and forwards it
+/// through a [`ProgressThrottle`]: a copy reports every 64 KiB, which would
+/// otherwise be thousands of identical events for a large movie.
+struct FinalizeProgress {
+    emit: AudioExportProgress,
+    throttle: std::cell::RefCell<ProgressThrottle>,
+}
+
+impl FinalizeProgress {
+    fn new(emit: AudioExportProgress, interval: Duration) -> Self {
+        FinalizeProgress {
+            emit,
+            throttle: std::cell::RefCell::new(ProgressThrottle::new(interval, VIDEO_FINALIZE_END)),
+        }
+    }
+
+    fn report(&self, done: usize, total: usize) {
+        self.report_at(done, total, Instant::now());
+    }
+
+    fn report_at(&self, done: usize, total: usize, now: Instant) {
+        let span = (VIDEO_FINALIZE_END - VIDEO_AUDIO_END) as usize;
+        let mapped =
+            VIDEO_AUDIO_END + (done.min(total.max(1)).saturating_mul(span) / total.max(1)) as i32;
+        if self.throttle.borrow_mut().admit(mapped, now) {
+            (self.emit)(mapped, AUDIO_PROGRESS_TOTAL);
+        }
     }
 }
 
@@ -1911,6 +1976,10 @@ pub(crate) struct ExportRunOptions<'a> {
 /// Only a completely encoded and validated file replaces the user's target.
 /// The guard removes its own temporary inode on failure or cancellation;
 /// reserved project-media outputs retain their separate owner.
+///
+/// The private file is either reserved here (`open_output_file`) or adopted
+/// from the encoder's workspace next to the target (`adopt_encoded`), which
+/// the encoder left there so the movie is published by rename, not copied.
 struct ExportOutputCleanup {
     path: PathBuf,
     enabled: bool,
@@ -1921,6 +1990,9 @@ struct ExportOutputCleanup {
     final_name: Option<OsString>,
     partial_name: Option<OsString>,
     target_identity: Option<ExportTargetIdentity>,
+    // Declared last: dropped after `file`, so its workspace is removed only
+    // once every handle of an unpublished result is closed.
+    adopted: Option<opentake_media::encode::EncodedFile>,
 }
 
 impl ExportOutputCleanup {
@@ -1936,6 +2008,7 @@ impl ExportOutputCleanup {
                 final_name: None,
                 partial_name: None,
                 target_identity: None,
+                adopted: None,
             });
         }
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1955,7 +2028,36 @@ impl ExportOutputCleanup {
             final_name: Some(final_name),
             partial_name: None,
             target_identity,
+            adopted: None,
         })
+    }
+
+    /// Take over a finished encode from its workspace next to the target as
+    /// this export's private file: verified, published and cleaned up like a
+    /// reserved one, through its retained handles.
+    fn adopt_encoded(
+        &mut self,
+        encoded: opentake_media::encode::EncodedFile,
+    ) -> Result<(), String> {
+        if !self.enabled || self.file.is_some() || self.partial_name.is_some() {
+            return Err("export output already has a private file".to_string());
+        }
+        let file = encoded
+            .file()
+            .try_clone()
+            .map_err(|error| format!("clone encoded export: {error}"))?;
+        self.file = Some(file);
+        self.partial_name = Some(encoded.name().to_os_string());
+        self.adopted = Some(encoded);
+        Ok(())
+    }
+
+    /// The retained directory holding the private file.
+    fn partial_directory(&self) -> Option<&File> {
+        match &self.adopted {
+            Some(encoded) => Some(encoded.directory()),
+            None => self.directory.as_ref(),
+        }
     }
 
     fn attach_output(&mut self, output: File) {
@@ -1964,6 +2066,11 @@ impl ExportOutputCleanup {
         self.file = Some(output);
     }
 
+    /// Reserve a private file directly in the retained target directory.
+    /// Production exports adopt the encoder's result instead
+    /// ([`Self::adopt_encoded`]); tests use this to drive the shared
+    /// verification, publishing and cleanup with hand-written contents.
+    #[cfg(test)]
     fn open_output_file(&mut self) -> Result<File, String> {
         let directory = self
             .directory
@@ -1998,6 +2105,9 @@ impl ExportOutputCleanup {
     }
 
     fn partial_path(&self) -> Result<PathBuf, String> {
+        if let Some(encoded) = &self.adopted {
+            return Ok(encoded.path());
+        }
         Ok(self.path.parent().unwrap_or_else(|| Path::new(".")).join(
             self.partial_name
                 .as_ref()
@@ -2027,14 +2137,22 @@ impl ExportOutputCleanup {
             file.sync_all()
                 .map_err(|error| format!("sync completed export: {error}"))?;
             replace_export_file(
-                directory,
-                file,
-                self.partial_name
-                    .as_ref()
-                    .expect("enabled export has a partial name"),
-                self.final_name
-                    .as_ref()
-                    .expect("enabled export has a target name"),
+                ExportRename {
+                    source_directory: self
+                        .partial_directory()
+                        .expect("enabled export has a directory"),
+                    directory,
+                    file,
+                    temporary: self
+                        .partial_name
+                        .as_ref()
+                        .expect("enabled export has a partial name"),
+                    final_name: self
+                        .final_name
+                        .as_ref()
+                        .expect("enabled export has a target name"),
+                },
+                &self.partial_path()?,
                 &self.path,
             )
             .map_err(|error| format!("publish completed export: {error}"))?;
@@ -2081,6 +2199,25 @@ impl ExportOutputCleanup {
         if visible_directory != retained_directory {
             return Err("export output parent changed during export".to_string());
         }
+        if let Some(encoded) = &self.adopted {
+            let visible_workspace = std::fs::symlink_metadata(encoded.directory_path())
+                .map_err(|error| format!("identify visible encode workspace: {error}"))?;
+            if metadata_is_symlink_or_reparse(&visible_workspace) || !visible_workspace.is_dir() {
+                return Err("encode workspace must remain a real directory".to_string());
+            }
+            let visible = FileIdentity::from_path(encoded.directory_path())
+                .map_err(|error| format!("identify visible encode workspace: {error}"))?;
+            let retained = FileIdentity::from_file(
+                encoded
+                    .directory()
+                    .try_clone()
+                    .map_err(|error| format!("clone retained encode workspace: {error}"))?,
+            )
+            .map_err(|error| format!("identify retained encode workspace: {error}"))?;
+            if visible != retained {
+                return Err("encode workspace changed during export".to_string());
+            }
+        }
         self.verify_target_identity()?;
         let partial_path = self.partial_path()?;
         let visible_file_metadata = std::fs::symlink_metadata(&partial_path)
@@ -2115,7 +2252,7 @@ impl Drop for ExportOutputCleanup {
     fn drop(&mut self) {
         if self.enabled && self.active && !self.succeeded {
             if let (Some(directory), Some(file), Some(partial_name)) =
-                (&self.directory, &self.file, &self.partial_name)
+                (self.partial_directory(), &self.file, &self.partial_name)
             {
                 if let Err(error) =
                     destroy_and_remove_reserved_output(directory, file, partial_name)
@@ -2167,6 +2304,8 @@ pub(crate) fn run_export_with_control(
             (lo, hi)
         }
     };
+    let preflight_throttle =
+        std::cell::RefCell::new(ProgressThrottle::new(PROGRESS_INTERVAL, PREFLIGHT_END));
     preflight_export_sources(
         &plan,
         manifest,
@@ -2175,6 +2314,18 @@ pub(crate) fn run_export_with_control(
         end_frame,
         control,
         external_cancel.as_ref(),
+        &|done, total| {
+            let Some(emit) = &on_progress else {
+                return;
+            };
+            let mapped = (done.min(total.max(1)) * PREFLIGHT_END as usize / total.max(1)) as i32;
+            if preflight_throttle
+                .borrow_mut()
+                .admit(mapped, Instant::now())
+            {
+                emit(mapped, AUDIO_PROGRESS_TOTAL);
+            }
+        },
     )?;
     let project_root = project_dir
         .as_ref()
@@ -2203,27 +2354,37 @@ pub(crate) fn run_export_with_control(
     // Declare this before the encoder so Rust drops the encoder first (which
     // reaps ffmpeg) and only then removes an error/cancelled partial output.
     let mut output_cleanup = ExportOutputCleanup::new(out_path.clone(), !reserved_output)?;
-    let output = match options.output_file.take() {
-        Some(output) => output,
-        None => output_cleanup.open_output_file()?,
-    };
-    output_cleanup.attach_output(output);
-    let encoder_output = output_cleanup.encoder_file()?;
-    let mut encoder = VideoEncoder::new_with_file(
-        &out_path,
-        encoder_output,
-        render_size.width,
-        render_size.height,
-        plan.fps,
-        &preset,
-    )
+    // An ordinary export encodes in a private workspace next to the target
+    // and publishes the result by rename; a reserved output belongs to its
+    // outer owner and receives a copy through its retained handle.
+    let mut encoder = match options.output_file.take() {
+        Some(output) => {
+            output_cleanup.attach_output(output);
+            VideoEncoder::new_with_file(
+                &out_path,
+                output_cleanup.encoder_file()?,
+                render_size.width,
+                render_size.height,
+                plan.fps,
+                &preset,
+            )
+        }
+        None => VideoEncoder::new_in_workspace(
+            &out_path,
+            render_size.width,
+            render_size.height,
+            plan.fps,
+            &preset,
+        ),
+    }
     .map_err(|e| format!("encoder init failed: {e}"))?;
 
     let range_total = end_frame - start_frame;
 
     let mut last_progress_emit = Instant::now();
     let mut lut_cache = HashMap::new();
-    let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
+    let mut texture_cache =
+        TextureCache::with_byte_budget(TEXTURE_CACHE_CAP, TEXTURE_CACHE_BYTE_BUDGET);
     let mut lottie = LottieMaterializer::new();
     let mut content_hashes = ContentHashCache::new();
     let mut video_streams = ExportVideoStreams::default();
@@ -2299,13 +2460,18 @@ pub(crate) fn run_export_with_control(
                 let mapped = if range_total == 0 {
                     VIDEO_RENDER_END
                 } else {
-                    done.saturating_mul(VIDEO_RENDER_END) / range_total
+                    PREFLIGHT_END
+                        + done.saturating_mul(VIDEO_RENDER_END - PREFLIGHT_END) / range_total
                 };
                 emit(mapped, AUDIO_PROGRESS_TOTAL);
                 last_progress_emit = now;
             }
         }
     }
+
+    #[cfg(test)]
+    LAST_EXPORT_TEXTURE_PEAK.with(|peak| peak.set(Some(texture_cache.peak_bytes())));
+    drop(texture_cache);
 
     // Decode + linearly mix every audio-bearing clip in bounded windows, then
     // append each window to the encoder's private PCM spool. `finish` muxes that
@@ -2341,22 +2507,25 @@ pub(crate) fn run_export_with_control(
                 .map_err(|error| format!("audio spool failed: {error}"))
         },
     )?;
-    let finalize_progress = on_progress.as_ref().map(|emit| {
-        let emit = Arc::clone(emit);
-        move |done: usize, total: usize| {
-            let span = (VIDEO_FINALIZE_END - VIDEO_AUDIO_END) as usize;
-            let mapped = VIDEO_AUDIO_END
-                + (done.min(total.max(1)).saturating_mul(span) / total.max(1)) as i32;
-            emit(mapped, AUDIO_PROGRESS_TOTAL);
-        }
-    });
-    match encoder.finish_cancellable(
-        &cancel,
-        finalize_progress
-            .as_ref()
-            .map(|callback| callback as &opentake_media::encode::EncodeProgressCallback),
-    ) {
-        Ok(()) => {}
+    let finalize_progress = on_progress
+        .as_ref()
+        .map(|emit| FinalizeProgress::new(Arc::clone(emit), PROGRESS_INTERVAL))
+        .map(|progress| move |done: usize, total: usize| progress.report(done, total));
+    let finalize_progress = finalize_progress
+        .as_ref()
+        .map(|callback| callback as &opentake_media::encode::EncodeProgressCallback);
+    let finished = if reserved_output {
+        encoder
+            .finish_cancellable(&cancel, finalize_progress)
+            .map(|()| None)
+    } else {
+        encoder
+            .finish_in_workspace(&cancel, finalize_progress)
+            .map(Some)
+    };
+    match finished {
+        Ok(Some(encoded)) => output_cleanup.adopt_encoded(encoded)?,
+        Ok(None) => {}
         Err(opentake_media::MediaError::Cancelled) => {
             return Err(CANCELLED_SENTINEL.to_string());
         }
@@ -2892,27 +3061,42 @@ impl ExportFileKey {
     }
 }
 
+/// The retained authorities of a publishing rename: `temporary` inside
+/// `source_directory` (the target's directory for a reserved private file,
+/// the encode workspace for an adopted one) replaces `final_name` inside
+/// `directory`. `file` is the retained handle of the temporary file.
+struct ExportRename<'a> {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    source_directory: &'a File,
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    directory: &'a File,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    file: &'a File,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    temporary: &'a std::ffi::OsStr,
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    final_name: &'a std::ffi::OsStr,
+}
+
 #[cfg(unix)]
 fn replace_export_file(
-    directory: &File,
-    _file: &File,
-    temporary: &std::ffi::OsStr,
-    final_name: &std::ffi::OsStr,
+    rename: ExportRename<'_>,
+    _temporary_path: &Path,
     _final_path: &Path,
 ) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
-    let temporary = CString::new(temporary.as_bytes())
+    let temporary = CString::new(rename.temporary.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "partial name contains NUL"))?;
-    let final_name = CString::new(final_name.as_bytes())
+    let final_name = CString::new(rename.final_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name contains NUL"))?;
-    // Both names are single components of the retained no-follow directory.
+    // Both names are single components of retained no-follow directories.
     let replaced = unsafe {
         libc::renameat(
-            directory.as_raw_fd(),
+            rename.source_directory.as_raw_fd(),
             temporary.as_ptr(),
-            directory.as_raw_fd(),
+            rename.directory.as_raw_fd(),
             final_name.as_ptr(),
         )
     };
@@ -2925,12 +3109,18 @@ fn replace_export_file(
 
 #[cfg(windows)]
 fn replace_export_file(
-    directory: &File,
-    file: &File,
-    _temporary: &std::ffi::OsStr,
-    final_name: &std::ffi::OsStr,
+    rename: ExportRename<'_>,
+    _temporary_path: &Path,
     _final_path: &Path,
 ) -> io::Result<()> {
+    // The rename goes through the retained file handle, so its source
+    // directory needs no handle of its own.
+    let ExportRename {
+        directory,
+        file,
+        final_name,
+        ..
+    } = rename;
     use windows_sys::Wdk::Storage::FileSystem::{
         FileRenameInformation, FileRenameInformationEx, FILE_RENAME_POSIX_SEMANTICS,
         FILE_RENAME_REPLACE_IF_EXISTS,
@@ -3035,13 +3225,11 @@ fn rename_retained_file(
 
 #[cfg(not(any(unix, windows)))]
 fn replace_export_file(
-    _directory: &File,
-    _file: &File,
-    temporary: &std::ffi::OsStr,
-    _final_name: &std::ffi::OsStr,
+    _rename: ExportRename<'_>,
+    temporary_path: &Path,
     final_path: &Path,
 ) -> io::Result<()> {
-    std::fs::rename(final_path.with_file_name(temporary), final_path)
+    std::fs::rename(temporary_path, final_path)
 }
 
 #[cfg(unix)]
@@ -3937,6 +4125,183 @@ mod tests {
         assert_eq!(worker.join().unwrap(), Err(CANCELLED_SENTINEL.to_string()));
         assert_eq!(cancelled, Ok(true));
         assert!(elapsed < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn uhd_export_keeps_the_texture_cache_within_its_byte_budget() {
+        use std::process::Command;
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!("SKIP: ffmpeg sidecars are required for the 4K export test");
+            return;
+        }
+        if RenderDevice::try_new().is_err() {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "OPENTAKE_REQUIRE_GPU is set but no GPU adapter was found"
+            );
+            eprintln!("SKIP: no GPU adapter for the 4K export test");
+            return;
+        }
+        // 24 distinct 4K frames: 759 MiB of video textures, more than the
+        // budget, and fewer entries than the count cap.
+        let frames = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("uhd.mp4");
+        let status = Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=3840x2160:rate=30")
+            .args(["-frames:v", &frames.to_string()])
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg("-y")
+            .arg(&source)
+            .status()
+            .expect("generate the 4K fixture with FFmpeg");
+        assert!(status.success(), "4K fixture must encode");
+
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        timeline.width = 3840;
+        timeline.height = 2160;
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("uhd", "uhd-source", 0, frames));
+        timeline.tracks.push(track);
+        let mut manifest = opentake_domain::MediaManifest::default();
+        manifest.entries.push(opentake_domain::MediaManifestEntry {
+            id: "uhd-source".into(),
+            name: "uhd.mp4".into(),
+            kind: ClipType::Video,
+            source: opentake_domain::MediaSource::External {
+                absolute_path: source.to_string_lossy().into_owned(),
+            },
+            duration: f64::from(frames) / 30.0,
+            generation_input: None,
+            source_width: Some(3840),
+            source_height: Some(2160),
+            source_fps: Some(30.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        });
+        let output = dir.path().join("uhd-export.mp4");
+        LAST_EXPORT_TEXTURE_PEAK.with(|peak| peak.set(None));
+        let summary = run_export_with_control(
+            &timeline,
+            &manifest,
+            &None,
+            &ExportRequest {
+                out_path: output.to_string_lossy().into_owned(),
+                codec: ExportCodec::H264,
+                quality: ExportQuality::P4k,
+            },
+            ExportRunOptions::default(),
+        )
+        .expect("4K export");
+        assert_eq!((summary.width, summary.height), (3840, 2160));
+        assert_eq!(summary.frame_count, frames);
+
+        let peak = LAST_EXPORT_TEXTURE_PEAK
+            .with(std::cell::Cell::get)
+            .expect("the export records its cache peak");
+        let frame_bytes = 3840 * 2160 * 4;
+        assert!(peak <= TEXTURE_CACHE_BYTE_BUDGET, "peak {peak} bytes");
+        assert!(
+            peak > TEXTURE_CACHE_BYTE_BUDGET - frame_bytes,
+            "the budget, not the entry cap, bounded the cache: peak {peak} bytes"
+        );
+    }
+
+    #[test]
+    fn preflight_reports_a_step_per_probe_and_decode() {
+        use std::process::Command;
+
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            eprintln!("SKIP: ffmpeg sidecars are required for the preflight test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.fps = 30;
+        timeline.width = 64;
+        timeline.height = 64;
+        let mut media = HashMap::new();
+        let mut sizes = HashMap::new();
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        for (index, id) in ["first", "second"].into_iter().enumerate() {
+            let source = dir.path().join(format!("{id}.mp4"));
+            let status = Command::new(opentake_media::ffmpeg_status::ffmpeg_path())
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=30",
+                ])
+                .args([
+                    "-frames:v",
+                    "10",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-y",
+                ])
+                .arg(&source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            // A second clip of the same source is checked once.
+            for copy in 0..2 {
+                let start = (index as i32 * 2 + copy) * 10;
+                track
+                    .clips
+                    .push(Clip::new(format!("{id}-{copy}"), id, start, 10));
+            }
+            sizes.insert(id.to_string(), (64, 64));
+            media.insert(
+                id.to_string(),
+                MediaInfo {
+                    path: source,
+                    source_fps: Some(30.0),
+                },
+            );
+        }
+        timeline.tracks.push(track);
+        let plan = try_build_render_plan(
+            &timeline,
+            opentake_render::RenderSize::new(64, 64),
+            &ManifestMetrics { sizes },
+        )
+        .unwrap();
+        let reports = std::cell::RefCell::new(Vec::new());
+        preflight_export_sources(
+            &plan,
+            &opentake_domain::MediaManifest::default(),
+            &media,
+            0,
+            plan.total_frames,
+            None,
+            None,
+            &|done, total| reports.borrow_mut().push((done, total)),
+        )
+        .unwrap();
+        // Two sources, each probed and decoded once.
+        assert_eq!(reports.into_inner(), [(1, 4), (2, 4), (3, 4), (4, 4)]);
     }
 
     #[test]
@@ -5156,6 +5521,147 @@ mod tests {
         assert_ne!(identify_export_target(&output).unwrap(), previous_identity);
         assert!(!partial.exists());
         assert!(opentake_media::probe::probe(&output).unwrap().has_video);
+    }
+
+    fn directory_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn encode_in_workspace(output: &Path) -> opentake_media::encode::EncodedFile {
+        let preset = resolve_preset(ExportCodec::H264, ExportQuality::P720, output).unwrap();
+        let mut encoder = VideoEncoder::new_in_workspace(output, 64, 64, 30, &preset).unwrap();
+        for _ in 0..3 {
+            encoder.push_frame(&RgbaFrame::black(64, 64)).unwrap();
+        }
+        encoder
+            .finish_in_workspace(&MediaCancelToken::new(), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn workspace_encode_is_published_by_rename_over_the_previous_movie() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous complete export").unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let encoded = encode_in_workspace(&output);
+        let workspace = encoded.directory_path().to_path_buf();
+        assert_eq!(workspace.parent(), Some(project.path()));
+        let encoded_identity =
+            FileIdentity::from_file(encoded.file().try_clone().unwrap()).unwrap();
+        cleanup.adopt_encoded(encoded).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
+
+        assert!(cleanup.probe_output().unwrap().has_video);
+        cleanup.verify_visible_identity().unwrap();
+        cleanup.publish().unwrap();
+        // Published by rename: the target is the inode FFmpeg wrote. Release
+        // the extra DELETE-capable Windows handle before the external probe.
+        assert_eq!(FileIdentity::from_path(&output).unwrap(), encoded_identity);
+        drop(encoded_identity);
+        drop(cleanup);
+
+        assert_ne!(identify_export_target(&output).unwrap(), previous_identity);
+        assert!(!workspace.exists());
+        assert_eq!(directory_entries(project.path()), ["final.mp4"]);
+        assert!(opentake_media::probe::probe(&output).unwrap().has_video);
+    }
+
+    #[test]
+    fn unpublished_workspace_encode_keeps_the_previous_movie() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous complete export").unwrap();
+        let previous_identity = identify_export_target(&output).unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let encoded = encode_in_workspace(&output);
+        let encoded_path = encoded.path();
+        cleanup.adopt_encoded(encoded).unwrap();
+        // A failure or cancellation after encoding drops the guard unpublished.
+        drop(cleanup);
+
+        assert_eq!(fs::read(&output).unwrap(), b"previous complete export");
+        assert_eq!(identify_export_target(&output).unwrap(), previous_identity);
+        assert!(!encoded_path.exists());
+        assert_eq!(directory_entries(project.path()), ["final.mp4"]);
+    }
+
+    #[test]
+    fn workspace_encode_is_not_published_over_a_replaced_target() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        fs::write(&output, b"previous export").unwrap();
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        cleanup.adopt_encoded(encode_in_workspace(&output)).unwrap();
+        fs::remove_file(&output).unwrap();
+        fs::write(&output, b"other writer's export").unwrap();
+
+        assert!(cleanup.publish().is_err());
+        drop(cleanup);
+        assert_eq!(fs::read(&output).unwrap(), b"other writer's export");
+        assert_eq!(directory_entries(project.path()), ["final.mp4"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_encode_rejects_a_replaced_workspace() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("final.mp4");
+        let mut cleanup = ExportOutputCleanup::new(output.clone(), true).unwrap();
+        let encoded = encode_in_workspace(&output);
+        let workspace = encoded.directory_path().to_path_buf();
+        let name = encoded.name().to_os_string();
+        cleanup.adopt_encoded(encoded).unwrap();
+        let moved = project.path().join("moved-workspace");
+        fs::rename(&workspace, &moved).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join(&name), b"replacement").unwrap();
+
+        assert!(cleanup.verify_visible_identity().is_err());
+        assert!(cleanup.publish().is_err());
+        drop(cleanup);
+        assert!(!output.exists(), "nothing was published");
+        assert!(
+            !moved.join(&name).exists(),
+            "the retained encode was removed through its own directory"
+        );
+        assert_eq!(fs::read(workspace.join(&name)).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn finalize_progress_is_throttled_and_ends_at_the_final_value() {
+        // A 128 MiB copy reports every 64 KiB: 2,048 reports across the copy
+        // span, then the completion value, replayed over 1.5 s.
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&emitted);
+        let emit: AudioExportProgress = Arc::new(move |done, total| {
+            recorded.lock().unwrap().push((done, total));
+        });
+        let progress = FinalizeProgress::new(emit, PROGRESS_INTERVAL);
+        let start = Instant::now();
+        let elapsed = Duration::from_millis(1_500);
+        let chunks = 2_048_u64;
+        for chunk in 1..=chunks {
+            let now = start + elapsed.mul_f64(chunk as f64 / chunks as f64);
+            let done = 900 + (chunk * 100 / chunks) as usize;
+            progress.report_at(done.min(999), 1_000, now);
+        }
+        progress.report_at(1_000, 1_000, start + elapsed);
+
+        let emitted = emitted.lock().unwrap().clone();
+        let bound = (elapsed.as_millis() / PROGRESS_INTERVAL.as_millis()) as usize + 2;
+        assert!(emitted.len() <= bound, "{} events", emitted.len());
+        assert_eq!(
+            emitted.last(),
+            Some(&(VIDEO_FINALIZE_END, AUDIO_PROGRESS_TOTAL))
+        );
+        assert!(emitted.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
 
     #[test]

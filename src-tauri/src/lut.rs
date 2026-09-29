@@ -132,24 +132,52 @@ pub(crate) fn resolve_project_lut(
     let Some(root) = root else {
         return Ok(None);
     };
-    let filename = format!("{}.cube", reference.id);
+    let filename = managed_lut_filename(reference);
     let bytes = root
         .read_lut(&filename, CubeLut::MAX_BYTES)
         .map_err(|error| RenderError::InvalidLut(error.to_string()))?
         .ok_or_else(|| RenderError::MissingLut(reference.id.clone()))?;
-    if sha256_hex(&bytes) != reference.id {
+    upload_verified_lut(&bytes, reference, device, queue, label).map(Some)
+}
+
+/// File name of a managed LUT inside the bundle's `media/luts` directory.
+pub(crate) fn managed_lut_filename(reference: &LutReference) -> String {
+    format!("{}.cube", reference.id)
+}
+
+/// Resolve a LUT from bytes that were read through the session's retained
+/// project root when the strict compositor's sources were authorized. The
+/// bytes are hash-checked here exactly like a managed read, so a LUT that was
+/// tampered with before authorization still fails.
+pub(crate) fn resolve_authorized_lut(
+    authorized: &std::collections::HashMap<String, Vec<u8>>,
+    reference: &LutReference,
+    device: &opentake_render::wgpu::Device,
+    queue: &opentake_render::wgpu::Queue,
+    label: &str,
+) -> Result<Arc<GpuLutTexture>, RenderError> {
+    reference.validate()?;
+    let bytes = authorized
+        .get(&reference.id)
+        .ok_or_else(|| RenderError::MissingLut(reference.id.clone()))?;
+    upload_verified_lut(bytes, reference, device, queue, label)
+}
+
+fn upload_verified_lut(
+    bytes: &[u8],
+    reference: &LutReference,
+    device: &opentake_render::wgpu::Device,
+    queue: &opentake_render::wgpu::Queue,
+    label: &str,
+) -> Result<Arc<GpuLutTexture>, RenderError> {
+    if sha256_hex(bytes) != reference.id {
         return Err(RenderError::InvalidLut(format!(
             "managed LUT {} failed its content hash",
             reference.id
         )));
     }
-    let lut = CubeLut::parse(&bytes).map_err(|error| RenderError::InvalidLut(error.to_string()))?;
-    Ok(Some(Arc::new(upload_lut_3d(
-        device,
-        queue,
-        &lut,
-        Some(label),
-    ))))
+    let lut = CubeLut::parse(bytes).map_err(|error| RenderError::InvalidLut(error.to_string()))?;
+    Ok(Arc::new(upload_lut_3d(device, queue, &lut, Some(label))))
 }
 
 #[cfg(test)]
