@@ -1550,6 +1550,23 @@ impl AppCore {
         )
     }
 
+    /// Poll a failed job's accepted provider job again: its failed outputs
+    /// return to `Generating`, its Ready outputs are kept. Returns the
+    /// provider job id.
+    pub fn resume_generation_job_for_project(
+        &self,
+        expected_project_epoch: u64,
+        expected_project_dir: &Path,
+        job_id: &str,
+        created_at: Option<f64>,
+    ) -> Result<String> {
+        self.persist_generation_mutation(
+            expected_project_epoch,
+            expected_project_dir,
+            |editor, ids| editor.resume_generation_job(job_id, created_at, ids),
+        )
+    }
+
     pub fn cancel_generation_output_for_project(
         &self,
         expected_project_epoch: u64,

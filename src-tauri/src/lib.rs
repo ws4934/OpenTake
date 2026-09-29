@@ -454,6 +454,7 @@ pub fn run() {
             export::cancel_export,
             generation::generation_cancel,
             generation::generation_retry,
+            generation::generation_retry_resumes,
             motion::motion_capability,
             motion::motion_preview,
             motion::motion_preview_cancel,

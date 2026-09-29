@@ -1259,6 +1259,86 @@ impl EditorSession {
         Ok(())
     }
 
+    /// Move a failed job's failed outputs back to `Generating` so its
+    /// provider job is polled and finalized again, without submitting
+    /// anything. Every output must be Failed or Ready, at least one Failed,
+    /// and each failed output must carry `provider_job_id`. Ready outputs
+    /// keep their result. Returns the provider job id.
+    pub(crate) fn resume_generation_job(
+        &mut self,
+        job_id: &str,
+        created_at: Option<f64>,
+        ids: &dyn IdGen,
+    ) -> Result<String> {
+        self.ensure_mutable()?;
+        let mut provider_job_id = None;
+        let mut failed = 0;
+        for input in self
+            .state
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| entry.generation_input.as_ref())
+            .filter(|input| input.job_id.as_deref() == Some(job_id))
+        {
+            match input.status {
+                Some(GenerationJobStatus::Ready) => continue,
+                Some(GenerationJobStatus::Failed) => failed += 1,
+                status => {
+                    return Err(CoreError::Media(format!(
+                        "generation job cannot resume from {status:?}"
+                    )))
+                }
+            }
+            let Some(id) = input.provider_job_id.as_deref() else {
+                return Err(CoreError::Media(
+                    "generation job has no provider job to resume".to_string(),
+                ));
+            };
+            if *provider_job_id.get_or_insert(id) != id {
+                return Err(CoreError::Media(
+                    "generation job outputs name different provider jobs".to_string(),
+                ));
+            }
+        }
+        let provider_job_id = match provider_job_id {
+            Some(id) if failed > 0 => id.to_string(),
+            _ => {
+                return Err(CoreError::Media(format!(
+                    "generation job has no failed output to resume: {job_id}"
+                )))
+            }
+        };
+        let mut events = Vec::new();
+        for entry in &mut self.state.manifest.entries {
+            let Some(input) = entry.generation_input.as_mut() else {
+                continue;
+            };
+            if input.job_id.as_deref() != Some(job_id)
+                || input.status != Some(GenerationJobStatus::Failed)
+            {
+                continue;
+            }
+            input.status = Some(GenerationJobStatus::Generating);
+            input.progress = Some(0.15);
+            input.error_code = None;
+            events.push((entry.id.clone(), input.clone()));
+        }
+        for (asset_id, input) in events {
+            self.append_generation_event(
+                ids,
+                &asset_id,
+                &input,
+                GenerationJobStatus::Generating,
+                Some(0.15),
+                None,
+                None,
+                created_at,
+            );
+        }
+        Ok(provider_job_id)
+    }
+
     pub(crate) fn cancel_generation_output(
         &mut self,
         asset_id: &str,

@@ -1061,3 +1061,180 @@ fn job_updates_leave_the_ready_outputs_of_a_partly_finalized_job_alone() {
         )
         .is_err());
 }
+
+#[test]
+fn resuming_a_failed_job_polls_its_provider_job_again_and_keeps_ready_outputs() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let runtime = core.runtime_snapshot();
+    let epoch = runtime.project_epoch;
+    let mut plan = upscale_plan();
+    plan.output_count = 2;
+    let committed = core
+        .begin_generation_job_for_project(epoch, &bundle, plan)
+        .unwrap();
+    let ready_id = committed.placeholder_asset_ids[0].clone();
+    let failed_id = committed.placeholder_asset_ids[1].clone();
+
+    // Active outputs cannot be resumed.
+    core.update_generation_job_for_project(
+        epoch,
+        &bundle,
+        &committed.job_id,
+        update(GenerationJobStatus::Generating, Some(0.2)),
+    )
+    .unwrap();
+    assert!(core
+        .resume_generation_job_for_project(epoch, &bundle, &committed.job_id, None)
+        .is_err());
+
+    let mut downloading = update(GenerationJobStatus::Downloading, Some(0.8));
+    downloading.provider_job_id = Some("fal::accepted".to_string());
+    core.update_generation_job_for_project(epoch, &bundle, &committed.job_id, downloading)
+        .unwrap();
+    // A job that is still running is not resumed.
+    assert!(core
+        .resume_generation_job_for_project(epoch, &bundle, &committed.job_id, None)
+        .is_err());
+    let relative_path = format!("media/{ready_id}.png");
+    fs::write(bundle.join(&relative_path), b"ready-output").unwrap();
+    core.finalize_generation_output_for_project(
+        epoch,
+        &bundle,
+        PreparedGenerationOutput {
+            asset_id: ready_id.clone(),
+            relative_path: relative_path.clone(),
+            probe: history_image_probe(),
+            created_at: Some(800_000_002.0),
+        },
+    )
+    .unwrap();
+    core.fail_generation_output_for_project(
+        epoch,
+        &bundle,
+        &failed_id,
+        "GENERATION_DOWNLOAD_FAILED",
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        core.resume_generation_job_for_project(
+            epoch,
+            &bundle,
+            &committed.job_id,
+            Some(800_000_003.0)
+        )
+        .unwrap(),
+        "fal::accepted"
+    );
+    let reopened = Project::open(&bundle).unwrap();
+    let input = |id: &str| {
+        reopened
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .generation_input
+            .clone()
+            .unwrap()
+    };
+    let ready = input(&ready_id);
+    assert_eq!(ready.status, Some(GenerationJobStatus::Ready));
+    let resumed = input(&failed_id);
+    assert_eq!(resumed.status, Some(GenerationJobStatus::Generating));
+    assert_eq!(resumed.error_code, None);
+    assert_eq!(resumed.provider_job_id.as_deref(), Some("fal::accepted"));
+    let log = reopened
+        .generation_log
+        .as_ref()
+        .unwrap()
+        .entries
+        .last()
+        .unwrap();
+    assert_eq!(log.status, Some(GenerationJobStatus::Generating));
+    assert_eq!(log.asset_id.as_deref(), Some(failed_id.as_str()));
+
+    // The resumed output finishes like any polled job.
+    for status in [
+        GenerationJobStatus::Downloading,
+        GenerationJobStatus::Finalizing,
+    ] {
+        core.update_generation_job_for_project(
+            epoch,
+            &bundle,
+            &committed.job_id,
+            update(status, Some(0.9)),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        core.media()
+            .entries
+            .iter()
+            .find(|entry| entry.id == ready_id)
+            .and_then(|entry| entry.generation_input.as_ref())
+            .and_then(|input| input.status),
+        Some(GenerationJobStatus::Ready)
+    );
+}
+
+#[test]
+fn a_failed_job_without_a_provider_id_cannot_be_resumed() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.project_revision().project_epoch;
+    let committed = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    core.fail_generation_output_for_project(
+        epoch,
+        &bundle,
+        &committed.placeholder_asset_ids[0],
+        "GENERATION_DOWNLOAD_FAILED",
+        None,
+    )
+    .unwrap();
+    let error = core
+        .resume_generation_job_for_project(epoch, &bundle, &committed.job_id, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("no provider job to resume"));
+    assert!(
+        core.update_generation_job_for_project(
+            epoch,
+            &bundle,
+            &committed.job_id,
+            update(GenerationJobStatus::Generating, None),
+        )
+        .is_err(),
+        "ordinary updates cannot restart terminal outputs"
+    );
+}
+
+#[test]
+fn a_cancelled_job_is_not_resumed() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.runtime_snapshot().project_epoch;
+    let committed = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    let mut accepted = update(GenerationJobStatus::Generating, Some(0.2));
+    accepted.provider_job_id = Some("fal::accepted".to_string());
+    core.update_generation_job_for_project(epoch, &bundle, &committed.job_id, accepted)
+        .unwrap();
+    core.cancel_generation_output_for_project(
+        epoch,
+        &bundle,
+        &committed.placeholder_asset_ids[0],
+        None,
+    )
+    .unwrap();
+    assert!(core
+        .resume_generation_job_for_project(epoch, &bundle, &committed.job_id, None)
+        .is_err());
+}
