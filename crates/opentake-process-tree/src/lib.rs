@@ -3,7 +3,7 @@
 use std::io;
 use std::process::Command;
 use std::time::Duration;
-#[cfg(any(test, windows))]
+#[cfg(any(test, unix, windows))]
 use std::time::Instant;
 
 #[cfg(any(test, windows))]
@@ -34,7 +34,7 @@ pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     }
 }
 
-#[cfg(any(test, windows))]
+#[cfg(any(test, unix, windows))]
 fn wait_for_processes_to_exit(
     timeout: Duration,
     mut active_processes: impl FnMut() -> io::Result<u32>,
@@ -359,11 +359,51 @@ impl ProcessTree {
                 std::thread::sleep,
             )?;
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            wait_for_processes_to_exit(
+                timeout,
+                || self.has_active_group_member().map(u32::from),
+                std::thread::sleep,
+            )?;
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = timeout;
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn has_active_group_member(&self) -> io::Result<bool> {
+        // kill(group, 0) includes orphaned zombies whose reaping belongs to
+        // init. Query active states instead, including processes still exiting.
+        let listed = background_command("ps")
+            .args(["-A", "-o", "pgid=,stat="])
+            .output()?;
+        if !listed.status.success() {
+            return Err(io::Error::other(format!(
+                "process group query exited {}",
+                listed.status
+            )));
+        }
+        let text = std::str::from_utf8(&listed.stdout)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let expected = self.process_group.to_string();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let mut fields = line.split_whitespace();
+            let (Some(group), Some(status), None) = (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid process group query row",
+                ));
+            };
+            if group == expected && !status.starts_with('Z') {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Mark normal completion and release containment without termination.
@@ -439,6 +479,20 @@ mod contract_tests {
         .expect("active process count reaches zero");
         assert_eq!(pauses, 2);
         assert!(counts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_wait_for_exit_rejects_a_live_process_group() {
+        let mut command = background_command("sleep");
+        configure_command(&mut command);
+        let mut child = command.arg("30").spawn().unwrap();
+        let tree = ProcessTree::attach(child.id()).unwrap();
+        let waiting = tree.wait_for_exit(Duration::from_millis(50));
+        tree.terminate().unwrap();
+        child.wait().unwrap();
+        tree.wait_for_exit(Duration::from_secs(1)).unwrap();
+        assert_eq!(waiting.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

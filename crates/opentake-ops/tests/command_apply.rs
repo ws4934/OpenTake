@@ -3457,7 +3457,7 @@ fn swap_media_replaces_ref_and_preserves_attributes() {
     c.speed = 1.5;
     let v = video_track("v", true, vec![c]);
     let entries = vec![
-        media_entry("old", ClipType::Video, 100.0 / 30.0),
+        media_entry("old", ClipType::Video, 120.0 / 30.0),
         media_entry("new", ClipType::Video, 160.0 / 30.0),
     ];
     let mut st = state_with_media(vec![v], entries);
@@ -3491,10 +3491,9 @@ fn swap_media_replaces_ref_and_preserves_attributes() {
 }
 
 #[test]
-fn swap_media_rejects_new_media_that_cannot_cover_the_existing_source_range() {
-    // Preserving trim would otherwise place most of the clip beyond the new
-    // asset. Refuse the swap without changing the document or undo history.
+fn swap_media_accepts_a_shorter_source_without_rewriting_clip_timing() {
     let mut c = clip("c", 0, 100);
+    c.media_ref = "old".into();
     c.start_frame = 20;
     c.trim_start_frame = 2;
     c.trim_end_frame = 3;
@@ -3506,7 +3505,8 @@ fn swap_media_rejects_new_media_that_cannot_cover_the_existing_source_range() {
     let mut st = state_with_media(vec![v], entries);
     let g = SeqIdGen::default();
 
-    let err = apply(
+    let before = st.timeline.clone();
+    let result = apply(
         &mut st,
         EditCommand::SwapMedia {
             clip_id: "c".into(),
@@ -3514,17 +3514,19 @@ fn swap_media_rejects_new_media_that_cannot_cover_the_existing_source_range() {
         },
         &g,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(err.to_string().contains("too short"));
+    assert!(result.changed);
     let clip = &st.timeline.tracks[0].clips[0];
-    assert_eq!(clip.media_ref, "asset");
+    assert_eq!(clip.media_ref, "short");
     // Start / duration / trim all untouched.
     assert_eq!(clip.start_frame, 20);
     assert_eq!(clip.duration_frames, 100);
     assert_eq!(clip.trim_start_frame, 2);
     assert_eq!(clip.trim_end_frame, 3);
-    assert_eq!(st.version(), 0);
+    assert_eq!(st.version(), 1);
+    apply(&mut st, EditCommand::Undo, &g).unwrap();
+    assert_eq!(st.timeline, before);
 }
 
 #[test]

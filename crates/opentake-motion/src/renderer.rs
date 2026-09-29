@@ -3312,8 +3312,15 @@ mod chromium_backend {
             width: u32,
             height: u32,
         ) -> MotionResult<()> {
-            // Screencast sizing is based on the compositor surface, so resize
-            // the browser contents before overriding the logical viewport.
+            // Keep native contents at least as large as the emulated viewport.
+            // Shrinking a macOS Chrome window can change toolbar layout and
+            // clip the compositor surface even after metrics are overridden.
+            // Measure without the previous job's emulation, and only grow.
+            self.command(
+                "Emulation.clearDeviceMetricsOverride",
+                json!({}),
+                Some(session),
+            )?;
             let window = self.command("Browser.getWindowForTarget", json!({}), Some(session))?;
             let window_id = window
                 .get("windowId")
@@ -3323,15 +3330,43 @@ mod chromium_backend {
                         "Chromium CDP response is missing integer field \"windowId\": {window}"
                     ))
                 })?;
-            self.command(
-                "Browser.setContentsSize",
-                json!({
-                    "windowId": window_id,
-                    "width": width,
-                    "height": height
-                }),
-                None,
-            )?;
+            let metrics = self.command("Page.getLayoutMetrics", json!({}), Some(session))?;
+            let dimension = |object: &Value, field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0 && *value <= i64::from(i32::MAX))
+                    .ok_or_else(|| {
+                        MotionError::render_failed(format!(
+                            "Chromium viewport response has invalid {field}"
+                        ))
+                    })
+            };
+            let bounds = &window["bounds"];
+            let viewport = &metrics["cssLayoutViewport"];
+            let width_delta = (i64::from(width) - dimension(viewport, "clientWidth")?).max(0);
+            let height_delta = (i64::from(height) - dimension(viewport, "clientHeight")?).max(0);
+            let outer_width = dimension(bounds, "width")? + width_delta;
+            let outer_height = dimension(bounds, "height")? + height_delta;
+            if outer_width <= 0
+                || outer_height <= 0
+                || outer_width > i64::from(i32::MAX)
+                || outer_height > i64::from(i32::MAX)
+            {
+                return Err(MotionError::render_failed(
+                    "Chromium window insets produce an invalid viewport size",
+                ));
+            }
+            if width_delta > 0 || height_delta > 0 {
+                self.command(
+                    "Browser.setWindowBounds",
+                    json!({
+                        "windowId": window_id,
+                        "bounds": {"width": outer_width, "height": outer_height}
+                    }),
+                    None,
+                )?;
+            }
             self.command(
                 "Emulation.setDeviceMetricsOverride",
                 device_metrics_params(width, height),
@@ -5540,10 +5575,14 @@ mod chromium_backend {
                     };
                     let id = request["id"].as_u64().unwrap();
                     let method = request["method"].as_str().unwrap().to_owned();
-                    let result = if method == "Browser.getWindowForTarget" {
-                        json!({"windowId": 42, "bounds": {}})
-                    } else {
-                        json!({})
+                    let result = match method.as_str() {
+                        "Browser.getWindowForTarget" => json!({
+                            "windowId": 42, "bounds": {"width": 40, "height": 40}
+                        }),
+                        "Page.getLayoutMetrics" => json!({
+                            "cssLayoutViewport": {"clientWidth": 40, "clientHeight": 8}
+                        }),
+                        _ => json!({}),
                     };
                     browser
                         .send(Message::text(
@@ -5571,21 +5610,32 @@ mod chromium_backend {
                 vec![
                     json!({
                         "id": 1,
-                        "method": "Browser.getWindowForTarget",
+                        "method": "Emulation.clearDeviceMetricsOverride",
                         "params": {},
                         "sessionId": "render-session"
                     }),
                     json!({
                         "id": 2,
-                        "method": "Browser.setContentsSize",
-                        "params": {
-                            "windowId": 42,
-                            "width": 48,
-                            "height": 32
-                        }
+                        "method": "Browser.getWindowForTarget",
+                        "params": {},
+                        "sessionId": "render-session"
                     }),
                     json!({
                         "id": 3,
+                        "method": "Page.getLayoutMetrics",
+                        "params": {},
+                        "sessionId": "render-session"
+                    }),
+                    json!({
+                        "id": 4,
+                        "method": "Browser.setWindowBounds",
+                        "params": {
+                            "windowId": 42,
+                            "bounds": {"width": 48, "height": 64}
+                        }
+                    }),
+                    json!({
+                        "id": 5,
                         "method": "Emulation.setDeviceMetricsOverride",
                         "params": {
                             "width": 48,
