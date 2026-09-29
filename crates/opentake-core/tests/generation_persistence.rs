@@ -1077,7 +1077,7 @@ fn resuming_a_failed_job_polls_its_provider_job_again_and_keeps_ready_outputs() 
     let ready_id = committed.placeholder_asset_ids[0].clone();
     let failed_id = committed.placeholder_asset_ids[1].clone();
 
-    // Without a provider job there is nothing to resume.
+    // Active outputs cannot be resumed.
     core.update_generation_job_for_project(
         epoch,
         &bundle,
@@ -1178,6 +1178,39 @@ fn resuming_a_failed_job_polls_its_provider_job_again_and_keeps_ready_outputs() 
             .and_then(|entry| entry.generation_input.as_ref())
             .and_then(|input| input.status),
         Some(GenerationJobStatus::Ready)
+    );
+}
+
+#[test]
+fn a_failed_job_without_a_provider_id_cannot_be_resumed() {
+    let (_temp, bundle) = saved_project();
+    let core = AppCore::new();
+    core.open_project(&bundle).unwrap();
+    let epoch = core.project_revision().project_epoch;
+    let committed = core
+        .begin_generation_job_for_project(epoch, &bundle, upscale_plan())
+        .unwrap();
+    core.fail_generation_output_for_project(
+        epoch,
+        &bundle,
+        &committed.placeholder_asset_ids[0],
+        "GENERATION_DOWNLOAD_FAILED",
+        None,
+    )
+    .unwrap();
+    let error = core
+        .resume_generation_job_for_project(epoch, &bundle, &committed.job_id, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("no provider job to resume"));
+    assert!(
+        core.update_generation_job_for_project(
+            epoch,
+            &bundle,
+            &committed.job_id,
+            update(GenerationJobStatus::Generating, None),
+        )
+        .is_err(),
+        "ordinary updates cannot restart terminal outputs"
     );
 }
 

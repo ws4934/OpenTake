@@ -292,9 +292,6 @@ fn valid_generation_transition(
         ) => true,
         (Some(Status::Finalizing), Status::Ready | Status::Failed | Status::Cancelled) => true,
         (Some(Status::Failed | Status::Cancelled), Status::Queued) => true,
-        // A failed job the provider accepted is polled again (a retry that
-        // resumes it instead of paying for a new one).
-        (Some(Status::Failed), Status::Generating) => true,
         (Some(Status::Ready), Status::Ready) => true,
         _ => false,
     }
