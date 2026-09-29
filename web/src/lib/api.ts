@@ -665,6 +665,14 @@ export async function cancelGeneration(jobId: string): Promise<boolean> {
   return false;
 }
 
+/** Whether retrying `jobId` resumes its accepted provider job, which costs
+ * nothing, instead of submitting it again. */
+export async function generationRetryResumes(jobId: string): Promise<boolean> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl<boolean>("generation_retry_resumes", { jobId });
+  return false;
+}
+
 export async function retryGeneration(
   jobId: string,
   costAuthorized: boolean,

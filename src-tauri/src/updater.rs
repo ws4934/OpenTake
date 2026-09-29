@@ -1759,102 +1759,120 @@ pub async fn install_update<R: Runtime>(
         .resources_table()
         .take::<PendingUpdate>(rid)
         .map_err(|_| "update resource is no longer available".to_string())?;
-    let bytes = run_with_update_timeout(
-        UPDATE_PACKAGE_DOWNLOAD_TIMEOUT,
-        download_verified_package(&pending.update, &pending.attestation, &on_event),
-    )
-    .await?;
-    let _ = on_event.send(UpdateInstallEvent::Installing);
+    let generation = app
+        .state::<std::sync::Arc<crate::generation::TauriGenerationBridge>>()
+        .inner()
+        .clone();
+    if generation.has_active() {
+        // Accepted jobs are kept for recovery. Jobs detached before
+        // submission need an explicit retry when the project reopens.
+        let detached = generation.detach_all_active();
+        return Err(format!(
+            "paused {detached} active generation job(s); accepted jobs resume after \
+             the update; retry installation after they stop"
+        ));
+    }
+    let motion = app.state::<crate::motion::MotionCommandState>();
+    if motion.has_active() {
+        let _ = motion.cancel_active();
+        return Err(
+            "cancelled an active motion render; retry installation after it stops".to_string(),
+        );
+    }
+    if app
+        .state::<crate::advanced::AdvancedWorkflowCommandState>()
+        .cancel_active()
+    {
+        return Err(
+            "cancelled an active advanced workflow; retry installation after it stops".to_string(),
+        );
+    }
+    if app
+        .state::<crate::advanced::MattingModelInstallState>()
+        .cancel_active()
+    {
+        return Err(
+            "cancelled an active model download; retry installation after it stops".to_string(),
+        );
+    }
+    // Take admission before downloading: a delayed recovery from a previous
+    // attempt must not restart paid jobs while this install is in progress.
+    let install_admission = admission.begin_install()?;
+    let result = async {
+        let bytes = run_with_update_timeout(
+            UPDATE_PACKAGE_DOWNLOAD_TIMEOUT,
+            download_verified_package(&pending.update, &pending.attestation, &on_event),
+        )
+        .await?;
+        let _ = on_event.send(UpdateInstallEvent::Installing);
 
-    let export_state = app.state::<crate::export::ExportControl>();
-    let core = app.state::<opentake_core::AppCore>();
-    install_with_save_barriers(
-        || {
-            let generation =
-                app.state::<std::sync::Arc<crate::generation::TauriGenerationBridge>>();
-            if generation.has_active() {
-                let cancelled = generation.cancel_all_active();
-                return Err(format!(
-                    "cancelled {cancelled} active generation job(s); retry installation after they stop"
-                ));
-            }
-            let motion = app.state::<crate::motion::MotionCommandState>();
-            if motion.has_active() {
-                let _ = motion.cancel_active();
-                return Err(
-                    "cancelled an active motion render; retry installation after it stops"
-                        .to_string(),
-                );
-            }
-            if app
-                .state::<crate::advanced::AdvancedWorkflowCommandState>()
-                .cancel_active()
-            {
-                return Err(
-                    "cancelled an active advanced workflow; retry installation after it stops"
-                        .to_string(),
-                );
-            }
-            if app
-                .state::<crate::advanced::MattingModelInstallState>()
-                .cancel_active()
-            {
-                return Err(
-                    "cancelled an active model download; retry installation after it stops"
-                        .to_string(),
-                );
-            }
-            let install_admission = admission.begin_install()?;
-            let export_guard = export_state
-                .try_begin("app-update-install")
-                .map_err(|_| "finish or cancel the active export before installing".to_string())?;
+        let export_state = app.state::<crate::export::ExportControl>();
+        let core = app.state::<opentake_core::AppCore>();
+        install_with_save_barriers(
+            || {
+                let export_guard = export_state
+                    .try_begin("app-update-install")
+                    .map_err(|_| "finish or cancel the active export before installing".to_string())?;
 
-            #[cfg(feature = "playback-engine")]
-            {
-                let playback = app.state::<crate::playback::PlaybackState>();
-                let transition = playback.begin_project_transition().map_err(|error| {
-                    format!("could not stop playback before installation: {error}")
+                #[cfg(feature = "playback-engine")]
+                {
+                    let playback = app.state::<crate::playback::PlaybackState>();
+                    let transition = playback.begin_project_transition().map_err(|error| {
+                        format!("could not stop playback before installation: {error}")
+                    })?;
+                    playback.activate_project(
+                        transition,
+                        app.state::<opentake_core::AppCore>()
+                            .project_revision()
+                            .project_epoch,
+                    );
+                }
+
+                // This is the mandatory cross-platform save barrier. On Windows,
+                // the official updater launches its installer and exits inside
+                // Update::install, so no code after install can be relied upon.
+                save_current_project(&core).map_err(|error| {
+                    format!("project save failed; update was not installed: {error}")
                 })?;
-                playback.activate_project(
-                    transition,
-                    app.state::<opentake_core::AppCore>()
-                        .project_revision()
-                        .project_epoch,
-                );
-            }
-
-            // This is the mandatory cross-platform save barrier. On Windows,
-            // the official updater launches its installer and exits inside
-            // Update::install, so no code after install can be relied upon.
-            save_current_project(&core).map_err(|error| {
-                format!("project save failed; update was not installed: {error}")
+                Ok(export_guard)
+            },
+            |_readiness| {
+                pending
+                    .update
+                    .install(&bytes)
+                    .map_err(|error| format!("update installation failed: {error}"))
+            },
+            || {
+                // macOS/Linux return from install. Take a second fresh epoch/path
+                // snapshot before restart to protect against any platform event
+                // that landed at the installation boundary. Windows exits inside
+                // Update::install and therefore relies on the barrier above.
+                #[cfg(not(target_os = "windows"))]
+                save_current_project(&core).map_err(|error| {
+                    format!(
+                        "project save failed after update installation; OpenTake was not restarted: {error}"
+                    )
+                })?;
+                Ok(())
+            },
+            || {
+                let _ = on_event.send(UpdateInstallEvent::Restarting);
+                app.restart();
+            },
+        )
+    }
+    .await;
+    drop(install_admission);
+    if let Err(install_error) = &result {
+        // The app remains open after a failed download or save barrier. A
+        // resume timer may already have fired while admission was closed.
+        tauri::async_runtime::spawn_blocking(move || generation.recover_current_project())
+            .await
+            .map_err(|error| {
+                format!("{install_error}; generation recovery could not run: {error}")
             })?;
-            Ok((install_admission, export_guard))
-        },
-        |_readiness| {
-            pending
-                .update
-                .install(&bytes)
-                .map_err(|error| format!("update installation failed: {error}"))
-        },
-        || {
-            // macOS/Linux return from install. Take a second fresh epoch/path
-            // snapshot before restart to protect against any platform event
-            // that landed at the installation boundary. Windows exits inside
-            // Update::install and therefore relies on the barrier above.
-            #[cfg(not(target_os = "windows"))]
-            save_current_project(&core).map_err(|error| {
-                format!(
-                    "project save failed after update installation; OpenTake was not restarted: {error}"
-                )
-            })?;
-            Ok(())
-        },
-        || {
-            let _ = on_event.send(UpdateInstallEvent::Restarting);
-            app.restart();
-        },
-    )
+    }
+    result
 }
 
 fn open_update_releases_with<E>(open: impl FnOnce(&str) -> Result<(), E>) -> Result<(), String>

@@ -5,7 +5,7 @@
 //! never persisted. Terminal downloads are probed, then streamed into the same
 //! complete-bundle publication that makes the original placeholder ready.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -58,6 +58,30 @@ const HOLD_RESULTS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Failure code for a job whose project could not record its state.
 const STATE_PERSIST_FAILED: &str = "GENERATION_STATE_PERSIST_FAILED";
+
+/// Failure code for a status poll the provider answered with a final error
+/// (an unknown job, a refused request): polling again cannot help.
+const PROVIDER_POLL_REFUSED: &str = "GENERATION_PROVIDER_POLL_REFUSED";
+
+/// Failure codes of a job that ended on this side, or while its status was
+/// polled, after the provider accepted it: the provider job may still hold
+/// its result, so a retry polls and finalizes it again instead of paying
+/// for a new one. `GENERATION_PROVIDER_POLL_FAILED` is what earlier versions
+/// wrote when a poll failed or its budget ran out.
+const RESUMABLE_FAILURES: &[&str] = &[
+    STATE_PERSIST_FAILED,
+    "GENERATION_PROVIDER_POLL_FAILED",
+    "GENERATION_RATE_LIMITED",
+    "GENERATION_AUTH_FAILED",
+    "GENERATION_RECOVERY_AUTH_UNAVAILABLE",
+    "GENERATION_DOWNLOAD_FAILED",
+    "GENERATION_FINALIZE_FAILED",
+    "GENERATION_FINALIZE_TASK_FAILED",
+];
+
+/// Failure code for a job a retry resumed that failed again: the next retry
+/// resubmits it (after the cost confirmation) instead of resuming it again.
+const RESUME_FAILED: &str = "GENERATION_RESUME_FAILED";
 
 /// How often one session resumes polling a job whose watch was interrupted
 /// (retry budget or deadline) before leaving it for the next reopen.
@@ -143,6 +167,8 @@ struct GenerationRuntime {
     orphaned_submissions: Mutex<HashMap<String, OrphanedGeneration>>,
     /// Interrupted watches resumed per job in this session.
     resumes: Mutex<HashMap<String, u32>>,
+    /// Failed jobs a retry resumed, until they end.
+    retry_resumed: Mutex<HashSet<String>>,
     next_task: std::sync::atomic::AtomicU64,
     /// Finalization leases and completions, keyed by project and job: a
     /// Save As copy of a generating job is finalized once per bundle.
@@ -979,24 +1005,50 @@ impl TauriGenerationBridge {
                 .is_empty()
     }
 
-    /// Cancel every task working for the open project. Detached tasks are
-    /// already cancelled; they are counted because they still have to exit.
-    pub(crate) fn cancel_all_active(&self) -> usize {
-        let jobs = self
-            .runtime
-            .jobs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for job in jobs.values() {
-            job.cancel.cancel();
-        }
-        jobs.len()
-            + self
+    /// Detach every task working for the open project before an update
+    /// installs, as replacing the project does: nothing is cancelled at the
+    /// provider, an accepted job (and a synchronous provider's results) is
+    /// kept in application data, and each task keeps its install lease until
+    /// it exits. Returns how many tasks still have to exit, detached ones
+    /// included. The jobs resume when the project is next opened; if the
+    /// update has not installed after `resume_delay`, the open project
+    /// resumes them.
+    pub(crate) fn detach_all_active(&self) -> usize {
+        let detached = {
+            let mut jobs = self
+                .runtime
+                .jobs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut exiting = self
                 .runtime
                 .exiting
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let detached = jobs.len();
+            for (job_id, job) in jobs.drain() {
+                exiting.insert(job_id, job.detach());
+            }
+            detached
+        };
+        if detached > 0 {
+            let bridge = self.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(bridge.timings.resume_delay).await;
+                let recovery = bridge.clone();
+                if let Err(error) =
+                    tauri::async_runtime::spawn_blocking(move || recovery.recover_current_project())
+                        .await
+                {
+                    eprintln!("[generation] resuming jobs detached for an update failed: {error}");
+                }
+            });
+        }
+        self.runtime
+            .exiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Cancel a running job, or one whose polling was interrupted and left
@@ -1057,15 +1109,28 @@ impl TauriGenerationBridge {
         Ok(true)
     }
 
+    /// Whether retrying `job_id` resumes its accepted provider job, which
+    /// costs nothing, instead of submitting a new one.
+    pub(crate) fn retry_resumes(&self, job_id: &str) -> bool {
+        resumable_job(&self.core.runtime_snapshot().media, job_id).is_some()
+    }
+
+    /// Retry a failed or cancelled job. A job the provider accepted that
+    /// failed on this side is polled and finalized again (see
+    /// [`RESUMABLE_FAILURES`]); any other job is submitted again, which needs
+    /// a fresh cost authorization.
     pub(crate) fn retry(
         &self,
         job_id: &str,
         cost_authorized: bool,
     ) -> Result<GenerationSubmission, String> {
+        let snapshot = self.core.runtime_snapshot();
+        if let Some(placeholder_asset_ids) = resumable_job(&snapshot.media, job_id) {
+            return self.resume_failed_job(&snapshot, job_id, placeholder_asset_ids);
+        }
         if !cost_authorized {
             return Err("cost authorization is required before retry".to_string());
         }
-        let snapshot = self.core.runtime_snapshot();
         let outputs = snapshot
             .media
             .entries
@@ -1161,6 +1226,103 @@ impl TauriGenerationBridge {
             }),
         };
         self.submit(request, &MediaCancelToken::new())
+    }
+
+    fn resume_failed_job(
+        &self,
+        snapshot: &opentake_core::ProjectRuntimeSnapshot,
+        job_id: &str,
+        placeholder_asset_ids: Vec<String>,
+    ) -> Result<GenerationSubmission, String> {
+        let _admission = self.admission.begin_activity()?;
+        let registration = self
+            .runtime
+            .registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .runtime
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(job_id)
+            || self
+                .runtime
+                .exiting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(job_id)
+        {
+            return Err(
+                "the previous generation task is still stopping; retry shortly".to_string(),
+            );
+        }
+        let project_dir = snapshot
+            .project_dir
+            .as_deref()
+            .ok_or_else(|| "no project is open".to_string())?;
+        let persisted = self.core.resume_generation_job_for_project(
+            snapshot.project_epoch,
+            project_dir,
+            job_id,
+            Some(now_apple_reference_seconds()),
+        );
+        // A flush failure after the manifest rename keeps the committed state
+        // live. Recover it before reporting the durability error to the caller.
+        let resumed = persisted.is_ok()
+            || (self.session_identity()
+                == (snapshot.project_epoch, Some(project_dir.to_path_buf()))
+                && self.core.media().entries.iter().any(|entry| {
+                    entry.generation_input.as_ref().is_some_and(|input| {
+                        input.job_id.as_deref() == Some(job_id)
+                            && input.status == Some(GenerationJobStatus::Generating)
+                    })
+                }));
+        if !resumed {
+            return Err(persisted.unwrap_err().to_string());
+        }
+        let key = finalization_key(project_dir, job_id);
+        self.runtime
+            .completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        self.runtime
+            .terminal_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        self.runtime
+            .resumes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(job_id);
+        self.runtime
+            .retry_resumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.to_string());
+        drop(registration);
+        let recovered = self.recover_jobs(Some(job_id));
+        persisted.map_err(|error| error.to_string())?;
+        if recovered == 0
+            && !self
+                .runtime
+                .jobs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(job_id)
+        {
+            return Err(
+                "generation recovery did not start; reopen the project to resume it".into(),
+            );
+        }
+        Ok(GenerationSubmission {
+            job_id: job_id.to_string(),
+            placeholder_asset_ids,
+            status: "generating".to_string(),
+            warnings: Vec::new(),
+        })
     }
 
     /// Resume provider polling for durable non-terminal jobs after a project is
@@ -2130,6 +2292,29 @@ impl TauriGenerationBridge {
             }
             return;
         }
+        let resumed_by_retry = {
+            let mut resumed = self
+                .runtime
+                .retry_resumed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(result, Err(JobStop::Detached)) {
+                resumed.contains(local_job_id)
+            } else {
+                resumed.remove(local_job_id)
+            }
+        };
+        let result = match result {
+            // A resume that fails the same way would repeat forever; the
+            // next retry submits the job again.
+            Err(JobStop::Failed(code))
+                if resumed_by_retry && RESUMABLE_FAILURES.contains(&code.as_str()) =>
+            {
+                eprintln!("[generation] job {local_job_id}: resumed job failed again ({code})");
+                Err(JobStop::Failed(RESUME_FAILED.to_string()))
+            }
+            result => result,
+        };
         match result {
             Ok(()) => {}
             Err(JobStop::Failed(code)) if code == SUBMIT_OUTCOME_UNKNOWN => {
@@ -2456,7 +2641,7 @@ impl TauriGenerationBridge {
                 Some(WatchEvent::Failed(error)) => {
                     return Err(JobStop::Failed(generation_provider_error_code(
                         &error,
-                        "GENERATION_PROVIDER_POLL_FAILED",
+                        PROVIDER_POLL_REFUSED,
                     )))
                 }
                 Some(WatchEvent::Interrupted(reason)) => {
@@ -2571,7 +2756,7 @@ impl TauriGenerationBridge {
         };
         let terminal_job_id = local_job_id.to_string();
         let terminal_placeholder_ids = placeholder_ids.to_vec();
-        tokio::task::spawn_blocking(move || {
+        let summary = tokio::task::spawn_blocking(move || {
             let downloader = downloader()?;
             finalize_terminal_outputs(
                 &store,
@@ -2590,6 +2775,26 @@ impl TauriGenerationBridge {
                 JobStop::Failed("GENERATION_FINALIZE_FAILED".to_string())
             }
         })?;
+        if !summary.claimed {
+            if !self.session_is(&binding.state()) {
+                return Err(JobStop::Detached);
+            }
+            if self.core.media().entries.iter().any(|entry| {
+                placeholder_ids.contains(&entry.id)
+                    && entry.generation_input.as_ref().is_some_and(|input| {
+                        !matches!(
+                            input.status,
+                            Some(
+                                GenerationJobStatus::Ready
+                                    | GenerationJobStatus::Failed
+                                    | GenerationJobStatus::Cancelled
+                            )
+                        )
+                    })
+            }) {
+                return Err(JobStop::Failed("GENERATION_FINALIZE_FAILED".to_string()));
+            }
+        }
         Ok(())
     }
 
@@ -2830,11 +3035,15 @@ struct TauriFinalizationStore {
     lease: Mutex<Option<String>>,
 }
 
+fn finalization_key(project_dir: &Path, job_id: &str) -> String {
+    format!("{}\n{job_id}", project_dir.display())
+}
+
 impl TauriFinalizationStore {
     /// Leases and completions are per bundle: a Save As copy of a
     /// generating job is its own placeholder set.
     fn key(&self, job_id: &str) -> String {
-        format!("{}\n{job_id}", self.binding.state().project_dir.display())
+        finalization_key(&self.binding.state().project_dir, job_id)
     }
 
     fn write<T>(
@@ -3331,6 +3540,44 @@ fn build_client(provider: &str, managed: bool) -> Result<GenClient, String> {
     Ok(GenClient::byok(registry, Catalog::builtin()))
 }
 
+/// The placeholders of `job_id` when a retry resumes it: every output is
+/// Failed or Ready, the failed ones name the same accepted provider job and
+/// failed with a [`RESUMABLE_FAILURES`] code, and that provider job can be
+/// polled again. A synchronous vendor's (OpenAI, ElevenLabs) result lives
+/// only in the memory of the client that submitted it, so its job is
+/// submitted again instead.
+fn resumable_job(media: &opentake_domain::MediaManifest, job_id: &str) -> Option<Vec<String>> {
+    let mut placeholders = Vec::new();
+    let mut provider_job_id = None;
+    for entry in &media.entries {
+        let Some(input) = entry.generation_input.as_ref() else {
+            continue;
+        };
+        if input.job_id.as_deref() != Some(job_id) {
+            continue;
+        }
+        placeholders.push(entry.id.clone());
+        match input.status {
+            Some(GenerationJobStatus::Ready) => continue,
+            Some(GenerationJobStatus::Failed) => {}
+            _ => return None,
+        }
+        let resumable = input
+            .error_code
+            .as_deref()
+            .is_some_and(|code| RESUMABLE_FAILURES.contains(&code));
+        let id = input.provider_job_id.as_deref()?;
+        if !resumable || *provider_job_id.get_or_insert(id) != id {
+            return None;
+        }
+    }
+    let provider_job_id = provider_job_id?;
+    let synchronous = ["openai::", "elevenlabs::"]
+        .iter()
+        .any(|prefix| provider_job_id.starts_with(prefix));
+    (!synchronous).then_some(placeholders)
+}
+
 fn generation_provider_error_code(error: &GenError, fallback: &str) -> String {
     match error {
         GenError::Unauthenticated | GenError::NotConfigured => "GENERATION_AUTH_FAILED",
@@ -3650,8 +3897,21 @@ pub async fn generation_cancel(
         .map_err(|error| format!("generation cancel worker failed: {error}"))?
 }
 
-/// Retrying commits new placeholders to the project, so it runs off the UI
-/// thread.
+/// Whether a retry of `job_id` resumes its accepted provider job (no cost)
+/// rather than submitting it again (after a cost confirmation).
+#[tauri::command]
+pub async fn generation_retry_resumes(
+    bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
+    job_id: String,
+) -> Result<bool, String> {
+    let bridge = Arc::clone(&bridge);
+    tauri::async_runtime::spawn_blocking(move || bridge.retry_resumes(&job_id))
+        .await
+        .map_err(|error| format!("generation retry worker failed: {error}"))
+}
+
+/// Retrying commits new placeholders to the project (or writes the resumed
+/// job), so it runs off the UI thread.
 #[tauri::command]
 pub async fn generation_retry(
     bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
@@ -3743,10 +4003,8 @@ mod tests {
             .with_poll_policy(quick_poll_policy(retry_budget))
     }
 
-    /// Delays the listed requests before the mock answers, like a slow
-    /// provider.
-    /// Holds requests to one URL until the test releases them, so a test can
-    /// act while a submission is in flight without depending on timing.
+    /// Holds the first request to one URL until the test releases it, so a
+    /// test can act while a request is in flight without depending on timing.
     struct GatedTransport {
         mock: MockTransport,
         gated_url: String,
@@ -3792,8 +4050,9 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move {
-                if request.url == self.gated_url {
-                    self.sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                if request.url == self.gated_url
+                    && !self.sent.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
                     self.release.notified().await;
                 }
                 self.mock.send(request).await
@@ -3877,60 +4136,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn updater_gate_observes_and_cancels_every_active_generation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_detaches_a_paid_submission_and_installs_only_after_it_is_kept() {
         let (_temp, bundle, core) = saved_core();
-        let mock = MockTransport::new();
+        let mock = moving_job_mock();
+        let transport = GatedTransport::new(&mock, FLUX_SUBMIT);
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let bridge = following_bridge(&core, &bundle, transport.clone(), &mock, admission.clone());
+        let submitted = submit_fixture_image(&bridge);
+        let asset_id = submitted.placeholder_asset_ids[0].clone();
+        wait_until("the submission to be sent", || transport.is_sent()).await;
+
+        // The update detaches the job instead of cancelling it, and cannot
+        // install while the paid submission still waits for its answer.
+        assert!(bridge.has_active());
+        assert_eq!(bridge.detach_all_active(), 1);
+        assert!(bridge.has_active());
+        assert!(admission.begin_install().is_err());
+        transport.release();
+        wait_until("the detached task to exit", || !bridge.has_active()).await;
+        drop(admission.begin_install().unwrap());
+        assert_eq!(bridge.detach_all_active(), 0);
+        let orphan = bridge.orphans.get(&submitted.job_id).unwrap().unwrap();
+        assert_eq!(orphan.provider_job_id.as_deref(), Some(MOVING_PROVIDER_JOB));
+        let input = on_disk_input(&bundle, &asset_id);
+        assert_ne!(input.status, Some(GenerationJobStatus::Cancelled));
+        assert_eq!(input.error_code, None);
+
+        // The update installs and the app restarts.
+        drop(bridge);
+        drop(core);
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let restarted = AppCore::new();
+        let bridge = following_bridge(
+            &restarted,
+            &bundle,
+            Arc::new(mock.clone()),
+            &mock,
+            crate::updater::InstallAdmissionGate::default(),
+        );
+        restarted.open_project(&bundle).unwrap();
+        bridge.recover_current_project();
+        let ready = wait_for_ready_model(&restarted, "fal:flux-pro").await;
+        assert_eq!(ready.id, asset_id);
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 1, "never resubmitted");
+        assert_eq!(bridge.orphans.get(&submitted.job_id).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_detached_for_an_update_that_did_not_install_resume() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
         let (cache, models) = runtime_dirs(&bundle);
-        let bridge = build_bridge_with_clients(
-            core,
+        let transport = GatedTransport::new(&mock, PROJECT_STATUS);
+        let client = fixture_client_with_transport(&mock, transport.clone()).with_poll_policy(
+            opentake_gen::PollPolicy {
+                interval: Duration::from_millis(5),
+                ..quick_poll_policy(20)
+            },
+        );
+        let bridge = build_bridge_with_timings(
+            core.clone(),
             cache,
             models,
-            Arc::new(FixtureClients {
-                client: fixture_client(&mock),
-            }),
+            Arc::new(FixtureClients { client }),
+            crate::updater::InstallAdmissionGate::default(),
+            GenerationTimings {
+                resume_delay: Duration::from_millis(300),
+                ..GenerationTimings::default()
+            },
         );
-        let first = MediaCancelToken::new();
-        let second = MediaCancelToken::new();
-        {
-            let mut jobs = bridge
-                .runtime
-                .jobs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            jobs.insert(
-                "job-1".to_string(),
-                ActiveGenerationJob {
-                    cancel: first.clone(),
-                    binding: JobBinding::new(1, bundle.clone()),
-                    task: 1,
-                    admission: bridge.admission.begin_activity().unwrap(),
-                },
-            );
-            jobs.insert(
-                "job-2".to_string(),
-                ActiveGenerationJob {
-                    cancel: second.clone(),
-                    binding: JobBinding::new(1, bundle.clone()),
-                    task: 2,
-                    admission: bridge.admission.begin_activity().unwrap(),
-                },
-            );
-        }
+        let submitted = submit_fixture_image(&bridge);
+        let asset_id = submitted.placeholder_asset_ids[0].clone();
+        wait_until("the first poll to be held", || transport.is_sent()).await;
 
-        assert!(bridge.has_active());
-        assert_eq!(bridge.cancel_all_active(), 2);
-        assert!(first.is_cancelled());
-        assert!(second.is_cancelled());
+        let input = on_disk_input(&bundle, &asset_id);
+        assert_eq!(input.status, Some(GenerationJobStatus::Generating));
+        assert_eq!(input.provider_job_id.as_deref(), Some(MOVING_PROVIDER_JOB));
+        assert_eq!(bridge.detach_all_active(), 1);
 
-        bridge
-            .runtime
-            .jobs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        assert!(!bridge.has_active());
-        assert_eq!(bridge.cancel_all_active(), 0);
+        // The update did not install: the open project resumes the job.
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
+        assert_eq!(ready.id, asset_id);
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 1, "never resubmitted");
     }
 
     #[test]
@@ -5377,6 +5676,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_uploading_when_its_project_is_replaced_asks_for_a_retry_on_reopen() {
+        let (temp, bundle, core) = saved_core_with_source_videos(&[("clip", 640, 360, 30.0)]);
+        let other = saved_bundle(temp.path(), "Other.opentake");
+        let mock = MockTransport::new();
+        mock.on_pending(Method::Post, "https://mockrep/v1/files");
+        let admission = crate::updater::InstallAdmissionGate::default();
+        let bridge = following_bridge(
+            &core,
+            &bundle,
+            Arc::new(mock.clone()),
+            &mock,
+            admission.clone(),
+        );
+        let submitted = bridge
+            .submit(
+                GenerationRequest::Upscale(UpscaleMediaArgs {
+                    cost_authorized: Some(true),
+                    media_ref: "clip".to_string(),
+                    model: Some("replicate:topaz-upscale".to_string()),
+                    source_clip_id: None,
+                }),
+                &MediaCancelToken::new(),
+            )
+            .unwrap();
+        let asset_id = submitted.placeholder_asset_ids[0].clone();
+        wait_until("the upload to start", || {
+            mock.calls()
+                .iter()
+                .any(|call| call.url == "https://mockrep/v1/files")
+        })
+        .await;
+
+        // Nothing was submitted, so the upload is abandoned and nothing is
+        // kept for the job.
+        core.open_project(&other).unwrap();
+        wait_until("the detached task to exit", || !bridge.has_active()).await;
+        drop(admission.begin_install().unwrap());
+        assert_eq!(bridge.orphan_record(&submitted.job_id), None);
+        let input = on_disk_input(&bundle, &asset_id);
+        assert_eq!(input.status, Some(GenerationJobStatus::Queued));
+        assert_eq!(input.provider_job_id, None);
+
+        core.open_project(&bundle).unwrap();
+        let failed =
+            wait_for_job_status(&core, &submitted.job_id, GenerationJobStatus::Failed).await;
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some("GENERATION_RESTART_RETRY_REQUIRED")
+        );
+        let reopened = on_disk_input(&bundle, &asset_id);
+        assert_eq!(reopened.status, Some(GenerationJobStatus::Failed));
+        assert_eq!(reopened.source_asset_id.as_deref(), Some("clip"));
+        assert!(
+            core.media().entries.iter().any(|entry| entry.id == "clip"),
+            "the source is kept"
+        );
+        assert!(!bridge.retry_resumes(&submitted.job_id));
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|call| call.url.contains("/predictions")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_during_submission_keeps_the_accepted_provider_job() {
         let (_temp, bundle, core) = saved_core();
         let mock = MockTransport::new();
@@ -6282,6 +6645,380 @@ mod tests {
             "GENERATION_RATE_LIMITED",
         )
         .await;
+    }
+
+    /// A committed fal image job the provider accepted as
+    /// [`MOVING_PROVIDER_JOB`], failed with `code`.
+    fn failed_accepted_job(
+        core: &AppCore,
+        bundle: &Path,
+        provider_job_id: &str,
+        code: &str,
+    ) -> (String, String) {
+        let epoch = core.runtime_snapshot().project_epoch;
+        let committed = core
+            .begin_generation_job_for_project(epoch, bundle, image_plan())
+            .unwrap();
+        core.update_generation_job_for_project(
+            epoch,
+            bundle,
+            &committed.job_id,
+            GenerationStateUpdate {
+                status: GenerationJobStatus::Generating,
+                progress: Some(0.15),
+                error_code: None,
+                provider_job_id: Some(provider_job_id.to_string()),
+                cost_credits: None,
+                created_at: None,
+            },
+        )
+        .unwrap();
+        let asset_id = committed.placeholder_asset_ids[0].clone();
+        core.fail_generation_output_for_project(epoch, bundle, &asset_id, code, None)
+            .unwrap();
+        (committed.job_id, asset_id)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retrying_an_accepted_job_that_failed_locally_resumes_it_without_paying_again() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, asset_id) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+
+        assert!(bridge.retry_resumes(&job_id));
+        // Nothing is paid, so no cost authorization is needed.
+        let resumed = bridge.retry(&job_id, false).unwrap();
+        assert_eq!(resumed.job_id, job_id);
+        assert_eq!(resumed.placeholder_asset_ids, vec![asset_id.clone()]);
+        let ready = wait_for_job_status(&core, &job_id, GenerationJobStatus::Ready).await;
+        assert_eq!(ready.provider_job_id.as_deref(), Some(MOVING_PROVIDER_JOB));
+        assert_eq!(
+            on_disk_input(&bundle, &asset_id).status,
+            Some(GenerationJobStatus::Ready)
+        );
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 0, "never resubmitted");
+        assert!(count_calls(&mock, PROJECT_STATUS) >= 1);
+        wait_until("the job to finish", || !bridge.has_active()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_after_a_real_download_failure_finishes_without_resubmitting() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        mock.on(
+            Method::Post,
+            FLUX_SUBMIT,
+            200,
+            json!({"request_id": "moving-1", "status": "IN_QUEUE"}),
+        );
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        mock.on_sequence(
+            Method::Get,
+            PROJECT_RESULT,
+            vec![
+                (
+                    200,
+                    json!({"images": [{"url": "data:image/png;base64,invalid!"}]}),
+                ),
+                (200, json!({"images": [{"url": png_data_url()}]})),
+            ],
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let submitted = submit_fixture_image(&bridge);
+        let failed =
+            wait_for_job_status(&core, &submitted.job_id, GenerationJobStatus::Failed).await;
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some("GENERATION_DOWNLOAD_FAILED")
+        );
+        wait_until("the failed finalization to exit", || !bridge.has_active()).await;
+
+        bridge.retry(&submitted.job_id, false).unwrap();
+        wait_for_job_status(&core, &submitted.job_id, GenerationJobStatus::Ready).await;
+        wait_until("the retry to exit", || !bridge.has_active()).await;
+        assert_eq!(
+            count_calls(&mock, FLUX_SUBMIT),
+            1,
+            "the paid job is never resubmitted"
+        );
+    }
+
+    #[test]
+    fn retry_cannot_change_a_failed_job_during_update_installation() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, asset_id) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        let _install = bridge.admission.begin_install().unwrap();
+
+        assert!(bridge.retry(&job_id, false).is_err());
+        assert_eq!(
+            placeholder_input(&core, &asset_id).status,
+            Some(GenerationJobStatus::Failed)
+        );
+        assert_eq!(
+            on_disk_input(&bundle, &asset_id).status,
+            Some(GenerationJobStatus::Failed)
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn retry_refuses_a_failed_job_whose_previous_task_is_still_finishing() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, asset_id) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        let epoch = core.project_revision().project_epoch;
+        let RecoveryClaim::Claimed { task, .. } = bridge.claim_job(&job_id, epoch, &bundle) else {
+            panic!("the previous task must be registered");
+        };
+
+        assert!(bridge.retry(&job_id, false).is_err());
+        assert_eq!(
+            placeholder_input(&core, &asset_id).status,
+            Some(GenerationJobStatus::Failed)
+        );
+        bridge.finish_task(&job_id, task);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_clears_a_terminal_lease_left_by_a_failed_finalization_task() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, _) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_FINALIZE_TASK_FAILED",
+        );
+        let key = finalization_key(&bundle, &job_id);
+        bridge
+            .runtime
+            .terminal_leases
+            .lock()
+            .unwrap()
+            .insert(key.clone());
+
+        bridge.retry(&job_id, false).unwrap();
+        wait_for_job_status(&core, &job_id, GenerationJobStatus::Ready).await;
+        wait_until("the retry to exit", || !bridge.has_active()).await;
+        assert!(!bridge
+            .runtime
+            .terminal_leases
+            .lock()
+            .unwrap()
+            .contains(&key));
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unclaimed_finalization_with_pending_outputs_reports_a_failure() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, asset_id) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        let epoch = core.project_revision().project_epoch;
+        core.resume_generation_job_for_project(epoch, &bundle, &job_id, None)
+            .unwrap();
+        bridge
+            .runtime
+            .completed
+            .lock()
+            .unwrap()
+            .insert(finalization_key(&bundle, &job_id));
+        let staging = bridge.staging_root.clone();
+        let result = bridge
+            .finalize_succeeded(
+                &JobBinding::new(epoch, bundle),
+                &job_id,
+                &[asset_id],
+                MOVING_PROVIDER_JOB,
+                None,
+                vec![png_data_url()],
+                move || {
+                    SecureResultDownloader::new(staging, MediaCancelToken::new())
+                        .map(|downloader| Box::new(downloader) as Box<ResultDownloader>)
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(JobStop::Failed(code)) if code == "GENERATION_FINALIZE_FAILED")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_recovers_a_committed_manifest_even_when_its_flush_reports_an_error() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, _) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        // The generation log flush succeeds; the manifest's post-rename
+        // directory flush fails, so its Generating state remains committed.
+        opentake_project::bundle::test_hooks::fail_directory_sync_after(1);
+        assert!(bridge.retry(&job_id, false).is_err());
+        wait_for_job_status(&core, &job_id, GenerationJobStatus::Ready).await;
+        wait_until("the recovered retry to exit", || !bridge.has_active()).await;
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_admission_blocks_recovery_until_installation_finishes() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            200,
+            json!({"status": "COMPLETED"}),
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, _) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        core.resume_generation_job_for_project(
+            core.project_revision().project_epoch,
+            &bundle,
+            &job_id,
+            None,
+        )
+        .unwrap();
+        let install = bridge.admission.begin_install().unwrap();
+
+        assert_eq!(bridge.recover_current_project(), 0);
+        assert!(mock.calls().is_empty());
+        drop(install);
+        assert_eq!(bridge.recover_current_project(), 1);
+        wait_for_job_status(&core, &job_id, GenerationJobStatus::Ready).await;
+        wait_until("the recovered task to exit", || !bridge.has_active()).await;
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_job_that_fails_again_is_submitted_again_by_the_next_retry() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = moving_job_mock();
+        mock.on(
+            Method::Get,
+            PROJECT_STATUS,
+            401,
+            json!({"error": {"code": "unauthenticated", "message": "private"}}),
+        );
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        let (job_id, asset_id) =
+            failed_accepted_job(&core, &bundle, MOVING_PROVIDER_JOB, STATE_PERSIST_FAILED);
+
+        bridge.retry(&job_id, false).unwrap();
+        let failed = wait_for_job_status(&core, &job_id, GenerationJobStatus::Failed).await;
+        assert_eq!(failed.error_code.as_deref(), Some(RESUME_FAILED));
+        wait_until("the job to finish", || !bridge.has_active()).await;
+        assert_eq!(
+            on_disk_input(&bundle, &asset_id).error_code.as_deref(),
+            Some(RESUME_FAILED)
+        );
+        assert!(!bridge.retry_resumes(&job_id));
+        assert!(
+            bridge.retry(&job_id, false).is_err(),
+            "a resubmission needs a cost authorization"
+        );
+        assert_eq!(count_calls(&mock, FLUX_SUBMIT), 0);
+    }
+
+    #[test]
+    fn retry_submits_again_when_the_provider_job_cannot_be_resumed() {
+        let (_temp, bundle, core) = saved_core();
+        let mock = MockTransport::new();
+        let bridge = outcome_bridge(&core, &bundle, &mock);
+        // The provider refused or failed the job.
+        let (refused, _) = failed_accepted_job(
+            &core,
+            &bundle,
+            MOVING_PROVIDER_JOB,
+            "GENERATION_PROVIDER_FAILED",
+        );
+        assert!(!bridge.retry_resumes(&refused));
+        let (unavailable, _) =
+            failed_accepted_job(&core, &bundle, MOVING_PROVIDER_JOB, PROVIDER_POLL_REFUSED);
+        assert!(!bridge.retry_resumes(&unavailable));
+        // A synchronous vendor's result cannot be fetched again.
+        let (synchronous, _) = failed_accepted_job(
+            &core,
+            &bundle,
+            "openai::image-1",
+            "GENERATION_DOWNLOAD_FAILED",
+        );
+        assert!(!bridge.retry_resumes(&synchronous));
+        // Nothing was accepted.
+        let epoch = core.runtime_snapshot().project_epoch;
+        let never_sent = core
+            .begin_generation_job_for_project(epoch, &bundle, image_plan())
+            .unwrap();
+        core.fail_generation_output_for_project(
+            epoch,
+            &bundle,
+            &never_sent.placeholder_asset_ids[0],
+            STATE_PERSIST_FAILED,
+            None,
+        )
+        .unwrap();
+        assert!(!bridge.retry_resumes(&never_sent.job_id));
+        for job_id in [&refused, &unavailable, &synchronous, &never_sent.job_id] {
+            assert!(bridge.retry(job_id, false).is_err());
+        }
+        assert!(mock.calls().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

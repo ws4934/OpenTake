@@ -79,6 +79,7 @@ import {
 import {
   importMedia,
   cancelGeneration,
+  generationRetryResumes,
   retryGeneration,
   extractAudio,
   generateThumbnail,
@@ -2831,16 +2832,23 @@ export function MediaCard({
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
-                  // The provider may already have billed a submission
-                  // whose answer never arrived: retrying could pay twice.
-                  const approved = window.confirm(
-                    submitOutcomeUnknown
-                      ? t("generation.outcomeUnknownRetryConfirm")
-                      : "重试会再次调用生成服务并可能产生费用。是否继续？",
-                  );
-                  if (approved) {
-                    void retryGeneration(item.generationInput!.jobId!, true);
-                  }
+                  const jobId = item.generationInput!.jobId!;
+                  void (async () => {
+                    // A job the provider accepted that failed on this side is
+                    // polled again at no cost; anything else is submitted again.
+                    if (await generationRetryResumes(jobId)) {
+                      await retryGeneration(jobId, false);
+                      return;
+                    }
+                    // The provider may already have billed a submission
+                    // whose answer never arrived: retrying could pay twice.
+                    const approved = window.confirm(
+                      submitOutcomeUnknown
+                        ? t("generation.outcomeUnknownRetryConfirm")
+                        : "重试会再次调用生成服务并可能产生费用。是否继续？",
+                    );
+                    if (approved) await retryGeneration(jobId, true);
+                  })().catch((error) => useEditorUiStore.getState().pushToast(String(error)));
                 }}
                 style={{
                   minWidth: 24,
