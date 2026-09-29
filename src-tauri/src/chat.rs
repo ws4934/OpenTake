@@ -260,7 +260,7 @@ impl ChatState {
         cache_root: PathBuf,
         models_dir: PathBuf,
         generation_bridge: Arc<dyn GenerationBridge>,
-        motion_bridge: Arc<dyn MotionBridge>,
+        motion_bridge: Arc<crate::motion::TauriMotionBridge>,
         advanced_bridge: Arc<dyn AdvancedWorkflowBridge>,
         motion_document_notify: crate::mcp::MotionDocumentNotifier,
         admission: crate::updater::InstallAdmissionGate,
@@ -285,7 +285,7 @@ impl ChatState {
         cache_root: PathBuf,
         models_dir: PathBuf,
         generation_bridge: Option<Arc<dyn GenerationBridge>>,
-        motion_bridge: Option<Arc<dyn MotionBridge>>,
+        motion_bridge: Option<Arc<crate::motion::TauriMotionBridge>>,
         advanced_bridge: Option<Arc<dyn AdvancedWorkflowBridge>>,
         motion_document_notify: Option<crate::mcp::MotionDocumentNotifier>,
         admission: crate::updater::InstallAdmissionGate,
@@ -293,11 +293,21 @@ impl ChatState {
         let handle: Arc<dyn CoreHandle> = Arc::new(AppCoreHandle::new(core.clone()));
         let registry = Arc::new(RwLock::new(crate::mcp::build_registry(&workflows_dir)));
         let bridge = crate::mcp::build_media_bridge(core.clone(), cache_root.clone(), models_dir);
+        // Motion Studio documents render through the same bridge as the
+        // editor's Motion commands: one resident browser, and one renderer
+        // serializing work on the shared `motion-frames` cache directories.
+        let motion_renderer = motion_bridge.clone().unwrap_or_else(|| {
+            Arc::new(crate::motion::TauriMotionBridge::new(
+                core.clone(),
+                cache_root,
+            ))
+        });
         let motion_documents = crate::mcp::build_motion_document_bridge(
             core.clone(),
-            cache_root,
+            motion_renderer,
             motion_document_notify,
         );
+        let motion_bridge = motion_bridge.map(|bridge| bridge as Arc<dyn MotionBridge>);
         let dispatcher = Arc::new(
             Dispatcher::with_all_capability_bridges(
                 handle,
