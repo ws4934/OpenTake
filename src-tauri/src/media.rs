@@ -3697,31 +3697,6 @@ fn save_clip_as_media_impl(
     workflow()
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn save_clip_as_media_workflow(
-    core: &AppCore,
-    control: &crate::export::ExportControl,
-    engine: &MediaEngine,
-    prewarm: &prewarm::PrewarmScheduler,
-    clip_id: &str,
-    operation_id: &str,
-    on_progress: crate::export::AudioExportProgress,
-    claimed_guard: Option<crate::export::ExportGuard>,
-) -> Result<MediaListDto, String> {
-    save_clip_as_media_workflow_from_snapshot(
-        core,
-        control,
-        engine,
-        prewarm,
-        core.runtime_snapshot(),
-        clip_id,
-        operation_id,
-        on_progress,
-        claimed_guard,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn save_clip_as_media_workflow_from_snapshot(
     core: &AppCore,
