@@ -6858,7 +6858,7 @@ mod tests {
         touch(&source);
         let mut project = opentake_project::Project::new(&bundle);
         let mut track = Track::new("video", ClipType::Video);
-        track.clips.push(Clip::new("zero", "source", 0, 0));
+        track.clips.push(Clip::new("zero", "source", 0, 1));
         project.timeline.tracks.push(track);
         project.manifest.entries.push(MediaManifestEntry {
             id: "source".into(),
@@ -6879,10 +6879,14 @@ mod tests {
             cached_remote_url: None,
             cached_remote_url_expires_at: None,
         });
-        project.save().expect("save zero-duration fixture");
+        project.save().expect("save fixture");
 
         let core = AppCore::new();
         core.open_project(bundle.clone()).expect("open fixture");
+        // Project open now refuses invalid clips. Inject the malformed worker
+        // snapshot to keep exercising the export preflight independently.
+        let mut snapshot = core.runtime_snapshot();
+        snapshot.timeline.tracks[0].clips[0].duration_frames = 0;
         let before_live = core.media();
         let manifest_path = bundle.join("media.json");
         let before_disk = fs::read(&manifest_path).expect("read persisted manifest");
@@ -6900,11 +6904,12 @@ mod tests {
         let engine = engine_for(tmp.path());
         let scheduler = prewarm::PrewarmScheduler::new(core.runtime_snapshot().project_epoch);
 
-        let error = save_clip_as_media_workflow(
+        let error = save_clip_as_media_workflow_from_snapshot(
             &core,
             &control,
             &engine,
             &scheduler,
+            snapshot,
             "zero",
             "save-as:zero-duration",
             on_progress,
