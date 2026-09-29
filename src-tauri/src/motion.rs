@@ -2101,7 +2101,27 @@ fn redact_encoder_stderr(tail: &[u8], known_paths: &[(String, &str)]) -> String 
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(crate::telemetry::redact_sensitive_text)
+        .map(|line| {
+            let mut redacted = crate::telemetry::redact_sensitive_text(line);
+            // A privacy path suffix can include FFmpeg's errno explanation.
+            // Preserve only fixed diagnostic labels, never arbitrary tail text.
+            if redacted.ends_with("[PATH]") {
+                if let Some((_, reason)) = line.rsplit_once(": ") {
+                    if matches!(
+                        reason,
+                        "Permission denied"
+                            | "No such file or directory"
+                            | "No space left on device"
+                            | "Invalid argument"
+                            | "Input/output error"
+                    ) {
+                        redacted.push(' ');
+                        redacted.push_str(reason);
+                    }
+                }
+            }
+            redacted
+        })
         .collect::<Vec<_>>()
         .join(" | ")
 }
