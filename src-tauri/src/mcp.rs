@@ -1038,6 +1038,84 @@ struct TauriMediaBridge {
     /// Dedicated compositor state for post-commit agent images. It is isolated
     /// from UI preview scheduling while still reusing its GPU context per turn.
     render: crate::render::RenderState,
+    /// GPU context for `inspect_timeline` and Lottie `inspect_media`, kept
+    /// apart from `render` so an inspection never waits on a result capture.
+    inspect_gpu: InspectGpu,
+}
+
+/// A lazily created GPU device, compositor, font rasterizer and Lottie
+/// renderer reused across inspections: adapter enumeration, pipeline builds
+/// and the system font scan are not repeated per call (issue #6). A context
+/// that hits a device-level failure is dropped and rebuilt on the next call.
+#[derive(Default)]
+struct InspectGpu {
+    idle: Mutex<Option<InspectGpuContext>>,
+    #[cfg(test)]
+    acquisitions: std::sync::atomic::AtomicUsize,
+}
+
+struct InspectGpuContext {
+    device: opentake_render::wgpu::Device,
+    queue: opentake_render::wgpu::Queue,
+    compositor: Compositor,
+    text_rasterizer: CosmicTextRasterizer,
+    lottie: crate::render::LottieMaterializer,
+}
+
+impl InspectGpu {
+    /// Run `operation` with the idle context, creating one if there is none.
+    /// The context is taken out of the slot while in use, so the lock is not
+    /// held across GPU work; a concurrent inspection builds its own and the
+    /// spare is dropped on return. `operation` reports whether the device
+    /// failed, in which case the context is not kept.
+    fn with_context<T>(
+        &self,
+        operation: impl FnOnce(&mut InspectGpuContext) -> (T, bool),
+    ) -> Result<T, opentake_render::RenderError> {
+        let idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut context = match idle {
+            Some(context) => context,
+            None => {
+                let dev = RenderDevice::try_new()?;
+                #[cfg(test)]
+                self.acquisitions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let text_rasterizer = CosmicTextRasterizer::new();
+                if !text_rasterizer.has_fonts() {
+                    eprintln!("[render] no system fonts discovered; text clips will render blank");
+                }
+                InspectGpuContext {
+                    compositor: Compositor::new(&dev.device),
+                    device: dev.device,
+                    queue: dev.queue,
+                    text_rasterizer,
+                    lottie: crate::render::LottieMaterializer::new(),
+                }
+            }
+        };
+        let (result, device_failed) = operation(&mut context);
+        if !device_failed {
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if idle.is_none() {
+                *idle = Some(context);
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn is_device_failure(error: &opentake_render::RenderError) -> bool {
+    matches!(
+        error,
+        opentake_render::RenderError::Readback(_) | opentake_render::RenderError::DeviceRequest(_)
+    )
 }
 
 struct RetainedExternalSource {
@@ -1134,6 +1212,7 @@ impl TauriMediaBridge {
             core,
             engine: crate::media_pressure::production_media_engine(cache_root, models_dir),
             render: crate::render::RenderState::new(),
+            inspect_gpu: InspectGpu::default(),
         }
     }
 }
@@ -1256,7 +1335,7 @@ impl MediaBridge for TauriMediaBridge {
         request: &InspectMediaRequest,
         cancel: &opentake_media::MediaCancelToken,
     ) -> Result<InspectMediaResult, BridgeError> {
-        inspect_source_media(&self.core, &self.engine, request, cancel)
+        inspect_source_media(&self.core, &self.engine, &self.inspect_gpu, request, cancel)
     }
 
     fn inspect_timeline(
@@ -1278,13 +1357,14 @@ impl MediaBridge for TauriMediaBridge {
         cancel: &opentake_media::MediaCancelToken,
     ) -> Result<InspectResult, BridgeError> {
         // Snapshot the live session, then composite off the session lock (the
-        // preview path's discipline; a local GPU context per call keeps this off
-        // the preview's cached `RenderState` mutex, matching export.rs).
+        // preview path's discipline) on the bridge's own inspection GPU
+        // context, which neither UI preview nor result capture uses.
         let snapshot = self.core.runtime_snapshot();
         let timeline = snapshot.timeline;
         let manifest = snapshot.media;
         let project_dir = snapshot.project_dir;
         composite_frames_jpeg(
+            &self.inspect_gpu,
             &timeline,
             &manifest,
             &project_dir,
@@ -2449,6 +2529,7 @@ fn inspect_image_thumbnail(
 fn inspect_source_media(
     core: &AppCore,
     engine: &MediaEngine,
+    gpu: &InspectGpu,
     request: &InspectMediaRequest,
     cancel: &opentake_media::MediaCancelToken,
 ) -> Result<InspectMediaResult, BridgeError> {
@@ -2485,7 +2566,7 @@ fn inspect_source_media(
     let byte_size = metadata.len();
 
     if entry.kind == ClipType::Lottie {
-        return inspect_lottie_frames(&path, request, byte_size);
+        return inspect_lottie_frames(gpu, &path, request, byte_size);
     }
 
     if entry.kind == ClipType::Image {
@@ -2565,10 +2646,35 @@ fn inspect_source_media(
 }
 
 fn inspect_lottie_frames(
+    gpu: &InspectGpu,
     path: &Path,
     request: &InspectMediaRequest,
     byte_size: u64,
 ) -> Result<InspectMediaResult, BridgeError> {
+    gpu.with_context(|ctx| {
+        let mut device_failed = false;
+        let rendered = render_lottie_frames(ctx, path, request, &mut device_failed);
+        (rendered, device_failed)
+    })
+    .map_err(|_| BridgeError::unavailable("inspect_media: Lottie GPU rendering unavailable"))?
+    .and_then(|(metadata, start, timestamps, rendered)| {
+        encode_lottie_inspection(request, byte_size, &metadata, start, timestamps, rendered)
+    })
+}
+
+type RenderedLottieFrames = (
+    crate::render::LottieMetadata,
+    f64,
+    Vec<f64>,
+    Vec<(f64, RgbaFrame)>,
+);
+
+fn render_lottie_frames(
+    ctx: &mut InspectGpuContext,
+    path: &Path,
+    request: &InspectMediaRequest,
+    device_failed: &mut bool,
+) -> Result<RenderedLottieFrames, BridgeError> {
     struct FixedResolver(Rc<GpuTexture>);
 
     impl TextureResolver for FixedResolver {
@@ -2581,10 +2687,8 @@ fn inspect_lottie_frames(
         }
     }
 
-    let dev = RenderDevice::try_new()
-        .map_err(|_| BridgeError::unavailable("inspect_media: Lottie GPU rendering unavailable"))?;
-    let mut materializer = crate::render::LottieMaterializer::new();
-    let metadata = materializer
+    let metadata = ctx
+        .lottie
         .metadata(path)
         .map_err(|_| BridgeError::unavailable("inspect_media: invalid Lottie document"))?;
     let start = request
@@ -2617,24 +2721,31 @@ fn inspect_lottie_frames(
     let source = TextureSource::Lottie {
         media_ref: request.media_ref.clone(),
     };
-    let compositor = Compositor::new(&dev.device);
     let mut cache = TextureCache::new(TEXTURE_CACHE_CAP);
     let mut rendered = Vec::with_capacity(timestamps.len());
     for &timestamp in &timestamps {
         let source_frame = (timestamp * metadata.frame_rate)
             .floor()
             .clamp(0.0, (metadata.frame_count - 1) as f64) as i64;
-        let texture = materializer
+        let texture = ctx
+            .lottie
             .resolve(
-                &dev.device,
-                &dev.queue,
+                &ctx.device,
+                &ctx.queue,
                 &mut cache,
                 path,
                 source_frame,
                 (render_size.width, render_size.height),
                 "inspect-media-lottie",
             )
-            .map_err(|_| BridgeError::new("inspect_media: failed to render Lottie frame"))?;
+            .map_err(|_| {
+                // The document already parsed above, so this is a render
+                // failure. Vello reports GPU trouble only as a generic wgpu
+                // scope error, so retire the context rather than risk keeping
+                // a lost device; the next call rebuilds it.
+                *device_failed = true;
+                BridgeError::new("inspect_media: failed to render Lottie frame")
+            })?;
         let draw = LayerDraw {
             source: &source,
             source_frame,
@@ -2655,21 +2766,36 @@ fn inspect_lottie_frames(
             clear_rgba: [0.5, 0.5, 0.5, 1.0],
             draws: vec![draw],
         };
-        let frame = compositor
+        let frame = ctx
+            .compositor
             .render_to_rgba(
-                &dev.device,
-                &dev.queue,
+                &ctx.device,
+                &ctx.queue,
                 render_size,
                 &plan,
                 &mut FixedResolver(texture),
             )
-            .map_err(|_| BridgeError::new("inspect_media: failed to composite Lottie frame"))?;
+            .map_err(|error| {
+                *device_failed = is_device_failure(&error);
+                BridgeError::new("inspect_media: failed to composite Lottie frame")
+            })?;
         rendered.push((
             timestamp,
             RgbaFrame::new(frame.width, frame.height, frame.rgba),
         ));
     }
 
+    Ok((metadata, start, timestamps, rendered))
+}
+
+fn encode_lottie_inspection(
+    request: &InspectMediaRequest,
+    byte_size: u64,
+    metadata: &crate::render::LottieMetadata,
+    start: f64,
+    timestamps: Vec<f64>,
+    rendered: Vec<(f64, RgbaFrame)>,
+) -> Result<InspectMediaResult, BridgeError> {
     let (frames, overview_timestamps) = if request.overview {
         let (bytes, _, _) = encode_storyboard_jpeg(&rendered)
             .ok_or_else(|| BridgeError::new("inspect_media: failed to encode Lottie overview"))?;
@@ -2854,10 +2980,11 @@ fn fit_render_size(canvas_w: i32, canvas_h: i32, longest_edge: u32) -> RenderSiz
 }
 
 /// Composite each frame in `frames` at the downscaled render size and JPEG-encode
-/// it. A local GPU context is acquired for the batch (export.rs discipline).
-/// Frames that fail to render are dropped (upstream `continue`s past a failed
-/// `generator.image(at:)`); an all-empty render is an `Err`.
+/// it on the reusable inspection GPU context. Frames that fail to render are
+/// dropped (upstream `continue`s past a failed `generator.image(at:)`); an
+/// all-empty render is an `Err`.
 fn composite_frames_jpeg(
+    gpu: &InspectGpu,
     timeline: &opentake_domain::Timeline,
     manifest: &opentake_domain::MediaManifest,
     project_dir: &Option<PathBuf>,
@@ -2880,52 +3007,56 @@ fn composite_frames_jpeg(
         .transpose()
         .map_err(|error| BridgeError::new(format!("open project LUT storage: {error}")))?;
 
-    let dev =
-        RenderDevice::try_new().map_err(|e| BridgeError::new(format!("no GPU device: {e}")))?;
-    let compositor = Compositor::new(&dev.device);
-    let text_rasterizer = CosmicTextRasterizer::new();
-    if !text_rasterizer.has_fonts() {
-        eprintln!("[render] no system fonts discovered; text clips will render blank");
-    }
-
-    let mut out_frames: Vec<InspectedFrame> = Vec::with_capacity(frames.len());
-    let mut lut_cache = HashMap::new();
-    let mut lottie = crate::render::LottieMaterializer::new();
-    for &f in frames {
-        ensure_bridge_not_cancelled(cancel)?;
-        let frame_plan = plan.frame(timeline, f);
-        let mut resolver = InspectResolver {
-            device: &dev.device,
-            queue: &dev.queue,
-            cache: TextureCache::new(TEXTURE_CACHE_CAP),
-            media: &media,
-            timeline_fps: plan.fps,
-            text: &text,
-            text_rasterizer: &text_rasterizer,
-            render_box: (render_size.width, render_size.height),
-            project_root: project_root.as_ref(),
-            lut_cache: &mut lut_cache,
-            lottie: &mut lottie,
-        };
-        let composite = match compositor.render_to_rgba(
-            &dev.device,
-            &dev.queue,
-            render_size,
-            &frame_plan,
-            &mut resolver,
-        ) {
-            Ok(c) => c,
-            Err(_) => continue, // skip an unrenderable frame (upstream parity)
-        };
-        let Some(bytes) = encode_jpeg(&composite) else {
-            continue;
-        };
-        out_frames.push(InspectedFrame {
-            frame: f,
-            bytes,
-            media_type: "image/jpeg".into(),
-        });
-    }
+    let out_frames = gpu
+        .with_context(|ctx| {
+            let mut device_failed = false;
+            let mut out_frames: Vec<InspectedFrame> = Vec::with_capacity(frames.len());
+            let mut lut_cache = HashMap::new();
+            for &f in frames {
+                if let Err(error) = ensure_bridge_not_cancelled(cancel) {
+                    return (Err(error), device_failed);
+                }
+                let frame_plan = plan.frame(timeline, f);
+                let mut resolver = InspectResolver {
+                    device: &ctx.device,
+                    queue: &ctx.queue,
+                    cache: TextureCache::new(TEXTURE_CACHE_CAP),
+                    media: &media,
+                    timeline_fps: plan.fps,
+                    text: &text,
+                    text_rasterizer: &ctx.text_rasterizer,
+                    render_box: (render_size.width, render_size.height),
+                    project_root: project_root.as_ref(),
+                    lut_cache: &mut lut_cache,
+                    lottie: &mut ctx.lottie,
+                };
+                let composite = match ctx.compositor.render_to_rgba(
+                    &ctx.device,
+                    &ctx.queue,
+                    render_size,
+                    &frame_plan,
+                    &mut resolver,
+                ) {
+                    Ok(c) => c,
+                    Err(error) => {
+                        // Skip an unrenderable frame (upstream parity); a lost
+                        // device also retires the context.
+                        device_failed |= is_device_failure(&error);
+                        continue;
+                    }
+                };
+                let Some(bytes) = encode_jpeg(&composite) else {
+                    continue;
+                };
+                out_frames.push(InspectedFrame {
+                    frame: f,
+                    bytes,
+                    media_type: "image/jpeg".into(),
+                });
+            }
+            (Ok(out_frames), device_failed)
+        })
+        .map_err(|e| BridgeError::new(format!("no GPU device: {e}")))??;
 
     if out_frames.is_empty() {
         return Err(BridgeError::new("Failed to render timeline frames."));
@@ -4453,6 +4584,7 @@ mod tests {
         let result = inspect_source_media(
             &core,
             &engine,
+            &InspectGpu::default(),
             &InspectMediaRequest {
                 media_ref: entry.id,
                 kind: ClipType::Image,
@@ -4533,6 +4665,7 @@ mod tests {
         let result = inspect_source_media(
             &core,
             &engine,
+            &InspectGpu::default(),
             &InspectMediaRequest {
                 media_ref: "project-image".into(),
                 kind: ClipType::Image,
@@ -4639,21 +4772,51 @@ mod tests {
         let core = AppCore::new();
         core.open_project(bundle).expect("open Lottie project");
         let engine = MediaEngine::new(tmp.path().join("cache"), tmp.path().join("models"));
+        let gpu = InspectGpu::default();
+        let inspect = || {
+            inspect_source_media(
+                &core,
+                &engine,
+                &gpu,
+                &InspectMediaRequest {
+                    media_ref: "lottie-asset".into(),
+                    kind: ClipType::Lottie,
+                    start_seconds: None,
+                    end_seconds: None,
+                    max_frames: 2,
+                    overview: false,
+                },
+                &opentake_media::MediaCancelToken::new(),
+            )
+            .expect("inspect imported Lottie")
+        };
 
-        let result = inspect_source_media(
-            &core,
-            &engine,
-            &InspectMediaRequest {
-                media_ref: "lottie-asset".into(),
-                kind: ClipType::Lottie,
-                start_seconds: None,
-                end_seconds: None,
-                max_frames: 2,
-                overview: false,
-            },
-            &opentake_media::MediaCancelToken::new(),
-        )
-        .expect("inspect imported Lottie");
+        let started = std::time::Instant::now();
+        let result = inspect();
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
+        let again = inspect();
+        eprintln!(
+            "inspect_lottie: first {first:?}, second {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            gpu.acquisitions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second Lottie inspection reuses the GPU context"
+        );
+        assert_eq!(
+            again
+                .frames
+                .iter()
+                .map(|frame| &frame.bytes)
+                .collect::<Vec<_>>(),
+            result
+                .frames
+                .iter()
+                .map(|frame| &frame.bytes)
+                .collect::<Vec<_>>()
+        );
 
         assert_eq!((result.width, result.height), (Some(16), Some(16)));
         assert_eq!(result.fps, Some(2.0));
@@ -4739,6 +4902,7 @@ mod tests {
         let error = inspect_source_media(
             &core,
             &engine,
+            &InspectGpu::default(),
             &InspectMediaRequest {
                 media_ref: entry.id,
                 kind: ClipType::Image,
@@ -5486,7 +5650,10 @@ mod tests {
             .push(external_entry("asset-1", &video, 320, 240));
 
         // Sample 3 frames across [0, 30) at the 512px cap.
+        let gpu = InspectGpu::default();
+        let started = std::time::Instant::now();
         let res = composite_frames_jpeg(
+            &gpu,
             &timeline,
             &manifest,
             &None,
@@ -5495,6 +5662,28 @@ mod tests {
             &opentake_media::MediaCancelToken::new(),
         )
         .expect("composite should succeed with a GPU + fixture");
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
+        let again = composite_frames_jpeg(
+            &gpu,
+            &timeline,
+            &manifest,
+            &None,
+            &[0, 10, 20],
+            512,
+            &opentake_media::MediaCancelToken::new(),
+        )
+        .expect("a second inspection succeeds");
+        eprintln!(
+            "inspect_timeline: first {first:?}, second {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            gpu.acquisitions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second inspect_timeline reuses the GPU context"
+        );
+        assert_eq!(again.frames.len(), 3);
         assert_eq!(res.frames.len(), 3);
         // 320x240 is already under 512 → unscaled.
         assert_eq!((res.width, res.height), (320, 240));

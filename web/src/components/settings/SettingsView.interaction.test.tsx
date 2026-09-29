@@ -525,6 +525,32 @@ it("disables official Codex login when the CLI is unavailable", async () => {
   expect(container.querySelector('input[type="password"]')).toBeNull();
 });
 
+it("asks to update an installed Codex CLI that is too old", async () => {
+  codex.status.mockResolvedValue({
+    available: false,
+    authenticated: false,
+    authMethod: null,
+    version: "codex-cli 0.145.9",
+    loginInProgress: false,
+    message: "Official Codex CLI codex-cli 0.145.9 is too old; update it to 0.146.0 or newer",
+  });
+  useEditorUiStore.setState({ settingsPane: "ai" });
+  useSettingsStore.setState({ byokProvider: "codex" });
+
+  await act(async () => root.render(<Harness />));
+  await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+  await act(async () => undefined);
+
+  expect(container.textContent).toContain(
+    t("settings.codexIncompatible", { version: "codex-cli 0.145.9" }),
+  );
+  expect(container.textContent).not.toContain(t("settings.codexUnavailable"));
+  const login = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+    (candidate) => candidate.textContent?.trim() === t("settings.codexLogin"),
+  )!;
+  expect(login.disabled).toBe(true);
+});
+
 it("surfaces official Codex status failures without exposing an API-key field", async () => {
   codex.status.mockRejectedValue(new Error("status exploded"));
   useEditorUiStore.setState({ settingsPane: "ai" });

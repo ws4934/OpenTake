@@ -123,11 +123,30 @@ function ensureNativeFrameListenerRegistration(
 ): Promise<() => void> {
   if (slot.registration) return slot.registration.ready;
 
+  // The `playback_error` listener shares the frame listener's lease: it is
+  // registered once while a preview can play natively, not on every PLAY, and
+  // a start waits for both. A failed error registration does not block
+  // playback (errors then go unreported, as before the listener existed).
+  const errorListener = onPlaybackError((event) => handleNativePlaybackError(event)).catch(
+    () => () => {},
+  );
   const registration: NativeFrameListenerRegistration = {
     generation: ++slot.registrationGeneration,
     ready: onPlaybackFrame((event) => {
       nativePlaybackController.acceptFrame(event);
-    }),
+    }).then(
+      async (unlistenFrame) => {
+        const unlistenError = await errorListener;
+        return () => {
+          unlistenFrame();
+          unlistenError();
+        };
+      },
+      async (reason: unknown) => {
+        (await errorListener)();
+        throw reason;
+      },
+    ),
   };
   slot.registration = registration;
   void registration.ready.catch(() => {
@@ -609,17 +628,6 @@ export function useTimelinePlaybackEngine(): void {
         ui.setActiveFrame(current.frame);
       });
 
-      let unlistenError: (() => void) | null = null;
-      // Start only once the error listener is registered too: a failure right
-      // after the resume must not be emitted before anyone listens.
-      const errorListenerReady = onPlaybackError((event) => handleNativePlaybackError(event)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else unlistenError = unlisten;
-        },
-        () => {},
-      );
-
       const startFrame = Math.max(0, Math.floor(useEditorUiStore.getState().activeFrame));
       const listenerReady = nativeFrameListenerLeaseRef.current?.ensureReady();
       if (!listenerReady) {
@@ -628,8 +636,10 @@ export function useTimelinePlaybackEngine(): void {
         setEngineFailed(true);
         return;
       }
+      // The lease registers the error listener with the frame listener, so a
+      // failure right after the resume is never emitted before anyone listens.
       const start = startNativePlaybackAfterListener(
-        Promise.all([listenerReady, errorListenerReady]),
+        listenerReady,
         () =>
           nativePlaybackController.start({ projectEpoch, timelineVersion }, startFrame, {
             onIdentity: (started) => {
@@ -664,7 +674,6 @@ export function useTimelinePlaybackEngine(): void {
       return () => {
         disposed = true;
         unsubscribePublication();
-        unlistenError?.();
         const current = identity ?? activeNativeIdentityRef.current;
         if (!current) return;
         const project = useProjectStore.getState();

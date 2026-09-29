@@ -262,24 +262,46 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-fn supported_codex_version(version: &str) -> bool {
-    let Some(raw) = version.strip_prefix("codex-cli ") else {
-        return false;
+/// A parsed Codex CLI version. It orders like semver precedence for the
+/// parts that matter here: a pre-release sorts before its release.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CodexVersion {
+    core: (u64, u64, u64),
+    release: bool,
+}
+
+/// The version in a `codex-cli X.Y[.Z][-pre][+build][ trailing text]` banner.
+fn codex_version(version: &str) -> Option<CodexVersion> {
+    let raw = version
+        .strip_prefix("codex-cli ")?
+        .split_whitespace()
+        .next()?;
+    let without_build = raw.split('+').next().unwrap_or(raw);
+    let (core, release) = match without_build.split_once('-') {
+        Some((core, _pre)) => (core, false),
+        None => (without_build, true),
     };
-    let core = raw.split(['-', '+']).next().unwrap_or(raw);
     let mut parts = core.split('.');
-    let parsed = (
-        parts.next().and_then(|value| value.parse::<u64>().ok()),
-        parts.next().and_then(|value| value.parse::<u64>().ok()),
-        parts.next().and_then(|value| value.parse::<u64>().ok()),
-    );
-    if parts.next().is_some() {
-        return false;
-    }
-    match parsed {
-        (Some(major), Some(minor), Some(patch)) => (major, minor, patch) >= MINIMUM_CODEX_VERSION,
-        _ => false,
-    }
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = match parts.next() {
+        Some(patch) => patch.parse::<u64>().ok()?,
+        None => 0,
+    };
+    parts.next().is_none().then_some(CodexVersion {
+        core: (major, minor, patch),
+        release,
+    })
+}
+
+fn supported_codex_version(version: &str) -> bool {
+    codex_version(version).is_some_and(|version| {
+        version
+            >= CodexVersion {
+                core: MINIMUM_CODEX_VERSION,
+                release: true,
+            }
+    })
 }
 
 fn parsed_codex_version(stdout: &[u8]) -> Option<String> {
@@ -412,11 +434,15 @@ async fn auth_status_until(
 ) -> Result<(CodexAuthStatus, Option<VerifiedCodex>), String> {
     let login_in_progress = login_is_running(state)?;
     let cancel = AtomicBool::new(false);
-    let Some(codex) = discover_codex_until(&cancel, deadline)
+    let codex = match discover_codex_until(&cancel, deadline)
         .await
         .map_err(|error| auth_probe_error("Codex version check", error))?
-    else {
-        return Ok((CodexAuthStatus::unavailable(), None));
+    {
+        CodexDiscovery::Supported(codex) => codex,
+        CodexDiscovery::Incompatible { version } => {
+            return Ok((CodexDiscovery::incompatible_status(version), None));
+        }
+        CodexDiscovery::NotFound => return Ok((CodexAuthStatus::unavailable(), None)),
     };
 
     if login_in_progress {
@@ -519,7 +545,7 @@ async fn run_login_process(
     let cancellation = wait_for_cancel(cancel.as_ref());
     tokio::pin!(cancellation);
     let selected = tokio::select! {
-        status = child.wait() => status.map_err(|_| CodexTurnError::ProviderFailed),
+        status = child.wait() => status.map_err(|_| CodexTurnError::CliFailed),
         _ = &mut cancellation => Err(CodexTurnError::Cancelled),
         _ = tokio::time::sleep_until(session_deadline) => Err(CodexTurnError::Timeout),
     };
@@ -630,7 +656,8 @@ pub async fn codex_login_start(
         return Ok(current);
     }
     let Some(codex) = codex else {
-        return Ok(CodexAuthStatus::unavailable());
+        // Not found or too old: `current` already says which.
+        return Ok(current);
     };
     start_login_until(&state, codex.clone(), deadline, activity).await?;
     Ok(CodexAuthStatus {
@@ -663,11 +690,15 @@ pub async fn codex_logout(
     let deadline = tokio::time::Instant::now() + CODEX_LOGOUT_TIMEOUT;
     cancel_login_until(&state, deadline).await?;
     let cancel = AtomicBool::new(false);
-    let Some(codex) = discover_codex_until(&cancel, deadline)
+    let codex = match discover_codex_until(&cancel, deadline)
         .await
         .map_err(|error| auth_probe_error("Codex version check", error))?
-    else {
-        return Ok(CodexAuthStatus::unavailable());
+    {
+        CodexDiscovery::Supported(codex) => codex,
+        CodexDiscovery::Incompatible { version } => {
+            return Ok(CodexDiscovery::incompatible_status(version));
+        }
+        CodexDiscovery::NotFound => return Ok(CodexAuthStatus::unavailable()),
     };
     let output = run_verified_probe(&codex, &["logout"], &cancel, deadline)
         .await
@@ -1001,10 +1032,142 @@ struct JsonlLineBuffer {
 }
 
 /// Whether the head of an oversized JSONL line is a completed `agent_message`
-/// item (Codex serializes the item type before its text).
+/// item (Codex serializes the item type before its text). Only the event's
+/// own `type` and its `item.type` count, never a `"type"` inside a string or
+/// another nested value such as tool arguments.
 fn oversized_line_is_agent_message(head: &[u8]) -> bool {
-    let head = String::from_utf8_lossy(head);
-    head.contains(r#""type":"item.completed""#) && head.contains(r#""type":"agent_message""#)
+    let (event_type, item_type) = jsonl_head_types(head);
+    event_type.as_deref() == Some("item.completed") && item_type.as_deref() == Some("agent_message")
+}
+
+/// Read the top-level `type` and the `item.type` string values from the
+/// first bytes of a JSONL event, which may end in the middle of a token.
+fn jsonl_head_types(head: &[u8]) -> (Option<String>, Option<String>) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        Root,
+        Item,
+        Other,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        Key,
+        Colon,
+        Value,
+        Comma,
+    }
+    struct Object {
+        scope: Scope,
+        expect: Expect,
+        key: String,
+    }
+    // `None` entries are arrays.
+    let mut stack: Vec<Option<Object>> = Vec::new();
+    let mut event_type = None;
+    let mut item_type = None;
+    let mut bytes = head.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'"' => {
+                let mut text = Vec::new();
+                let mut closed = false;
+                while let Some(byte) = bytes.next() {
+                    match byte {
+                        b'"' => {
+                            closed = true;
+                            break;
+                        }
+                        b'\\' => match bytes.next() {
+                            Some(escaped) => text.push(escaped),
+                            None => break,
+                        },
+                        _ => text.push(byte),
+                    }
+                }
+                if !closed {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&text).into_owned();
+                if let Some(Some(object)) = stack.last_mut() {
+                    match object.expect {
+                        Expect::Key => {
+                            object.key = text;
+                            object.expect = Expect::Colon;
+                        }
+                        Expect::Value => {
+                            if object.key == "type" {
+                                match object.scope {
+                                    Scope::Root => event_type = Some(text),
+                                    Scope::Item => item_type = Some(text),
+                                    Scope::Other => {}
+                                }
+                            }
+                            object.expect = Expect::Comma;
+                        }
+                        Expect::Colon | Expect::Comma => break,
+                    }
+                }
+            }
+            b'{' => {
+                let scope = match stack.last_mut() {
+                    None => Scope::Root,
+                    Some(Some(parent)) => {
+                        let scope = if parent.scope == Scope::Root && parent.key == "item" {
+                            Scope::Item
+                        } else {
+                            Scope::Other
+                        };
+                        parent.expect = Expect::Comma;
+                        scope
+                    }
+                    Some(None) => Scope::Other,
+                };
+                stack.push(Some(Object {
+                    scope,
+                    expect: Expect::Key,
+                    key: String::new(),
+                }));
+            }
+            b'[' => {
+                if stack.is_empty() {
+                    break;
+                }
+                if let Some(Some(parent)) = stack.last_mut() {
+                    parent.expect = Expect::Comma;
+                }
+                stack.push(None);
+            }
+            b'}' | b']' => {
+                stack.pop();
+                if stack.is_empty() {
+                    break;
+                }
+            }
+            b':' => {
+                if let Some(Some(object)) = stack.last_mut() {
+                    object.expect = Expect::Value;
+                }
+            }
+            b',' => {
+                if let Some(Some(object)) = stack.last_mut() {
+                    object.expect = Expect::Key;
+                }
+            }
+            byte if byte.is_ascii_whitespace() => {}
+            _ => {
+                // A number, `true`, `false` or `null`: consume the scalar.
+                while bytes.peek().is_some_and(|next| {
+                    !matches!(next, b',' | b'}' | b']') && !next.is_ascii_whitespace()
+                }) {
+                    bytes.next();
+                }
+                if let Some(Some(object)) = stack.last_mut() {
+                    object.expect = Expect::Comma;
+                }
+            }
+        }
+    }
+    (event_type, item_type)
 }
 
 /// Cancel-safe: bytes consumed from `reader` stay in `buffer` until a full
@@ -1117,7 +1280,7 @@ async fn terminate_and_reap_until(
     tree.disarm();
     match result {
         Ok(Ok(status)) => Ok(status),
-        Ok(Err(_)) => Err(CodexTurnError::ProviderFailed),
+        Ok(Err(_)) => Err(CodexTurnError::CliFailed),
         Err(_) => Err(CodexTurnError::Timeout),
     }
 }
@@ -1153,10 +1316,8 @@ async fn run_probe(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     opentake_media::process_tree::configure_command(command.as_std_mut());
-    let mut child = command
-        .spawn()
-        .map_err(|_| CodexTurnError::ProviderFailed)?;
-    let child_id = child.id().ok_or(CodexTurnError::ProviderFailed)?;
+    let mut child = command.spawn().map_err(|_| CodexTurnError::CliFailed)?;
+    let child_id = child.id().ok_or(CodexTurnError::CliFailed)?;
     let mut tree = match opentake_media::process_tree::ProcessTree::attach(child_id) {
         Ok(tree) => tree,
         Err(_) => {
@@ -1178,7 +1339,7 @@ async fn run_probe(
     let deadline_wait = tokio::time::sleep_until(work_deadline(deadline));
     tokio::pin!(deadline_wait);
     let selected = tokio::select! {
-        status = child.wait() => status.map_err(|_| CodexTurnError::ProviderFailed),
+        status = child.wait() => status.map_err(|_| CodexTurnError::CliFailed),
         _ = &mut cancellation => Err(CodexTurnError::Cancelled),
         _ = &mut deadline_wait => Err(CodexTurnError::Timeout),
     };
@@ -1206,11 +1367,51 @@ async fn run_probe(
     })
 }
 
+/// What Codex CLI discovery found. An installed but too old CLI is reported
+/// as such, so the user is asked to update it rather than to install Codex.
+enum CodexDiscovery {
+    Supported(VerifiedCodex),
+    /// No supported candidate; `version` is the newest parsable one found.
+    Incompatible {
+        version: String,
+    },
+    NotFound,
+}
+
+impl CodexDiscovery {
+    fn incompatible_status(version: String) -> CodexAuthStatus {
+        CodexAuthStatus {
+            available: false,
+            authenticated: false,
+            auth_method: None,
+            message: format!(
+                "Official Codex CLI {version} is too old; update it to {}.{}.{} or newer",
+                MINIMUM_CODEX_VERSION.0, MINIMUM_CODEX_VERSION.1, MINIMUM_CODEX_VERSION.2
+            ),
+            version: Some(version),
+            login_in_progress: false,
+        }
+    }
+}
+
 async fn discover_codex_until(
     cancel: &AtomicBool,
     deadline: tokio::time::Instant,
-) -> Result<Option<VerifiedCodex>, CodexTurnError> {
-    for path in candidate_paths() {
+) -> Result<CodexDiscovery, CodexTurnError> {
+    discover_codex_among(candidate_paths(), cancel, deadline).await
+}
+
+/// Use the first supported candidate; otherwise report the newest version
+/// that was found but is too old.
+async fn discover_codex_among(
+    candidates: Vec<PathBuf>,
+    cancel: &AtomicBool,
+    deadline: tokio::time::Instant,
+) -> Result<CodexDiscovery, CodexTurnError> {
+    // A `codex-cli` banner whose version cannot be parsed still means Codex
+    // is installed; it ranks below every parsed version.
+    let mut newest_incompatible: Option<(Option<CodexVersion>, String)> = None;
+    for path in candidates {
         let Some(identity) = ExecutableIdentity::capture(&path) else {
             continue;
         };
@@ -1227,14 +1428,24 @@ async fn discover_codex_until(
             continue;
         };
         if supported_codex_version(&version) {
-            return Ok(Some(VerifiedCodex {
+            return Ok(CodexDiscovery::Supported(VerifiedCodex {
                 path,
                 version,
                 identity,
             }));
         }
+        let parsed = codex_version(&version);
+        if newest_incompatible
+            .as_ref()
+            .is_none_or(|(newest, _)| parsed > *newest)
+        {
+            newest_incompatible = Some((parsed, version));
+        }
     }
-    Ok(None)
+    Ok(match newest_incompatible {
+        Some((_, version)) => CodexDiscovery::Incompatible { version },
+        None => CodexDiscovery::NotFound,
+    })
 }
 
 async fn run_verified_probe(
@@ -1251,15 +1462,6 @@ async fn run_verified_probe(
         return Err(CodexTurnError::Unavailable);
     }
     Ok(output)
-}
-
-async fn discover_codex_for_turn(
-    cancel: &AtomicBool,
-    deadline: tokio::time::Instant,
-) -> Result<Option<(PathBuf, String)>, CodexTurnError> {
-    Ok(discover_codex_until(cancel, deadline)
-        .await?
-        .map(|codex| (codex.path, codex.version)))
 }
 
 async fn write_prompt_with_lifecycle<W: AsyncWrite + Unpin>(
@@ -1295,21 +1497,66 @@ async fn write_prompt_with_lifecycle<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Deadline for draining the MCP endpoint. After a user cancel the dispatches
-/// observe their tokens and end promptly, so a straggler must not hold the
-/// cancelled turn open until the turn deadline. Internal failures keep the
-/// full deadline: timing out there would drop the endpoint, whose `Drop`
-/// cancels the whole turn and discards the error reply that is still saved.
+/// When to stop waiting for the MCP endpoint's tool calls to drain. Once the
+/// dispatches were told to stop (a user cancel or an internal failure) they
+/// observe their tokens and end promptly, so a straggler that ignores its
+/// token gets only a short grace. A turn that ended normally keeps the turn
+/// deadline for its tool calls, but a Stop pressed while they drain switches
+/// to the same short grace. Giving up detaches the endpoint (see
+/// `EphemeralMcpEndpoint::close_or_detach`), which keeps the turn's saved
+/// error or timeout reply instead of cancelling the whole turn; the detached
+/// calls can only commit into the project they were admitted for.
+async fn endpoint_drain_give_up(
+    deadline: tokio::time::Instant,
+    dispatch_cancelled: bool,
+    cancel: &AtomicBool,
+) {
+    if dispatch_cancelled {
+        tokio::time::sleep_until(endpoint_close_deadline(
+            deadline,
+            tokio::time::Instant::now(),
+            true,
+        ))
+        .await;
+        return;
+    }
+    tokio::select! {
+        () = tokio::time::sleep_until(deadline) => {}
+        () = wait_for_cancel(cancel) => {
+            tokio::time::sleep_until(endpoint_close_deadline(
+                deadline,
+                tokio::time::Instant::now(),
+                true,
+            ))
+            .await;
+        }
+    }
+}
+
+/// Deadline for draining the MCP endpoint: the short grace once the
+/// dispatches were cancelled, the turn deadline otherwise.
 fn endpoint_close_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
-    user_cancelled: bool,
+    dispatch_cancelled: bool,
 ) -> tokio::time::Instant {
-    if user_cancelled {
+    if dispatch_cancelled {
         deadline.min(now + CANCELLED_TURN_CLEANUP_GRACE)
     } else {
         deadline
     }
+}
+
+/// Close the endpoint after Codex could not be started. The caller has
+/// already cancelled the dispatches, so the drain gets the short grace.
+async fn close_endpoint_after_failure(
+    endpoint: opentake_agent::mcp::server::EphemeralMcpEndpoint,
+    cancel: &AtomicBool,
+    deadline: tokio::time::Instant,
+) {
+    let _ = endpoint
+        .close_or_detach(endpoint_drain_give_up(deadline, true, cancel))
+        .await;
 }
 
 fn strict_config_rejected(stderr: &[u8]) -> bool {
@@ -1326,7 +1573,7 @@ async fn consume_exec_stream<R, F>(
     context: &CodexTurnContext,
     deadline: tokio::time::Instant,
     on_tool_call: &mut F,
-) -> Result<CodexTurnOutput, CodexTurnError>
+) -> StreamEnd
 where
     R: AsyncRead + Unpin,
     F: FnMut(ToolCall),
@@ -1342,23 +1589,36 @@ where
     loop {
         tokio::select! {
             line = read_bounded_line(&mut reader, &mut line_buffer) => {
-                let Some(line) = line? else {
-                    break;
+                let line = match line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => return StreamEnd::Failed(error),
                 };
-                if let Some(call) = stream.accept_line(line)? {
-                    on_tool_call(call);
+                match stream.accept_line(line) {
+                    Ok(Some(call)) => on_tool_call(call),
+                    Ok(None) => {}
+                    Err(error) => return StreamEnd::Failed(error),
                 }
             }
             _ = poll.tick() => {
                 if context.cancel.load(Ordering::Acquire) {
-                    return Err(CodexTurnError::Cancelled);
+                    return StreamEnd::Failed(CodexTurnError::Cancelled);
                 }
             }
-            _ = endpoint.stopped() => return Err(CodexTurnError::McpStart),
-            _ = &mut deadline => return Err(CodexTurnError::Timeout),
+            _ = endpoint.stopped() => return StreamEnd::Failed(CodexTurnError::McpStart),
+            _ = &mut deadline => return StreamEnd::Failed(CodexTurnError::Timeout),
         }
     }
-    stream.finish()
+    StreamEnd::Eof(stream.finish())
+}
+
+/// How reading Codex's JSONL stream ended.
+enum StreamEnd {
+    /// Codex closed stdout; the turn's result, which may still be an error
+    /// (no reply). Codex is exiting, so its exit status decides the rest.
+    Eof(Result<CodexTurnOutput, CodexTurnError>),
+    /// A failure found while Codex still runs; Codex is killed.
+    Failed(CodexTurnError),
 }
 
 /// Codex JSONL stream state, separated from the process plumbing so a whole
@@ -1452,14 +1712,24 @@ pub async fn run_agent_turn<F>(
 where
     F: FnMut(ToolCall),
 {
+    run_agent_turn_among(candidate_paths(), context, prompt, on_tool_call).await
+}
+
+async fn run_agent_turn_among<F>(
+    candidates: Vec<PathBuf>,
+    context: CodexTurnContext,
+    prompt: &str,
+    on_tool_call: F,
+) -> Result<CodexTurnOutput, CodexTurnError>
+where
+    F: FnMut(ToolCall),
+{
     let deadline = tokio::time::Instant::now() + CODEX_TURN_TIMEOUT;
-    let Some((path, version)) = discover_codex_for_turn(context.cancel.as_ref(), deadline).await?
-    else {
-        return Err(CodexTurnError::Unavailable);
+    let path = match discover_codex_among(candidates, context.cancel.as_ref(), deadline).await? {
+        CodexDiscovery::Supported(codex) => codex.path,
+        CodexDiscovery::Incompatible { .. } => return Err(CodexTurnError::IncompatibleCli),
+        CodexDiscovery::NotFound => return Err(CodexTurnError::Unavailable),
     };
-    if !supported_codex_version(&version) {
-        return Err(CodexTurnError::IncompatibleCli);
-    }
     let output = run_probe(
         &path,
         &["login", "status"],
@@ -1484,7 +1754,7 @@ where
 }
 
 #[cfg(all(test, unix))]
-async fn run_agent_turn_with_executable<F>(
+pub(crate) async fn run_agent_turn_with_executable<F>(
     path: &Path,
     context: CodexTurnContext,
     prompt: &str,
@@ -1497,7 +1767,7 @@ where
     run_agent_turn_with_executable_until(path, context, prompt, on_tool_call, deadline).await
 }
 
-async fn run_agent_turn_with_executable_until<F>(
+pub(crate) async fn run_agent_turn_with_executable_until<F>(
     path: &Path,
     context: CodexTurnContext,
     prompt: &str,
@@ -1540,9 +1810,9 @@ where
         Ok(child) => child,
         Err(_) => {
             context.gate.request_dispatch_cancel();
-            let _ = tokio::time::timeout_at(deadline, endpoint.close()).await;
+            close_endpoint_after_failure(endpoint, context.cancel.as_ref(), deadline).await;
             drop(isolated_cwd);
-            return Err(CodexTurnError::ProviderFailed);
+            return Err(CodexTurnError::CliFailed);
         }
     };
     let child_id = match child.id() {
@@ -1551,9 +1821,9 @@ where
             context.gate.request_dispatch_cancel();
             let _ = child.start_kill();
             let _ = tokio::time::timeout_at(deadline, child.wait()).await;
-            let _ = tokio::time::timeout_at(deadline, endpoint.close()).await;
+            close_endpoint_after_failure(endpoint, context.cancel.as_ref(), deadline).await;
             drop(isolated_cwd);
-            return Err(CodexTurnError::ProviderFailed);
+            return Err(CodexTurnError::CliFailed);
         }
     };
     let mut tree = match opentake_media::process_tree::ProcessTree::attach(child_id) {
@@ -1562,9 +1832,9 @@ where
             context.gate.request_dispatch_cancel();
             let _ = child.start_kill();
             let _ = tokio::time::timeout_at(deadline, child.wait()).await;
-            let _ = tokio::time::timeout_at(deadline, endpoint.close()).await;
+            close_endpoint_after_failure(endpoint, context.cancel.as_ref(), deadline).await;
             drop(isolated_cwd);
-            return Err(CodexTurnError::ProviderFailed);
+            return Err(CodexTurnError::CliFailed);
         }
     };
 
@@ -1585,7 +1855,7 @@ where
             )
             .await
         }
-        None => Err(CodexTurnError::Protocol),
+        None => Err(CodexTurnError::CliFailed),
     };
     let mut outcome = prompt_result.err().map(Err);
     let mut status: Option<std::io::Result<ExitStatus>> = None;
@@ -1605,9 +1875,19 @@ where
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let wait_deadline = tokio::time::sleep_until(operation_deadline);
             tokio::pin!(wait_deadline);
+            // After EOF Codex is exiting: wait for its status (so an exit
+            // failure is reported as such) unless the turn is stopped.
+            let mut reached_eof = false;
+            let mut stopped = false;
             loop {
                 tokio::select! {
-                    result = &mut consume, if outcome.is_none() => outcome = Some(result),
+                    end = &mut consume, if outcome.is_none() => match end {
+                        StreamEnd::Eof(result) => {
+                            reached_eof = true;
+                            outcome = Some(result);
+                        }
+                        StreamEnd::Failed(error) => outcome = Some(Err(error)),
+                    },
                     waited = &mut wait, if status.is_none() => {
                         status = Some(waited);
                         // The immediate CLI may have left descendants holding the
@@ -1615,30 +1895,36 @@ where
                         let _ = tree.terminate();
                         tree.disarm();
                     }
-                    _ = poll.tick(), if outcome.is_none() => {
+                    _ = poll.tick(), if outcome.is_none() || reached_eof => {
                         if context.cancel.load(Ordering::Acquire) {
                             outcome = Some(Err(CodexTurnError::Cancelled));
+                            stopped = true;
                         }
                     }
-                    _ = endpoint.stopped(), if outcome.is_none() => {
+                    _ = endpoint.stopped(), if outcome.is_none() || reached_eof => {
                         outcome = Some(Err(CodexTurnError::McpStart));
+                        stopped = true;
                     }
                     _ = &mut wait_deadline, if outcome.is_none() || status.is_none() => {
                         outcome = Some(Err(CodexTurnError::Timeout));
+                        stopped = true;
                     }
                 }
                 if outcome.is_some() && status.is_some() {
                     break;
                 }
-                if outcome.as_ref().is_some_and(Result::is_err) {
+                if stopped || (!reached_eof && outcome.as_ref().is_some_and(Result::is_err)) {
                     break;
                 }
             }
         } else {
-            outcome = Some(Err(CodexTurnError::Protocol));
+            outcome = Some(Err(CodexTurnError::CliFailed));
         }
     }
     let mut outcome = outcome.unwrap_or(Err(CodexTurnError::Protocol));
+    // Whether Codex exited by itself; otherwise it is still running and is
+    // killed below, and its exit status reflects that kill.
+    let exited_on_its_own = status.is_some();
     let wait_failed = match status.as_ref() {
         Some(Ok(status)) => !status.success(),
         Some(Err(_)) => true,
@@ -1650,6 +1936,14 @@ where
     let outcome_was_cancelled = matches!(&outcome, Err(CodexTurnError::Cancelled));
     let externally_cancelled = context.cancel.load(Ordering::Acquire);
     let requested_cleanup_cancel = outcome.is_err() || externally_cancelled;
+    // A descendant may keep a capture pipe open after the CLI exits. Bound
+    // every cleanup phase by the same grace, including reaping and stderr,
+    // so an internal failure cannot fall back to the full turn deadline.
+    let cleanup_deadline = endpoint_close_deadline(
+        deadline,
+        tokio::time::Instant::now(),
+        requested_cleanup_cancel,
+    );
     if requested_cleanup_cancel {
         if outcome_was_cancelled || externally_cancelled {
             context.gate.request_cancel();
@@ -1661,24 +1955,30 @@ where
     }
     let status = match status {
         Some(Ok(status)) => Ok(status),
-        Some(Err(_)) | None => terminate_and_reap_until(&mut child, &mut tree, deadline).await,
-    };
-    let close_deadline = endpoint_close_deadline(
-        deadline,
-        tokio::time::Instant::now(),
-        outcome_was_cancelled || externally_cancelled,
-    );
-    let endpoint_close = tokio::time::timeout_at(close_deadline, endpoint.close()).await;
-    let endpoint_result = match endpoint_close {
-        Ok(result) => result,
-        Err(_) => {
-            if outcome.is_ok() {
-                outcome = Err(CodexTurnError::Timeout);
-            }
-            Err(opentake_agent::mcp::server::EphemeralMcpError::Join)
+        Some(Err(_)) | None => {
+            terminate_and_reap_until(&mut child, &mut tree, cleanup_deadline).await
         }
     };
-    let stderr = match join_capture_until(stderr_task, deadline).await {
+    let endpoint_result = endpoint
+        .close_or_detach(endpoint_drain_give_up(
+            cleanup_deadline,
+            requested_cleanup_cancel,
+            context.cancel.as_ref(),
+        ))
+        .await;
+    if matches!(
+        endpoint_result,
+        Err(opentake_agent::mcp::server::EphemeralMcpError::Detached)
+    ) && outcome.is_ok()
+    {
+        outcome = Err(CodexTurnError::Timeout);
+    }
+    let stderr_deadline = endpoint_close_deadline(
+        cleanup_deadline,
+        tokio::time::Instant::now(),
+        context.cancel.load(Ordering::Acquire),
+    );
+    let stderr = match join_capture_until(stderr_task, stderr_deadline).await {
         Ok(stderr) => stderr,
         Err(error) => {
             if outcome.is_ok() {
@@ -1697,7 +1997,7 @@ where
     }
     let status = match status {
         Ok(status) => status,
-        Err(error) => return Err(error),
+        Err(error) => return outcome.and(Err(error)),
     };
     if !status.success()
         && !matches!(
@@ -1707,11 +2007,16 @@ where
     {
         outcome = Err(if strict_config_rejected(&stderr) {
             CodexTurnError::StrictConfigRejected
-        } else if matches!(outcome, Err(CodexTurnError::ProviderFailed)) {
-            // Keep the reported turn failure (and its sign-in hint).
-            CodexTurnError::ProviderFailed
         } else {
-            CodexTurnError::CliFailed
+            match outcome {
+                // Keep the reported turn failure (and its sign-in hint).
+                Err(CodexTurnError::ProviderFailed) => CodexTurnError::ProviderFailed,
+                // A failure found while Codex still ran (for example a
+                // protocol error) caused the kill; the kill's exit status
+                // must not relabel it.
+                Err(error) if !exited_on_its_own => error,
+                _ => CodexTurnError::CliFailed,
+            }
         });
     }
     if endpoint_result.is_err() && outcome.is_ok() {
@@ -1903,6 +2208,18 @@ mod tests {
         assert!(supported_codex_version("codex-cli 1.0.0"));
         assert!(!supported_codex_version("codex-cli unknown"));
         assert!(!supported_codex_version("other 0.146.0"));
+        // A pre-release of the minimum is older than the minimum.
+        assert!(!supported_codex_version("codex-cli 0.146.0-alpha.3"));
+        assert!(supported_codex_version("codex-cli 0.146.1-alpha.1"));
+        assert!(supported_codex_version("codex-cli 0.146.0+build.7"));
+        // Short and annotated banners still parse.
+        assert!(supported_codex_version("codex-cli 0.146"));
+        assert!(!supported_codex_version("codex-cli 0.145"));
+        assert!(supported_codex_version("codex-cli 0.146.0 (4f2a9c1)"));
+        assert_eq!(
+            codex_version("codex-cli 0.147 (dev)").map(|version| version.core),
+            Some((0, 147, 0))
+        );
     }
 
     #[test]
@@ -2226,6 +2543,32 @@ mod tests {
     }
 
     #[test]
+    fn oversized_reply_detection_keys_on_the_item_type() {
+        let reply =
+            br#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"abc"#;
+        assert!(oversized_line_is_agent_message(reply));
+        // A tool call whose arguments mention an agent_message is not a reply.
+        let tool = br#"{"type":"item.completed","item":{"id":"t","type":"mcp_tool_call","tool":"add_texts","arguments":{"type":"agent_message","text":"a \"type\":\"agent_message\" b"#;
+        assert!(!oversized_line_is_agent_message(tool));
+        // Neither is a string value containing the marker ahead of the item.
+        let note = br#"{"note":"{\"type\":\"agent_message\"}","type":"item.completed","item":{"id":"t","type":"mcp_tool_call","result":"#;
+        assert!(!oversized_line_is_agent_message(note));
+        // A nested object's type is not the item's type.
+        let nested = br#"{"type":"item.completed","item":{"meta":{"type":"agent_message"},"id":"t","type":"mcp_tool_call","#;
+        assert!(!oversized_line_is_agent_message(nested));
+        // A started (not completed) message is not the reply.
+        let started =
+            br#"{"type":"item.started","item":{"id":"m","type":"agent_message","text":"abc"#;
+        assert!(!oversized_line_is_agent_message(started));
+        // Whitespace, numbers and arrays before the type are skipped.
+        let spaced = br#"{ "seq" : 12 , "tags" : [1, {"type":"agent_message"}], "type" : "item.completed" , "item" : { "id" : "m" , "type" : "agent_message" , "text" : "#;
+        assert!(oversized_line_is_agent_message(spaced));
+        // A head that ends inside the item type decides nothing.
+        let cut = br#"{"type":"item.completed","item":{"id":"m","type":"agent_mes"#;
+        assert!(!oversized_line_is_agent_message(cut));
+    }
+
+    #[test]
     fn a_reply_above_the_display_limit_is_truncated_with_a_note() {
         let text = "é".repeat(MAX_FINAL_TEXT_BYTES / 2 + 10);
         let event = serde_json::json!({
@@ -2242,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_user_cancel_shortens_the_endpoint_drain() {
+    fn a_dispatch_cancel_shortens_the_endpoint_drain() {
         let now = tokio::time::Instant::now();
         let deadline = now + Duration::from_secs(600);
         assert_eq!(
@@ -2252,6 +2595,41 @@ mod tests {
         assert_eq!(endpoint_close_deadline(deadline, now, false), deadline);
         let soon = now + Duration::from_secs(1);
         assert_eq!(endpoint_close_deadline(soon, now, true), soon);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_normal_drain_switches_to_the_short_grace() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let give_up = endpoint_drain_give_up(deadline, false, cancel.as_ref());
+        tokio::pin!(give_up);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(600), &mut give_up)
+                .await
+                .is_err(),
+            "a turn that ended normally keeps waiting for its tool calls"
+        );
+        cancel.store(true, Ordering::Release);
+        let stopped = tokio::time::Instant::now();
+        tokio::time::timeout(
+            CANCELLED_TURN_CLEANUP_GRACE + Duration::from_secs(1),
+            &mut give_up,
+        )
+        .await
+        .expect("a Stop bounds the drain by the short grace");
+        assert!(tokio::time::Instant::now() - stopped >= CANCELLED_TURN_CLEANUP_GRACE);
+
+        // A dispatch cancel (Stop or an internal failure) uses the short grace
+        // from the start; the deadline still bounds both.
+        let started = tokio::time::Instant::now();
+        endpoint_drain_give_up(deadline, true, &AtomicBool::new(false)).await;
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            CANCELLED_TURN_CLEANUP_GRACE
+        );
+        let near = tokio::time::Instant::now() + Duration::from_secs(1);
+        endpoint_drain_give_up(near, false, &AtomicBool::new(false)).await;
+        assert_eq!(tokio::time::Instant::now(), near);
     }
 
     #[test]
@@ -2811,5 +3189,152 @@ exit 2
         assert!(!cwd.exists());
         assert_endpoint_closed(&endpoint).await;
         assert!(!format!("{result:?}").contains("private/path/token"));
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_with_version(root: &Path, name: &str, version: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        fake_codex_script(
+            &dir,
+            &format!("if [ \"${{1:-}}\" = \"--version\" ]; then echo 'codex-cli {version}'; exit 0; fi\nexit 3"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_codex_is_reported_as_incompatible_not_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let old = fake_codex_with_version(root.path(), "old", "0.145.9");
+        let older = fake_codex_with_version(root.path(), "older", "0.100.0");
+        let new = fake_codex_with_version(root.path(), "new", "0.146.0");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let cancel = AtomicBool::new(false);
+
+        let found = discover_codex_among(vec![older.clone(), old.clone()], &cancel, deadline)
+            .await
+            .unwrap();
+        let CodexDiscovery::Incompatible { version } = found else {
+            panic!("an old CLI must be reported as incompatible");
+        };
+        assert_eq!(
+            version, "codex-cli 0.145.9",
+            "the newest old version is named"
+        );
+        let status = CodexDiscovery::incompatible_status(version);
+        assert!(!status.available);
+        assert_eq!(status.version.as_deref(), Some("codex-cli 0.145.9"));
+        assert!(status.message.contains("0.145.9"), "{}", status.message);
+        assert!(
+            status.message.contains("update it to 0.146.0"),
+            "{}",
+            status.message
+        );
+
+        let found = discover_codex_among(vec![old.clone(), new.clone()], &cancel, deadline)
+            .await
+            .unwrap();
+        let CodexDiscovery::Supported(codex) = found else {
+            panic!("the supported candidate must win over an older one");
+        };
+        assert_eq!(codex.path, new);
+        assert!(matches!(
+            discover_codex_among(vec![root.path().join("missing")], &cancel, deadline)
+                .await
+                .unwrap(),
+            CodexDiscovery::NotFound
+        ));
+
+        // An installed Codex whose banner cannot be parsed is not "missing",
+        // and a parsed old version is named in preference to it.
+        let odd = fake_codex_with_version(root.path(), "odd", "nightly");
+        let CodexDiscovery::Incompatible { version } =
+            discover_codex_among(vec![odd.clone()], &cancel, deadline)
+                .await
+                .unwrap()
+        else {
+            panic!("an unparsable Codex banner is reported as incompatible");
+        };
+        assert_eq!(version, "codex-cli nightly");
+        let CodexDiscovery::Incompatible { version } =
+            discover_codex_among(vec![odd, older.clone()], &cancel, deadline)
+                .await
+                .unwrap()
+        else {
+            panic!("an old CLI must be reported as incompatible");
+        };
+        assert_eq!(version, "codex-cli 0.100.0");
+
+        let result = run_agent_turn_among(
+            vec![old],
+            turn_context(Arc::new(AtomicBool::new(false))),
+            "prompt",
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), CodexTurnError::IncompatibleCli);
+        let result = run_agent_turn_among(
+            Vec::new(),
+            turn_context(Arc::new(AtomicBool::new(false))),
+            "prompt",
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), CodexTurnError::Unavailable);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_executable_that_cannot_start_is_a_cli_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let result = run_agent_turn_with_executable(
+            &root.path().join("missing-codex"),
+            turn_context(Arc::new(AtomicBool::new(false))),
+            "prompt",
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), CodexTurnError::CliFailed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_protocol_error_keeps_its_kind_after_codex_is_killed() {
+        let root = tempfile::tempdir().unwrap();
+        let script = fake_codex_script(
+            root.path(),
+            r#"
+IFS= read -r prompt || true
+printf '%s\n' '{"type":"thread.started"}'
+printf '%s\n' 'not json'
+sleep 60
+"#,
+        );
+        let result = run_agent_turn_with_executable(
+            &script,
+            turn_context(Arc::new(AtomicBool::new(false))),
+            "prompt",
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), CodexTurnError::Protocol);
+
+        // Codex that fails by itself is still a CLI failure.
+        let script = fake_codex_script(
+            root.path(),
+            r#"
+IFS= read -r prompt || true
+printf '%s\n' '{"type":"thread.started"}'
+exit 4
+"#,
+        );
+        let result = run_agent_turn_with_executable(
+            &script,
+            turn_context(Arc::new(AtomicBool::new(false))),
+            "prompt",
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), CodexTurnError::CliFailed);
     }
 }

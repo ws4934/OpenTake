@@ -15,8 +15,8 @@ pub use wgpu;
 
 pub use plan::{
     affine_transform, build_render_plan, compose, crop_to_uv, source_frame_index,
-    try_build_render_plan, AudioClipPlan, ClipPlan, CompoundAncestor, FramePlan, LayerDraw,
-    RenderPlan, RenderSize, TextureSource,
+    try_build_render_plan, try_collect_audio_clips, AudioClipPlan, ClipPlan, CompoundAncestor,
+    FramePlan, LayerDraw, RenderPlan, RenderSize, TextureSource,
 };
 pub use size::{even, export_render_size, ExportResolution};
 pub use source::{unpremultiply_rgba, DecodedFrame, FrameProvider, SourceMetrics};

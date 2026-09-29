@@ -126,6 +126,19 @@ fn status_for(account: &str) -> Result<SecretStatus, String> {
     }
 }
 
+/// Store a provider key. The generation availability cache is invalidated on
+/// every outcome, since a failed keychain write may still have changed it.
+fn save_key(store: &dyn KeyStore, account: &str, key: &str) -> Result<(), String> {
+    let _credentials_changed = crate::generation_availability::InvalidateOnExit;
+    store.save(account, key).map_err(|e| e.to_string())
+}
+
+/// Remove a provider key; see [`save_key`] for the cache invalidation.
+fn delete_key(store: &dyn KeyStore, account: &str) -> Result<(), String> {
+    let _credentials_changed = crate::generation_availability::InvalidateOnExit;
+    store.delete(account).map_err(|e| e.to_string())
+}
+
 /// `secret_save`: persist a provider's API key to the OS keychain. The key is
 /// trimmed; an empty key is rejected rather than stored. Returns the new masked
 /// status so the front end never has to round-trip the plaintext back.
@@ -141,9 +154,7 @@ pub fn secret_save(
     if trimmed.is_empty() {
         return Err("API key is empty".to_string());
     }
-    KeyringStore::new()
-        .save(account, trimmed)
-        .map_err(|e| e.to_string())?;
+    save_key(&KeyringStore::new(), account, trimmed)?;
     status_for(account)
 }
 
@@ -162,9 +173,7 @@ pub fn secret_delete(
 ) -> Result<SecretStatus, String> {
     let _activity = crate::updater::begin_mutating_activity(&admission)?;
     let account = account_for(&provider)?;
-    KeyringStore::new()
-        .delete(account)
-        .map_err(|e| e.to_string())?;
+    delete_key(&KeyringStore::new(), account)?;
     status_for(account)
 }
 
@@ -212,5 +221,22 @@ mod tests {
         let masked = mask("é🔑abc");
         assert_eq!(masked.chars().count(), 40);
         assert!(masked.ends_with("🔑abc"));
+    }
+
+    #[test]
+    fn saving_or_deleting_a_key_refreshes_generation_availability() {
+        use crate::generation_availability::GenerationAvailabilityCache;
+        use opentake_gen::MemoryKeyStore;
+
+        let store = MemoryKeyStore::new();
+        let cache = GenerationAvailabilityCache::new_with_ttl(std::time::Duration::from_secs(3600));
+        let available = || cache.get(|| store.load("fal-api-key").unwrap().is_some());
+        assert!(!available());
+
+        save_key(&store, "fal-api-key", "fal-key").unwrap();
+        assert!(available());
+
+        delete_key(&store, "fal-api-key").unwrap();
+        assert!(!available());
     }
 }

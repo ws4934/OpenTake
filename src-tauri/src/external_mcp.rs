@@ -456,6 +456,11 @@ struct ExternalMcpLifecycle {
     state: ExternalMcpListenerState,
     error: Option<String>,
     auth_failure: Option<String>,
+    /// Whether `auth_failure` may clear on retry: a credential read or a
+    /// catalog write that failed transiently (a locked keychain, a full
+    /// disk). A catalog or preferences file that could not be loaded at
+    /// startup is not retried.
+    auth_retryable: bool,
     endpoint: Option<ManagedMcpEndpoint>,
     listening_socket: Option<ListeningSocket>,
 }
@@ -546,6 +551,7 @@ impl ExternalMcpState {
                 state: ExternalMcpListenerState::Disabled,
                 error: None,
                 auth_failure: None,
+                auth_retryable: false,
                 endpoint: None,
                 listening_socket: None,
             })),
@@ -581,6 +587,7 @@ impl ExternalMcpState {
                     },
                     error: None,
                     auth_failure: None,
+                    auth_retryable: false,
                     endpoint: None,
                     listening_socket: None,
                 }));
@@ -600,6 +607,7 @@ impl ExternalMcpState {
                     state: ExternalMcpListenerState::AuthFailure,
                     error: Some(sanitize_auth_failure(&error)),
                     auth_failure: Some(error),
+                    auth_retryable: false,
                     endpoint: None,
                     listening_socket: None,
                 }));
@@ -623,6 +631,7 @@ impl ExternalMcpState {
             state: ExternalMcpListenerState::AuthFailure,
             error: Some(sanitize_auth_failure(&error)),
             auth_failure: Some(error),
+            auth_retryable: false,
             endpoint: None,
             listening_socket: None,
         }));
@@ -635,6 +644,7 @@ impl ExternalMcpState {
             return;
         }
         self.ensure_last_use_worker().await;
+        self.retry_auth(&mut lifecycle).await;
         self.reconcile_listener(&mut lifecycle).await;
     }
 
@@ -647,6 +657,7 @@ impl ExternalMcpState {
         let mut lifecycle = self.lifecycle.lock().await;
         self.ensure_running(&lifecycle)?;
         self.ensure_last_use_worker().await;
+        self.retry_auth(&mut lifecycle).await;
         if enabled {
             self.ensure_auth_ready(&lifecycle)?;
         }
@@ -670,6 +681,7 @@ impl ExternalMcpState {
     pub(crate) async fn pair(&self, name: &str) -> Result<ExternalMcpPairingReceipt, String> {
         let mut lifecycle = self.lifecycle.lock().await;
         self.ensure_running(&lifecycle)?;
+        self.retry_auth(&mut lifecycle).await;
         self.ensure_auth_ready(&lifecycle)?;
         let receipt = match self.with_catalog_write(|catalog| catalog.pair(name)) {
             Ok(receipt) => receipt,
@@ -678,12 +690,7 @@ impl ExternalMcpState {
                 return Err(error);
             }
         };
-        if let Err(error) = self.refresh_credentials() {
-            lifecycle.auth_failure = Some(error.clone());
-            self.reconcile_listener(&mut lifecycle).await;
-            return Err(error);
-        }
-        self.reconcile_listener(&mut lifecycle).await;
+        self.refresh_after_catalog_write(&mut lifecycle).await?;
         Ok(receipt)
     }
 
@@ -693,6 +700,7 @@ impl ExternalMcpState {
     ) -> Result<ExternalMcpPairingReceipt, String> {
         let mut lifecycle = self.lifecycle.lock().await;
         self.ensure_running(&lifecycle)?;
+        self.retry_auth(&mut lifecycle).await;
         self.ensure_auth_ready(&lifecycle)?;
         let previous = self.active_client(client_id)?;
         if let Some(endpoint) = lifecycle.endpoint.as_ref() {
@@ -713,33 +721,43 @@ impl ExternalMcpState {
                 return Err(error);
             }
         };
-        self.refresh_credentials()?;
-        self.reconcile_listener(&mut lifecycle).await;
+        self.refresh_after_catalog_write(&mut lifecycle).await?;
         Ok(receipt)
     }
 
     pub(crate) async fn revoke(&self, client_id: &str) -> Result<ExternalMcpStatus, String> {
         let mut lifecycle = self.lifecycle.lock().await;
         self.ensure_running(&lifecycle)?;
-        self.ensure_auth_ready(&lifecycle)?;
-        let previous = self.active_client(client_id)?;
-        if let Some(endpoint) = lifecycle.endpoint.as_ref() {
+        self.retry_auth(&mut lifecycle).await;
+        // Revoking only removes access, so it runs even while credentials
+        // cannot be loaded: a missing or mismatched keychain item for one
+        // client fails the load for every client, and revoking that client
+        // is how the user recovers. The listener is stopped during an
+        // authentication failure, so there is no session to cancel then;
+        // the catalog itself still refuses writes while a commit is pending.
+        let previous = if lifecycle.auth_failure.is_none() {
+            Some(self.active_client(client_id)?)
+        } else {
+            None
+        };
+        if let (Some(endpoint), Some(previous)) = (lifecycle.endpoint.as_ref(), previous.as_ref()) {
             endpoint
-                .cancel_client(&previous)
+                .cancel_client(previous)
                 .await
                 .map_err(|error| error.to_string())?;
         }
         if let Err(error) = self.with_catalog_write(|catalog| catalog.revoke(client_id)) {
             if self.catalog.read().is_ok_and(|catalog| !catalog.pending) {
-                if let Some(endpoint) = lifecycle.endpoint.as_ref() {
-                    endpoint.restore_client(&previous);
+                if let (Some(endpoint), Some(previous)) =
+                    (lifecycle.endpoint.as_ref(), previous.as_ref())
+                {
+                    endpoint.restore_client(previous);
                 }
             }
             self.handle_catalog_failure(&mut lifecycle, &error).await;
             return Err(error);
         }
-        self.refresh_credentials()?;
-        self.reconcile_listener(&mut lifecycle).await;
+        self.refresh_after_catalog_write(&mut lifecycle).await?;
         Ok(self.status_for(&lifecycle))
     }
 
@@ -787,6 +805,7 @@ impl ExternalMcpState {
         if let Err(error) = self.refresh_credentials() {
             let _ = self.stop_listener(lifecycle).await;
             lifecycle.auth_failure = Some(error);
+            lifecycle.auth_retryable = true;
             lifecycle.state = ExternalMcpListenerState::AuthFailure;
             lifecycle.error = Some("external MCP authentication is unavailable".to_string());
             self.emit_status(lifecycle);
@@ -851,6 +870,7 @@ impl ExternalMcpState {
         let ready = self.catalog.read().is_ok_and(|catalog| !catalog.pending);
         if !ready {
             lifecycle.auth_failure = Some(error.to_string());
+            lifecycle.auth_retryable = true;
         }
         self.reconcile_listener(lifecycle).await;
     }
@@ -885,6 +905,66 @@ impl ExternalMcpState {
 
     fn emit_status(&self, lifecycle: &ExternalMcpLifecycle) {
         self.status.publish(self.status_for(lifecycle));
+    }
+
+    /// Retry a transient authentication failure: finish a catalog commit
+    /// left pending and reload the credentials. On success the failure is
+    /// cleared and the listener reconciled (and the status emitted) at once,
+    /// so a later error in the caller cannot leave a stale `AuthFailure`
+    /// behind; a failed retry keeps the failure and is logged.
+    async fn retry_auth(&self, lifecycle: &mut ExternalMcpLifecycle) {
+        if lifecycle.auth_failure.is_none() || !lifecycle.auth_retryable {
+            return;
+        }
+        let recovered = self
+            .with_catalog_write(|catalog| {
+                if catalog.pending {
+                    catalog.recover_pending_commit()?;
+                    if catalog.pending {
+                        // The commit file is already gone; only the directory
+                        // sync that clears the flag failed.
+                        catalog.clear_pending()?;
+                    }
+                }
+                Ok(())
+            })
+            .and_then(|()| self.refresh_credentials());
+        match recovered {
+            Ok(()) => {
+                eprintln!("[external-mcp] authentication recovered");
+                lifecycle.auth_failure = None;
+                lifecycle.auth_retryable = false;
+                lifecycle.error = None;
+                self.reconcile_listener(lifecycle).await;
+            }
+            // Credential errors can name keychain internals; log only that
+            // the retry failed.
+            Err(_) => eprintln!("[external-mcp] authentication retry failed"),
+        }
+    }
+
+    /// Reload the credential snapshot after a committed catalog change and
+    /// reconcile the listener. A snapshot that loads again clears a
+    /// retryable authentication failure (for example after revoking the
+    /// client whose keychain item was missing); one that fails becomes one.
+    async fn refresh_after_catalog_write(
+        &self,
+        lifecycle: &mut ExternalMcpLifecycle,
+    ) -> Result<(), String> {
+        let refreshed = self.refresh_credentials();
+        match &refreshed {
+            Ok(()) if lifecycle.auth_retryable => {
+                lifecycle.auth_failure = None;
+                lifecycle.auth_retryable = false;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                lifecycle.auth_failure = Some(error.clone());
+                lifecycle.auth_retryable = true;
+            }
+        }
+        self.reconcile_listener(lifecycle).await;
+        refreshed
     }
 
     fn ensure_auth_ready(&self, lifecycle: &ExternalMcpLifecycle) -> Result<(), String> {
@@ -971,8 +1051,17 @@ impl ExternalMcpState {
 
     async fn ensure_last_use_worker(&self) {
         let mut worker = self.last_use_worker.lock().await;
-        if worker.is_some() {
+        if worker
+            .as_ref()
+            .is_some_and(|worker| !worker.join.is_finished())
+        {
             return;
+        }
+        if let Some(finished) = worker.take() {
+            // The worker only ends on shutdown or a panic; start a new one.
+            if let Err(error) = finished.join.await {
+                eprintln!("[external-mcp] last-use worker stopped: {error}");
+            }
         }
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let join = spawn_last_use_worker(
@@ -1054,6 +1143,10 @@ fn status_from_parts(
     }
 }
 
+/// First delay before the last-use worker retries a failed write; it doubles
+/// up to the regular write interval.
+const LAST_USE_RETRY_INITIAL: Duration = Duration::from_secs(1);
+
 fn spawn_last_use_worker(
     catalog: Arc<RwLock<ExternalMcpCatalog>>,
     tracker: Arc<LastUseTracker>,
@@ -1062,8 +1155,14 @@ fn spawn_last_use_worker(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
+        // After a failed flush, wait before retrying instead of spinning on
+        // the entries that are still due.
+        let mut retry: Option<(tokio::time::Instant, Duration)> = None;
         loop {
-            let deadline = tracker.next_deadline();
+            let deadline = match retry {
+                Some((at, _)) => Some(at),
+                None => tracker.next_deadline(),
+            };
             match deadline {
                 Some(deadline) => tokio::select! {
                     _ = &mut shutdown => {
@@ -1071,7 +1170,7 @@ fn spawn_last_use_worker(
                             catalog, tracker, lifecycle, status, true
                         ).await;
                     }
-                    () = tracker.changed.notified() => {}
+                    () = tracker.changed.notified(), if retry.is_none() => {}
                     _ = tokio::time::sleep_until(deadline) => {}
                 },
                 None => tokio::select! {
@@ -1083,14 +1182,28 @@ fn spawn_last_use_worker(
                     () = tracker.changed.notified() => {}
                 },
             }
-            flush_last_use_blocking(
+            match flush_last_use_blocking(
                 catalog.clone(),
                 tracker.clone(),
                 lifecycle.clone(),
                 status.clone(),
                 false,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => retry = None,
+                Err(error) => {
+                    // Keep the timestamps dirty and try again later; one
+                    // failed write must not stop recording use for good.
+                    let delay = retry.map_or(LAST_USE_RETRY_INITIAL, |(_, delay)| {
+                        (delay * 2).min(Duration::from_secs(LAST_USED_WRITE_INTERVAL_SECS as u64))
+                    });
+                    eprintln!(
+                        "[external-mcp] could not persist last-use times, retrying in {delay:?}: {error}"
+                    );
+                    retry = Some((tokio::time::Instant::now() + delay, delay));
+                }
+            }
         }
     })
 }
@@ -1676,15 +1789,30 @@ fn read_preferences(root: &Path) -> Result<ExternalMcpPreferences, String> {
     let pending = root.join(PREFERENCES_PENDING_FILE);
     match fs::read(&pending) {
         Ok(bytes) => {
-            let target: ExternalMcpPreferences = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("read external MCP pending preferences: {error}"))?;
+            let Ok(target) = serde_json::from_slice::<ExternalMcpPreferences>(&bytes) else {
+                // An unreadable target was never published, so the current
+                // file still holds the last committed preferences. Discard it
+                // instead of failing every later load.
+                eprintln!("[external-mcp] discarding unreadable pending preferences");
+                fs::remove_file(&pending)
+                    .map_err(|error| format!("clear external MCP pending preferences: {error}"))?;
+                sync_parent_directory(root)
+                    .map_err(|error| format!("sync external MCP preferences directory: {error}"))?;
+                return read_preferences_file(root);
+            };
             let current = read_preferences_file(root)?;
             if current != target {
                 persist_preferences(root, target, &std::sync::atomic::AtomicUsize::new(0))
                     .map_err(|error| error.error)?;
             }
-            fs::remove_file(&pending)
-                .map_err(|error| format!("clear external MCP pending preferences: {error}"))?;
+            // Publishing the target above already cleared the pending file.
+            match fs::remove_file(&pending) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("clear external MCP pending preferences: {error}"));
+                }
+            }
             sync_parent_directory(root)
                 .map_err(|error| format!("sync external MCP preferences directory: {error}"))?;
         }
@@ -2141,6 +2269,10 @@ mod tests {
 
         fn fail_loads(&self) {
             self.fail_loads.store(true, Ordering::SeqCst);
+        }
+
+        fn restore_loads(&self) {
+            self.fail_loads.store(false, Ordering::SeqCst);
         }
     }
 
@@ -3134,6 +3266,243 @@ mod tests {
         assert!(
             restarted.status().await.enabled,
             "restart recovers published target"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_pending_preferences_from_before_publication_apply_on_load() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let directory = root.path().join(CATALOG_DIRECTORY);
+        fs::create_dir_all(&directory).expect("create catalog directory");
+        // A crash after writing the pending target but before publishing it.
+        fs::write(
+            directory.join(PREFERENCES_FILE),
+            serde_json::to_vec(&ExternalMcpPreferences { enabled: false }).unwrap(),
+        )
+        .expect("write published preferences");
+        fs::write(
+            directory.join(PREFERENCES_PENDING_FILE),
+            serde_json::to_vec(&ExternalMcpPreferences { enabled: true }).unwrap(),
+        )
+        .expect("write pending preferences");
+
+        let state = lifecycle_state(&root, Arc::new(MemoryMcpSecretStore::default()));
+        let status = state.status().await;
+        assert_ne!(status.state, ExternalMcpListenerState::AuthFailure);
+        assert!(status.enabled, "the pending target is applied");
+        assert!(state.lifecycle.lock().await.auth_failure.is_none());
+        assert!(!directory.join(PREFERENCES_PENDING_FILE).exists());
+        assert_eq!(
+            read_preferences_file(&directory).unwrap(),
+            ExternalMcpPreferences { enabled: true }
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transient_secret_store_failure_recovers_on_retry() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let secrets = Arc::new(InstrumentedSecretStore::default());
+        let state = lifecycle_state(&root, secrets.clone());
+        state.set_enabled(true).await.expect("enable endpoint");
+        state.pair("Cursor").await.expect("pair client");
+        secrets.fail_loads();
+        state.initialize().await;
+        assert_eq!(
+            state.status().await.state,
+            ExternalMcpListenerState::AuthFailure
+        );
+        assert!(
+            state.pair("Claude").await.is_err(),
+            "the failure persists while the keychain is unavailable"
+        );
+
+        secrets.restore_loads();
+        state
+            .set_enabled(true)
+            .await
+            .expect("enabling retries the credential load");
+        assert_eq!(
+            state.status().await.state,
+            ExternalMcpListenerState::Listening
+        );
+        assert!(state.lifecycle.lock().await.auth_failure.is_none());
+        state.shutdown().await.expect("drain listener");
+
+        // With the endpoint disabled the retry lands in Disabled; with no
+        // clients it lands in Paused.
+        let root = catalog_root();
+        let secrets = Arc::new(InstrumentedSecretStore::default());
+        let state = lifecycle_state(&root, secrets.clone());
+        state.set_enabled(true).await.expect("enable endpoint");
+        let paired = state.pair("Cursor").await.expect("pair client");
+        secrets.fail_loads();
+        state.initialize().await;
+        secrets.restore_loads();
+        state
+            .revoke(&paired.client.id)
+            .await
+            .expect("revoking retries the credential load first");
+        assert_eq!(state.status().await.state, ExternalMcpListenerState::Paused);
+        assert!(state.lifecycle.lock().await.auth_failure.is_none());
+        state.shutdown().await.expect("stop lifecycle");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_recovered_auth_is_reconciled_even_when_the_action_then_fails() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let secrets = Arc::new(InstrumentedSecretStore::default());
+        let state = lifecycle_state(&root, secrets.clone());
+        state.set_enabled(true).await.expect("enable endpoint");
+        state.pair("Cursor").await.expect("pair client");
+        secrets.fail_loads();
+        state.initialize().await;
+        assert_eq!(
+            state.status().await.state,
+            ExternalMcpListenerState::AuthFailure
+        );
+
+        // The keychain is back but the preferences cannot be written: a
+        // directory where the pending file goes makes the write fail before
+        // anything is published.
+        secrets.restore_loads();
+        let blocker = root
+            .path()
+            .join(CATALOG_DIRECTORY)
+            .join(PREFERENCES_PENDING_FILE);
+        fs::create_dir_all(blocker.join("occupied")).expect("block the pending file");
+        let events = Arc::new(Mutex::new(Vec::<ExternalMcpStatus>::new()));
+        let captured = events.clone();
+        state.set_status_sink(Arc::new(move |status| {
+            captured.lock().expect("record status").push(status);
+        }));
+        assert!(state.set_enabled(true).await.is_err());
+
+        let status = state.status().await;
+        assert_eq!(status.state, ExternalMcpListenerState::Listening);
+        assert_eq!(status.error, None);
+        assert!(state.lifecycle.lock().await.auth_failure.is_none());
+        let emitted = events
+            .lock()
+            .expect("read statuses")
+            .last()
+            .map(|status| status.state);
+        assert_eq!(emitted, Some(ExternalMcpListenerState::Listening));
+        fs::remove_dir_all(&blocker).expect("unblock the pending file");
+        state.shutdown().await.expect("drain listener");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_revoking_a_client_with_a_bad_credential_recovers_the_others() {
+        for corrupt in [false, true] {
+            let _port = LIFECYCLE_PORT.lock().await;
+            let root = catalog_root();
+            let secrets = Arc::new(MemoryMcpSecretStore::default());
+            let state = lifecycle_state(&root, secrets.clone());
+            state.set_enabled(true).await.expect("enable endpoint");
+            let broken = state.pair("Cursor").await.expect("pair client");
+            state.pair("Claude").await.expect("pair second client");
+            let account = secret_account(&broken.client.id);
+            if corrupt {
+                secrets
+                    .save_mcp_secret(&account, "not-the-paired-token")
+                    .expect("replace the credential");
+            } else {
+                secrets
+                    .delete_mcp_secret(&account)
+                    .expect("remove the credential");
+            }
+            state.initialize().await;
+            assert_eq!(
+                state.status().await.state,
+                ExternalMcpListenerState::AuthFailure
+            );
+            assert!(state.pair("Other").await.is_err());
+
+            state
+                .revoke(&broken.client.id)
+                .await
+                .expect("revoking does not need the other credentials loaded");
+
+            let status = state.status().await;
+            assert_eq!(status.state, ExternalMcpListenerState::Listening);
+            assert!(state.lifecycle.lock().await.auth_failure.is_none());
+            assert_eq!(secrets.load_mcp_secret(&account).unwrap(), None);
+            state.shutdown().await.expect("drain listener");
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_unreadable_pending_preferences_are_discarded_on_load() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let directory = root.path().join(CATALOG_DIRECTORY);
+        fs::create_dir_all(&directory).expect("create catalog directory");
+        fs::write(
+            directory.join(PREFERENCES_FILE),
+            serde_json::to_vec(&ExternalMcpPreferences { enabled: true }).unwrap(),
+        )
+        .expect("write published preferences");
+        fs::write(directory.join(PREFERENCES_PENDING_FILE), b"{\"enab")
+            .expect("write a torn pending file");
+
+        let state = lifecycle_state(&root, Arc::new(MemoryMcpSecretStore::default()));
+        let status = state.status().await;
+        assert_ne!(status.state, ExternalMcpListenerState::AuthFailure);
+        assert!(status.enabled, "the published preferences stay in effect");
+        assert!(!directory.join(PREFERENCES_PENDING_FILE).exists());
+
+        drop(state);
+        let reloaded = lifecycle_state(&root, Arc::new(MemoryMcpSecretStore::default()));
+        assert_ne!(
+            reloaded.status().await.state,
+            ExternalMcpListenerState::AuthFailure
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_last_use_worker_survives_a_failed_write() {
+        let _port = LIFECYCLE_PORT.lock().await;
+        let root = catalog_root();
+        let secrets = Arc::new(MemoryMcpSecretStore::default());
+        let state = lifecycle_state(&root, secrets.clone());
+        let paired = state.pair("Cursor").await.expect("pair client");
+        state.initialize().await;
+        let before = state.catalog_publish_count_for_test();
+
+        state
+            .catalog
+            .read()
+            .expect("external MCP catalog")
+            .fail_next_atomic_rename_for_test();
+        let t0 = 1_800_000_000;
+        state.authorizer.last_use.record(&paired.client.id, t0);
+        // The first write fails; the worker retries after its back-off.
+        wait_for_publish_count(&state, before + 1).await;
+        assert!(
+            state
+                .last_use_worker
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|worker| !worker.join.is_finished()),
+            "the worker keeps running after a failed write"
+        );
+        assert_eq!(
+            load_catalog(&root, secrets.clone()).clients()[0].last_used_at,
+            Some(t0)
+        );
+
+        state.authorizer.last_use.record(&paired.client.id, t0 + 90);
+        state
+            .shutdown()
+            .await
+            .expect("shutdown reports no stale error");
+        assert_eq!(
+            load_catalog(&root, secrets).clients()[0].last_used_at,
+            Some(t0 + 90)
         );
     }
 

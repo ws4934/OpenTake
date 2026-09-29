@@ -210,6 +210,102 @@ describe("native playback identity", () => {
     expect(deferred).toEqual([]);
   });
 
+  it("keeps the error of a resume that overlaps an older resume of the same session", async () => {
+    const finishes: Array<() => void> = [];
+    let blockStart = false;
+    const api = {
+      playbackStart: vi.fn(async () => {
+        if (!blockStart) return;
+        await new Promise<void>((resolve) => {
+          finishes.push(resolve);
+        });
+      }),
+      playbackPause: vi.fn(async () => {}),
+      playbackSeek: vi.fn(async () => {}),
+      playbackStop: vi.fn(async () => {}),
+    };
+    const controller = createNativePlaybackController(api, () => "overlap");
+    const identity = await controller.start(revision(1, 4), 0);
+    await controller.pause(identity, 20);
+
+    // Play, pause, play again before the first handshake returns.
+    blockStart = true;
+    const firstDeferred: unknown[] = [];
+    const first = controller.start(revision(1, 4), 20, {
+      onDeferredError: (event) => firstDeferred.push(event),
+    });
+    await Promise.resolve();
+    await controller.pause(identity, 20);
+    const secondDeferred: unknown[] = [];
+    const second = controller.start(revision(1, 4), 20, {
+      onDeferredError: (event) => secondDeferred.push(event),
+    });
+    await Promise.resolve();
+    expect(finishes).toHaveLength(2);
+
+    // The older start settles first; the retried resume then fails before
+    // its own handshake returns.
+    finishes[0]();
+    await expect(first).rejects.toMatchObject({ code: "superseded" });
+    const failure = {
+      ...identity,
+      frame: 20,
+      code: "videoDecode" as const,
+      message: "clip-1 decode failed",
+      fatal: true,
+    };
+    expect(controller.acceptError(failure)).toBe(false);
+
+    finishes[1]();
+    await expect(second).resolves.toEqual(identity);
+    expect(firstDeferred).toEqual([]);
+    expect(secondDeferred).toEqual([failure]);
+  });
+
+  it("delivers an error to the committing start when both overlapping resumes saw it", async () => {
+    const finishes: Array<() => void> = [];
+    let blockStart = false;
+    const api = {
+      playbackStart: vi.fn(async () => {
+        if (!blockStart) return;
+        await new Promise<void>((resolve) => {
+          finishes.push(resolve);
+        });
+      }),
+      playbackPause: vi.fn(async () => {}),
+      playbackSeek: vi.fn(async () => {}),
+      playbackStop: vi.fn(async () => {}),
+    };
+    const controller = createNativePlaybackController(api, () => "overlap-both");
+    const identity = await controller.start(revision(1, 4), 0);
+    await controller.pause(identity, 20);
+
+    blockStart = true;
+    const first = controller.start(revision(1, 4), 20);
+    await Promise.resolve();
+    await controller.pause(identity, 20);
+    const secondDeferred: unknown[] = [];
+    const second = controller.start(revision(1, 4), 20, {
+      onDeferredError: (event) => secondDeferred.push(event),
+    });
+    await Promise.resolve();
+    const failure = {
+      ...identity,
+      frame: 20,
+      code: "videoDecode" as const,
+      message: "clip-1 decode failed",
+      fatal: true,
+    };
+    expect(controller.acceptError(failure)).toBe(false);
+
+    // The newer start commits before the older one settles.
+    finishes[1]();
+    await expect(second).resolves.toEqual(identity);
+    finishes[0]();
+    await expect(first).rejects.toMatchObject({ code: "superseded" });
+    expect(secondDeferred).toEqual([failure]);
+  });
+
   it("does not let a late pause completion re-freeze a resumed session", async () => {
     let finishPause!: () => void;
     const api = {

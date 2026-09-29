@@ -32,6 +32,66 @@ use opentake_media::analysis::{
     DenoiseProfileBuilder, DenoiseStream,
 };
 use opentake_media::{MediaCancelToken, MediaError, PcmFormat, PcmSpec, PcmStream};
+use opentake_render::AudioClipPlan;
+
+/// One audible clip of a mix and the gain chain around it: a top-level clip,
+/// or a leaf of a nested sequence flattened by the render plan
+/// ([`AudioClipPlan`]), whose volume multiplies its compound ancestors', whose
+/// true-peak ceiling is the strictest along the chain and whose denoise is the
+/// leaf setting, then the first configured ancestor (outermost first).
+/// Export and preview mix through this one definition, so a
+/// compound clip sounds the same in both.
+pub(crate) trait AudioPlanLike {
+    fn clip(&self) -> &Clip;
+    fn volume_at(&self, frame: i32) -> f64;
+    fn true_peak_ceiling_dbtp(&self) -> Option<f64>;
+    fn audio_denoise(&self) -> Option<AudioDenoise>;
+}
+
+impl AudioPlanLike for Clip {
+    fn clip(&self) -> &Clip {
+        self
+    }
+
+    fn volume_at(&self, frame: i32) -> f64 {
+        Clip::volume_at(self, frame)
+    }
+
+    fn true_peak_ceiling_dbtp(&self) -> Option<f64> {
+        self.loudness_normalization
+            .map(|normalization| normalization.true_peak_ceiling_dbtp)
+    }
+
+    fn audio_denoise(&self) -> Option<AudioDenoise> {
+        self.audio_denoise
+    }
+}
+
+impl AudioPlanLike for AudioClipPlan {
+    fn clip(&self) -> &Clip {
+        &self.clip
+    }
+
+    fn volume_at(&self, frame: i32) -> f64 {
+        AudioClipPlan::volume_at(self, frame)
+    }
+
+    fn true_peak_ceiling_dbtp(&self) -> Option<f64> {
+        std::iter::once(&self.gain_clip)
+            .chain(self.compound_ancestors.iter())
+            .filter_map(|clip| {
+                clip.loudness_normalization
+                    .map(|normalization| normalization.true_peak_ceiling_dbtp)
+            })
+            .min_by(f64::total_cmp)
+    }
+
+    fn audio_denoise(&self) -> Option<AudioDenoise> {
+        std::iter::once(&self.gain_clip)
+            .chain(self.compound_ancestors.iter())
+            .find_map(|clip| clip.audio_denoise)
+    }
+}
 
 /// Source frames pulled from the decoder per read.
 const SOURCE_READ_FRAMES: usize = 8 * 1024;
