@@ -14,6 +14,8 @@ const nativeApiHarness = vi.hoisted(() => {
     unlistenCalls: 0,
     getPreviewEndpoint: vi.fn(),
     onPlaybackFrame: vi.fn(),
+    onPlaybackError: vi.fn(),
+    activeErrorListeners: 0,
     playbackStart: vi.fn(),
     playbackPause: vi.fn(),
     playbackSeek: vi.fn(),
@@ -48,6 +50,12 @@ const nativeApiHarness = vi.hoisted(() => {
       });
     });
   });
+  harness.onPlaybackError.mockImplementation(() => {
+    harness.activeErrorListeners += 1;
+    return Promise.resolve(() => {
+      harness.activeErrorListeners -= 1;
+    });
+  });
   harness.playbackStart.mockImplementation(async () => {
     harness.order.push("start");
   });
@@ -65,6 +73,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
     isTauri: true,
     getPreviewEndpoint: nativeApiHarness.getPreviewEndpoint,
     onPlaybackFrame: nativeApiHarness.onPlaybackFrame,
+    onPlaybackError: nativeApiHarness.onPlaybackError,
     playbackStart: nativeApiHarness.playbackStart,
     playbackPause: nativeApiHarness.playbackPause,
     playbackSeek: nativeApiHarness.playbackSeek,
@@ -148,6 +157,8 @@ beforeEach(async () => {
     "http://127.0.0.1:43123/frame",
   );
   nativeApiHarness.onPlaybackFrame.mockClear();
+  nativeApiHarness.onPlaybackError.mockClear();
+  nativeApiHarness.activeErrorListeners = 0;
   nativeApiHarness.playbackStart.mockClear();
   nativeApiHarness.playbackPause.mockClear();
   nativeApiHarness.playbackSeek.mockClear();
@@ -263,6 +274,33 @@ describe("shouldSyncPausedMediaToFrame", () => {
     await unmountPlaybackHook(root);
     expect(nativeApiHarness.activeListeners).toBe(0);
     expect(nativeApiHarness.unlistenCalls).toBe(1);
+  });
+
+  it("registers the playback error listener once across play, pause and play", async () => {
+    useProjectStore.setState({ projectEpoch: 4, timelineVersion: 7, timeline: rustTimeline() });
+    useEditorUiStore.setState({
+      activeFrame: 0,
+      currentFrame: 0,
+      isPlaying: true,
+      isScrubbing: false,
+      rustEngineFailed: false,
+    });
+
+    const root = await mountPlaybackHook();
+    expect(nativeApiHarness.playbackStart).toHaveBeenCalledTimes(1);
+    for (const playing of [false, true, false, true]) {
+      await act(async () => {
+        useEditorUiStore.getState().setPlaying(playing);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    expect(nativeApiHarness.playbackStart).toHaveBeenCalledTimes(3);
+    expect(nativeApiHarness.onPlaybackError).toHaveBeenCalledTimes(1);
+    expect(nativeApiHarness.activeErrorListeners).toBe(1);
+    await unmountPlaybackHook(root);
+    expect(nativeApiHarness.activeErrorListeners).toBe(0);
   });
 
   it("retires the native playback identity as soon as scrubbing begins", async () => {

@@ -332,6 +332,7 @@ impl PlaybackState {
 
     /// Coordinate a start synchronously, including a retained resume's
     /// blocking handshake (which runs without the slot lock).
+    #[cfg(test)]
     fn coordinate_start(
         &self,
         identity: PlaybackIdentity,
@@ -768,7 +769,9 @@ impl PlaybackState {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         if slot.sessions.cancel_project_transition(transition) {
             if let Some(running) = slot.running.as_ref() {
-                running.publication.reopen();
+                // The transition closed the gate without pausing: a real
+                // failure the session raised meanwhile is reported now.
+                running.publication.reopen_after_transition();
             }
         }
     }
@@ -1558,7 +1561,7 @@ mod tests {
             super::super::session::PlaybackErrorCode::Superseded
         );
         assert!(!publication.is_open());
-        assert!(muted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(muted.is_muted());
         audio_stopped
             .recv_timeout(Duration::from_secs(2))
             .expect("late audio is stopped");
@@ -2027,7 +2030,7 @@ mod tests {
                 .expect("engine resume observes staged audio state"),
             "audio must remain muted until the engine clock is positioned"
         );
-        assert!(!paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!paused.is_muted());
         drop(backlog);
     }
 
@@ -2111,7 +2114,7 @@ mod tests {
                 .expect("engine resume observes staged audio state"),
             "fresh audio must remain muted until the engine clock is positioned"
         );
-        assert!(!paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!paused.is_muted());
         state
             .control(current, SessionControl::Stop, 0)
             .expect("stop fresh playback");
@@ -2146,7 +2149,7 @@ mod tests {
 
         assert_eq!(error.code, super::super::session::PlaybackErrorCode::Engine);
         assert!(error.message.contains("callback unavailable"));
-        assert!(paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(paused.is_muted());
         let slot = state
             .slot
             .lock()
@@ -2331,7 +2334,7 @@ mod tests {
             "pause waited {pause_latency:?} for the audio handshake"
         );
         assert!(
-            audio_paused.load(std::sync::atomic::Ordering::Acquire),
+            audio_paused.is_muted(),
             "audio must stay muted after Resume→Pause"
         );
         assert!(!gate.is_open());
@@ -2403,14 +2406,14 @@ mod tests {
             .expect("resume")
             .is_none());
         assert!(gate.is_open());
-        assert!(!audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!audio_paused.is_muted());
         assert!(!session_is_paused(&state, &current));
 
         state
             .control(current.clone(), SessionControl::Pause, 30)
             .expect("pause");
         assert!(!gate.is_open());
-        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(audio_paused.is_muted());
         assert!(session_is_paused(&state, &current));
     }
 
@@ -2444,7 +2447,7 @@ mod tests {
         engine_stopped
             .recv_timeout(Duration::from_secs(2))
             .expect("render thread stopped");
-        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(audio_paused.is_muted());
         assert!(!gate.is_open());
         assert_eq!(state.active_identity(), None);
         assert!(state
@@ -2514,7 +2517,7 @@ mod tests {
             .expect("join installer")
             .expect("install completes paused");
 
-        assert!(audio_paused.load(std::sync::atomic::Ordering::Acquire));
+        assert!(audio_paused.is_muted());
         assert!(!publication.is_open());
         assert!(session_is_paused(&state, &current));
         state
@@ -2644,7 +2647,7 @@ mod tests {
         .expect("failed engine audio queued for bounded reap");
 
         assert!(!gate.is_open());
-        assert!(muted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(muted.is_muted());
         stop_seen
             .recv_timeout(Duration::from_secs(2))
             .expect("audio stop requested before command-path helper returns");
@@ -2680,7 +2683,7 @@ mod tests {
             .expect("stop queues teardown");
 
         assert!(!gate.is_open());
-        assert!(muted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(muted.is_muted());
         assert_eq!(frame_status(&server, &identity, 0), 204);
         audio_stop
             .recv_timeout(Duration::from_secs(2))
@@ -2863,6 +2866,47 @@ mod tests {
             .expect("capacity recovered")
             .expect("replacement build admitted");
         drop(pending);
+    }
+
+    #[test]
+    fn a_failure_during_a_cancelled_project_transition_is_reported_not_swallowed() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let report = |message: &'static str| -> super::super::transport::HeldReport {
+            let reports = Arc::clone(&reports);
+            Box::new(move || reports.lock().unwrap().push(message))
+        };
+
+        // Cancelled transition: the session kept running and its real
+        // failure is reported when the gate reopens.
+        let current = identity(8, 3, "transition-failure");
+        let (state, publication) = state_with_running(current.clone());
+        let transition = state
+            .begin_project_transition()
+            .expect("begin project transition");
+        publication.report_or_hold(true, report("decode failed during transition"));
+        assert!(reports.lock().unwrap().is_empty());
+        state.cancel_project_transition(transition);
+        assert_eq!(
+            *reports.lock().unwrap(),
+            ["decode failed during transition"]
+        );
+        state
+            .control(current, SessionControl::Stop, 0)
+            .expect("stop retained test session");
+
+        // Completed transition: the old project's session is torn down and
+        // its failure is not shown for the new project.
+        let old = identity(9, 3, "transition-completed");
+        let (state, publication) = state_with_running(old);
+        let transition = state
+            .begin_project_transition()
+            .expect("begin project transition");
+        publication.report_or_hold(true, report("old project failure"));
+        state.activate_project(transition, 10);
+        assert_eq!(
+            *reports.lock().unwrap(),
+            ["decode failed during transition"]
+        );
     }
 
     #[test]

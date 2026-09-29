@@ -1,5 +1,5 @@
 use opentake_domain::{Clip, ClipType, NestedSequence, Timeline, Track};
-use opentake_render::{try_build_render_plan, RenderSize, SourceMetrics};
+use opentake_render::{try_build_render_plan, try_collect_audio_clips, RenderSize, SourceMetrics};
 
 struct Metrics;
 
@@ -125,4 +125,6 @@ fn compound_audio_uses_the_same_trimmed_root_span() {
     assert_eq!(flattened.clip.trim_start_frame, 4);
     assert_eq!(flattened.volume_at(20), 0.0);
     assert!((flattened.volume_at(22) - 0.08).abs() < 1e-12);
+    // Preview audio flattens through the same list without a render size.
+    assert_eq!(try_collect_audio_clips(&root).unwrap(), plan.audio_clips);
 }

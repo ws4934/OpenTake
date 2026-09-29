@@ -8,10 +8,6 @@
 //! projections in [`project`]. The cpal master clock ([`audio`]) + loopback JPEG
 //! transport ([`transport`]) realise those traits, and [`commands`] registers the
 //! `playback_*` Tauri commands the front end drives during PLAY.
-//!
-//! A few public items stay exercised only by the gated GPU+ffmpeg integration
-//! tests or one build-feature matrix, so the module keeps a `dead_code` allow.
-#![allow(dead_code)]
 
 pub mod audio;
 pub mod commands;

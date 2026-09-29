@@ -47,8 +47,6 @@ struct ServerState {
 struct LatestFrame {
     identity: PlaybackIdentity,
     frame: i32,
-    sequence: u64,
-    terminal: bool,
     jpeg: Bytes,
 }
 
@@ -56,22 +54,13 @@ struct LatestFrame {
 struct LatestFrameStore(Arc<RwLock<Option<LatestFrame>>>);
 
 impl LatestFrameStore {
-    fn publish(
-        &self,
-        identity: PlaybackIdentity,
-        frame: i32,
-        sequence: u64,
-        terminal: bool,
-        jpeg: Bytes,
-    ) {
+    fn publish(&self, identity: PlaybackIdentity, frame: i32, jpeg: Bytes) {
         *self
             .0
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LatestFrame {
             identity,
             frame,
-            sequence,
-            terminal,
             jpeg,
         });
     }
@@ -119,10 +108,14 @@ struct FrameQuery {
     timeline_version: u64,
     session_id: String,
     frame: i32,
+    /// Sent by the front end with every request; [`LatestFrameStore::lookup`]
+    /// serves the newest frame whatever the sequence, so it is only parsed.
+    #[allow(dead_code)]
     sequence: u64,
 }
 
 impl FrameQuery {
+    #[cfg(test)]
     fn new(
         project_epoch: u64,
         timeline_version: u64,
@@ -150,6 +143,9 @@ impl FrameQuery {
     }
 }
 
+/// A failure report deferred while publication was closed.
+pub(crate) type HeldReport = Box<dyn FnOnce() + Send>;
+
 #[derive(Default)]
 struct GateState {
     open: bool,
@@ -157,6 +153,11 @@ struct GateState {
     /// older epoch (a frame queued before a pause or a seek) can never publish
     /// after a later reopen.
     epoch: u64,
+    /// The first fatal failure (or first non-fatal report) while closed. A cancelled project
+    /// transition reopens the gate of a session that kept running and
+    /// reports it then; any other reopen (a resume, which retries the
+    /// render) or the session's teardown drops it.
+    held: Option<(bool, HeldReport)>,
 }
 
 #[derive(Clone, Default)]
@@ -181,8 +182,48 @@ impl PublicationGate {
         state.epoch = state.epoch.wrapping_add(1);
     }
 
+    /// Reopen for a resume. A failure held while closed is dropped: the
+    /// resume retries the render, which reports again if it still fails.
     pub fn reopen(&self) {
-        self.lock().open = true;
+        let held = {
+            let mut state = self.lock();
+            state.open = true;
+            state.held.take()
+        };
+        drop(held);
+    }
+
+    /// Reopen after a cancelled project transition, which closed the gate
+    /// without pausing the session: report the failure the session raised
+    /// meanwhile instead of losing it.
+    pub fn reopen_after_transition(&self) {
+        let held = {
+            let mut state = self.lock();
+            state.open = true;
+            state.held.take()
+        };
+        if let Some((_, report)) = held {
+            report();
+        }
+    }
+
+    /// Run `report` now while publication is open; otherwise keep it (the
+    /// first fatal one, otherwise the first report) for [`Self::reopen_after_transition`].
+    pub(crate) fn report_or_hold(&self, fatal: bool, report: HeldReport) {
+        {
+            let mut state = self.lock();
+            if !state.open {
+                if state
+                    .held
+                    .as_ref()
+                    .is_none_or(|(held_fatal, _)| fatal && !held_fatal)
+                {
+                    state.held = Some((fatal, report));
+                }
+                return;
+            }
+        }
+        report();
     }
 
     /// Retire every frame captured so far without closing publication: the
@@ -193,6 +234,7 @@ impl PublicationGate {
         state.epoch = state.epoch.wrapping_add(1);
     }
 
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.lock().open
     }
@@ -415,8 +457,7 @@ impl EncodedFramePublication {
             let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
             let terminal = frame >= self.last_frame;
             if let Some(jpeg) = jpeg {
-                self.latest
-                    .publish(self.identity.clone(), frame, sequence, terminal, jpeg);
+                self.latest.publish(self.identity.clone(), frame, jpeg);
             }
             PlaybackFramePublication::new(self.identity.clone(), frame, sequence, terminal)
         })
@@ -699,7 +740,9 @@ impl PlaybackErrorEvent {
 /// A [`PlaybackErrorSink`] that emits a Tauri `playback_error` event while
 /// the session's publication gate is open. A paused, stopped or replaced
 /// session reports nothing: its failures (for example a decode cancelled by
-/// the teardown itself) are not the running transport's to show.
+/// the teardown itself) are not the running transport's to show. A failure
+/// raised during a project transition that is then cancelled is reported
+/// when the gate reopens.
 pub struct TauriPlaybackErrorEmitter {
     app: AppHandle,
     identity: PlaybackIdentity,
@@ -718,20 +761,16 @@ impl TauriPlaybackErrorEmitter {
 
 impl PlaybackErrorSink for TauriPlaybackErrorEmitter {
     fn report(&self, failure: PlaybackFailure) {
-        if let Some(event) = gated_error_event(&self.gate, &self.identity, failure) {
-            let _ = self.app.emit("playback_error", event);
-        }
+        let fatal = failure.fatal;
+        let event = PlaybackErrorEvent::new(&self.identity, failure);
+        let app = self.app.clone();
+        self.gate.report_or_hold(
+            fatal,
+            Box::new(move || {
+                let _ = app.emit("playback_error", event);
+            }),
+        );
     }
-}
-
-/// The event for `failure`, or `None` once the session's gate is closed.
-fn gated_error_event(
-    gate: &PublicationGate,
-    identity: &PlaybackIdentity,
-    failure: PlaybackFailure,
-) -> Option<PlaybackErrorEvent> {
-    gate.is_open()
-        .then(|| PlaybackErrorEvent::new(identity, failure))
 }
 
 #[cfg(test)]
@@ -904,7 +943,7 @@ mod tests {
     fn frame_route_never_serves_another_session_latest() {
         let latest = LatestFrameStore::default();
         let identity = identity(3, 5, "current");
-        latest.publish(identity.clone(), 18, 4, false, Bytes::from_static(b"jpeg"));
+        latest.publish(identity.clone(), 18, Bytes::from_static(b"jpeg"));
 
         // Session, project epoch and timeline version stay hard boundaries.
         assert!(latest
@@ -946,13 +985,7 @@ mod tests {
         let latest = LatestFrameStore::default();
         let identity = identity(1, 2, "session-9");
         for frame in 0..60 {
-            latest.publish(
-                identity.clone(),
-                frame,
-                frame as u64 + 1,
-                false,
-                Bytes::from_static(b"jpeg"),
-            );
+            latest.publish(identity.clone(), frame, Bytes::from_static(b"jpeg"));
         }
         for requested in 0..60 {
             assert_eq!(
@@ -1118,24 +1151,73 @@ mod tests {
         assert_eq!(seen.last(), Some(&501));
     }
 
+    /// A report that records `message` into `reports` when it runs.
+    fn recording_report(
+        reports: &Arc<Mutex<Vec<&'static str>>>,
+        message: &'static str,
+    ) -> HeldReport {
+        let reports = Arc::clone(reports);
+        Box::new(move || {
+            reports
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(message)
+        })
+    }
+
+    fn reported(reports: &Arc<Mutex<Vec<&'static str>>>) -> Vec<&'static str> {
+        reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     #[test]
     fn playback_errors_are_dropped_once_the_session_gate_closes() {
         let gate = PublicationGate::open();
-        let session = identity(4, 9, "error-gate");
-        let failure = PlaybackFailure {
-            frame: 12,
-            code: PlaybackFailureCode::VideoDecode,
-            message: "clip-1 cancelled".to_string(),
-            fatal: true,
-        };
-        assert!(gated_error_event(&gate, &session, failure.clone()).is_some());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        gate.report_or_hold(true, recording_report(&reports, "open"));
+        assert_eq!(reported(&reports), ["open"]);
         gate.close();
-        assert!(
-            gated_error_event(&gate, &session, failure.clone()).is_none(),
+        gate.report_or_hold(true, recording_report(&reports, "while paused"));
+        assert_eq!(
+            reported(&reports),
+            ["open"],
             "a paused or torn-down session reports nothing"
         );
+        // A resume retries the render instead of replaying the old failure.
         gate.reopen();
-        assert!(gated_error_event(&gate, &session, failure).is_some());
+        assert_eq!(reported(&reports), ["open"]);
+        gate.report_or_hold(true, recording_report(&reports, "resumed"));
+        assert_eq!(reported(&reports), ["open", "resumed"]);
+    }
+
+    #[test]
+    fn a_failure_during_a_cancelled_project_transition_is_reported_when_it_reopens() {
+        let gate = PublicationGate::open();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        // A project transition closes the gate without pausing the session,
+        // whose render then genuinely fails.
+        gate.close();
+        gate.report_or_hold(true, recording_report(&reports, "first failure"));
+        gate.report_or_hold(true, recording_report(&reports, "second failure"));
+        assert!(reported(&reports).is_empty());
+        gate.reopen_after_transition();
+        assert_eq!(reported(&reports), ["first failure"]);
+        gate.reopen_after_transition();
+        assert_eq!(reported(&reports), ["first failure"], "reported once");
+    }
+
+    #[test]
+    fn a_held_fatal_failure_replaces_an_earlier_nonfatal_report() {
+        let gate = PublicationGate::open();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        gate.close();
+        gate.report_or_hold(false, recording_report(&reports, "audio warning"));
+        gate.report_or_hold(true, recording_report(&reports, "fatal render failure"));
+        gate.report_or_hold(false, recording_report(&reports, "later warning"));
+        gate.reopen_after_transition();
+        assert_eq!(reported(&reports), ["fatal render failure"]);
     }
 
     #[test]

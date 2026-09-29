@@ -118,6 +118,11 @@ export interface NativePlaybackController {
   shouldFallback(error: unknown): boolean;
 }
 
+interface StartSlot {
+  identity: PlaybackIdentity;
+  errors: PlaybackErrorEvent[];
+}
+
 export function createNativePlaybackController(
   playbackApi: NativePlaybackApi,
   mintSessionId: () => string = createSessionId,
@@ -127,9 +132,11 @@ export function createNativePlaybackController(
   let paused = false;
   let lastSequence = -1;
   let lifecycleGeneration = 0;
-  // The session a `start` is resuming, and errors it reported meanwhile.
-  let starting: PlaybackIdentity | null = null;
-  let deferredErrors: PlaybackErrorEvent[] = [];
+  // One slot per `start` in flight: the session it starts or resumes and the
+  // errors that session reported meanwhile. Overlapping resumes of one paused
+  // session (play, pause, play within one handshake) each keep their own slot,
+  // so an older start settling first cannot take or clear a newer one's errors.
+  const startingSlots = new Set<StartSlot>();
 
   const stopIdentity = async (
     identity: PlaybackIdentity,
@@ -190,8 +197,8 @@ export function createNativePlaybackController(
           message: "native playback start was superseded",
         } satisfies PlaybackCommandError;
       }
-      starting = identity;
-      deferredErrors = [];
+      const slot: StartSlot = { identity, errors: [] };
+      startingSlots.add(slot);
       try {
         await playbackApi.playbackStart(
           Math.max(0, Math.floor(frame)),
@@ -199,10 +206,8 @@ export function createNativePlaybackController(
           requestedMediaId ?? undefined,
         );
       } finally {
-        if (starting === identity) starting = null;
+        startingSlots.delete(slot);
       }
-      const deferred = deferredErrors;
-      deferredErrors = [];
       if (
         startGeneration !== lifecycleGeneration ||
         !samePlaybackIdentity(current, identity)
@@ -213,7 +218,7 @@ export function createNativePlaybackController(
         } satisfies PlaybackCommandError;
       }
       paused = false;
-      for (const event of deferred) options?.onDeferredError?.(event);
+      for (const event of slot.errors) options?.onDeferredError?.(event);
       return identity;
     },
     async pause(identity, frame) {
@@ -282,7 +287,11 @@ export function createNativePlaybackController(
     acceptError(event) {
       if (!samePlaybackIdentity(current, event)) return false;
       if (!paused) return true;
-      if (samePlaybackIdentity(starting, event)) deferredErrors.push(event);
+      // Every start in flight for this session holds the error; only the one
+      // that commits (the newest) delivers it.
+      for (const slot of startingSlots) {
+        if (samePlaybackIdentity(slot.identity, event)) slot.errors.push(event);
+      }
       return false;
     },
     shouldFallback(error) {
