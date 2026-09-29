@@ -62,3 +62,78 @@ fn starts_only_with_explicit_packaged_or_environment_dsn() {
     assert!(!redacted.contains("abc123"));
     assert!(!redacted.contains("xyz"));
 }
+
+#[test]
+fn explicit_empty_environment_dsn_disables_packaged_reporting() {
+    for environment in ["", "  \n\t"] {
+        assert_eq!(
+            init_telemetry_with(
+                Some("https://packaged@example.com/1"),
+                Some(environment),
+                |_| { panic!("an explicit opt-out must not start telemetry") }
+            ),
+            TelemetryInitStatus::Disabled
+        );
+    }
+}
+
+#[test]
+fn sensitive_values_are_removed_from_common_panic_formats() {
+    for (input, forbidden) in [
+        ("password: hunter2", "hunter2"),
+        (r#"{"api_key": "sk-live-123"}"#, "sk-live-123"),
+        ("https://api.example.com/v1?access_token=abc123", "abc123"),
+        (
+            "https://api.example.com/v1?signature=abc123&format=json",
+            "abc123",
+        ),
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ("Proxy-Authorization: Bearer hidden-token", "hidden-token"),
+        (
+            "invalid x-api-key sk-ant-api03-SECRETSECRET",
+            "sk-ant-api03",
+        ),
+        ("OPENAI_API_KEY=sk-proj-abc", "sk-proj-abc"),
+        ("client_secret=abc123", "abc123"),
+        ("refresh_token=abc", "abc"),
+        ("token = abc123", "abc123"),
+        (r#"{"password":"a secret with \"quotes\""}"#, "quotes"),
+        (
+            r"open C:\Users\John Smith\Videos\Wedding.mov failed",
+            "Wedding",
+        ),
+        (
+            "/Users/alice/My Projects/Client Secret Cut.opentake",
+            "Client Secret Cut",
+        ),
+        (r"\\fileserver\share\Client\cut.mov", "fileserver"),
+        (
+            "/Users/alice/My [Client] (private)/Client Secret.mov",
+            "Client Secret",
+        ),
+        (
+            "standalone sk-live-123 and r8_provider_secret",
+            "r8_provider_secret",
+        ),
+        ("Bearer opaque-token", "opaque-token"),
+    ] {
+        let scrubbed = redact_sensitive_text(input);
+        assert!(
+            !scrubbed.contains(forbidden),
+            "credential or private path was retained"
+        );
+    }
+    let path = redact_sensitive_text(r"open C:\Users\John Smith\Videos\Wedding.mov failed");
+    assert!(!path.contains("John Smith"));
+}
+
+#[test]
+fn ordinary_diagnostics_keep_their_text_and_whitespace() {
+    for input in [
+        "failed to decode frame 42",
+        "decode failed: EOF\nplease retry\tframe 42",
+        "request failed: https://api.example.com/v1/status",
+    ] {
+        assert_eq!(redact_sensitive_text(input), input);
+    }
+}
