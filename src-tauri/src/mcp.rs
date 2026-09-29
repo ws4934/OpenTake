@@ -4791,8 +4791,15 @@ mod tests {
             .expect("inspect imported Lottie")
         };
 
+        let started = std::time::Instant::now();
         let result = inspect();
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
         let again = inspect();
+        eprintln!(
+            "inspect_lottie: first {first:?}, second {:?}",
+            started.elapsed()
+        );
         assert_eq!(
             gpu.acquisitions.load(std::sync::atomic::Ordering::SeqCst),
             1,
