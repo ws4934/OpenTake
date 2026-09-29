@@ -230,7 +230,48 @@ fn agent_speed_properties_rescale_animation_but_do_not_ripple() {
 }
 
 #[test]
-fn agent_explicit_duration_rescales_animation_without_moving_other_clips() {
+fn duration_only_changes_clamp_animation_without_retiming_or_ripple() {
+    for duration in [15, 60] {
+        let mut state = state(vec![animated("a", 0), animated("b", 120)]);
+        state.timeline.tracks[0].clips[0]
+            .opacity_track
+            .as_mut()
+            .unwrap()
+            .upsert(Keyframe::with_interpolation(10, 0.5, Interpolation::Linear));
+        let before = state.timeline.clone();
+        edit(
+            &mut state,
+            EditCommand::SetClipProperties {
+                clip_ids: vec!["a".into()],
+                properties: Box::new(ClipProperties {
+                    duration_frames: Some(duration),
+                    ..Default::default()
+                }),
+            },
+        );
+        let clips = &state.timeline.tracks[0].clips;
+        let expected = if duration == 15 {
+            vec![(0, 0.0), (10, 0.5)]
+        } else {
+            vec![(0, 0.0), (10, 0.5), (30, 1.0)]
+        };
+        assert_eq!(keyframes(&clips[0]), expected);
+        assert_eq!(clips[0].fade_in_frames, 10);
+        assert_eq!(
+            clips[0].fade_out_frames,
+            if duration == 15 { 5 } else { 20 }
+        );
+        assert_eq!(clips[1].start_frame, 120);
+        let after = state.timeline.clone();
+        edit(&mut state, EditCommand::Undo);
+        assert_eq!(state.timeline, before);
+        edit(&mut state, EditCommand::Redo);
+        assert_eq!(state.timeline, after);
+    }
+}
+
+#[test]
+fn unchanged_speed_does_not_retime_an_explicit_duration_edit() {
     let mut state = state(vec![animated("a", 0), animated("b", 30)]);
     edit(
         &mut state,
@@ -238,11 +279,12 @@ fn agent_explicit_duration_rescales_animation_without_moving_other_clips() {
             clip_ids: vec!["a".into()],
             properties: Box::new(ClipProperties {
                 duration_frames: Some(15),
+                speed: Some(1.0),
                 ..Default::default()
             }),
         },
     );
     let clips = &state.timeline.tracks[0].clips;
-    assert_eq!(keyframes(&clips[0]), [(0, 0.0), (15, 1.0)]);
+    assert_eq!(keyframes(&clips[0]), [(0, 0.0)]);
     assert_eq!(clips[1].start_frame, 30);
 }
