@@ -653,6 +653,22 @@ impl ProjectMediaCapability {
         })
     }
 
+    /// Re-run the open-time identity gate against the retained root, for
+    /// writers that prepared a leaf before taking the project locks.
+    pub(crate) fn ensure_current(&self, core: &AppCore, project_epoch: u64) -> Result<(), String> {
+        core.ensure_project_root_identity_for_project(
+            project_epoch,
+            &self.project_dir,
+            &self.root_identity,
+        )
+        .map_err(|error| error.to_string())?;
+        if self.matches_namespace()? {
+            Ok(())
+        } else {
+            Err("project media directory changed before commit".to_string())
+        }
+    }
+
     fn create_leaf(&self, name: &Path) -> Result<Handle, String> {
         Self::create_leaf_in(&self.media, name)
     }
