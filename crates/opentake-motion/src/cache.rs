@@ -16,11 +16,11 @@
 //! [`MotionCachePin`] holds, so a render in progress, or frames still being
 //! encoded or read, are never deleted underneath their owner.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -38,6 +38,32 @@ const PARTIAL_MARKER_FILE: &str = ".opentake-motion-partial-v4";
 /// cache lookup can never observe a half-deleted frame set.
 const EVICTING_PREFIX: &str = ".evicting-";
 static COMPLETION_MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
+const RENDER_DIR_LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// Cache directories with a render in progress, shared by every renderer
+/// instance in the process. Two renderers pointed at the same cache root (for
+/// example the editor's and the agent's) would otherwise clear or resume each
+/// other's frames and race the completion marker while both render the same
+/// content.
+fn active_render_dirs() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Exclusive, process-wide claim on one cache directory. Released on drop.
+#[derive(Debug)]
+pub(crate) struct RenderDirGuard {
+    dir: PathBuf,
+}
+
+impl Drop for RenderDirGuard {
+    fn drop(&mut self) {
+        active_render_dirs()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.dir);
+    }
+}
 static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PINNED_DIRS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
@@ -219,6 +245,31 @@ impl MotionCache {
         let dir = self.dir_for(req);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    /// Claim the request's cache directory for this render, waiting while
+    /// another renderer instance in the process renders the same content.
+    /// `check_abort` runs between polls so cancellation and the render
+    /// deadline still apply while waiting. Callers re-check [`Self::is_cached`]
+    /// after the claim: the previous holder usually completed the same frames.
+    pub(crate) fn lock_render_dir(
+        &self,
+        req: &MotionRenderRequest,
+        check_abort: &dyn Fn() -> MotionResult<()>,
+    ) -> MotionResult<RenderDirGuard> {
+        let dir = self.dir_for(req);
+        loop {
+            {
+                let mut active = active_render_dirs()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if active.insert(dir.clone()) {
+                    return Ok(RenderDirGuard { dir });
+                }
+            }
+            check_abort()?;
+            std::thread::sleep(RENDER_DIR_LOCK_POLL);
+        }
     }
 
     /// Prepare a cache directory for a render. Removing the marker first
@@ -862,6 +913,48 @@ mod tests {
         // touched, so a later renderer failure cannot reuse stale frames.
         assert_eq!(cache.begin_render(&req).unwrap(), dir);
         assert!(!cache.is_cached(&req));
+    }
+
+    #[test]
+    fn render_dir_lock_is_shared_across_cache_instances() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = MotionCache::new(tmp.path());
+        let second = MotionCache::new(tmp.path());
+        let req = code_req("<shared/>");
+        let guard = first.lock_render_dir(&req, &|| Ok(())).unwrap();
+
+        // A second instance on the same root cannot claim the directory and
+        // honors its abort check while waiting.
+        let aborted = second.lock_render_dir(&req, &|| Err(crate::error::MotionError::Cancelled));
+        assert!(matches!(aborted, Err(crate::error::MotionError::Cancelled)));
+
+        // A different request is independent.
+        let other = second
+            .lock_render_dir(&code_req("<other/>"), &|| Ok(()))
+            .unwrap();
+        drop(other);
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let acquired = acquired.clone();
+            let req = req.clone();
+            std::thread::spawn(move || {
+                let guard = second.lock_render_dir(&req, &|| Ok(())).unwrap();
+                acquired.store(true, Ordering::SeqCst);
+                drop(guard);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "the second instance must wait while the directory is claimed"
+        );
+        drop(guard);
+        waiter.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]

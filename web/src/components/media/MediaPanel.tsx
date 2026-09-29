@@ -79,6 +79,7 @@ import {
 import {
   importMedia,
   cancelGeneration,
+  generationRetryResumes,
   retryGeneration,
   extractAudio,
   generateThumbnail,
@@ -2379,17 +2380,34 @@ export function FolderTile({
   );
 }
 
+/** Retries after a failed thumbnail load before the card shows its type icon. */
+export const MEDIA_THUMBNAIL_MAX_RETRIES = 6;
+
+/**
+ * Exponential back-off (250 ms doubling to 8 s, about 16 s in total) before
+ * retry `attempt + 1`, or `null` once retries are exhausted. A burst of
+ * thumbnails queues behind playback in the native asset protocol, so a load
+ * can fail transiently (504 or 503 with Retry-After) well after the first
+ * second.
+ */
+export function mediaThumbnailRetryDelayMs(attempt: number): number | null {
+  if (attempt >= MEDIA_THUMBNAIL_MAX_RETRIES) return null;
+  return Math.min(250 * 2 ** attempt, 8000);
+}
+
 /** A failed <img> does not recover when its cached file becomes readable later.
  * Retry only the asset read, not decoding or timeline work. */
 function MediaCardThumbnail({ src, name, type }: { src: string; name: string; type: MediaItem["type"] }) {
   const [attempt, setAttempt] = useState(0);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    if (!failed || attempt >= 2) return;
+    if (!failed) return;
+    const delay = mediaThumbnailRetryDelayMs(attempt);
+    if (delay === null) return;
     const timer = window.setTimeout(() => {
       setAttempt((previous) => previous + 1);
       setFailed(false);
-    }, attempt === 0 ? 250 : 1000);
+    }, delay);
     return () => window.clearTimeout(timer);
   }, [attempt, failed]);
 
@@ -2814,16 +2832,23 @@ export function MediaCard({
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
-                  // The provider may already have billed a submission
-                  // whose answer never arrived: retrying could pay twice.
-                  const approved = window.confirm(
-                    submitOutcomeUnknown
-                      ? t("generation.outcomeUnknownRetryConfirm")
-                      : "重试会再次调用生成服务并可能产生费用。是否继续？",
-                  );
-                  if (approved) {
-                    void retryGeneration(item.generationInput!.jobId!, true);
-                  }
+                  const jobId = item.generationInput!.jobId!;
+                  void (async () => {
+                    // A job the provider accepted that failed on this side is
+                    // polled again at no cost; anything else is submitted again.
+                    if (await generationRetryResumes(jobId)) {
+                      await retryGeneration(jobId, false);
+                      return;
+                    }
+                    // The provider may already have billed a submission
+                    // whose answer never arrived: retrying could pay twice.
+                    const approved = window.confirm(
+                      submitOutcomeUnknown
+                        ? t("generation.outcomeUnknownRetryConfirm")
+                        : "重试会再次调用生成服务并可能产生费用。是否继续？",
+                    );
+                    if (approved) await retryGeneration(jobId, true);
+                  })().catch((error) => useEditorUiStore.getState().pushToast(String(error)));
                 }}
                 style={{
                   minWidth: 24,

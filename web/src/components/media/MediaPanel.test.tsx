@@ -49,6 +49,8 @@ vi.mock("../../lib/api", () => ({
   motionDocumentPatch: vi.fn(),
   motionPreview: vi.fn(),
   motionPreviewCancel: vi.fn().mockResolvedValue(false),
+  generationRetryResumes: vi.fn().mockResolvedValue(false),
+  retryGeneration: vi.fn().mockResolvedValue({ jobId: "job", placeholderAssetIds: [], status: "queued" }),
 }));
 
 vi.mock("../../lib/asset", () => ({
@@ -81,10 +83,12 @@ import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import {
   AudioWaveform,
   FolderTile,
+  MEDIA_THUMBNAIL_MAX_RETRIES,
   MediaCard,
   MediaFavoriteButton,
   MediaPanel,
   filterMediaByType,
+  mediaThumbnailRetryDelayMs,
   sortMediaItems,
 } from "./MediaPanel";
 
@@ -312,6 +316,35 @@ describe("MediaCard thumbnail load recovery", () => {
     }
   });
 
+  it("backs off exponentially across more retries than a short queue burst lasts", () => {
+    const delays = Array.from({ length: MEDIA_THUMBNAIL_MAX_RETRIES + 1 }, (_, attempt) =>
+      mediaThumbnailRetryDelayMs(attempt),
+    );
+    expect(delays).toEqual([250, 500, 1000, 2000, 4000, 8000, null]);
+  });
+
+  it("recovers a thumbnail that keeps failing for several seconds", async () => {
+    vi.useFakeTimers();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const item = { ...mediaItem("slow-thumb"), thumbnail: "/cache/slow.png" };
+    try {
+      await act(async () => root.render(<MediaCard item={item} />));
+      for (let failure = 0; failure < 4; failure++) {
+        await act(async () => container.querySelector("img")!.dispatchEvent(new Event("error")));
+        await act(async () => vi.advanceTimersByTime(mediaThumbnailRetryDelayMs(failure)!));
+      }
+      const recovered = container.querySelector("img")!;
+      expect(recovered.getAttribute("src")).toBe("asset:///cache/slow.png?opentake-thumbnail-retry=4");
+      await act(async () => recovered.dispatchEvent(new Event("load")));
+      expect(container.querySelector("img")).toBe(recovered);
+    } finally {
+      await act(async () => root.unmount());
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds repeated thumbnail failures and leaves the media card usable instead of a broken image", async () => {
     vi.useFakeTimers();
     const container = document.createElement("div");
@@ -319,11 +352,11 @@ describe("MediaCard thumbnail load recovery", () => {
     const root = createRoot(container);
     try {
       await act(async () => root.render(<MediaCard item={{ ...mediaItem("permanent-thumb"), thumbnail: "/cache/unavailable.png" }} />));
-      for (let failure = 0; failure < 3; failure++) {
+      for (let failure = 0; failure <= MEDIA_THUMBNAIL_MAX_RETRIES; failure++) {
         const img = container.querySelector("img")!;
         expect(img).not.toBeNull();
         await act(async () => img.dispatchEvent(new Event("error")));
-        await act(async () => vi.advanceTimersByTime(2000));
+        await act(async () => vi.advanceTimersByTime(8000));
       }
       expect(container.querySelector("img")).toBeNull();
       await act(async () => vi.advanceTimersByTime(30000));
@@ -698,6 +731,50 @@ describe("media grid interaction consistency", () => {
       await act(async () => root.unmount());
     },
   );
+
+  it("resumes an accepted job without a cost confirmation and confirms a resubmission", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirm);
+    vi.mocked(api.retryGeneration).mockClear();
+    const failed = (jobId: string): MediaItem => ({
+      ...mediaItem(jobId),
+      generationStatus: "failed",
+      generationErrorCode: "GENERATION_DOWNLOAD_FAILED",
+      generationInput: {
+        prompt: "mountains",
+        model: "test",
+        duration: 1,
+        aspectRatio: "16:9",
+        provider: "fal",
+        jobId,
+      },
+    });
+    const clickRetry = async () => {
+      const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "重试",
+      );
+      await act(async () => retry?.click());
+    };
+
+    vi.mocked(api.generationRetryResumes).mockResolvedValueOnce(true);
+    await act(async () => root.render(<MediaCard item={failed("job-resume")} />));
+    await clickRetry();
+    expect(api.generationRetryResumes).toHaveBeenLastCalledWith("job-resume");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(api.retryGeneration).toHaveBeenLastCalledWith("job-resume", false);
+
+    vi.mocked(api.generationRetryResumes).mockResolvedValueOnce(false);
+    await act(async () => root.render(<MediaCard item={failed("job-resubmit")} />));
+    await clickRetry();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(api.retryGeneration).toHaveBeenLastCalledWith("job-resubmit", true);
+
+    vi.unstubAllGlobals();
+    await act(async () => root.unmount());
+  });
 
   it("keeps extract audio keyboard-reachable from zero hover without adding idle visual noise", async () => {
     dialogMocks.saveDialog.mockResolvedValue(dialogMocks.save);

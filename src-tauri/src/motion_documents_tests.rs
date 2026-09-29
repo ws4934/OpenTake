@@ -490,3 +490,90 @@ fn rejects_manifest_that_pretty_serialization_cannot_read_back() {
             .is_some_and(|name| name.starts_with("rev-"))
     }));
 }
+
+#[test]
+fn save_rejects_sources_whose_combined_document_exceeds_the_render_limit() {
+    let (_temp, core, project) = saved_core("render-limit");
+    let store = MotionDocumentStore::new(core);
+    let original = create_document(&store);
+
+    // Each file alone is within MAX_SOURCE_BYTES, but HTML + CSS compile into
+    // one inline document that the renderer would refuse to preview or publish.
+    let html = format!("<main>{}</main>", "a".repeat(DEFAULT_MAX_DOCUMENT_BYTES));
+    assert!(html.len() <= MAX_SOURCE_BYTES);
+    let request = replace_html(&original, &html);
+    let hash_error = store
+        .hash_patch(MotionDocumentHashRequest {
+            document_id: request.document_id.clone(),
+            file: request.file.clone(),
+            baseline_hash: request.baseline_hash.clone(),
+            edits: request.edits.clone(),
+        })
+        .expect_err("prospective hash must refuse an unrenderable document");
+    let error = store
+        .save_patch(request)
+        .expect_err("save must refuse an unrenderable document");
+    for message in [&hash_error, &error] {
+        assert!(message.contains("too large to render"), "{message}");
+        assert!(
+            message.contains(&DEFAULT_MAX_DOCUMENT_BYTES.to_string()),
+            "{message}"
+        );
+    }
+    assert_eq!(store.read(&original.summary.id).unwrap(), original);
+    assert_eq!(
+        revision_directories(&project).len(),
+        1,
+        "a rejected save must not leave a revision directory"
+    );
+
+    // A document exactly at the limit still saves and compiles within it.
+    let overhead = MotionDocumentSource::new("", &original.css).inline_document_len();
+    let body = DEFAULT_MAX_DOCUMENT_BYTES - overhead - "<main></main>".len();
+    let html = format!("<main>{}</main>", "a".repeat(body));
+    let saved = store
+        .save_patch(replace_html(&original, &html))
+        .expect("a document at the render limit saves");
+    let document = MotionDocumentSource::new(saved.html, saved.css)
+        .inline_document()
+        .unwrap();
+    assert_eq!(document.len(), DEFAULT_MAX_DOCUMENT_BYTES);
+}
+
+fn revision_directories(project: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(project.join(MOTION_DOCUMENTS_DIR))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("rev-"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn identity_failure_before_commit_removes_the_new_revision_directory() {
+    let (_temp, core, project) = saved_core("identity-cleanup");
+    let store = MotionDocumentStore::new(core);
+    let original = create_document(&store);
+    let before = revision_directories(&project);
+    assert_eq!(before.len(), 1);
+
+    store.fail_next_commit_identity_for_test();
+    let error = store
+        .create(MotionDocumentCreateRequest {
+            title: Some("second".into()),
+        })
+        .expect_err("create must fail when the project identity changes");
+    assert!(error.contains("project changed"), "{error}");
+    assert_eq!(revision_directories(&project), before);
+
+    store.fail_next_commit_identity_for_test();
+    let error = store
+        .save_patch(replace_html(&original, "<main>patched</main>"))
+        .expect_err("save must fail when the project identity changes");
+    assert!(error.contains("project changed"), "{error}");
+    assert_eq!(revision_directories(&project), before);
+    assert_eq!(store.read(&original.summary.id).unwrap(), original);
+    assert_eq!(store.list().unwrap(), vec![original.summary]);
+}
