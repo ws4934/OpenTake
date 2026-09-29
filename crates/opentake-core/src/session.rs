@@ -805,6 +805,18 @@ impl EditorSession {
             .into_owned())
     }
 
+    /// External media paths of the current manifest, without cloning it.
+    pub fn media_external_paths(&self) -> impl Iterator<Item = &str> {
+        self.state
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.source {
+                MediaSource::External { absolute_path } => Some(absolute_path.as_str()),
+                MediaSource::Project { .. } => None,
+            })
+    }
+
     /// Count catalog entries without cloning the catalog under the session lock.
     pub fn media_count(&self) -> usize {
         self.state.manifest.entries.len()

@@ -419,7 +419,66 @@ pub struct BundleExportSnapshot {
 
 struct CoreSessionSlot {
     project_epoch: u64,
+    editor: TrackedEditor,
+}
+
+/// Source of process-unique [`TrackedEditor`] generations. Uniqueness across
+/// every `AppCore` in the process lets consumers share one cache keyed by
+/// generation without also identifying the core it came from.
+static NEXT_EDITOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_editor_generation() -> u64 {
+    NEXT_EDITOR_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The editor session plus a generation that changes on every mutable access.
+///
+/// The media manifest has many mutation paths (edit commands, imports,
+/// relinks, checkpoints, whole-session replacement) and not all of them bump
+/// the document version. Every one of them needs `&mut EditorSession`, so a
+/// fresh generation on `DerefMut` structurally covers all of them, including
+/// future ones: a cache keyed by this generation can only be conservatively
+/// invalidated, never silently stale.
+struct TrackedEditor {
     editor: EditorSession,
+    generation: u64,
+}
+
+impl TrackedEditor {
+    fn new(editor: EditorSession) -> Self {
+        Self {
+            editor,
+            generation: next_editor_generation(),
+        }
+    }
+}
+
+impl std::ops::Deref for TrackedEditor {
+    type Target = EditorSession;
+
+    fn deref(&self) -> &EditorSession {
+        &self.editor
+    }
+}
+
+impl std::ops::DerefMut for TrackedEditor {
+    fn deref_mut(&mut self) -> &mut EditorSession {
+        self.generation = next_editor_generation();
+        &mut self.editor
+    }
+}
+
+/// Identity of the state that authorizes external media reads: the project
+/// session plus a process-unique generation of the editor that owns the media
+/// manifest. Any manifest change yields a different value, so an index derived
+/// from [`AppCore::external_media_paths`] stays valid exactly while
+/// [`AppCore::media_authority_revision`] returns the same value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MediaAuthorityRevision {
+    pub project_epoch: u64,
+    pub editor_generation: u64,
+    /// External media is only authorized for a saved or opened project.
+    pub has_project_dir: bool,
 }
 
 /// Fully loaded project replacement awaiting an atomic session commit.
@@ -459,9 +518,17 @@ impl CoreSessionSlot {
     }
 
     fn replace_editor(&mut self, editor: EditorSession) -> TimelineSnapshot {
-        self.editor = editor;
+        self.editor = TrackedEditor::new(editor);
         self.project_epoch += 1;
         self.timeline_snapshot()
+    }
+}
+
+fn media_authority_revision(session: &CoreSessionSlot) -> MediaAuthorityRevision {
+    MediaAuthorityRevision {
+        project_epoch: session.project_epoch,
+        editor_generation: session.editor.generation,
+        has_project_dir: session.editor.project_dir().is_some(),
     }
 }
 
@@ -531,7 +598,7 @@ impl AppCore {
         AppCore {
             session: Arc::new(Mutex::new(CoreSessionSlot {
                 project_epoch: 0,
-                editor: EditorSession::new_project(),
+                editor: TrackedEditor::new(EditorSession::new_project()),
             })),
             project_identity_workflow: Arc::new(RwLock::new(())),
             project_bundle_publication: Arc::new(Mutex::new(())),
@@ -600,6 +667,26 @@ impl AppCore {
             project_epoch: session.project_epoch,
             version: session.editor.version(),
         }
+    }
+
+    /// O(1) identity of the state behind [`Self::external_media_paths`]. Hot
+    /// authorization paths compare it with a cached index instead of cloning
+    /// the runtime snapshot on every request.
+    pub fn media_authority_revision(&self) -> MediaAuthorityRevision {
+        let session = self.lock();
+        media_authority_revision(&session)
+    }
+
+    /// Every external media path in the current manifest, paired with the
+    /// revision it was read at under the same session lock.
+    pub fn external_media_paths(&self) -> (MediaAuthorityRevision, Vec<PathBuf>) {
+        let session = self.lock();
+        let paths = session
+            .editor
+            .media_external_paths()
+            .map(PathBuf::from)
+            .collect();
+        (media_authority_revision(&session), paths)
     }
 
     /// Snapshot the exact retained bundle authority under the same session
@@ -2783,6 +2870,65 @@ mod tests {
     use opentake_ops::command::{ClipEntry, ClipProperties};
     use std::sync::Mutex;
 
+    #[test]
+    fn media_authority_revision_tracks_every_manifest_change_but_not_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("clip.mp4");
+        std::fs::write(&source, b"clip").unwrap();
+        let core = AppCore::new();
+        let unsaved = core.media_authority_revision();
+        assert!(!unsaved.has_project_dir);
+
+        core.save_project(Some(directory.path().join("Revision.opentake")))
+            .unwrap();
+        let saved = core.media_authority_revision();
+        assert!(saved.has_project_dir);
+        assert_ne!(saved, unsaved);
+
+        // Reads never invalidate an index derived from the revision.
+        let _ = core.runtime_snapshot();
+        let _ = core.media();
+        let _ = core.project_asset_authority();
+        assert_eq!(core.media_authority_revision(), saved);
+        let (read_revision, paths) = core.external_media_paths();
+        assert_eq!(read_revision, saved);
+        assert!(paths.is_empty());
+
+        // Imports do not bump the document version, but must change the revision.
+        let version = core.project_revision().version;
+        let imported = core
+            .import_media_file(&source, "clip", &crate::ProbedMedia::default())
+            .unwrap();
+        assert_eq!(core.project_revision().version, version);
+        let after_import = core.media_authority_revision();
+        assert_ne!(after_import, saved);
+        let (revision, paths) = core.external_media_paths();
+        assert_eq!(revision, after_import);
+        assert_eq!(paths, vec![source.clone()]);
+
+        core.apply(EditCommand::DeleteMedia {
+            asset_ids: vec![imported.id.clone()],
+        })
+        .unwrap();
+        let after_delete = core.media_authority_revision();
+        assert_ne!(after_delete, after_import);
+        assert!(core.external_media_paths().1.is_empty());
+
+        // Replacing the session yields a fresh epoch and generation.
+        core.new_project();
+        let replaced = core.media_authority_revision();
+        assert_ne!(replaced.project_epoch, after_delete.project_epoch);
+        assert_ne!(replaced.editor_generation, after_delete.editor_generation);
+    }
+
+    #[test]
+    fn media_authority_generations_are_unique_across_cores() {
+        let first = AppCore::new().media_authority_revision();
+        let second = AppCore::new().media_authority_revision();
+        assert_eq!(first.project_epoch, second.project_epoch);
+        assert_ne!(first.editor_generation, second.editor_generation);
+    }
+
     /// Build a core whose session has one empty video track, ready for AddClips.
     fn core_with_track() -> AppCore {
         let core = AppCore::new();
@@ -4412,7 +4558,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             for _ in 0..20_000 {
                 let mut session = writer_core.lock();
-                std::mem::swap(&mut session.editor, &mut spare);
+                std::mem::swap(&mut *session.editor, &mut spare);
                 session.project_epoch += 1;
                 drop(session);
                 std::thread::yield_now();
