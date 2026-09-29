@@ -220,7 +220,9 @@ pub use search::{
     Row, SamplerOptions,
 };
 
-pub use index_coordinator::{work_needed, ExportPause, IndexProgress, WorkNeeded};
+pub use index_coordinator::{
+    work_needed, ExportPause, ExportPauseGuard, IndexProgress, WorkNeeded,
+};
 
 pub use ort_worker::ExecutionProvider;
 
@@ -255,6 +257,14 @@ impl MediaEngine {
             models_dir: models_dir.into(),
             export_pause: ExportPause::new(),
         }
+    }
+
+    /// Share an existing playback/export pressure counter instead of the
+    /// private one created by [`MediaEngine::new`]. Every engine in one process
+    /// must observe the same counter so background work yields consistently.
+    pub fn with_export_pause(mut self, export_pause: ExportPause) -> Self {
+        self.export_pause = export_pause;
+        self
     }
 
     pub fn cache_root(&self) -> &Path {
@@ -368,8 +378,8 @@ impl MediaEngine {
         search::rank(query_vector, indexes, limit, relative_cutoff, min_score)
     }
 
-    /// The shared export-pause signal; `opentake-render` calls `begin`/`end`
-    /// around exports so background indexing yields.
+    /// The shared playback/export pressure signal. The desktop shell holds a
+    /// guard around exports and native playback so background indexing yields.
     pub fn export_pause(&self) -> ExportPause {
         self.export_pause.clone()
     }
@@ -465,6 +475,21 @@ mod tests {
         assert!(e.export_pause().is_active());
         p.end();
         assert!(!e.export_pause().is_active());
+    }
+
+    #[test]
+    fn engines_built_with_one_export_pause_share_its_counter() {
+        let shared = ExportPause::new();
+        let a = MediaEngine::new("/a", "/m").with_export_pause(shared.clone());
+        let b = MediaEngine::new("/b", "/m").with_export_pause(shared.clone());
+        assert!(a.export_pause().ptr_eq(&b.export_pause()));
+        assert!(!a
+            .export_pause()
+            .ptr_eq(&MediaEngine::new("/c", "/m").export_pause()));
+        let guard = a.export_pause().guard();
+        assert!(b.export_pause().is_active());
+        drop(guard);
+        assert!(!shared.is_active());
     }
 
     #[test]

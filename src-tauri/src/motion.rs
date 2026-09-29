@@ -744,11 +744,15 @@ fn map_preview_motion_error(error: MotionError) -> MotionPreviewError {
         MotionError::RendererUnavailable(_) => {
             preview_error("Motion preview requires the packaged Chromium renderer.")
         }
+        // Sandbox reasons (document too large, blocked URL) describe the
+        // author's own source and are actionable, so keep them.
+        MotionError::Sandbox(reason) => {
+            preview_error(&format!("Motion preview request is invalid: {reason}."))
+        }
         MotionError::InvalidSource(_)
         | MotionError::InvalidRequest(_)
         | MotionError::UnknownTemplate(_)
-        | MotionError::Manifest(_)
-        | MotionError::Sandbox(_) => preview_error("Motion preview request is invalid."),
+        | MotionError::Manifest(_) => preview_error("Motion preview request is invalid."),
         MotionError::Timeout(_) => preview_error("Motion preview exceeded its time budget."),
         MotionError::RenderFailed(_) | MotionError::Io(_) => {
             preview_error("Motion preview could not be rendered.")
@@ -1304,6 +1308,19 @@ impl TauriMotionBridge {
             transparent: Some(transparent),
             ..GenerationInput::default()
         };
+        // Copy and sync the encoded output into the project's media directory
+        // before taking the project locks: a transparent ProRes output can be
+        // hundreds of megabytes, and saves and other publications must not
+        // wait for it. The locks cover only the identity re-check and commit.
+        let (project_media, mut published) = stage_motion_output(
+            &self.core,
+            snapshot.project_epoch,
+            &project_dir,
+            &output,
+            transparent,
+            cancel,
+            &|| {},
+        )?;
         (self.progress)(MotionProgress::Committing);
         let publication = self.core.lock_project_bundle_publication();
         let identity = self.core.lock_project_identity_workflow();
@@ -1317,25 +1334,9 @@ impl TauriMotionBridge {
                 "project changed before Motion Studio publishing committed",
             ));
         }
-        let project_media = crate::library::ProjectMediaCapability::open_verified(
-            &self.core,
-            snapshot.project_epoch,
-            &project_dir,
-            true,
-        )
-        .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
-        let leaf_name = format!(
-            "motion-{}.{}",
-            uuid::Uuid::new_v4(),
-            if transparent { "mov" } else { "mp4" }
-        );
-        let mut published = project_media
-            .create_import(std::path::Path::new(&leaf_name))
+        project_media
+            .ensure_current(&self.core, snapshot.project_epoch)
             .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
-        let mut encoded = std::fs::File::open(&output).map_err(io_motion_error)?;
-        std::io::copy(&mut encoded, published.file_mut()).map_err(io_motion_error)?;
-        published.file_mut().flush().map_err(io_motion_error)?;
-        published.file().sync_all().map_err(io_motion_error)?;
         if !project_media
             .matches_leaf(&published)
             .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?
@@ -1343,19 +1344,6 @@ impl TauriMotionBridge {
             return Err(MotionBridgeError::new(
                 MotionBridgeErrorKind::RenderFailed,
                 "motion output identity changed before project commit",
-            ));
-        }
-        project_media
-            .sync_media_directory()
-            .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
-        ensure_motion_active(cancel)?;
-        if expected_authority
-            .as_ref()
-            .is_some_and(|authority| !self.core.project_asset_authority_matches(authority))
-        {
-            return Err(MotionBridgeError::new(
-                MotionBridgeErrorKind::RenderFailed,
-                "project changed before Motion Studio publishing committed",
             ));
         }
         let mut events = DeferredCoreEvents::default();
@@ -1434,6 +1422,71 @@ impl TauriMotionBridge {
             },
         })
     }
+}
+
+/// Copy the encoded output into a new retained leaf under the project's
+/// `media/` directory and make it durable. Runs without project locks; the
+/// caller re-checks project and leaf identity under the locks before commit.
+/// `after_chunk` observes copy progress in tests.
+fn stage_motion_output(
+    core: &AppCore,
+    project_epoch: u64,
+    project_dir: &std::path::Path,
+    output: &std::path::Path,
+    transparent: bool,
+    cancel: &opentake_media::MediaCancelToken,
+    after_chunk: &dyn Fn(),
+) -> Result<
+    (
+        crate::library::ProjectMediaCapability,
+        crate::library::ProjectImportGuard,
+    ),
+    MotionBridgeError,
+> {
+    let project_media = crate::library::ProjectMediaCapability::open_verified(
+        core,
+        project_epoch,
+        project_dir,
+        true,
+    )
+    .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
+    let leaf_name = format!(
+        "motion-{}.{}",
+        uuid::Uuid::new_v4(),
+        if transparent { "mov" } else { "mp4" }
+    );
+    let mut published = project_media
+        .create_import(std::path::Path::new(&leaf_name))
+        .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
+    let mut encoded = std::fs::File::open(output).map_err(io_motion_error)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        ensure_motion_active(cancel)?;
+        let read = std::io::Read::read(&mut encoded, &mut buffer).map_err(io_motion_error)?;
+        if read == 0 {
+            break;
+        }
+        published
+            .file_mut()
+            .write_all(&buffer[..read])
+            .map_err(io_motion_error)?;
+        after_chunk();
+    }
+    published.file_mut().flush().map_err(io_motion_error)?;
+    published.file().sync_all().map_err(io_motion_error)?;
+    if !project_media
+        .matches_leaf(&published)
+        .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?
+    {
+        return Err(MotionBridgeError::new(
+            MotionBridgeErrorKind::RenderFailed,
+            "motion output identity changed while it was copied into the project",
+        ));
+    }
+    project_media
+        .sync_media_directory()
+        .map_err(|error| MotionBridgeError::new(MotionBridgeErrorKind::RenderFailed, error))?;
+    Ok((project_media, published))
 }
 
 fn validate_document_source_identity(
@@ -1929,6 +1982,10 @@ fn encode_frames(
             )
         })?
         .join("frame_%05d.png");
+    let redactions = [
+        (pattern.to_string_lossy().into_owned(), "<frames>"),
+        (output.to_string_lossy().into_owned(), "<output>"),
+    ];
     let mut command = opentake_media::process_tree::background_command(
         opentake_media::ffmpeg_status::ffmpeg_path(),
     );
@@ -1948,7 +2005,7 @@ fn encode_frames(
         .arg("-y")
         .arg(output)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| {
             MotionBridgeError::new(
@@ -1956,27 +2013,46 @@ fn encode_frames(
                 "FFmpeg could not be started for motion encoding",
             )
         })?;
+    let stderr = child.stderr.take().map(spawn_stderr_tail);
+    let stderr_summary = move || {
+        stderr
+            .and_then(|reader| reader.join().ok())
+            .map(|tail| redact_encoder_stderr(&tail, &redactions))
+            .unwrap_or_default()
+    };
     loop {
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
+            drop(stderr_summary());
             return Err(MotionBridgeError::new(
                 MotionBridgeErrorKind::Cancelled,
                 "motion render cancelled",
             ));
         }
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => {
+            Ok(Some(status)) if status.success() => {
+                drop(stderr_summary());
+                return Ok(());
+            }
+            Ok(Some(status)) => {
+                let summary = stderr_summary();
                 return Err(MotionBridgeError::new(
                     MotionBridgeErrorKind::RenderFailed,
-                    "FFmpeg failed to encode the motion frame sequence",
+                    if summary.is_empty() {
+                        format!("FFmpeg failed to encode the motion frame sequence ({status})")
+                    } else {
+                        format!(
+                            "FFmpeg failed to encode the motion frame sequence ({status}): {summary}"
+                        )
+                    },
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(stderr_summary());
                 return Err(MotionBridgeError::new(
                     MotionBridgeErrorKind::RenderFailed,
                     "motion encoder status could not be read",
@@ -1984,6 +2060,50 @@ fn encode_frames(
             }
         }
     }
+}
+
+/// Bytes of encoder stderr kept for error messages. `-v error` output is
+/// small; the bound only matters for a pathological stream.
+const ENCODER_STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// Drain `stderr` on a helper thread so FFmpeg never blocks on a full pipe,
+/// keeping only the last [`ENCODER_STDERR_TAIL_BYTES`].
+fn spawn_stderr_tail(
+    mut stderr: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut tail = Vec::with_capacity(ENCODER_STDERR_TAIL_BYTES);
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    tail.extend_from_slice(&chunk[..read]);
+                    if tail.len() > ENCODER_STDERR_TAIL_BYTES {
+                        tail.drain(..tail.len() - ENCODER_STDERR_TAIL_BYTES);
+                    }
+                }
+            }
+        }
+        tail
+    })
+}
+
+/// One-line, path-free summary of the encoder's stderr tail: the frame and
+/// output paths become placeholders and any other absolute path is redacted.
+fn redact_encoder_stderr(tail: &[u8], known_paths: &[(String, &str)]) -> String {
+    let mut text = String::from_utf8_lossy(tail).into_owned();
+    for (path, placeholder) in known_paths {
+        if !path.is_empty() {
+            text = text.replace(path.as_str(), placeholder);
+        }
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(crate::telemetry::redact_sensitive_text)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn map_motion_error(error: MotionError) -> MotionBridgeError {
@@ -2012,6 +2132,101 @@ fn io_motion_error(error: std::io::Error) -> MotionBridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_sandbox_errors_keep_the_specific_reason() {
+        let oversized = "x".repeat(opentake_motion::DEFAULT_MAX_DOCUMENT_BYTES + 1);
+        let error = SandboxPolicy::default()
+            .check_document_size(&oversized)
+            .expect_err("oversized document is refused");
+        let preview = map_preview_motion_error(error);
+        assert!(
+            preview.message.contains(&format!(
+                "over the {}-byte limit",
+                opentake_motion::DEFAULT_MAX_DOCUMENT_BYTES
+            )),
+            "{}",
+            preview.message
+        );
+        assert_eq!(preview.diagnostics[0].message, preview.message);
+    }
+
+    #[test]
+    fn output_copy_into_project_media_does_not_block_project_save() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().expect("publish fixture parent");
+        let project = temp.path().join("publish.opentake");
+        let core = AppCore::new();
+        core.save_project(Some(project.clone()))
+            .expect("save publish fixture project");
+        let epoch = core.runtime_snapshot().project_epoch;
+        let output = temp.path().join("output.mov");
+        let bytes = (0..3 * 1024 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&output, &bytes).expect("write encoded output");
+
+        let (copying_tx, copying_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let blocked = AtomicBool::new(false);
+        let (staged, saved) = std::thread::scope(|scope| {
+            let stage = scope.spawn(|| {
+                stage_motion_output(
+                    &core,
+                    epoch,
+                    &project,
+                    &output,
+                    true,
+                    &opentake_media::MediaCancelToken::new(),
+                    &|| {
+                        if !blocked.swap(true, Ordering::SeqCst) {
+                            copying_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        }
+                    },
+                )
+            });
+            copying_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the copy starts");
+            // The copy is parked mid-file; a project save must still finish.
+            let (saved_tx, saved_rx) = mpsc::channel();
+            let saving_core = &core;
+            scope.spawn(move || saved_tx.send(saving_core.save_project(None)).unwrap());
+            let saved = saved_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("project save must not wait for the output copy");
+            release_tx.send(()).unwrap();
+            (stage.join().unwrap(), saved)
+        });
+        saved.expect("project save succeeds during the copy");
+        let (project_media, published) = staged.expect("output staged into media");
+        assert!(published.path().starts_with(project.join("media")));
+        assert_eq!(std::fs::read(published.path()).unwrap(), bytes);
+
+        // The commit-time checks still bind the staged leaf to this project.
+        let _publication = core.lock_project_bundle_publication();
+        let _identity = core.lock_project_identity_workflow();
+        project_media
+            .ensure_current(&core, epoch)
+            .expect("the project is unchanged");
+        assert!(project_media.matches_leaf(&published).unwrap());
+        drop(_identity);
+        drop(_publication);
+
+        // A Save As between the copy and the commit is detected.
+        core.save_project(Some(temp.path().join("moved.opentake")))
+            .expect("save as");
+        assert!(project_media.ensure_current(&core, epoch).is_err());
+        let staged_path = published.path().to_path_buf();
+        drop(published);
+        assert!(
+            !staged_path.exists(),
+            "an uncommitted staged output is removed"
+        );
+    }
 
     #[test]
     fn motion_edit_preserves_recorded_transparency() {
@@ -2283,8 +2498,70 @@ mod tests {
         assert_eq!(error.kind, MotionBridgeErrorKind::RenderFailed);
         assert!(error.message.contains("FFmpeg failed"));
         assert!(
+            error.message.contains("): "),
+            "the error carries FFmpeg's stderr summary: {}",
+            error.message
+        );
+        assert!(
             !output.exists() || output.metadata().unwrap().len() == 0,
             "failed encoding must not leave a usable output"
+        );
+    }
+
+    #[test]
+    fn encoder_failure_reports_a_redacted_stderr_summary() {
+        if !opentake_media::ffmpeg_status::ffmpeg_available() {
+            eprintln!("SKIP: FFmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-frames");
+        let rendered = RenderedClip {
+            content_hash: "e".repeat(64),
+            frames: vec![missing.join("frame_00000.png")],
+            fps: 30,
+            width: 64,
+            height: 36,
+            transparent: false,
+        };
+        let output = temp.path().join("output.mp4");
+        let error = encode_frames(
+            &rendered,
+            &output,
+            false,
+            &opentake_media::MediaCancelToken::new(),
+        )
+        .expect_err("a missing frame directory must fail to encode");
+        assert_eq!(error.kind, MotionBridgeErrorKind::RenderFailed);
+        assert!(
+            error.message.contains("<frames>"),
+            "the summary names the input without its path: {}",
+            error.message
+        );
+        let root = temp.path().to_string_lossy();
+        assert!(!error.message.contains(root.as_ref()), "{}", error.message);
+    }
+
+    #[test]
+    fn encoder_stderr_tail_is_bounded_and_redacted() {
+        let noisy = [
+            b"x".repeat(ENCODER_STDERR_TAIL_BYTES * 3),
+            b"\n/Users/alice/Movies/frame_%05d.png: No such file\n".to_vec(),
+        ]
+        .concat();
+        let tail = spawn_stderr_tail(std::io::Cursor::new(noisy))
+            .join()
+            .unwrap();
+        assert_eq!(tail.len(), ENCODER_STDERR_TAIL_BYTES);
+        assert!(tail.ends_with(b"No such file\n"));
+
+        let summary = redact_encoder_stderr(
+            b"[image2] /tmp/cache/abc/frame_%05d.png: No such file or directory\nC:\\Users\\bob\\out.mp4: Permission denied\n",
+            &[("/tmp/cache/abc/frame_%05d.png".to_string(), "<frames>")],
+        );
+        assert_eq!(
+            summary,
+            "[image2] <frames>: No such file or directory | [PATH] Permission denied"
         );
     }
 

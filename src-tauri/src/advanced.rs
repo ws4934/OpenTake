@@ -45,8 +45,13 @@ use tauri::{AppHandle, Emitter, State};
 use crate::media::MediaState;
 use crate::voice_revocations::{unix_now_seconds, PendingVoiceRevocation, VoiceRevocationStore};
 
+#[path = "advanced_caches.rs"]
+mod caches;
+use caches::AdvancedWorkflowCaches;
+
 pub struct TauriAdvancedWorkflowBridge {
     core: AppCore,
+    caches: AdvancedWorkflowCaches,
     cache_root: PathBuf,
     models_dir: PathBuf,
     caption_translator: Arc<dyn CaptionTranslationProvider>,
@@ -1676,6 +1681,7 @@ impl TauriAdvancedWorkflowBridge {
             caption_translator: Arc::new(NetworkCaptionTranslationProvider),
             voice_provider: Arc::new(NetworkElevenLabsVoiceProvider),
             voice_revocations,
+            caches: AdvancedWorkflowCaches::default(),
         }
     }
 
@@ -1706,6 +1712,7 @@ impl TauriAdvancedWorkflowBridge {
             models_dir,
             caption_translator,
             voice_provider: Arc::new(NetworkElevenLabsVoiceProvider),
+            caches: AdvancedWorkflowCaches::default(),
         }
     }
 
@@ -1727,7 +1734,23 @@ impl TauriAdvancedWorkflowBridge {
             caption_translator: Arc::new(NetworkCaptionTranslationProvider),
             avatar_provider,
             voice_provider,
+            caches: AdvancedWorkflowCaches::default(),
         }
+    }
+
+    /// Cached, cancellable source digest for the matting and object-removal
+    /// cache keys; an unchanged source is not re-read on the next run.
+    fn source_sha256(
+        &self,
+        path: &Path,
+        cancel: &MediaCancelToken,
+    ) -> Result<String, AdvancedWorkflowError> {
+        self.caches
+            .source_sha256(path, cancel)
+            .map_err(|error| match error {
+                MediaError::Cancelled => cancelled_workflow("advanced video workflow cancelled"),
+                error => advanced_execution(error.to_string()),
+            })
     }
 
     /// Provider voices whose removal is still owed to the user.
@@ -2000,11 +2023,8 @@ impl TauriAdvancedWorkflowBridge {
                 "matting currently requires an ordinary forward 1x video clip",
             ));
         }
-        let installed = verify_rvm_model(&self.models_dir).map_err(|error| {
-            AdvancedWorkflowError::new(
-                AdvancedWorkflowErrorKind::CapabilityUnavailable,
-                error.to_string(),
-            )
+        let installed = self.caches.rvm_model(&self.models_dir).map_err(|error| {
+            AdvancedWorkflowError::new(AdvancedWorkflowErrorKind::CapabilityUnavailable, error)
         })?;
         if args
             .model
@@ -2030,19 +2050,15 @@ impl TauriAdvancedWorkflowBridge {
         if !is_video {
             return Err(advanced_invalid("matting source is not a video"));
         }
-        let source_sha256 =
-            file_sha256(&source_path).map_err(|error| advanced_execution(error.to_string()))?;
-        let key_seed = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            source_sha256,
-            installed.sha256,
-            clip.trim_start_frame,
-            clip.duration_frames,
+        let source_sha256 = self.source_sha256(&source_path, cancel)?;
+        let cache_key = matting_cache_key(
+            &source_sha256,
+            &installed.sha256,
+            &clip,
             snapshot.timeline.fps,
             start,
-            end
+            end,
         );
-        let cache_key = format!("{:x}", Sha256::digest(key_seed.as_bytes()));
         let cache_dir = self.cache_root.join("matting");
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| advanced_execution(error.to_string()))?;
@@ -2260,15 +2276,18 @@ impl TauriAdvancedWorkflowBridge {
         if !is_video {
             return Err(advanced_invalid("object-removal source is not a video"));
         }
-        let source_sha256 =
-            file_sha256(&source_path).map_err(|error| advanced_execution(error.to_string()))?;
+        let source_sha256 = self.source_sha256(&source_path, cancel)?;
         let mask_json =
             serde_json::to_string(&mask).map_err(|error| advanced_execution(error.to_string()))?;
-        let key_seed = format!(
-            "{source_sha256}|{MODEL}|{}|{}|{}|{start}|{end}|{mask_json}",
-            clip.trim_start_frame, clip.duration_frames, snapshot.timeline.fps
+        let cache_key = object_removal_cache_key(
+            &source_sha256,
+            MODEL,
+            &clip,
+            snapshot.timeline.fps,
+            start,
+            end,
+            &mask_json,
         );
-        let cache_key = format!("{:x}", Sha256::digest(key_seed.as_bytes()));
         let cache_dir = self.cache_root.join("object-removal");
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| advanced_execution(error.to_string()))?;
@@ -3859,7 +3878,9 @@ impl AdvancedWorkflowBridge for TauriAdvancedWorkflowBridge {
             ToolName::GenerateAvatar,
             ToolName::CloneVoice,
         ];
-        if verify_rvm_model(&self.models_dir).is_ok() {
+        // Called for every Agent tool dispatch: verify the ~15 MB model only
+        // when its file changes.
+        if self.caches.rvm_model(&self.models_dir).is_ok() {
             tools.push(ToolName::GenerateMatte);
         }
         tools
@@ -3938,6 +3959,47 @@ fn advanced_resource(message: impl Into<String>) -> AdvancedWorkflowError {
 
 fn advanced_execution(message: impl Into<String>) -> AdvancedWorkflowError {
     AdvancedWorkflowError::new(AdvancedWorkflowErrorKind::ExecutionFailed, message)
+}
+
+/// The processed range is keyed relative to the clip: output frame `i` is
+/// processed when `clip.start_frame + i` falls in `[start, end)`, so two clips
+/// with the same trim at different timeline positions need different keys for
+/// the same absolute range, and a moved clip can reuse its result.
+fn clip_relative_range(clip: &opentake_domain::Clip, start: i32, end: i32) -> (i32, i32) {
+    (start - clip.start_frame, end - clip.start_frame)
+}
+
+fn matting_cache_key(
+    source_sha256: &str,
+    model_sha256: &str,
+    clip: &opentake_domain::Clip,
+    fps: i32,
+    start: i32,
+    end: i32,
+) -> String {
+    let (relative_start, relative_end) = clip_relative_range(clip, start, end);
+    let key_seed = format!(
+        "matting-v2|{source_sha256}|{model_sha256}|{}|{}|{fps}|{relative_start}|{relative_end}",
+        clip.trim_start_frame, clip.duration_frames
+    );
+    format!("{:x}", Sha256::digest(key_seed.as_bytes()))
+}
+
+fn object_removal_cache_key(
+    source_sha256: &str,
+    model: &str,
+    clip: &opentake_domain::Clip,
+    fps: i32,
+    start: i32,
+    end: i32,
+    mask_json: &str,
+) -> String {
+    let (relative_start, relative_end) = clip_relative_range(clip, start, end);
+    let key_seed = format!(
+        "object-removal-v2|{source_sha256}|{model}|{}|{}|{fps}|{relative_start}|{relative_end}|{mask_json}",
+        clip.trim_start_frame, clip.duration_frames
+    );
+    format!("{:x}", Sha256::digest(key_seed.as_bytes()))
 }
 
 fn cancelled_workflow(message: impl Into<String>) -> AdvancedWorkflowError {
@@ -4492,6 +4554,41 @@ mod tests {
     use opentake_ops::ClipEntry;
     use std::collections::HashSet;
     use std::process::Command;
+
+    #[test]
+    fn matting_and_object_removal_keys_use_the_clip_relative_range() {
+        let mut first = Clip::new("first", "asset", 100, 60);
+        first.trim_start_frame = 12;
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.start_frame = 130;
+
+        // Same source, trim, duration and absolute range, different placement:
+        // they process different parts of the clip and must not share a key.
+        assert_ne!(
+            matting_cache_key("src", "model", &first, 30, 130, 150),
+            matting_cache_key("src", "model", &second, 30, 130, 150)
+        );
+        assert_ne!(
+            object_removal_cache_key("src", "fill", &first, 30, 130, 150, "{}"),
+            object_removal_cache_key("src", "fill", &second, 30, 130, 150, "{}")
+        );
+
+        // The same clip-relative range is the same work, so a moved clip
+        // reuses its cached result.
+        assert_eq!(
+            matting_cache_key("src", "model", &first, 30, 110, 120),
+            matting_cache_key("src", "model", &second, 30, 140, 150)
+        );
+        assert_eq!(
+            object_removal_cache_key("src", "fill", &first, 30, 110, 120, "{}"),
+            object_removal_cache_key("src", "fill", &second, 30, 140, 150, "{}")
+        );
+        assert_ne!(
+            matting_cache_key("src", "model", &first, 30, 110, 120),
+            object_removal_cache_key("src", "model", &first, 30, 110, 120, "{}")
+        );
+    }
 
     #[test]
     fn advanced_work_cannot_begin_after_update_install_claims_admission() {

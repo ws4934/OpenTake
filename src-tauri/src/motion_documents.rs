@@ -11,6 +11,7 @@ use cap_fs_ext::DirExt;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use opentake_core::{AppCore, ProjectAssetAuthority};
+use opentake_motion::{MotionDocumentSource, DEFAULT_MAX_DOCUMENT_BYTES};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -130,6 +131,8 @@ pub struct MotionDocumentStore {
     fail_next_catalog_replace: AtomicBool,
     #[cfg(test)]
     fail_next_catalog_sync: AtomicBool,
+    #[cfg(test)]
+    fail_next_commit_identity: AtomicBool,
 }
 
 struct AuthorizedProjectRoot {
@@ -163,6 +166,8 @@ impl MotionDocumentStore {
             fail_next_catalog_replace: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_catalog_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_commit_identity: AtomicBool::new(false),
         }
     }
 
@@ -259,7 +264,10 @@ impl MotionDocumentStore {
                 summary: document.summary.clone(),
             },
         );
-        project.ensure_current(&self.core)?;
+        if let Err(error) = self.ensure_commit_identity(&project) {
+            cleanup_revision_directory(&root, &directory);
+            return Err(error);
+        }
         if cancel.is_some_and(opentake_media::MediaCancelToken::is_cancelled) {
             cleanup_revision_directory(&root, &directory);
             return Err("motion document create was cancelled".into());
@@ -418,7 +426,10 @@ impl MotionDocumentStore {
                 summary: next.summary.clone(),
             },
         );
-        project.ensure_current(&self.core)?;
+        if let Err(error) = self.ensure_commit_identity(&project) {
+            cleanup_revision_directory(&root, &directory);
+            return Err(error);
+        }
         if cancel.is_some_and(opentake_media::MediaCancelToken::is_cancelled) {
             cleanup_revision_directory(&root, &directory);
             return Err("motion document patch was cancelled".into());
@@ -431,6 +442,15 @@ impl MotionDocumentStore {
         }
         cleanup_revision_directory(&root, &current_entry.directory);
         Ok(next)
+    }
+
+    /// Identity re-check before a new revision is published to the catalog.
+    fn ensure_commit_identity(&self, project: &AuthorizedProjectRoot) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_next_commit_identity.swap(false, Ordering::SeqCst) {
+            return Err("current project changed before document commit".to_string());
+        }
+        project.ensure_current(&self.core)
     }
 
     fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
@@ -464,6 +484,11 @@ impl MotionDocumentStore {
     #[cfg(test)]
     fn fail_next_catalog_replace_for_test(&self) {
         self.fail_next_catalog_replace.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_commit_identity_for_test(&self) {
+        self.fail_next_commit_identity.store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -616,6 +641,7 @@ fn document_with_content(
     validate_source(css)?;
     let html = normalize_line_endings(html);
     let css = normalize_line_endings(css);
+    validate_render_size(&html, &css)?;
     validate_parameters(&parameters)?;
     let summary = MotionDocumentSummary {
         id,
@@ -736,16 +762,18 @@ fn prospective_sources(
     if edits.len() > MAX_PATCH_EDITS {
         return Err("motion document patch has too many edits".into());
     }
-    match editable {
-        EditableFile::Html => Ok((
+    let (html, css) = match editable {
+        EditableFile::Html => (
             normalize_line_endings(&apply_replacements(&current.html, edits, MAX_SOURCE_BYTES)?),
             current.css.clone(),
-        )),
-        EditableFile::Css => Ok((
+        ),
+        EditableFile::Css => (
             current.html.clone(),
             normalize_line_endings(&apply_replacements(&current.css, edits, MAX_SOURCE_BYTES)?),
-        )),
-    }
+        ),
+    };
+    validate_render_size(&html, &css)?;
+    Ok((html, css))
 }
 
 fn normalize_line_endings(source: &str) -> String {
@@ -817,6 +845,20 @@ fn validate_summary(summary: &MotionDocumentSummary) -> Result<(), String> {
 fn validate_source(source: &str) -> Result<(), String> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err("motion document source exceeds its byte limit".into());
+    }
+    Ok(())
+}
+
+/// Preview and publishing render the HTML and CSS as one inline document under
+/// the renderer's sandbox ceiling. Enforce that ceiling when saving, so a
+/// document that stores successfully can also be rendered.
+fn validate_render_size(html: &str, css: &str) -> Result<(), String> {
+    let combined = MotionDocumentSource::new(html, css).inline_document_len();
+    if combined > DEFAULT_MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "motion document is too large to render: HTML and CSS combine to {combined} bytes, \
+             over the {DEFAULT_MAX_DOCUMENT_BYTES}-byte document limit"
+        ));
     }
     Ok(())
 }

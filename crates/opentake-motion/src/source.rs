@@ -180,11 +180,22 @@ impl MotionDocumentSource {
         }
         validate_html_fragment(&self.html)?;
         validate_stylesheet(&self.css)?;
-        Ok(format!(
+        Ok(self.assemble())
+    }
+
+    /// Byte length of the document [`Self::inline_document`] would produce,
+    /// without validating the sources. Storage uses it to enforce the
+    /// renderer's [`crate::sandbox::DEFAULT_MAX_DOCUMENT_BYTES`] at save time.
+    pub fn inline_document_len(&self) -> usize {
+        self.assemble().len()
+    }
+
+    fn assemble(&self) -> String {
+        format!(
             r#"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="{OFFLINE_DOCUMENT_CSP}"><style>html,body,#opentake-motion-root{{box-sizing:border-box;width:100%;height:100%;margin:0;overflow:hidden}}{css}</style></head><body><div id="opentake-motion-root">{html}</div></body></html>"#,
             css = self.css,
             html = self.html,
-        ))
+        )
     }
 }
 
@@ -582,6 +593,19 @@ mod tests {
         assert!(runtime.contains("seek"));
         assert!(!document.contains("file://"));
         assert!(!document.contains("/Users/"));
+    }
+
+    #[test]
+    fn inline_document_len_matches_the_compiled_document() {
+        let source = MotionDocumentSource::new("<main>é</main>", "main { color: red }");
+        assert_eq!(
+            source.inline_document_len(),
+            source.inline_document().unwrap().len()
+        );
+        // Measured without validation, so storage can bound unsafe drafts too.
+        let unsafe_draft = MotionDocumentSource::new("<script></script>", "");
+        assert!(unsafe_draft.inline_document().is_err());
+        assert!(unsafe_draft.inline_document_len() > "<script></script>".len());
     }
 
     #[test]

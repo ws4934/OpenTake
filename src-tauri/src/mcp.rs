@@ -579,17 +579,15 @@ pub(crate) fn build_media_bridge(
     Arc::new(TauriMediaBridge::new(core, cache_root, models_dir))
 }
 
+/// `motion` is the editor's shared bridge in production, so the Agent's
+/// document previews and publishes reuse its renderer and browser.
 pub(crate) fn build_motion_document_bridge(
     core: AppCore,
-    cache_root: PathBuf,
+    motion: Arc<crate::motion::TauriMotionBridge>,
     notify: Option<MotionDocumentNotifier>,
 ) -> Arc<dyn MotionDocumentBridge> {
     let documents = Arc::new(crate::motion_documents::MotionDocumentStore::new(
         core.clone(),
-    ));
-    let motion = Arc::new(crate::motion::TauriMotionBridge::new(
-        core.clone(),
-        cache_root,
     ));
     let active = Arc::new(Mutex::new(
         HashMap::<u64, opentake_media::MediaCancelToken>::new(),
@@ -1212,7 +1210,7 @@ impl TauriMediaBridge {
     fn new(core: AppCore, cache_root: PathBuf, models_dir: PathBuf) -> Self {
         TauriMediaBridge {
             core,
-            engine: MediaEngine::new(cache_root, models_dir),
+            engine: crate::media_pressure::production_media_engine(cache_root, models_dir),
             render: crate::render::RenderState::new(),
             inspect_gpu: InspectGpu::default(),
         }
@@ -3336,7 +3334,10 @@ mod tests {
         let captured = notifications.clone();
         let bridge = build_motion_document_bridge(
             core.clone(),
-            fixture.path().join("motion-cache"),
+            Arc::new(crate::motion::TauriMotionBridge::new(
+                core.clone(),
+                fixture.path().join("motion-cache"),
+            )),
             Some(Arc::new(move |summary| {
                 captured
                     .lock()
@@ -4123,6 +4124,24 @@ mod tests {
             .import_from_path(&empty.to_string_lossy(), None, None)
             .expect_err("MCP empty directory import must be rejected");
         assert_eq!(core.media(), before);
+    }
+
+    #[test]
+    fn mcp_media_engine_shares_the_app_playback_export_pressure() {
+        let tmp = tempfile::tempdir().expect("create temp root");
+        let bridge = TauriMediaBridge::new(
+            AppCore::new(),
+            tmp.path().join("cache"),
+            tmp.path().join("models"),
+        );
+        let app_engine = crate::media_pressure::production_media_engine(
+            tmp.path().join("cache"),
+            tmp.path().join("models"),
+        );
+        assert!(bridge
+            .engine
+            .export_pause()
+            .ptr_eq(&app_engine.export_pause()));
     }
 
     #[test]
