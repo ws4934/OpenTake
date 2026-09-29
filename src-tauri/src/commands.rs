@@ -265,23 +265,33 @@ pub async fn project_new<R: tauri::Runtime>(
                 "project bundle changed while it was being prepared",
             ));
         }
-        let result = commit_prepared_project_open_with_playback_and_prewarm(
-            &app.state::<AppCore>(),
-            prepared,
-            &app.state::<crate::playback::PlaybackState>(),
-            &app.state::<crate::media::prewarm::PrewarmScheduler>(),
-        );
+        let result = commit_project_transition_off_thread(&app, move |app| {
+            commit_prepared_project_open_with_playback_and_prewarm(
+                &app.state::<AppCore>(),
+                prepared,
+                &app.state::<crate::playback::PlaybackState>(),
+                &app.state::<crate::media::prewarm::PrewarmScheduler>(),
+            )
+        })
+        .await
+        .map_err(crate::playback::session::PlaybackCommandError::engine)
+        .and_then(|result| result);
         drop(lifecycle);
         if result.is_ok() {
             grant_saved_project_bundle(&app, &path);
         }
         return result;
     }
-    let result = project_new_with_playback_and_prewarm(
-        &app.state::<AppCore>(),
-        &app.state::<crate::playback::PlaybackState>(),
-        &app.state::<crate::media::prewarm::PrewarmScheduler>(),
-    );
+    let result = commit_project_transition_off_thread(&app, |app| {
+        project_new_with_playback_and_prewarm(
+            &app.state::<AppCore>(),
+            &app.state::<crate::playback::PlaybackState>(),
+            &app.state::<crate::media::prewarm::PrewarmScheduler>(),
+        )
+    })
+    .await
+    .map_err(crate::playback::session::PlaybackCommandError::engine)
+    .and_then(|result| result);
     drop(lifecycle);
     result
 }
@@ -342,19 +352,23 @@ pub async fn project_new<R: tauri::Runtime>(
         {
             return Err("project bundle changed while it was being prepared".into());
         }
-        let core = app.state::<AppCore>();
         let prewarm = app.state::<crate::media::prewarm::PrewarmScheduler>();
         prewarm.begin_project_transition()?;
-        let snapshot = TimelineSnapshotDto::from(core.commit_project_open(prepared));
+        let snapshot = commit_project_transition_off_thread(&app, move |app| {
+            TimelineSnapshotDto::from(app.state::<AppCore>().commit_project_open(prepared))
+        })
+        .await?;
         prewarm.activate_project(snapshot.project_epoch);
         drop(lifecycle);
         grant_saved_project_bundle(&app, &path);
         return Ok(snapshot);
     }
-    let core = app.state::<AppCore>();
     let prewarm = app.state::<crate::media::prewarm::PrewarmScheduler>();
     prewarm.begin_project_transition()?;
-    let snapshot = handle_project_new(&core);
+    let snapshot = commit_project_transition_off_thread(&app, |app| {
+        handle_project_new(&app.state::<AppCore>())
+    })
+    .await?;
     prewarm.activate_project(snapshot.project_epoch);
     drop(lifecycle);
     Ok(snapshot)
@@ -386,6 +400,25 @@ where
             Err(format!("{operation} timed out after {timeout:?}"))
         }
     }
+}
+
+/// Run a project transition's commit off the async runtime. The commit
+/// waits for the project-identity write lock, which Agent tools, chat saves
+/// and asset requests hold for reading, so it must not block a runtime
+/// worker while it waits.
+async fn commit_project_transition_off_thread<R, T, F>(
+    app: &AppHandle<R>,
+    commit: F,
+) -> Result<T, String>
+where
+    R: tauri::Runtime,
+    T: Send + 'static,
+    F: FnOnce(&AppHandle<R>) -> T + Send + 'static,
+{
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || commit(&app))
+        .await
+        .map_err(|error| format!("project transition task failed: {error}"))
 }
 
 async fn prepare_project_open_off_thread(
@@ -470,12 +503,17 @@ pub async fn project_open<R: tauri::Runtime>(
             "project bundle changed while it was being prepared",
         ));
     }
-    let result = commit_prepared_project_open_with_playback_and_prewarm(
-        &app.state::<AppCore>(),
-        prepared,
-        &app.state::<crate::playback::PlaybackState>(),
-        &app.state::<crate::media::prewarm::PrewarmScheduler>(),
-    );
+    let result = commit_project_transition_off_thread(&app, move |app| {
+        commit_prepared_project_open_with_playback_and_prewarm(
+            &app.state::<AppCore>(),
+            prepared,
+            &app.state::<crate::playback::PlaybackState>(),
+            &app.state::<crate::media::prewarm::PrewarmScheduler>(),
+        )
+    })
+    .await
+    .map_err(crate::playback::session::PlaybackCommandError::engine)
+    .and_then(|result| result);
     drop(lifecycle);
     result
 }
@@ -547,10 +585,12 @@ pub async fn project_open<R: tauri::Runtime>(
     {
         return Err("project bundle changed while it was being prepared".into());
     }
-    let core = app.state::<AppCore>();
     let prewarm = app.state::<crate::media::prewarm::PrewarmScheduler>();
     prewarm.begin_project_transition()?;
-    let snapshot = TimelineSnapshotDto::from(core.commit_project_open(prepared));
+    let snapshot = commit_project_transition_off_thread(&app, move |app| {
+        TimelineSnapshotDto::from(app.state::<AppCore>().commit_project_open(prepared))
+    })
+    .await?;
     prewarm.activate_project(snapshot.project_epoch);
     drop(lifecycle);
     Ok(snapshot)
@@ -2630,7 +2670,8 @@ impl KeyframeValueDto {
 mod project_open_async_tests {
     use super::{
         authorize_composite_sources, await_project_cover_save_worker,
-        capture_composite_project_thumbnail, capture_project_cover_within_budget, internal_error,
+        capture_composite_project_thumbnail, capture_project_cover_within_budget,
+        commit_project_transition_off_thread, handle_project_new, internal_error,
         prepare_saved_project_off_thread, project_save_for_project,
         project_save_for_project_with_checkpoint, project_save_for_project_with_commit_gate,
         run_blocking_with_timeout, save_current_project_before_exit, ProjectCoverCapture,
@@ -2640,6 +2681,52 @@ mod project_open_async_tests {
     use opentake_core::AppCore;
     use std::time::Duration;
     use tauri::Manager as _;
+
+    /// A project transition waits for the identity lease that in-flight work
+    /// holds; the async command must keep its runtime thread free meanwhile.
+    #[tokio::test]
+    async fn project_transition_commit_waits_for_the_identity_lease_off_the_runtime() {
+        let core = AppCore::new();
+        let before = core.project_revision().project_epoch;
+        let app = tauri::test::mock_builder()
+            .manage(core.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build managed mock app");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let lease_core = core.clone();
+        let holder = std::thread::spawn(move || {
+            let _identity = lease_core.lock_project_identity_workflow();
+            held_tx.send(()).expect("report the held lease");
+            // Bounded, so a regression fails the assertions below instead of
+            // hanging the single-threaded test runtime forever.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        held_rx.recv().expect("identity lease held");
+
+        let handle = app.handle().clone();
+        let commit = tokio::spawn(async move {
+            commit_project_transition_off_thread(&handle, |app| {
+                handle_project_new(&app.state::<AppCore>())
+            })
+            .await
+        });
+        // This current-thread runtime keeps running other tasks while the
+        // commit waits for the lease.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!commit.is_finished(), "the commit must wait for the lease");
+        assert_eq!(core.project_revision().project_epoch, before);
+
+        release_tx.send(()).expect("release the lease");
+        let snapshot = commit
+            .await
+            .expect("commit task joined")
+            .expect("commit ran");
+        assert_ne!(snapshot.project_epoch, before);
+        holder.join().expect("lease holder joined");
+    }
 
     fn jpeg_bytes(color: [u8; 3]) -> Vec<u8> {
         let pixels = color.repeat(16 * 9);

@@ -6,11 +6,15 @@
 //!   assembled system prompt (base + active workflow plugin) and the tools
 //!   capability; `list_tools` returns all [`ToolName`] schemas; `call_tool`
 //!   dispatches through the in-process pipeline and converts the result.
-//! - [`build_router`] mounts the `StreamableHttpService` at `/mcp` behind a
-//!   loopback-only Origin/Host guard (DNS-rebinding defense), plus a minimal
-//!   `/.well-known/oauth-protected-resource` so probing clients get a definitive
-//!   "no auth" answer.
-//! - [`serve`] binds the loopback listener and runs the server.
+//! - [`bind_ephemeral_gated`] (one in-app Agent turn) and
+//!   [`bind_managed_gated_on`] (the external MCP endpoint) mount the
+//!   `StreamableHttpService` at `/mcp` behind a loopback-only Origin/Host guard
+//!   (DNS-rebinding defense) and a Bearer credential check, plus
+//!   `/.well-known/oauth-protected-resource` metadata (RFC 9728) that names the
+//!   endpoint's absolute URL and header Bearer tokens.
+//! - The unauthenticated `build_router*` / `serve*` entry points only exist
+//!   for tests and behind the `legacy-unauthenticated-mcp` feature: any local
+//!   process could call every editing tool through them.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -30,13 +34,14 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::ChatTurnGate;
-use crate::mcp::advanced::AdvancedWorkflowBridge;
 use crate::mcp::convert::to_call_tool_result;
-use crate::mcp::core_handle::CoreHandle;
 use crate::mcp::dispatch::{dispatch_admission_class, DispatchAdmissionClass, Dispatcher};
-use crate::mcp::generation::GenerationBridge;
-use crate::mcp::media_bridge::{MediaBridge, MCP_REQUEST_BODY_MAX};
-use crate::mcp::motion::MotionBridge;
+use crate::mcp::media_bridge::MCP_REQUEST_BODY_MAX;
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
+use crate::mcp::{
+    advanced::AdvancedWorkflowBridge, core_handle::CoreHandle, generation::GenerationBridge,
+    media_bridge::MediaBridge, motion::MotionBridge,
+};
 use crate::plugin::registry::PluginRegistry;
 use crate::prompt::assemble::assemble_system_prompt;
 use crate::tools::descriptions::{description, input_schema};
@@ -73,6 +78,8 @@ fn turn_inactive_error() -> McpError {
 
 #[derive(Clone)]
 enum DispatchAuthority {
+    /// Unauthenticated sessions of the legacy routers.
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     Direct,
     Gated {
         gate: Arc<dyn ChatTurnGate>,
@@ -88,6 +95,7 @@ impl DispatchAuthority {
         client: Option<AuthenticatedMcpClient>,
     ) -> Result<Option<DispatchPermit>, McpError> {
         match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
             Self::Direct => Ok(None),
             Self::Gated { activity, .. } => activity
                 .try_enter(request_cancel, client)
@@ -104,6 +112,7 @@ impl DispatchAuthority {
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<crate::tools::result::ToolResult> {
         match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
             Self::Direct => Some(dispatcher.dispatch_cancellable(name, args, request_cancel)),
             Self::Gated {
                 gate, undo_scope, ..
@@ -114,8 +123,10 @@ impl DispatchAuthority {
     }
 
     fn request_cancel(&self) {
-        if let Self::Gated { gate, .. } = self {
-            gate.request_cancel();
+        match self {
+            #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
+            Self::Direct => {}
+            Self::Gated { gate, .. } => gate.request_cancel(),
         }
     }
 }
@@ -266,7 +277,6 @@ impl DispatchActivity {
         }
     }
 
-    #[cfg(test)]
     fn active(&self) -> usize {
         self.state
             .lock()
@@ -380,12 +390,14 @@ pub struct McpServer {
 impl McpServer {
     /// Build a session server over the shared document handle + plugin registry,
     /// with no media bridge (render/import tools then report "not available").
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn new(handle: Arc<dyn CoreHandle>, registry: Arc<RwLock<PluginRegistry>>) -> Self {
         Self::with_bridge(handle, registry, None)
     }
 
     /// Build a session server with an optional [`MediaBridge`] injected, so
     /// `inspect_timeline` / `import_media` reach the real GPU + import paths.
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_bridge(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -394,6 +406,7 @@ impl McpServer {
         Self::with_bridges(handle, registry, bridge, None)
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -403,6 +416,7 @@ impl McpServer {
         Self::with_capability_bridges(handle, registry, bridge, generation_bridge, None)
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_capability_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -420,6 +434,7 @@ impl McpServer {
         )
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     pub fn with_all_capability_bridges(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -439,6 +454,7 @@ impl McpServer {
         )
     }
 
+    #[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
     fn with_all_capability_bridges_and_admission(
         handle: Arc<dyn CoreHandle>,
         registry: Arc<RwLock<PluginRegistry>>,
@@ -1074,17 +1090,50 @@ async fn finite_number_guard(
     .await
 }
 
-/// Minimal OAuth protected-resource metadata: the server requires no auth (it is
-/// loopback-only), so it advertises no authorization servers.
-async fn oauth_protected_resource() -> axum::Json<Value> {
-    axum::Json(serde_json::json!({
-        "resource": "opentake",
-        "authorization_servers": [],
-    }))
+/// How the `/.well-known/oauth-protected-resource` route describes its endpoint.
+#[derive(Clone)]
+struct ProtectedResourceMetadata {
+    /// Absolute URL of the MCP endpoint (RFC 9728 `resource`).
+    resource: Arc<str>,
+    /// Whether the router requires an `Authorization: Bearer` header.
+    bearer: bool,
+}
+
+impl ProtectedResourceMetadata {
+    fn for_addr(addr: SocketAddr, bearer: bool) -> Self {
+        Self {
+            resource: format!("http://{addr}/mcp").into(),
+            bearer,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        if self.bearer {
+            // The Bearer credential is issued out of band (per Agent turn, or
+            // paired by the user), so there is no authorization server to name.
+            serde_json::json!({
+                "resource": &*self.resource,
+                "bearer_methods_supported": ["header"],
+            })
+        } else {
+            serde_json::json!({
+                "resource": &*self.resource,
+                "authorization_servers": [],
+            })
+        }
+    }
+}
+
+/// OAuth protected-resource metadata (RFC 9728) for the MCP endpoint.
+async fn oauth_protected_resource(
+    axum::extract::State(metadata): axum::extract::State<ProtectedResourceMetadata>,
+) -> axum::Json<Value> {
+    axum::Json(metadata.to_json())
 }
 
 /// Build the axum router with no media bridge (render/import tools report "not
 /// available"). See [`build_router_with_bridge`].
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1094,6 +1143,7 @@ pub fn build_router(
 
 /// Build a no-bridge router for an explicitly selected loopback listener port.
 /// Integration tests and embedders that bind port `0` use the actual bound port.
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_for_port(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1105,6 +1155,7 @@ pub fn build_router_for_port(
 /// Build the axum router: `StreamableHttpService` at `/mcp`, the OAuth
 /// well-known endpoint, and the loopback guard layered over everything. The
 /// optional [`MediaBridge`] is cloned into each per-session [`McpServer`].
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_with_bridge(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1116,6 +1167,7 @@ pub fn build_router_with_bridge(
 /// Build a bridge-enabled router whose Host/Origin guards expect the supplied
 /// listener port. This is the dynamic-port counterpart of
 /// [`build_router_with_bridge`].
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_with_bridge_for_port(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1125,6 +1177,7 @@ pub fn build_router_with_bridge_for_port(
     build_router_with_bridges_for_port(handle, registry, bridge, None, expected_port)
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_with_bridges_for_port(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1142,6 +1195,7 @@ pub fn build_router_with_bridges_for_port(
     )
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_with_capability_bridges_for_port(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1161,6 +1215,7 @@ pub fn build_router_with_capability_bridges_for_port(
     )
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub fn build_router_with_all_capability_bridges_for_port(
     handle: Arc<dyn CoreHandle>,
     registry: Arc<RwLock<PluginRegistry>>,
@@ -1197,10 +1252,14 @@ pub fn build_router_with_all_capability_bridges_for_port(
         .layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_MAX))
         .service(service);
 
+    let metadata = ProtectedResourceMetadata::for_addr(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, expected_port)),
+        false,
+    );
     axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
-            axum::routing::get(oauth_protected_resource),
+            axum::routing::get(oauth_protected_resource).with_state(metadata),
         )
         .route_service("/mcp", service)
         .layer(axum::middleware::from_fn(finite_number_guard))
@@ -1214,7 +1273,9 @@ pub fn build_router_with_all_capability_bridges_for_port(
 
 struct GatedRouterTransport {
     shutdown: CancellationToken,
-    expected_port: u16,
+    /// The bound loopback address; its port is what the Host/Origin guards
+    /// expect, and it names the resource in the well-known metadata.
+    addr: SocketAddr,
     authorization: Option<ManagedAuthorizationState>,
 }
 
@@ -1261,26 +1322,31 @@ fn build_gated_router_for_port(
         .layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_MAX))
         .service(service);
 
-    let router = axum::Router::new()
+    let metadata =
+        ProtectedResourceMetadata::for_addr(transport.addr, transport.authorization.is_some());
+    // Only the MCP route needs the Bearer credential: the RFC 9728 metadata is
+    // what a client reads to learn that it needs one.
+    let mcp = axum::Router::new().route_service("/mcp", service);
+    let mcp = match transport.authorization {
+        Some(authorization) => mcp.layer(axum::middleware::from_fn_with_state(
+            authorization,
+            bearer_authorization_guard,
+        )),
+        None => mcp,
+    };
+    axum::Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
-            axum::routing::get(oauth_protected_resource),
+            axum::routing::get(oauth_protected_resource).with_state(metadata),
         )
-        .route_service("/mcp", service)
+        .merge(mcp)
         .layer(axum::middleware::from_fn(finite_number_guard))
         .layer(axum::middleware::from_fn(content_type_guard))
         .layer(axum::middleware::from_fn(protocol_version_guard))
         .layer(axum::middleware::from_fn_with_state(
-            transport.expected_port,
+            transport.addr.port(),
             localhost_guard,
-        ));
-    match transport.authorization {
-        Some(authorization) => router.layer(axum::middleware::from_fn_with_state(
-            authorization,
-            bearer_authorization_guard,
-        )),
-        None => router,
-    }
+        ))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1291,6 +1357,8 @@ pub enum EphemeralMcpError {
     Serve(#[source] std::io::Error),
     #[error("the private OpenTake MCP endpoint task failed")]
     Join,
+    #[error("the private OpenTake MCP endpoint was detached before its tool calls finished")]
+    Detached,
     #[error("could not create private OpenTake MCP credentials")]
     Entropy(#[source] getrandom::Error),
 }
@@ -1342,27 +1410,61 @@ impl EphemeralMcpEndpoint {
 
     /// Stop admission first, terminate transport sessions, then wait for every
     /// blocking dispatcher call before joining the listener task.
-    pub async fn close(mut self) -> Result<(), EphemeralMcpError> {
+    pub async fn close(self) -> Result<(), EphemeralMcpError> {
+        self.close_or_detach(std::future::pending()).await
+    }
+
+    /// [`Self::close`], but stop waiting once `give_up` completes. The
+    /// endpoint is then detached rather than dropped: admission stays closed,
+    /// the listener task is aborted, and only the still-running dispatches are
+    /// asked to stop through [`ChatTurnGate::request_dispatch_cancel`]. A
+    /// dropped endpoint cancels the whole turn instead, which would discard a
+    /// terminal reply the owner still has to record. The detached dispatches
+    /// cannot start new tool calls and commit only into their admitted
+    /// project, so they end on their own.
+    pub async fn close_or_detach(
+        mut self,
+        give_up: impl std::future::Future<Output = ()>,
+    ) -> Result<(), EphemeralMcpError> {
         self.activity.stop_accepting();
         self.shutdown.cancel();
-        self.activity.wait_zero().await;
-        let result = match self.join.as_mut() {
-            Some(join) => match join.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(EphemeralMcpError::Serve(error)),
-                Err(error) => {
-                    tracing::error!(
-                        target: "opentake::mcp::private",
-                        task_cancelled = error.is_cancelled(),
-                        task_panic = error.is_panic(),
-                        "private MCP listener task failed"
-                    );
-                    Err(EphemeralMcpError::Join)
-                }
-            },
-            None => Err(EphemeralMcpError::Join),
+        let activity = self.activity.clone();
+        let join = self.join.take();
+        let abort = join.as_ref().map(tokio::task::JoinHandle::abort_handle);
+        let drain = async move {
+            activity.wait_zero().await;
+            match join {
+                Some(join) => match join.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(EphemeralMcpError::Serve(error)),
+                    Err(error) => {
+                        tracing::error!(
+                            target: "opentake::mcp::private",
+                            task_cancelled = error.is_cancelled(),
+                            task_panic = error.is_panic(),
+                            "private MCP listener task failed"
+                        );
+                        Err(EphemeralMcpError::Join)
+                    }
+                },
+                None => Err(EphemeralMcpError::Join),
+            }
         };
-        self.join.take();
+        let result = tokio::select! {
+            result = drain => result,
+            () = give_up => {
+                self.cancel_gate.request_dispatch_cancel();
+                if let Some(abort) = abort {
+                    abort.abort();
+                }
+                tracing::warn!(
+                    target: "opentake::mcp::private",
+                    active_dispatches = self.activity.active(),
+                    "private MCP endpoint detached before its dispatches drained"
+                );
+                Err(EphemeralMcpError::Detached)
+            }
+        };
         self.closed = true;
         result
     }
@@ -1571,7 +1673,7 @@ pub async fn bind_managed_gated_on(
         activity.clone(),
         GatedRouterTransport {
             shutdown: shutdown.clone(),
-            expected_port: bound_addr.port(),
+            addr: bound_addr,
             authorization: Some(ManagedAuthorizationState {
                 authorizer,
                 sessions: Some(client_sessions.clone()),
@@ -1648,7 +1750,7 @@ async fn bind_ephemeral_gated_on(
         activity.clone(),
         GatedRouterTransport {
             shutdown: shutdown.clone(),
-            expected_port: bound_addr.port(),
+            addr: bound_addr,
             authorization: Some(ManagedAuthorizationState {
                 authorizer: Arc::new(SingleBearerAuthorizer::new(bearer_token.clone())),
                 sessions: None,
@@ -1680,6 +1782,7 @@ async fn bind_ephemeral_gated_on(
 /// dispatcher. Every call still passes through `gate`; unlike the direct legacy
 /// constructors this cannot silently create a second undo/plugin/capability
 /// universe beside the in-app Agent.
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve_gated_dispatcher(
     addr: SocketAddr,
     dispatcher: Arc<Dispatcher>,
@@ -1705,7 +1808,7 @@ pub async fn serve_gated_dispatcher(
         DispatchActivity::new(),
         GatedRouterTransport {
             shutdown: CancellationToken::new(),
-            expected_port: bound_addr.port(),
+            addr: bound_addr,
             authorization: None,
         },
     );
@@ -1715,6 +1818,7 @@ pub async fn serve_gated_dispatcher(
 
 /// Bind `addr` (loopback) and serve the MCP router with no media bridge. See
 /// [`serve_with_bridge`].
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve(
     addr: SocketAddr,
     handle: Arc<dyn CoreHandle>,
@@ -1725,6 +1829,7 @@ pub async fn serve(
 
 /// Bind `addr` (loopback) and serve the MCP router until the process exits, with
 /// an optional [`MediaBridge`] injected (the Tauri shell passes `Some`).
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve_with_bridge(
     addr: SocketAddr,
     handle: Arc<dyn CoreHandle>,
@@ -1734,6 +1839,7 @@ pub async fn serve_with_bridge(
     serve_with_bridges(addr, handle, registry, bridge, None).await
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve_with_bridges(
     addr: SocketAddr,
     handle: Arc<dyn CoreHandle>,
@@ -1744,6 +1850,7 @@ pub async fn serve_with_bridges(
     serve_with_capability_bridges(addr, handle, registry, bridge, generation_bridge, None).await
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve_with_capability_bridges(
     addr: SocketAddr,
     handle: Arc<dyn CoreHandle>,
@@ -1764,6 +1871,7 @@ pub async fn serve_with_capability_bridges(
     .await
 }
 
+#[cfg(any(test, feature = "legacy-unauthenticated-mcp"))]
 pub async fn serve_with_all_capability_bridges(
     addr: SocketAddr,
     handle: Arc<dyn CoreHandle>,
@@ -3159,6 +3267,181 @@ mod tests {
 
         endpoint.shutdown();
         endpoint.wait().await.expect("stop managed endpoint");
+    }
+
+    /// A [`BlockingGate`] that tells whole-turn cancellation apart from a
+    /// dispatch-only cancellation.
+    struct CancelKindGate {
+        inner: BlockingGate,
+        turn_cancels: AtomicUsize,
+        dispatch_cancels: AtomicUsize,
+    }
+
+    impl ChatTurnGate for CancelKindGate {
+        fn timeline(&self, dispatcher: &Dispatcher) -> Option<Timeline> {
+            self.inner.timeline(dispatcher)
+        }
+
+        fn dispatch(&self, dispatcher: &Dispatcher, name: &str, args: Value) -> Option<ToolResult> {
+            self.inner.dispatch(dispatcher, name, args)
+        }
+
+        fn request_cancel(&self) {
+            self.turn_cancels.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn request_dispatch_cancel(&self) {
+            self.dispatch_cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_well_known_metadata_names_the_endpoint_and_bearer_header() {
+        let registry = Arc::new(RwLock::new(PluginRegistry::with_builtins()));
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::new(TestHandle::new()),
+            registry.clone(),
+        ));
+        let endpoint =
+            bind_ephemeral_gated(dispatcher, registry, Arc::new(CountingGate::new(true)))
+                .await
+                .expect("bind private endpoint");
+        let url = format!(
+            "http://{}/.well-known/oauth-protected-resource",
+            endpoint.addr()
+        );
+        let client = reqwest::Client::new();
+        // Discovery needs no credential; the MCP route itself still does.
+        let metadata: Value = client
+            .get(&url)
+            .send()
+            .await
+            .expect("metadata request")
+            .error_for_status()
+            .expect("anonymous metadata is served")
+            .json()
+            .await
+            .expect("metadata json");
+        let anonymous_mcp = client
+            .post(endpoint.url())
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .send()
+            .await
+            .expect("anonymous MCP request");
+        assert_eq!(anonymous_mcp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(metadata["resource"], endpoint.url());
+        assert!(metadata["resource"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+        assert_eq!(
+            metadata["bearer_methods_supported"],
+            serde_json::json!(["header"])
+        );
+        assert!(
+            metadata.get("authorization_servers").is_none(),
+            "{metadata}"
+        );
+        endpoint.close().await.expect("close private endpoint");
+    }
+
+    #[tokio::test]
+    async fn legacy_router_metadata_uses_an_absolute_resource_url() {
+        let registry = Arc::new(RwLock::new(PluginRegistry::with_builtins()));
+        let router = build_router_for_port(Arc::new(TestHandle::new()), registry, 4321);
+        let request = axum::http::Request::get("/.well-known/oauth-protected-resource")
+            .header("host", "127.0.0.1:4321")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
+        assert!(response.status().is_success());
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let metadata: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata["resource"], "http://127.0.0.1:4321/mcp");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_close_or_detach_keeps_the_turn_and_aborts_the_listener() {
+        let registry = Arc::new(RwLock::new(PluginRegistry::with_builtins()));
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::new(TestHandle::new()),
+            registry.clone(),
+        ));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(CancelKindGate {
+            inner: BlockingGate::new(entered_tx, cancel_tx),
+            turn_cancels: AtomicUsize::new(0),
+            dispatch_cancels: AtomicUsize::new(0),
+        });
+        let endpoint = bind_ephemeral_gated(dispatcher, registry, gate.clone())
+            .await
+            .expect("bind private endpoint");
+        let addr = endpoint.addr();
+        let client = reqwest::Client::new();
+        let initialized = client
+            .post(endpoint.url())
+            .bearer_auth(endpoint.bearer_token())
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&initialize_body())
+            .send()
+            .await
+            .expect("initialize private session");
+        let session = initialized
+            .headers()
+            .get("mcp-session-id")
+            .expect("stateful private session")
+            .clone();
+        let call_url = endpoint.url().to_owned();
+        let token = endpoint.bearer_token().to_owned();
+        let call = tokio::spawn(async move {
+            client
+                .post(call_url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", session)
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": { "name": "get_timeline", "arguments": {} }
+                }))
+                .send()
+                .await
+        });
+        entered_rx
+            .await
+            .expect("blocking dispatch entered the gate");
+
+        let result = endpoint
+            .close_or_detach(tokio::time::sleep(std::time::Duration::from_millis(50)))
+            .await;
+        assert!(
+            matches!(result, Err(EphemeralMcpError::Detached)),
+            "{result:?}"
+        );
+        assert_eq!(gate.dispatch_cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gate.turn_cancels.load(Ordering::SeqCst),
+            0,
+            "a detached endpoint must not cancel the whole turn"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached listener must terminate");
+        gate.inner.release();
+        let _ = call.await;
     }
 
     #[tokio::test]

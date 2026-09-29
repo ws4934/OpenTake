@@ -798,7 +798,9 @@ function AiPane() {
                 {!codexStatus
                   ? t("settings.codexChecking")
                   : !codexStatus.available
-                    ? t("settings.codexUnavailable")
+                    ? codexStatus.version
+                      ? t("settings.codexIncompatible", { version: codexStatus.version })
+                      : t("settings.codexUnavailable")
                     : codexStatus.loginInProgress
                       ? t("settings.codexWaiting")
                       : codexStatus.authenticated

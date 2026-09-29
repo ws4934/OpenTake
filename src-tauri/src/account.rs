@@ -234,6 +234,7 @@ fn set_backend_url(
     state: &AccountState,
     raw_url: Option<String>,
 ) -> Result<(), String> {
+    let _credentials_changed = crate::generation_availability::InvalidateOnExit;
     let normalized = raw_url
         .as_deref()
         .map(str::trim)
@@ -354,6 +355,7 @@ fn finish_login_success(
     token: &str,
     info: AccountInfo,
 ) -> Result<AccountInfo, String> {
+    let _credentials_changed = crate::generation_availability::InvalidateOnExit;
     let mut runtime = state.lock();
     if runtime.generation != attempt.generation {
         return Err(SUPERSEDED_MSG.to_string());
@@ -450,6 +452,7 @@ pub async fn account_login(
 }
 
 fn logout(store: &dyn KeyStore, state: &AccountState) -> Result<(), String> {
+    let _credentials_changed = crate::generation_availability::InvalidateOnExit;
     let mut runtime = state.lock();
     advance_generation(&mut runtime);
     if let Err(error) = clear_bound_credential(store) {
@@ -862,6 +865,43 @@ mod tests {
         );
         assert_eq!(store.load(TOKEN_ACCOUNT).unwrap(), None);
         assert_eq!(state.get(), AccountStatus::Offline);
+    }
+
+    #[test]
+    fn account_writers_refresh_generation_availability() {
+        let store = MemoryKeyStore::new();
+        let state = AccountState::default();
+        let cache = crate::generation_availability::GenerationAvailabilityCache::new_with_ttl(
+            std::time::Duration::from_secs(3600),
+        );
+        let available = || {
+            cache.get(|| {
+                let backend = load_backend_url(&store).unwrap();
+                load_bound_credential(&store, backend.as_deref())
+                    .unwrap()
+                    .is_some()
+            })
+        };
+        let info = || AccountInfo {
+            user_id: "user".into(),
+            email: None,
+            plan: None,
+        };
+
+        set_backend_url(&store, &state, Some("https://one.example.com".into())).unwrap();
+        assert!(!available());
+        let attempt = begin_login(&store, &state).unwrap();
+        finish_login_success(&store, &state, attempt, "token-one", info()).unwrap();
+        assert!(available());
+
+        set_backend_url(&store, &state, Some("https://two.example.com".into())).unwrap();
+        assert!(!available());
+        let attempt = begin_login(&store, &state).unwrap();
+        finish_login_success(&store, &state, attempt, "token-two", info()).unwrap();
+        assert!(available());
+
+        logout(&store, &state).unwrap();
+        assert!(!available());
     }
 
     #[test]

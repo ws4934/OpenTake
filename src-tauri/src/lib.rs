@@ -27,6 +27,7 @@ pub mod external_mcp;
 pub mod feedback;
 mod fs_availability;
 mod generation;
+mod generation_availability;
 mod generation_orphans;
 mod haptic;
 mod home;

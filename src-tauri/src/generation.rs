@@ -291,6 +291,8 @@ pub(crate) struct TauriGenerationBridge {
     admission: crate::updater::InstallAdmissionGate,
     timings: GenerationTimings,
     orphans: Arc<OrphanedGenerationStore>,
+    /// `can_generate` answer, so tool dispatch does not read the keychain.
+    availability: Arc<crate::generation_availability::GenerationAvailabilityCache>,
 }
 
 trait GenerationClientFactory: Send + Sync {
@@ -416,6 +418,7 @@ pub(crate) fn build_bridge(
         admission,
         timings: GenerationTimings::default(),
         orphans: Arc::new(OrphanedGenerationStore::new(orphans_root)),
+        availability: Arc::new(crate::generation_availability::GenerationAvailabilityCache::new()),
     })
 }
 
@@ -477,6 +480,12 @@ fn build_bridge_with_timings(
         orphans: Arc::new(OrphanedGenerationStore::new(
             cache_root.join("app-data").join("generation-orphans"),
         )),
+        availability: Arc::new(
+            crate::generation_availability::GenerationAvailabilityCache::with_epoch(
+                crate::generation_availability::test_epoch(),
+                Duration::from_secs(3600),
+            ),
+        ),
     })
 }
 
@@ -2949,7 +2958,8 @@ impl GenerationArtifactDownloader for HeldResultDownloader {
 
 impl GenerationBridge for TauriGenerationBridge {
     fn can_generate(&self) -> bool {
-        !self.configured_byok_prefixes().is_empty() || self.has_managed_credential()
+        self.availability
+            .get(|| !self.configured_byok_prefixes().is_empty() || self.has_managed_credential())
     }
 
     fn submit(
@@ -7569,5 +7579,90 @@ mod tests {
             record.and_then(|record| record.provider_job_id).as_deref(),
             Some(HELD_PROVIDER_JOB)
         );
+    }
+
+    /// Counts keychain-backed availability reads.
+    #[derive(Default)]
+    struct CountingClients {
+        reads: std::sync::atomic::AtomicUsize,
+        configured: std::sync::atomic::AtomicBool,
+    }
+
+    impl GenerationClientFactory for CountingClients {
+        fn configured_byok_prefixes(&self) -> BTreeSet<String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.configured.load(std::sync::atomic::Ordering::SeqCst) {
+                BTreeSet::from(["fal".to_string()])
+            } else {
+                BTreeSet::new()
+            }
+        }
+
+        fn has_managed_credential(&self) -> bool {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+
+        fn build(&self, _provider: &str, _managed: bool) -> Result<GenClient, String> {
+            Err("no provider in this test".to_string())
+        }
+    }
+
+    #[test]
+    fn tool_dispatch_reads_generation_credentials_once_until_they_change() {
+        let (temp, _bundle, core) = saved_core();
+        let clients = Arc::new(CountingClients::default());
+        let epoch = crate::generation_availability::test_epoch();
+        let mut bridge = Arc::try_unwrap(build_bridge_with_clients(
+            core.clone(),
+            temp.path().join("cache"),
+            temp.path().join("models"),
+            clients.clone(),
+        ))
+        .ok()
+        .expect("sole bridge handle");
+        bridge.availability = Arc::new(
+            crate::generation_availability::GenerationAvailabilityCache::with_epoch(
+                epoch,
+                Duration::from_secs(3600),
+            ),
+        );
+        let bridge = Arc::new(bridge);
+        let dispatcher = Dispatcher::with_bridges(
+            Arc::new(AppCoreHandle::new(core)),
+            Arc::new(RwLock::new(PluginRegistry::new())),
+            None,
+            Some(bridge.clone()),
+        );
+        let reads = || clients.reads.load(std::sync::atomic::Ordering::SeqCst);
+
+        for _ in 0..100 {
+            let result = dispatcher.dispatch("get_timeline", json!({}));
+            assert!(!result.is_error, "{}", result.text_joined());
+        }
+        assert!(
+            reads() <= 2,
+            "{} keychain reads for 100 dispatches",
+            reads()
+        );
+        assert!(!bridge.can_generate());
+        let settled = reads();
+
+        // Saving a key (or signing in) invalidates the answer at once.
+        clients
+            .configured
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(bridge.can_generate());
+        for _ in 0..100 {
+            dispatcher.dispatch("get_timeline", json!({}));
+        }
+        assert_eq!(reads(), settled + 1);
+
+        clients
+            .configured
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(!bridge.can_generate());
     }
 }

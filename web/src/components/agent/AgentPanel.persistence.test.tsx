@@ -704,6 +704,53 @@ describe("AgentPanel project sessions", () => {
     }
   });
 
+  it("does not show a delete failure in the project opened meanwhile", async () => {
+    apiMocks.chatSessions.mockResolvedValue([
+      { id: "chat-a", messages: [], createdAt: 2, isOpen: true },
+      { id: "chat-b", messages: [], createdAt: 1, isOpen: true },
+    ]);
+    installConfirm(true);
+    let rejectDelete: (reason: unknown) => void = () => {};
+    apiMocks.chatSessionDelete.mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectDelete = reject;
+        }),
+    );
+    try {
+      await act(async () => {
+        root?.render(<AgentPanel />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const deleteButton = container?.querySelector<HTMLButtonElement>(
+        'button[aria-label^="agent.deleteChat "]',
+      );
+      await act(async () => {
+        deleteButton?.click();
+        await Promise.resolve();
+      });
+      expect(apiMocks.chatSessionDelete).toHaveBeenCalledWith(
+        "chat-a",
+        41,
+        "/tmp/Current.opentake",
+      );
+
+      await act(async () => {
+        useProjectStore.setState({ projectEpoch: 42, projectPath: "/tmp/Other.opentake" });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        rejectDelete("stale project: the chat belongs to another project");
+        for (let tick = 0; tick < 4; tick += 1) await Promise.resolve();
+      });
+      expect(container?.querySelector('[role="alert"]')).toBeNull();
+    } finally {
+      restoreConfirm();
+    }
+  });
+
   it("offers to delete closed chats that have no tab", async () => {
     apiMocks.chatSessions.mockResolvedValue([
       { id: "chat-open", messages: [], createdAt: 3, isOpen: true },
