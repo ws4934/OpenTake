@@ -249,6 +249,7 @@ interface NativeApplicationMenuHandles {
 }
 
 export interface ApplicationMenuStateSnapshot {
+  textEntryFocus: boolean;
   enabled: Readonly<Record<string, boolean>>;
   checked: Readonly<Record<string, boolean>>;
 }
@@ -312,7 +313,8 @@ export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
     mcp: actionsEnabled,
     feedback: false,
   };
-  if (hasTextEntryFocus()) {
+  const textEntryFocus = hasTextEntryFocus();
+  if (textEntryFocus) {
     for (const id of DOCUMENT_EDIT_COMMANDS) enabled[id] = false;
   }
   const checked: Record<string, boolean> = {
@@ -325,7 +327,7 @@ export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
     layoutVertical: ui.layoutPreset === "vertical",
     fullscreen: ui.fullscreen,
   };
-  return { enabled, checked };
+  return { textEntryFocus, enabled, checked };
 }
 
 async function applyNativeApplicationMenuState(
@@ -443,6 +445,34 @@ async function installNativeApplicationMenu(): Promise<() => void> {
     ],
   });
   handles.texts.set("group:edit", { item: editMenu, labelKey: "menu.edit" });
+  // WKWebView receives text shortcuts through Cocoa responder actions. Keep
+  // document callbacks guarded, and swap in native actions while typing.
+  let textEditMenu: typeof editMenu | undefined;
+  if (/Mac/i.test(navigator.platform)) {
+    const nativeEditItem = async (
+      id: string,
+      item: "Undo" | "Redo" | "Cut" | "Copy" | "Paste" | "SelectAll",
+    ) => {
+      const entry = entries.get(id)!;
+      const handle = await PredefinedMenuItem.new({ item, text: t(entry.labelKey) });
+      handles.texts.set(`native:${id}`, { item: handle, labelKey: entry.labelKey });
+      return handle;
+    };
+    textEditMenu = await Submenu.new({
+      id: "editText",
+      text: t("menu.edit"),
+      items: [
+        await nativeEditItem("undo", "Undo"),
+        await nativeEditItem("redo", "Redo"),
+        await separator(),
+        await nativeEditItem("cut", "Cut"),
+        await nativeEditItem("copy", "Copy"),
+        await nativeEditItem("paste", "Paste"),
+        await nativeEditItem("selectAll", "SelectAll"),
+      ],
+    });
+    handles.texts.set("group:editText", { item: textEditMenu, labelKey: "menu.edit" });
+  }
   const layoutMenu = await Submenu.new({
     id: "layout",
     text: t("view.layout"),
@@ -481,6 +511,7 @@ async function installNativeApplicationMenu(): Promise<() => void> {
   handles.texts.set("group:help", { item: helpMenu, labelKey: "menu.help" });
   const menu = await Menu.new({ items: [appMenu, fileMenu, editMenu, viewMenu, helpMenu] });
   await menu.setAsAppMenu();
+  let displayedEditMenu: typeof editMenu | null = editMenu;
 
   let syncQueue = Promise.resolve();
   let stateSignature = "";
@@ -493,8 +524,22 @@ async function installNativeApplicationMenu(): Promise<() => void> {
     if (nextSignature === stateSignature) return;
     stateSignature = nextSignature;
     syncQueue = syncQueue
-      .then(() => applyNativeApplicationMenuState(handles, snapshot))
-      .catch(() => {
+      .then(async () => {
+        if (disposed) return;
+        const nextEditMenu = snapshot.textEntryFocus && textEditMenu ? textEditMenu : editMenu;
+        if (displayedEditMenu !== nextEditMenu) {
+          if (displayedEditMenu) {
+            await menu.remove(displayedEditMenu);
+            displayedEditMenu = null;
+          }
+          await menu.insert(nextEditMenu, 2);
+          displayedEditMenu = nextEditMenu;
+        }
+        await applyNativeApplicationMenuState(handles, snapshot);
+      })
+      .catch((error: unknown) => {
+        console.error("Native application menu synchronization failed", error);
+        useEditorUiStore.getState().pushToast(t("menu.installFailed"));
         stateSignature = "";
       });
   };
