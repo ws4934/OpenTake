@@ -743,11 +743,9 @@ pub(crate) async fn save_project_with_composite_cover<R: tauri::Runtime>(
         let _activity =
             crate::updater::begin_mutating_activity(&admission).map_err(validation_error)?;
         let core = app.state::<AppCore>();
-        let render = app.state::<crate::render::RenderState>();
         save_project_with_composite_cover_blocking(
             &app,
             &core,
-            &render,
             path,
             expected_project_epoch,
             expected_project_path,
@@ -807,11 +805,21 @@ pub(crate) async fn save_current_project_before_exit<R: tauri::Runtime>(
     .map(|_| ())
 }
 
+/// Budget for rendering the project cover inside a save. The save's own
+/// deadline covers persistence; a slow cover (a large or offline source, a
+/// busy GPU) falls back to keeping the previous cover instead.
+const PROJECT_COVER_CAPTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Set while a cover capture thread runs. A capture that outlived its budget
+/// keeps it set until it observes cancellation, so repeated autosaves cannot
+/// pile up capture threads behind a stuck source.
+static PROJECT_COVER_CAPTURE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[allow(clippy::too_many_arguments)]
 fn save_project_with_composite_cover_blocking<R: tauri::Runtime>(
     app: &AppHandle<R>,
     core: &AppCore,
-    render: &crate::render::RenderState,
     path: Option<String>,
     expected_project_epoch: u64,
     expected_project_path: Option<String>,
@@ -824,11 +832,82 @@ fn save_project_with_composite_cover_blocking<R: tauri::Runtime>(
         path,
         expected_project_epoch,
         expected_project_path,
-        |snapshot| capture_composite_project_thumbnail(app, core, snapshot, render, cancel),
+        |snapshot| {
+            let app = app.clone();
+            let snapshot = snapshot.clone();
+            capture_project_cover_within_budget(
+                PROJECT_COVER_CAPTURE_BUDGET,
+                cancel,
+                &PROJECT_COVER_CAPTURE_IN_FLIGHT,
+                move |cover_cancel| {
+                    let core = app.state::<AppCore>();
+                    let render = app.state::<crate::render::RenderState>();
+                    capture_composite_project_thumbnail(
+                        &app,
+                        &core,
+                        &snapshot,
+                        &render,
+                        cover_cancel,
+                    )
+                },
+            )
+        },
         gate,
         || {},
         || !cancel.is_cancelled() && std::time::Instant::now() < deadline,
     )
+}
+
+/// Run `capture` on its own thread for at most `budget`. On expiry (or when
+/// the save is cancelled) the capture is cancelled cooperatively and the save
+/// proceeds with [`ProjectCoverCapture::CaptureFailed`], which preserves the
+/// previous cover, without waiting for the capture thread.
+fn capture_project_cover_within_budget(
+    budget: std::time::Duration,
+    save_cancel: &opentake_media::MediaCancelToken,
+    in_flight: &'static std::sync::atomic::AtomicBool,
+    capture: impl FnOnce(&opentake_media::MediaCancelToken) -> ProjectCoverCapture + Send + 'static,
+) -> ProjectCoverCapture {
+    use std::sync::atomic::Ordering;
+
+    struct InFlight(&'static std::sync::atomic::AtomicBool);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return ProjectCoverCapture::CaptureFailed;
+    }
+    let guard = InFlight(in_flight);
+    let cover_cancel = opentake_media::MediaCancelToken::new();
+    let worker_cancel = cover_cancel.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("project-cover".into())
+        .spawn(move || {
+            let _guard = guard;
+            let _ = sender.send(capture(&worker_cancel));
+        });
+    if spawned.is_err() {
+        return ProjectCoverCapture::CaptureFailed;
+    }
+    let expires = std::time::Instant::now() + budget;
+    loop {
+        let remaining = expires.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() || save_cancel.is_cancelled() {
+            cover_cancel.cancel();
+            return ProjectCoverCapture::CaptureFailed;
+        }
+        match receiver.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
+            Ok(capture) => return capture,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return ProjectCoverCapture::CaptureFailed;
+            }
+        }
+    }
 }
 
 fn capture_composite_project_thumbnail<R: tauri::Runtime>(
@@ -839,7 +918,7 @@ fn capture_composite_project_thumbnail<R: tauri::Runtime>(
     cancel: &opentake_media::MediaCancelToken,
 ) -> ProjectCoverCapture {
     let bounds = opentake_media::PROJECT_COMPOSITE_COVER_BOUNDS;
-    let frame_index = match crate::render::representative_timeline_frame(
+    let (frame_index, media_refs) = match crate::render::representative_cover_frame(
         &snapshot.timeline,
         &snapshot.media,
         bounds.0.max(bounds.1),
@@ -848,7 +927,7 @@ fn capture_composite_project_thumbnail<R: tauri::Runtime>(
         Ok(None) => return ProjectCoverCapture::NoVisibleContent,
         Err(_) => return ProjectCoverCapture::CaptureFailed,
     };
-    let authority = match authorize_composite_sources(app, core, snapshot) {
+    let authority = match authorize_composite_sources(app, core, snapshot, &media_refs) {
         Ok(authority) => authority,
         Err(_) => return ProjectCoverCapture::CaptureFailed,
     };
@@ -875,19 +954,29 @@ fn capture_composite_project_thumbnail<R: tauri::Runtime>(
     )
 }
 
+/// Authorize and open only `media_refs` (the media drawn at the cover frame).
+/// External sources must pass the scope check on both the requested path and
+/// the retained handle's final path; project media go through the retained
+/// bundle root. The scope pattern sets are cloned at most once per call.
 fn authorize_composite_sources<R: tauri::Runtime>(
     app: &AppHandle<R>,
     core: &AppCore,
     snapshot: &opentake_core::ProjectRuntimeSnapshot,
+    media_refs: &std::collections::HashSet<String>,
 ) -> Result<crate::render::CompositeSourceAuthority, String> {
     let project_authority = core.project_asset_authority();
-    let scope = app.asset_protocol_scope();
+    let scope = crate::safe_asset_protocol::asset_scope_snapshot(app);
     let mut files = std::collections::HashMap::new();
-    for entry in &snapshot.media.entries {
+    for entry in snapshot
+        .media
+        .entries
+        .iter()
+        .filter(|entry| media_refs.contains(&entry.id))
+    {
         let retained = match &entry.source {
             opentake_domain::MediaSource::External { absolute_path } => {
                 let requested = std::path::Path::new(absolute_path);
-                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, requested) {
+                if !scope.allows(requested) {
                     continue;
                 }
                 let Ok((file, final_path)) =
@@ -895,7 +984,7 @@ fn authorize_composite_sources<R: tauri::Runtime>(
                 else {
                     continue;
                 };
-                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, &final_path) {
+                if !scope.allows(&final_path) {
                     continue;
                 }
                 file
@@ -2540,7 +2629,8 @@ impl KeyframeValueDto {
 #[cfg(test)]
 mod project_open_async_tests {
     use super::{
-        await_project_cover_save_worker, capture_composite_project_thumbnail, internal_error,
+        authorize_composite_sources, await_project_cover_save_worker,
+        capture_composite_project_thumbnail, capture_project_cover_within_budget, internal_error,
         prepare_saved_project_off_thread, project_save_for_project,
         project_save_for_project_with_checkpoint, project_save_for_project_with_commit_gate,
         run_blocking_with_timeout, save_current_project_before_exit, ProjectCoverCapture,
@@ -2936,6 +3026,299 @@ mod project_open_async_tests {
         assert_eq!(
             std::fs::read(bundle.join("thumbnail.jpg")).expect("read retained cover"),
             previous
+        );
+    }
+
+    #[test]
+    fn cover_capture_over_its_budget_preserves_the_cover_and_the_save_succeeds() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let bundle = fixture.path().join("SlowCover.opentake");
+        let previous = jpeg_bytes([30, 60, 90]);
+        let mut project = opentake_project::Project::new(&bundle);
+        project.thumbnail = Some(previous.clone());
+        project.save().expect("save prior cover fixture");
+        let core = AppCore::new();
+        core.open_project(&bundle).expect("open fixture");
+        let snapshot = core.runtime_snapshot();
+        let observed_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_observed_cancel = observed_cancel.clone();
+
+        project_save_for_project(
+            &core,
+            None,
+            snapshot.project_epoch,
+            Some(bundle.to_string_lossy().into_owned()),
+            |_| {
+                capture_project_cover_within_budget(
+                    std::time::Duration::from_millis(100),
+                    &opentake_media::MediaCancelToken::new(),
+                    &IN_FLIGHT,
+                    move |cancel| {
+                        // A capture blocked on a slow source until cancelled.
+                        while !cancel.is_cancelled() {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        worker_observed_cancel.store(true, Ordering::Release);
+                        ProjectCoverCapture::Captured(jpeg_bytes([1, 2, 3]))
+                    },
+                )
+            },
+        )
+        .expect("a slow cover must not fail the save");
+
+        assert_eq!(
+            std::fs::read(bundle.join("thumbnail.jpg")).expect("read retained cover"),
+            previous
+        );
+        let released = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while IN_FLIGHT.load(Ordering::Acquire) && std::time::Instant::now() < released {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(observed_cancel.load(Ordering::Acquire));
+        assert!(!IN_FLIGHT.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cover_capture_is_skipped_while_a_previous_capture_is_still_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(true);
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_ran = ran.clone();
+        assert_eq!(
+            capture_project_cover_within_budget(
+                std::time::Duration::from_secs(30),
+                &opentake_media::MediaCancelToken::new(),
+                &IN_FLIGHT,
+                move |_| {
+                    worker_ran.store(true, Ordering::Release);
+                    ProjectCoverCapture::NoVisibleContent
+                },
+            ),
+            ProjectCoverCapture::CaptureFailed
+        );
+        assert!(!ran.load(Ordering::Acquire));
+        assert!(
+            IN_FLIGHT.load(Ordering::Acquire),
+            "the running capture keeps its claim"
+        );
+    }
+
+    #[test]
+    fn cover_capture_within_its_budget_returns_the_capture() {
+        use std::sync::atomic::AtomicBool;
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+        assert_eq!(
+            capture_project_cover_within_budget(
+                std::time::Duration::from_secs(30),
+                &opentake_media::MediaCancelToken::new(),
+                &IN_FLIGHT,
+                |_| ProjectCoverCapture::NoVisibleContent,
+            ),
+            ProjectCoverCapture::NoVisibleContent
+        );
+    }
+
+    /// A saved project whose manifest holds `count` external images `m-N`
+    /// under `fixture/media` (created on disk when `create_files`), with the
+    /// fixture directory granted recursively.
+    fn external_cover_fixture(
+        fixture: &std::path::Path,
+        count: usize,
+        create_files: bool,
+    ) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        AppCore,
+        opentake_core::ProjectRuntimeSnapshot,
+    ) {
+        use opentake_domain::{ClipType, MediaManifestEntry, MediaSource};
+
+        let media = fixture.join("media");
+        std::fs::create_dir_all(&media).expect("media directory");
+        let core = AppCore::new();
+        core.save_project(Some(fixture.join("Cover.opentake")))
+            .expect("save project");
+        let mut snapshot = core.runtime_snapshot();
+        for index in 0..count {
+            let path = media.join(format!("m-{index}.png"));
+            if create_files {
+                std::fs::write(&path, b"png").expect("write media");
+            }
+            snapshot.media.entries.push(MediaManifestEntry {
+                id: format!("m-{index}"),
+                name: format!("m-{index}"),
+                kind: ClipType::Image,
+                source: MediaSource::External {
+                    absolute_path: path.to_string_lossy().into_owned(),
+                },
+                duration: 1.0,
+                source_width: Some(64),
+                source_height: Some(64),
+                source_fps: None,
+                generation_input: None,
+                has_audio: Some(false),
+                color: None,
+                proxy: None,
+                folder_id: None,
+                cached_remote_url: None,
+                cached_remote_url_expires_at: None,
+            });
+        }
+        let app = tauri::test::mock_app();
+        app.handle()
+            .asset_protocol_scope()
+            .allow_directory(fixture, true)
+            .expect("grant fixture");
+        (app, core, snapshot)
+    }
+
+    #[test]
+    fn cover_authorizes_only_the_media_drawn_at_the_representative_frame() {
+        use opentake_domain::{Clip, ClipType, NestedSequence, Timeline, Track};
+
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let (app, core, mut snapshot) = external_cover_fixture(fixture.path(), 300, true);
+        let mut visible = Clip::new("visible", "m-7", 0, 30);
+        visible.media_type = ClipType::Image;
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(visible);
+        let mut later = Clip::new("later", "m-8", 300, 30);
+        later.media_type = ClipType::Image;
+        track.clips.push(later);
+        let mut leaf = Clip::new("leaf", "m-42", 0, 30);
+        leaf.media_type = ClipType::Image;
+        let mut nested_track = Track::new("nested-video", ClipType::Video);
+        nested_track.clips.push(leaf);
+        let mut nested = Timeline::new();
+        nested.tracks.push(nested_track);
+        snapshot
+            .timeline
+            .nested_sequences
+            .push(NestedSequence::new("sequence", "Sequence", nested));
+        let mut compound_track = Track::new("compound", ClipType::Video);
+        compound_track
+            .clips
+            .push(Clip::new_nested("compound", "sequence", 0, 30));
+        snapshot.timeline.tracks.push(track);
+        snapshot.timeline.tracks.push(compound_track);
+
+        let bounds = opentake_media::PROJECT_COMPOSITE_COVER_BOUNDS;
+        let (_, media_refs) = crate::render::representative_cover_frame(
+            &snapshot.timeline,
+            &snapshot.media,
+            bounds.0.max(bounds.1),
+        )
+        .expect("valid plan")
+        .expect("visible content");
+        let authority = authorize_composite_sources(app.handle(), &core, &snapshot, &media_refs)
+            .expect("authorize cover sources");
+
+        assert_eq!(
+            authority.media_ids(),
+            ["m-42", "m-7"].into_iter().collect(),
+            "only the representative frame's media (nested leaves included) are opened"
+        );
+    }
+
+    #[test]
+    fn cover_authorization_clones_the_scope_patterns_at_most_once() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        // Files are not created: this measures scope work without holding
+        // 800 descriptors on runners with a low open-file limit.
+        let (app, core, snapshot) = external_cover_fixture(fixture.path(), 800, false);
+        for index in 0..800 {
+            app.handle()
+                .asset_protocol_scope()
+                .allow_file(fixture.path().join(format!("media/m-{index}.png")))
+                .expect("exact grant");
+        }
+        let every_entry = snapshot
+            .media
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let before = crate::safe_asset_protocol::asset_scope_snapshot_captures(app.handle());
+
+        authorize_composite_sources(app.handle(), &core, &snapshot, &every_entry)
+            .expect("authorize cover sources");
+
+        assert!(
+            crate::safe_asset_protocol::asset_scope_snapshot_captures(app.handle()) - before <= 1
+        );
+    }
+
+    /// Measurement for the pull request (run with `--release --ignored`).
+    #[test]
+    #[ignore = "benchmark; run explicitly in release mode"]
+    fn benchmark_cover_authorization_with_800_entries() {
+        use opentake_domain::{Clip, ClipType, Track};
+
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let (app, core, mut snapshot) = external_cover_fixture(fixture.path(), 800, true);
+        for index in 0..800 {
+            app.handle()
+                .asset_protocol_scope()
+                .allow_file(fixture.path().join(format!("media/m-{index}.png")))
+                .expect("exact grant");
+        }
+        let mut track = Track::new("video", ClipType::Video);
+        for index in 0..800 {
+            let mut clip = Clip::new(
+                format!("clip-{index}"),
+                format!("m-{index}"),
+                index * 30,
+                30,
+            );
+            clip.media_type = ClipType::Image;
+            track.clips.push(clip);
+        }
+        snapshot.timeline.tracks.push(track);
+        let bounds = opentake_media::PROJECT_COMPOSITE_COVER_BOUNDS;
+
+        let started = std::time::Instant::now();
+        let (_, media_refs) = crate::render::representative_cover_frame(
+            &snapshot.timeline,
+            &snapshot.media,
+            bounds.0.max(bounds.1),
+        )
+        .unwrap()
+        .unwrap();
+        let authority =
+            authorize_composite_sources(app.handle(), &core, &snapshot, &media_refs).unwrap();
+        let frame_scoped = started.elapsed();
+        assert_eq!(authority.media_ids().len(), 1);
+        drop(authority);
+
+        // The previous behaviour: every entry, two cloning scope checks each.
+        let scope = app.handle().asset_protocol_scope();
+        let started = std::time::Instant::now();
+        let mut files = Vec::new();
+        for entry in &snapshot.media.entries {
+            let opentake_domain::MediaSource::External { absolute_path } = &entry.source else {
+                continue;
+            };
+            let requested = std::path::Path::new(absolute_path);
+            if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, requested) {
+                continue;
+            }
+            let (file, final_path) =
+                crate::safe_asset_protocol::open_retained_regular_file(requested).unwrap();
+            assert!(crate::safe_asset_protocol::scope_allows_lexical_path(
+                &scope,
+                &final_path
+            ));
+            files.push(file);
+        }
+        let legacy = started.elapsed();
+        eprintln!(
+            "cover authorization, 800 entries: frame-scoped {frame_scoped:?} \
+             (legacy all-entries loop {legacy:?}, {} handles)",
+            files.len()
         );
     }
 

@@ -175,7 +175,7 @@ fn legacy_and_current_asset_schemes_use_the_safe_async_handler() {
     assert!(runtime
         .contains(".register_asynchronous_uri_scheme_protocol(\n            \"opentake-asset\","));
     assert_eq!(
-        runtime.matches(".respond(\n").count(),
+        runtime.matches("_asset_protocol.respond(").count(),
         2,
         "both schemes must delegate to SafeAssetProtocol::respond"
     );

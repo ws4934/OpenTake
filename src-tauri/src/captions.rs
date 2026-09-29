@@ -238,7 +238,7 @@ pub async fn generate_captions(
     let core = core.inner().clone();
     let cache_root = media.engine().cache_root().to_path_buf();
     let models_dir = media.engine().models_dir().to_path_buf();
-    let worker = crate::search::production_index_worker(media.engine().export_pause());
+    let worker = crate::search::production_index_worker();
     let job = worker
         .submit(
             JobRequest::new(
@@ -257,7 +257,7 @@ pub async fn generate_captions(
                 if worker_cancel.is_cancelled() || cancel.is_cancelled() {
                     return Err(WorkerError::Cancelled);
                 }
-                let engine = MediaEngine::new(cache_root, models_dir);
+                let engine = crate::media_pressure::production_media_engine(cache_root, models_dir);
                 let progress: CaptionProgressCallback = Arc::new(move |done, total, part| {
                     let _ = app.emit(
                         "captions://progress",

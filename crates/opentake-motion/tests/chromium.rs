@@ -188,6 +188,67 @@ mod live {
         );
     }
 
+    pub(super) fn concurrent_instances_share_cache_directory_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let first = renderer(root.path());
+        let second = renderer(root.path());
+        let frames = 24;
+        let request = MotionRenderRequest::new(
+            MotionSource::code(
+                r#"<!doctype html><style>html,body{margin:0;width:100%;height:100%;background:rgb(90,120,150)}</style>"#,
+            ),
+            10,
+            frames,
+            48,
+            32,
+        )
+        .with_transparent(false);
+
+        // Two independent renderer instances (each with its own browser) on
+        // one cache root render the same content at the same time, as the
+        // editor and the agent could before they shared a bridge.
+        let render = |renderer: &HeadlessChromiumRenderer| {
+            let progress = std::sync::Mutex::new(Vec::new());
+            let result = renderer.render_with_cancellation_and_progress(
+                &request,
+                &MotionCancellationToken::new(),
+                &|done, total| progress.lock().unwrap().push((done, total)),
+            );
+            (result, progress.into_inner().unwrap())
+        };
+        let ((left, left_progress), (right, right_progress)) = thread::scope(|scope| {
+            let left = scope.spawn(|| render(&first));
+            let right = scope.spawn(|| render(&second));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        let left = left.expect("first concurrent render");
+        let right = right.expect("second concurrent render");
+        assert_eq!(left.content_hash, right.content_hash);
+        assert_eq!(left.frames, right.frames);
+        assert_eq!(left.frames.len(), frames as usize);
+        for frame in &left.frames {
+            let (width, height) =
+                image::image_dimensions(frame).expect("every published frame is a readable PNG");
+            assert_eq!((width, height), (48, 32));
+        }
+        assert!(MotionCache::new(root.path()).is_cached(&request));
+
+        // Exactly one instance rendered; the other waited for the directory
+        // claim and then reported a single complete cache hit instead of
+        // rewriting (or clearing) the same frames.
+        let cache_hit = vec![(frames, frames)];
+        let hits = [&left_progress, &right_progress]
+            .into_iter()
+            .filter(|progress| **progress == cache_hit)
+            .count();
+        assert_eq!(
+            hits, 1,
+            "one render must be a cache hit: {left_progress:?} / {right_progress:?}"
+        );
+        first.shutdown_pool();
+        second.shutdown_pool();
+    }
+
     pub(super) fn browser_pool_reuses_session_probe() {
         let profiles_before = live_profiles();
         let root = tempfile::tempdir().unwrap();
@@ -1342,6 +1403,13 @@ fn host_wrapper_context_csp_and_guard_probe() {
 fn consecutive_cache_misses_reuse_one_chromium_session() {
     let _live_test_guard = live_test_guard();
     live::browser_pool_reuses_session_probe();
+}
+
+#[cfg(feature = "chromium")]
+#[test]
+fn concurrent_renderer_instances_share_one_cache_directory() {
+    let _live_test_guard = live_test_guard();
+    live::concurrent_instances_share_cache_directory_probe();
 }
 
 #[cfg(feature = "chromium")]

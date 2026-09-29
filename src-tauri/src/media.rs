@@ -6487,6 +6487,7 @@ mod tests {
             .unwrap();
         let scheduler = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
         let worker_core = core.clone();
         let worker_root = tmp.path().to_path_buf();
         let task = std::thread::spawn(move || {
@@ -6499,18 +6500,27 @@ mod tests {
                 Some(false),
                 || {
                     entered_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(500));
+                    resume_rx.recv().unwrap();
                 },
             )
         });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let start = std::time::Instant::now();
-        let _snapshot = core.runtime_snapshot();
-        let elapsed = start.elapsed();
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let snapshot_core = core.clone();
+        let snapshot = std::thread::spawn(move || {
+            let _snapshot = snapshot_core.runtime_snapshot();
+            snapshot_tx.send(()).unwrap();
+        });
+        // The rescan stays paused until the snapshot has answered, so a
+        // snapshot that waited for the rescan could never finish in time: the
+        // generous bound only absorbs a slow runner.
+        let snapshot_without_waiting = snapshot_rx.recv_timeout(Duration::from_secs(30));
+        resume_tx.send(()).unwrap();
+        snapshot.join().unwrap();
         let imported = task.join().unwrap().unwrap();
         assert!(
-            elapsed < Duration::from_millis(100),
-            "snapshot waited {elapsed:?}"
+            snapshot_without_waiting.is_ok(),
+            "snapshot waited for the directory rescan"
         );
         assert_eq!(imported.items.len(), 1);
     }

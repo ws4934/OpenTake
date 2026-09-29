@@ -19,7 +19,7 @@
 //! (one frame at a time, no GPU contention). The continuous playback engine
 //! (#53) will move this onto a dedicated render thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
@@ -401,6 +401,12 @@ pub(crate) struct CompositeSourceAuthority {
 impl CompositeSourceAuthority {
     pub(crate) fn new(files: HashMap<String, File>) -> Self {
         Self { files }
+    }
+
+    /// Media ids with a retained, authorized handle.
+    #[cfg(test)]
+    pub(crate) fn media_ids(&self) -> std::collections::BTreeSet<&str> {
+        self.files.keys().map(String::as_str).collect()
     }
 }
 
@@ -1227,16 +1233,33 @@ fn preview_render_size(canvas_w: i32, canvas_h: i32, cap: u32) -> RenderSize {
     RenderSize::new(even(cw * scale), even(ch * scale))
 }
 
-/// Derive cover candidate ordering from the same authoritative render plan used
-/// by preview/export. Source materialization is deliberately deferred so an
-/// offline or corrupt planned layer becomes `CaptureFailed`, not false
-/// `NoVisibleContent`.
-pub(crate) fn representative_timeline_frame(
+/// Derive the cover frame from the same authoritative render plan used by
+/// preview/export, plus every media id drawn at it. Nested sequences are
+/// flattened by the render plan, so their leaf media are included; cover
+/// capture authorizes and opens exactly this set. Source materialization is
+/// deliberately deferred so an offline or corrupt planned layer becomes
+/// `CaptureFailed`, not false `NoVisibleContent`.
+pub(crate) fn representative_cover_frame(
     timeline: &Timeline,
     manifest: &opentake_domain::MediaManifest,
     max_size: u32,
-) -> Result<Option<i32>, String> {
-    Ok(authoritative_render_plan(timeline, manifest, max_size)?.representative_frame(timeline))
+) -> Result<Option<(i32, HashSet<String>)>, String> {
+    let plan = authoritative_render_plan(timeline, manifest, max_size)?;
+    let Some(frame) = plan.representative_frame(timeline) else {
+        return Ok(None);
+    };
+    let media_refs = plan
+        .frame(timeline, frame)
+        .draws
+        .iter()
+        .filter_map(|draw| match draw.source {
+            TextureSource::Decoded { media_ref }
+            | TextureSource::Image { media_ref }
+            | TextureSource::Lottie { media_ref } => Some(media_ref.clone()),
+            TextureSource::Text { .. } => None,
+        })
+        .collect();
+    Ok(Some((frame, media_refs)))
 }
 
 fn authoritative_render_plan(

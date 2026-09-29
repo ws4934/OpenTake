@@ -2134,6 +2134,8 @@ pub(crate) fn run_export_with_control(
     req: &ExportRequest,
     mut options: ExportRunOptions<'_>,
 ) -> Result<ExportSummary, String> {
+    // Background indexing/transcription yields while any export runs (#43).
+    let _pressure = crate::media_pressure::export_guard();
     let control = options.control;
     let external_cancel = options.external_cancel.clone();
     validate_export_cancel_sources(control, external_cancel.as_ref())?;

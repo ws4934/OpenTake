@@ -53,8 +53,25 @@ impl LibraryState {
                 "global library unavailable: storage reconciliation failed: {error}"
             ));
         }
+        let store = Arc::new(store);
+        // Hashing duplicate copies can take long; keep it off the setup thread.
+        let background = Arc::clone(&store);
+        if let Err(error) = std::thread::Builder::new()
+            .name("opentake-library-duplicates".into())
+            .spawn(move || match background.resolve_duplicate_copies() {
+                Ok(0) => {}
+                Ok(resolved) => {
+                    eprintln!("[library] resolved duplicate copies of {resolved} entries")
+                }
+                Err(error) => {
+                    eprintln!("[library] duplicate copy resolution failed: {error}")
+                }
+            })
+        {
+            eprintln!("[library] could not start duplicate resolution: {error}");
+        }
         LibraryState {
-            store: Some(Arc::new(store)),
+            store: Some(store),
             init_error: None,
             workflow_lock: Mutex::new(()),
         }
@@ -634,6 +651,22 @@ impl ProjectMediaCapability {
             media_identity,
             project_dir: project_dir.to_owned(),
         })
+    }
+
+    /// Re-run the open-time identity gate against the retained root, for
+    /// writers that prepared a leaf before taking the project locks.
+    pub(crate) fn ensure_current(&self, core: &AppCore, project_epoch: u64) -> Result<(), String> {
+        core.ensure_project_root_identity_for_project(
+            project_epoch,
+            &self.project_dir,
+            &self.root_identity,
+        )
+        .map_err(|error| error.to_string())?;
+        if self.matches_namespace()? {
+            Ok(())
+        } else {
+            Err("project media directory changed before commit".to_string())
+        }
     }
 
     fn create_leaf(&self, name: &Path) -> Result<Handle, String> {
@@ -1274,6 +1307,33 @@ mod tests {
             std::fs::read(files.join(format!("{}.mp4", "0".repeat(64)))).unwrap(),
             b"final orphan"
         );
+    }
+
+    #[test]
+    fn startup_keeps_the_library_available_with_foreign_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let files = root.join(opentake_media::library::FILES_SUBDIR);
+        std::fs::create_dir_all(files.join(".staging/unexpected-dir")).unwrap();
+        std::fs::write(files.join(".DS_Store"), b"finder metadata").unwrap();
+        std::fs::write(files.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::create_dir(files.join("Some Folder")).unwrap();
+
+        let library = LibraryState::new(LibraryStore::new(root));
+
+        let store = library.store().expect("library stays available");
+        let source = tmp.path().join("clip.mp4");
+        std::fs::write(&source, b"favorite bytes").unwrap();
+        let entry = store
+            .favorite(&FavoriteRequest {
+                source: &source,
+                kind: "video",
+                category: None,
+                favorited_at: 1.0,
+                thumb: None,
+            })
+            .unwrap();
+        assert!(store.remove(&entry.id).unwrap());
     }
 
     #[test]
@@ -2048,7 +2108,7 @@ mod tests {
                     },
                 )
             });
-            let staging_path = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let staging_path = entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             assert!(staging_path.exists());
             let save_destination = destination.clone();
             let saving = scope.spawn(move || {
@@ -2056,7 +2116,10 @@ mod tests {
                     .send(core_ref.save_project(Some(save_destination)).is_ok())
                     .unwrap();
             });
-            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_millis(100));
+            // The import stays paused until the save has answered, so a save
+            // that waited for the import could never finish in time: the
+            // generous bound only absorbs a slow runner.
+            let saved_without_waiting = saved_rx.recv_timeout(Duration::from_secs(30));
             resume_tx.send(()).unwrap();
             saving.join().unwrap();
             let error = importing

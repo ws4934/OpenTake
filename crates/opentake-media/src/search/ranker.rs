@@ -9,6 +9,7 @@
 //! floor (`top * relative_cutoff`) — order matters: limit before floor, so the
 //! result is always ≤ `limit`.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use crate::search::embed_store::AssetIndex;
@@ -50,9 +51,12 @@ fn shot_key(t: f64) -> u64 {
 ///   (upstream default 0.85), applied **after** the limit cut.
 /// - `min_score`: optional absolute floor (upstream `visualMatchCosineFloor`
 ///   0.05), applied **before** the top/limit logic.
-pub fn search(
+///
+/// `indexes` may hold owned indexes or shared ones (`Arc<AssetIndex>` from the
+/// decoded-index cache).
+pub fn search<I: Borrow<AssetIndex>>(
     query: &[f32],
-    indexes: &[(String, AssetIndex)],
+    indexes: &[(String, I)],
     limit: usize,
     relative_cutoff: f32,
     min_score: Option<f32>,
@@ -60,6 +64,7 @@ pub fn search(
     let mut hits: Vec<Hit> = Vec::new();
 
     for (asset_id, index) in indexes {
+        let index: &AssetIndex = index.borrow();
         let dim = index.header.dim;
         let count = index.header.count;
         if dim != query.len() || count == 0 {
@@ -70,6 +75,12 @@ pub fn search(
         // Best frame per shot: first occurrence wins ties (existing.score >= score skips).
         let mut best_per_shot: HashMap<u64, (usize, f32)> = HashMap::new();
         for (i, &score) in scores.iter().enumerate() {
+            // A damaged index can yield NaN/infinite scores. They have no
+            // meaningful rank, must not displace a shot's finite best frame,
+            // and would break the sort comparator's total order.
+            if !score.is_finite() {
+                continue;
+            }
             let key = shot_key(index.rows[i].shot_start);
             match best_per_shot.get(&key) {
                 Some(&(_, existing)) if existing >= score => {}
@@ -263,5 +274,46 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].asset_id, "b"); // higher score first
         assert_eq!(hits[1].asset_id, "a");
+    }
+
+    #[test]
+    fn non_finite_scores_are_excluded_without_panicking() {
+        // Shot 0: finite 0.6 then NaN (NaN must not displace the finite best).
+        // Shot 1: +inf, shot 2: 0.9, shot 3: NaN, shot 4: 0.3.
+        let idx = index(
+            1,
+            vec![
+                row(0.0, 0.0),
+                row(0.5, 0.0),
+                row(1.0, 1.0),
+                row(2.0, 2.0),
+                row(3.0, 3.0),
+                row(4.0, 4.0),
+            ],
+            vec![0.6, f32::NAN, f32::INFINITY, 0.9, f32::NAN, 0.3],
+        );
+        let mut indexes = vec![("a".to_string(), idx)];
+        // Many NaN rows across assets exercise the sort with a large input.
+        for n in 0..64 {
+            let rows = (0..8).map(|i| row(i as f64, i as f64)).collect();
+            let vectors = (0..8)
+                .map(|i| {
+                    if (i + n) % 2 == 0 {
+                        f32::NAN
+                    } else {
+                        i as f32 / 10.0
+                    }
+                })
+                .collect();
+            indexes.push((format!("n{n}"), index(1, rows, vectors)));
+        }
+        let hits = search(&[1.0], &indexes[..1], 20, 0.0, None);
+        let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
+        assert_eq!(scores, vec![0.9, 0.6, 0.3]);
+        assert_eq!(hits[1].time, 0.0);
+
+        let many = search(&[1.0], &indexes, 1000, 0.0, None);
+        assert!(many.iter().all(|h| h.score.is_finite()));
+        assert!(many.windows(2).all(|w| w[0].score >= w[1].score));
     }
 }
