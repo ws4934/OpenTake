@@ -54,6 +54,7 @@ export const useMediaStore = create<MediaState>((set) => ({
 let started = false;
 let unlisten: (() => void) | null = null;
 let refreshGeneration = 0;
+let lastAppliedRefreshGeneration = 0;
 let lifecycleGeneration = 0;
 let nextImportOperationId = 0;
 const MAX_EVENT_REFRESH_ATTEMPTS = 2;
@@ -82,9 +83,11 @@ async function convergeMediaEvent(lifecycleActive: () => boolean): Promise<void>
   for (let attempt = 0; attempt < MAX_EVENT_REFRESH_ATTEMPTS; attempt += 1) {
     if (!lifecycleActive() || requestToken !== latestSyncRequestToken) return;
     try {
-      const applied = await refreshMedia();
+      const refresh = refreshMedia();
+      const requestGeneration = refreshGeneration;
+      const applied = await refresh;
       if (!lifecycleActive() || requestToken !== latestSyncRequestToken) return;
-      if (applied) return;
+      if (applied || lastAppliedRefreshGeneration > requestGeneration) return;
       lastError = new Error(
         "media mirror refresh was superseded before convergence",
       );
@@ -144,6 +147,7 @@ export function applyMediaListForProject(
   if (!isCurrentMediaProject(project)) return false;
   const generation = ++refreshGeneration;
   useMediaStore.setState(catalogState(list));
+  lastAppliedRefreshGeneration = generation;
   clearOlderSyncError(generation);
   return true;
 }
@@ -185,6 +189,7 @@ export function resetProjectMediaState(): void {
   mediaErrorOwner = null;
   activeImportOperations.clear();
   useMediaStore.setState({ items: [], folders: [], importing: false, error: null });
+  lastAppliedRefreshGeneration = 0;
 }
 
 /** Fetch the current catalog into the store (items + folder tree). */
@@ -199,6 +204,7 @@ export async function refreshMedia(): Promise<boolean> {
   // assets from overlapping snapshots; collapse by the authoritative item id so
   // the grid never renders the same asset twice (last wins, backend order kept).
   useMediaStore.setState(catalogState(list));
+  lastAppliedRefreshGeneration = generation;
   clearOlderSyncError(generation);
   return true;
 }
