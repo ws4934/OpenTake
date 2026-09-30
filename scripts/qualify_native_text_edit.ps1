@@ -91,7 +91,11 @@ function Wait-Until([scriptblock]$Check, [string]$Description) {
         Write-Output "Window: $($visible.Current.Name), class=$($visible.Current.ClassName)"
         foreach ($element in $visible.FindAll([System.Windows.Automation.TreeScope]::Descendants,
             [System.Windows.Automation.Condition]::TrueCondition)) {
-            Write-Output "UI: $($element.Current.ControlType.ProgrammaticName) | $($element.Current.Name) | $($element.Current.AutomationId)"
+            $range = $null
+            $value = if ($element.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$range)) {
+                "value=$($range.Current.Value), max=$($range.Current.Maximum)"
+            } else { '' }
+            Write-Output "UI: $($element.Current.ControlType.ProgrammaticName) | $($element.Current.Name) | $value | focused=$($element.Current.HasKeyboardFocus)"
         }
     }
     throw "Timed out: $Description"
@@ -269,6 +273,7 @@ try {
     Click-Element (Find-Names @('Add Text', '添加文本'))
     Wait-Until { @(Clip-Elements).Count -eq 1 } 'one added timeline clip'
     $clip = @(Clip-Elements)[0]
+    Write-Output "Initial clip: $($clip.Current.Name)"
     Click-Element $clip
     $clip.SetFocus()
     Wait-Until { $clip.Current.HasKeyboardFocus } 'timeline clip keyboard focus'
@@ -309,6 +314,16 @@ try {
     Send-Keys '^z'
     Wait-Until { @(Clip-Elements).Count -eq 2 } 'timeline undo'
     Write-Output 'PASS: timeline undo'
+} catch {
+    if (Test-Path (Join-Path $project 'project.json')) {
+        $snapshot = Get-Content -Raw (Join-Path $project 'project.json') | ConvertFrom-Json
+        foreach ($track in $snapshot.tracks) {
+            foreach ($clip in $track.clips) {
+                Write-Output "Persisted clip: id=$($clip.id), start=$($clip.startFrame), duration=$($clip.durationFrames)"
+            }
+        }
+    }
+    throw
 } finally {
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
 }
