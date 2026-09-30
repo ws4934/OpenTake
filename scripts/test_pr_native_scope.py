@@ -68,6 +68,7 @@ class AffectedPackagesTests(unittest.TestCase):
         for path in (
             "Cargo.lock",
             "Cargo.toml",
+            "vendor/ffmpeg-sidecar/src/child.rs",
             ".cargo/config.toml",
             ".github/workflows/pr-native.yml",
             "scripts/ffmpeg-sidecars.lock.json",

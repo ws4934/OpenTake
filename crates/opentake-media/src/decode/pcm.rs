@@ -625,8 +625,7 @@ fn decode_pcm_streaming_with_ceiling<S: PcmSink>(
         }
     };
     let sink = make_sink(limit.expected / frame_bytes)?;
-    let mut child = ff::ffmpeg()
-        .args(args)
+    let mut child = ff::ffmpeg_decode(args, path)?
         .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
@@ -759,15 +758,12 @@ impl PcmStream {
             .checked_add(frame_bytes)
             .ok_or_else(|| audio_buffer_too_large("PCM reader cap overflow"))?;
         let limit = ReadLimit { cap, expected };
-        let mut child = ff::ffmpeg()
-            .args(bounded_pcm_args(
-                path,
-                spec,
-                Some(range),
-                expected / frame_bytes,
-            ))
-            .spawn_counted()
-            .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
+        let mut child = ff::ffmpeg_decode(
+            bounded_pcm_args(path, spec, Some(range), expected / frame_bytes),
+            path,
+        )?
+        .spawn_counted()
+        .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
         cancel.child_spawned();
         let Some(stdout) = child.take_stdout() else {
             terminate_child(&mut child);

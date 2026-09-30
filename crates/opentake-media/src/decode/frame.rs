@@ -701,8 +701,7 @@ pub fn decode_frame_at_with_color_cancellable(
         return Err(MediaError::Cancelled);
     }
     let color = resolve_path_color(path, color, cancel)?;
-    let mut child = ff::ffmpeg()
-        .args(frame_args_with_color(path, req, color.as_ref()))
+    let mut child = ff::ffmpeg_decode(frame_args_with_color(path, req, color.as_ref()), path)?
         .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();
@@ -1126,8 +1125,7 @@ fn decode_grid_run(
     if cancel.is_cancelled() {
         return Err(MediaError::Cancelled);
     }
-    let mut child = ff::ffmpeg()
-        .args(grid_frame_args(path, base, color, run))
+    let mut child = ff::ffmpeg_decode(grid_frame_args(path, base, color, run), path)?
         .spawn_counted()
         .map_err(|e| MediaError::Ffmpeg(format!("spawn: {e}")))?;
     cancel.child_spawned();

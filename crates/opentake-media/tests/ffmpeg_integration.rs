@@ -1230,6 +1230,34 @@ fn native_windows_path_inputs_preserve_the_original_file() {
         named_pcm.as_ref().map(|pcm| pcm.samples_f32.len())
     );
     assert!(probe_matches && frame_matches && stream_matches && pcm_matches, "pathname transport must read the original native filename, not its replacement-character shadow");
+    let times = [0.0, 0.1, 0.2, 0.3];
+    let batch = decode_frames_at(&raw, &times, &request);
+    assert_eq!(batch.len(), times.len());
+    for frame in batch {
+        assert_eq!(frame.unwrap().1, retained_frame);
+    }
+    let stereo = PcmSpec {
+        channels: 2,
+        ..mono
+    };
+    let expected =
+        opentake_media::decode_pcm_interleaved(&original, &stereo, Some((0.1, 0.8))).unwrap();
+    let interleaved =
+        opentake_media::decode_pcm_interleaved(&raw, &stereo, Some((0.1, 0.8))).unwrap();
+    assert_eq!(interleaved, expected);
+    let mut audio = opentake_media::PcmStream::open(&raw, &stereo, (0.1, 0.8), &cancel).unwrap();
+    let mut actual = Vec::new();
+    while audio.read(1024, &mut actual).unwrap() > 0 {}
+    assert_eq!(actual, expected);
+    drop(audio);
+
+    std::fs::remove_file(&raw).unwrap();
+    assert!(
+        probe(&raw).is_err(),
+        "missing original must not probe its shadow"
+    );
+    assert!(decode_frame_at(&raw, &request).is_err());
+    assert!(extract_pcm(&raw, &mono, None).is_err());
 }
 
 #[cfg(windows)]

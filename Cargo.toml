@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/ffmpeg-sidecar"]
 members = [
     "crates/opentake-domain",
     "crates/opentake-process-tree",
@@ -37,3 +38,6 @@ opentake-motion = { path = "crates/opentake-motion" }
 opentake-agent = { path = "crates/opentake-agent" }
 opentake-gen = { path = "crates/opentake-gen" }
 opentake-core = { path = "crates/opentake-core" }
+
+[patch.crates-io]
+ffmpeg-sidecar = { path = "vendor/ffmpeg-sidecar" }
