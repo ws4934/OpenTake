@@ -417,14 +417,21 @@ fn read_project_preview(bundle: &Path) -> Option<HomeProjectPreview> {
     if !metadata.is_file() || metadata.len() > MAX_PROJECT_PREVIEW_BYTES {
         return None;
     }
-    parse_project_preview(file.take(MAX_PROJECT_PREVIEW_BYTES + 1))
+    parse_project_preview(file)
 }
 
 fn parse_project_preview(reader: impl Read) -> Option<HomeProjectPreview> {
-    // serde_json reads byte-by-byte from an unbuffered reader (one syscall per
-    // byte on a raw File), so the buffer is what keeps large projects fast.
-    let wire: HomeProjectPreviewWire =
-        serde_json::from_reader(std::io::BufReader::with_capacity(64 * 1024, reader)).ok()?;
+    // Slice parsing can skip large clip payloads efficiently. Enforce the bound
+    // here too: the retained file may grow after its metadata was checked.
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    reader
+        .take(MAX_PROJECT_PREVIEW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PROJECT_PREVIEW_BYTES {
+        return None;
+    }
+    let wire: HomeProjectPreviewWire = serde_json::from_slice(&bytes).ok()?;
     let (Some(canvas_width), Some(canvas_height), Some(track_kinds)) =
         (wire.width, wire.height, wire.track_kinds)
     else {
@@ -2127,7 +2134,9 @@ mod tests {
             inner: std::io::Cursor::new(json.as_slice()),
             reads: 0,
         };
+        let started = std::time::Instant::now();
         let preview = parse_project_preview(&mut reader).unwrap();
+        eprintln!("16 MiB Home preview parse: {:?}", started.elapsed());
 
         assert_eq!((preview.canvas_width, preview.canvas_height), (1920, 1080));
         assert_eq!(
@@ -2144,6 +2153,13 @@ mod tests {
             reader.reads,
             json.len()
         );
+    }
+
+    #[test]
+    fn project_preview_parse_rejects_input_that_grows_past_the_byte_limit() {
+        let json = large_project_json(MAX_PROJECT_PREVIEW_BYTES as usize);
+        assert!(json.len() > MAX_PROJECT_PREVIEW_BYTES as usize);
+        assert!(parse_project_preview(json.as_slice()).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
