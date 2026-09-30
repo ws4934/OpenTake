@@ -118,6 +118,20 @@ function Clip-Elements {
     @($elements | Where-Object { $_.Current.Name -match '^Clip [^ ]+ on ' })
 }
 
+function Folder-Dialog {
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $script:process.Id
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770'
+        )
+    )
+    [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+        [System.Windows.Automation.TreeScope]::Children, $condition
+    )
+}
+
 New-Item -ItemType Directory -Force -Path $TestRoot | Out-Null
 $project = Join-Path $TestRoot 'NativeEdit.opentake'
 New-Item -ItemType Directory -Force -Path (Join-Path $project 'media') | Out-Null
@@ -140,17 +154,37 @@ try {
     if (-not [NativeEditInput]::SetForegroundWindow($script:window.Current.NativeWindowHandle)) {
         throw 'Cannot activate the qualification application'
     }
-    Wait-Until { $null -ne (Find-Names @('Open', 'Open…', 'New Project', '新建工程', '设置', 'Settings')) } 'frontend readiness'
-    Send-Keys '^o'
+    Wait-Until { $null -ne (Find-Names @('Open Project', '打开项目')) } 'frontend readiness'
+    Click-Element (Find-Names @('Open Project', '打开项目'))
+    $script:dialog = $null
+    Wait-Until { $script:dialog = Folder-Dialog; $null -ne $script:dialog } 'native project folder picker'
+    if (-not [NativeEditInput]::SetForegroundWindow($script:dialog.Current.NativeWindowHandle)) {
+        throw 'Cannot activate the project folder picker'
+    }
     # The native folder picker accepts an address through Ctrl+L. This grants
     # exactly the disposable fixture through the same dialog as a real user.
-    Start-Sleep -Milliseconds 500
     Send-Keys '^l'
     [System.Windows.Forms.Clipboard]::SetText($project)
     Send-Keys '^v'
     Send-Keys '{ENTER}'
-    Start-Sleep -Milliseconds 500
-    Send-Keys '{ENTER}'
+    $script:selectFolder = $null
+    Wait-Until {
+        $script:selectFolder = $script:dialog.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.AndCondition]::new(
+                [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'
+                ),
+                [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Button
+                )
+            )
+        )
+        $null -ne $script:selectFolder -and $script:selectFolder.Current.IsEnabled
+    } 'folder selection button'
+    Click-Element $script:selectFolder
+    Wait-Until { $null -eq (Folder-Dialog) } 'project folder accepted'
     $search = $null
     Wait-Until { $script:search = Find-Names @('Search', '搜索'); $null -ne $script:search } 'editor search input'
     Qualify-Text $script:search 'input'
