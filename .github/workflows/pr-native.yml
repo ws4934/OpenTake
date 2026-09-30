@@ -60,6 +60,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Set up JPEG SIMD on Windows
+        if: runner.os == 'Windows'
+        run: |
+          pwsh -File scripts/setup_jpeg_simd.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'JPEG SIMD setup failed' }
+      - name: Set up JPEG SIMD on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/setup_jpeg_simd.sh
 
       - name: Free disk space
         if: runner.os == 'Linux'
