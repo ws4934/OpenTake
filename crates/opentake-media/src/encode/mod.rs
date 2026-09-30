@@ -1149,6 +1149,7 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
         const FILE_SHARE_READ: u32 = 0x1;
         const FILE_SHARE_WRITE: u32 = 0x2;
         const DELETE: u32 = 0x0001_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -1205,7 +1206,6 @@ fn open_encoded_file(_directory: &File, path: &Path, name: &std::ffi::OsStr) -> 
     {
         use std::os::windows::fs::OpenOptionsExt;
         const DELETE: u32 = 0x0001_0000;
-        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const FILE_SHARE_READ: u32 = 0x1;
