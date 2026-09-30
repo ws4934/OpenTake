@@ -1905,4 +1905,34 @@ mod tests {
     fn windows_cancelling_mux_wait_reaps_child() {
         assert_cancelling_mux_wait_reaps_child();
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_is_hidden_and_keeps_its_retained_identity() {
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp
+            .path()
+            .join(std::ffi::OsString::from_wide(&[100, 105, 114, 45, 0xd800]));
+        std::fs::create_dir(&parent).unwrap();
+        let workspace = EncodeWorkspace::in_directory(&parent).unwrap();
+        let path = workspace.path().to_path_buf();
+        let attributes = workspace.directory.metadata().unwrap().file_attributes();
+        assert_ne!(
+            attributes & FILE_ATTRIBUTE_HIDDEN,
+            0,
+            "private workspace must be hidden on Windows"
+        );
+        assert!(
+            std::fs::rename(&path, parent.join("moved")).is_err(),
+            "the original no-delete-sharing lease must still prevent rebinding"
+        );
+        drop(workspace);
+        assert!(
+            !path.exists(),
+            "the hidden workspace is still cleaned up by its retained handle"
+        );
+    }
 }
