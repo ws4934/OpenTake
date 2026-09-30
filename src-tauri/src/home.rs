@@ -559,7 +559,7 @@ fn authorize_home_thumbnail<R: tauri::Runtime>(app: &AppHandle<R>, thumbnail: &P
     if !snapshot.has_exact_file_grant(thumbnail) && scope.allow_file(thumbnail).is_err() {
         return false;
     }
-    thumbnail == final_path
+    same_path(thumbnail, &final_path)
         || snapshot.has_exact_file_grant(&final_path)
         || scope.allow_file(final_path).is_ok()
 }
