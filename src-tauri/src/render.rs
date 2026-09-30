@@ -2432,9 +2432,19 @@ mod tests {
 
         // Neither composite path may build its own contract.
         let constructor = concat!("TextureInterpolationConfig", "::new(");
-        let constructions = |source: &str| source.matches(constructor).count();
-        assert_eq!(constructions(include_str!("render.rs")), 1);
-        assert_eq!(constructions(include_str!("export.rs")), 0);
+        let constructions = |source: &str| {
+            let (production, _) = source
+                .split_once("mod tests {")
+                .expect("the file has a separate test module");
+            production.matches(constructor).count()
+        };
+        for (source, expected) in [
+            (include_str!("render.rs"), 1),
+            (include_str!("export.rs"), 0),
+        ] {
+            assert_eq!(constructions(source), expected);
+            assert_eq!(constructions(&source.replace('\n', "\r\n")), expected);
+        }
         assert!(include_str!("export.rs")
             .contains("crate::render::timeline_interpolation_config(plan.fps)?"));
     }

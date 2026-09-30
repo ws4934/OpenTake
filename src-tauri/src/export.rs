@@ -62,22 +62,18 @@ use opentake_media::decode::spawn_video_stream;
 #[cfg(test)]
 use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
-use opentake_media::{
-    decode_frame_at, decode_frame_at_cancellable, interpolate_frame_pair, source_frame_pair,
-    ContentHashCache, ExportPreset, ExportResolution as EncodeResolution,
-    FrameInterpolationFallback, FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmFormat,
-    PcmSpec, RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder, VideoStream,
-    VideoStreamRequest,
-};
 #[cfg(test)]
 use opentake_media::{
-    extract_pcm, extract_pcm_cancellable_with_progress, PcmBuffer, PcmProgressCallback,
+    decode_frame_at, extract_pcm, extract_pcm_cancellable_with_progress, PcmBuffer,
+    PcmProgressCallback,
+};
+use opentake_media::{
+    decode_frame_at_cancellable, ContentHashCache, ExportPreset,
+    ExportResolution as EncodeResolution, FrameRequest, MediaCancelToken, PcmFormat, PcmSpec,
+    RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder, VideoStream, VideoStreamRequest,
 };
 use opentake_project::ProjectRoot;
-use opentake_render::gpu::compositor::{
-    TextureInterpolationConfig, TextureInterpolationFallback, TextureInterpolationMode,
-    TextureResolveRequest,
-};
+use opentake_render::gpu::compositor::{TextureInterpolationMode, TextureResolveRequest};
 use opentake_render::gpu::texture::upload_rgba;
 use opentake_render::{
     export_render_size, source_frame_index, try_build_render_plan, Compositor,
@@ -541,7 +537,6 @@ fn encoder_frame(codec: ExportCodec, composite: DecodedFrame) -> RgbaFrame {
 /// Resolvable info for one media asset, projected from the manifest.
 struct MediaInfo {
     path: PathBuf,
-    source_fps: Option<f64>,
 }
 
 /// A text clip projected from the timeline, keyed by clip id.
@@ -581,6 +576,7 @@ struct MediaResolver<'d> {
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
     video_frames: &'d HashMap<String, RgbaFrame>,
+    cancel: &'d MediaCancelToken,
     materialization_error: Option<String>,
 }
 
@@ -783,95 +779,6 @@ impl MediaResolver<'_> {
         let tex = upload_rgba(self.device, self.queue, &frame, false, Some("export-text"));
         Some(self.cache.insert(key, tex))
     }
-
-    fn resolve_interpolated_video(
-        &mut self,
-        media_ref: &str,
-        source_frame: i64,
-        interpolation: TextureInterpolationConfig,
-    ) -> Option<Rc<GpuTexture>> {
-        let key = format!(
-            "vf:{media_ref}:{source_frame}:{:?}:{:.6}:{:.6}",
-            interpolation.mode, interpolation.source_fps, interpolation.target_fps
-        );
-        if let Some(tex) = self.cache.get(&key) {
-            return Some(tex);
-        }
-        let Some(info) = self.media.get(media_ref) else {
-            return self.fail_materialization(format!("video source {media_ref} is unavailable"));
-        };
-        let source_fps = info.source_fps.unwrap_or(interpolation.source_fps);
-        if !source_fps.is_finite() || source_fps <= 0.0 {
-            return self
-                .fail_materialization(format!("video source {media_ref} has invalid frame rate"));
-        }
-        let (first_index, next_index, alpha) =
-            source_frame_pair(source_frame, interpolation.target_fps, source_fps);
-        let decode = |index: i64| {
-            decode_frame_at(
-                &info.path,
-                &FrameRequest {
-                    time_secs: index as f64 / source_fps,
-                    max_size: self.render_box,
-                    apply_rotation: true,
-                },
-            )
-            .map(|(_, frame)| frame)
-        };
-        let first = match decode(first_index) {
-            Ok(frame) => frame,
-            Err(error) => {
-                return self.fail_materialization(format!(
-                    "video source {media_ref} decode failed: {error}"
-                ));
-            }
-        };
-        let last = if next_index == first_index {
-            first.clone()
-        } else {
-            // A half-open media duration may not expose the mathematical next
-            // frame at the tail. Hold the last decodable endpoint instead of
-            // dropping the whole layer to black.
-            match decode(next_index) {
-                Ok(frame) => frame,
-                Err(opentake_media::MediaError::NoFrameAt { .. }) if info.path.is_file() => {
-                    first.clone()
-                }
-                Err(error) => {
-                    return self.fail_materialization(format!(
-                        "video source {media_ref} interpolation endpoint decode failed: {error}"
-                    ));
-                }
-            }
-        };
-        let requested = match interpolation.mode {
-            TextureInterpolationMode::Nearest => FrameInterpolationMode::Nearest,
-            TextureInterpolationMode::Blend => FrameInterpolationMode::Blend,
-            TextureInterpolationMode::OpticalFlow => FrameInterpolationMode::OpticalFlow,
-        };
-        let fallback = match interpolation.fallback {
-            TextureInterpolationFallback::Nearest => FrameInterpolationFallback::Nearest,
-            TextureInterpolationFallback::Blend => FrameInterpolationFallback::Blend,
-            TextureInterpolationFallback::Error => FrameInterpolationFallback::Error,
-        };
-        let frame = match interpolate_frame_pair(&first, &last, alpha, requested, fallback, true) {
-            Ok(result) => result.frame,
-            Err(error) => {
-                return self.fail_materialization(format!(
-                    "video source {media_ref} interpolation failed: {error}"
-                ));
-            }
-        };
-        let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
-        let tex = upload_rgba(
-            self.device,
-            self.queue,
-            &decoded,
-            false,
-            Some("export-optical-flow"),
-        );
-        Some(self.cache.insert(key, tex))
-    }
 }
 
 impl TextureResolver for MediaResolver<'_> {
@@ -946,8 +853,11 @@ impl TextureResolver for MediaResolver<'_> {
             max_size: self.render_box,
             apply_rotation: true,
         };
-        let (_actual, frame) = match decode_frame_at(&info.path, &req) {
+        let (_actual, frame) = match decode_frame_at_cancellable(&info.path, &req, self.cancel) {
             Ok(decoded) => decoded,
+            Err(opentake_media::MediaError::Cancelled) => {
+                return self.fail_materialization(CANCELLED_SENTINEL);
+            }
             Err(error) => {
                 return self.fail_materialization(format!(
                     "media source {media_ref} decode failed: {error}"
@@ -963,18 +873,14 @@ impl TextureResolver for MediaResolver<'_> {
         &mut self,
         request: TextureResolveRequest<'_>,
     ) -> Option<Rc<GpuTexture>> {
-        match request.source {
-            TextureSource::Decoded { media_ref }
-                if request.interpolation.mode != TextureInterpolationMode::Nearest =>
-            {
-                self.resolve_interpolated_video(
-                    media_ref,
-                    request.source_frame,
-                    request.interpolation,
-                )
-            }
-            _ => self.resolve(request.source, request.source_frame),
+        if matches!(request.source, TextureSource::Decoded { .. })
+            && request.interpolation.mode != TextureInterpolationMode::Nearest
+        {
+            return self.fail_materialization(
+                "export video interpolation is unavailable; use nearest-frame sampling",
+            );
         }
+        self.resolve(request.source, request.source_frame)
     }
 
     fn resolve_lut(
@@ -1052,13 +958,7 @@ fn project_media(
                 sizes.insert(entry.id.clone(), (w as u32, h as u32));
             }
         }
-        media.insert(
-            entry.id.clone(),
-            MediaInfo {
-                path,
-                source_fps: entry.source_fps,
-            },
-        );
+        media.insert(entry.id.clone(), MediaInfo { path });
     }
     (sizes, media)
 }
@@ -1070,15 +970,13 @@ fn project_media(
 ///
 /// Every probe and frame decode is one step of `on_progress(done, total)`,
 /// so a project with many sources shows progress instead of sitting at 0%.
-#[allow(clippy::too_many_arguments)]
 fn preflight_export_sources(
     plan: &RenderPlan,
     manifest: &opentake_domain::MediaManifest,
     media: &HashMap<String, MediaInfo>,
     start_frame: i32,
     end_frame: i32,
-    control: Option<&ExportControl>,
-    external_cancel: Option<&MediaCancelToken>,
+    cancel: &MediaCancelToken,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<(), String> {
     let names: HashMap<&str, &str> = manifest
@@ -1132,7 +1030,9 @@ fn preflight_export_sources(
         on_progress(done, total);
     };
     for (media_ref, kind, first_frame) in sources {
-        check_audio_cancel_with_external(control, external_cancel)?;
+        if cancel.is_cancelled() {
+            return Err(CANCELLED_SENTINEL.to_string());
+        }
         let label = match names.get(media_ref) {
             Some(name) => format!("{name} ({media_ref})"),
             None => media_ref.to_string(),
@@ -1151,8 +1051,12 @@ fn preflight_export_sources(
         if kind == ClipType::Lottie {
             continue;
         }
-        let probe = opentake_media::probe::probe(&info.path)
-            .map_err(|error| format!("export source {label} cannot be probed: {error}"))?;
+        let source_error = |action: &str, error| match error {
+            opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
+            error => format!("export source {label} cannot be {action}: {error}"),
+        };
+        let probe = opentake_media::probe::probe_cancellable(&info.path, cancel)
+            .map_err(|error| source_error("probed", error))?;
         step();
         if kind == ClipType::Audio {
             if !probe.has_audio {
@@ -1170,9 +1074,12 @@ fn preflight_export_sources(
             max_size: (64, 64),
             apply_rotation: true,
         };
-        decode_frame_at(&info.path, &request)
-            .map_err(|error| format!("export source {label} cannot be decoded: {error}"))?;
+        decode_frame_at_cancellable(&info.path, &request, cancel)
+            .map_err(|error| source_error("decoded", error))?;
         step();
+    }
+    if cancel.is_cancelled() {
+        return Err(CANCELLED_SENTINEL.to_string());
     }
     Ok(())
 }
@@ -1472,15 +1379,7 @@ pub(crate) fn mix_timeline_audio_for_paths(
 ) -> Result<Option<Vec<f32>>, String> {
     let media = paths
         .iter()
-        .map(|(id, path)| {
-            (
-                id.clone(),
-                MediaInfo {
-                    path: path.clone(),
-                    source_fps: None,
-                },
-            )
-        })
+        .map(|(id, path)| (id.clone(), MediaInfo { path: path.clone() }))
         .collect();
     Ok(mix_timeline_audio(timeline, &media, None, None)?.map(|pcm| pcm.samples_f32))
 }
@@ -2276,6 +2175,10 @@ pub(crate) fn run_export_with_control(
     let control = options.control;
     let external_cancel = options.external_cancel.clone();
     validate_export_cancel_sources(control, external_cancel.as_ref())?;
+    let video_cancel = control
+        .map(ExportControl::media_cancel_token)
+        .or_else(|| external_cancel.clone())
+        .unwrap_or_default();
     // A queued cancellation must win before GPU setup or reserving an output.
     // Later frame/audio checks still cover running work.
     check_audio_cancel_with_external(control, external_cancel.as_ref())?;
@@ -2312,8 +2215,7 @@ pub(crate) fn run_export_with_control(
         &media,
         start_frame,
         end_frame,
-        control,
-        external_cancel.as_ref(),
+        &video_cancel,
         &|done, total| {
             let Some(emit) = &on_progress else {
                 return;
@@ -2388,10 +2290,6 @@ pub(crate) fn run_export_with_control(
     let mut lottie = LottieMaterializer::new();
     let mut content_hashes = ContentHashCache::new();
     let mut video_streams = ExportVideoStreams::default();
-    let video_cancel = control
-        .map(ExportControl::media_cancel_token)
-        .or_else(|| external_cancel.clone())
-        .unwrap_or_default();
     for f in start_frame..end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
@@ -2429,6 +2327,7 @@ pub(crate) fn run_export_with_control(
             project_root: project_root.as_ref(),
             lut_cache: &mut lut_cache,
             video_frames: &video_frames,
+            cancel: &video_cancel,
             materialization_error: None,
         };
         let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
@@ -2444,6 +2343,9 @@ pub(crate) fn run_export_with_control(
             .map_err(|e| format!("composite render failed at frame {f}: {e}"))?;
         if let Some(error) = resolver.materialization_error.take() {
             encoder.abort();
+            if error == CANCELLED_SENTINEL {
+                return Err(error);
+            }
             return Err(format!(
                 "export materialization failed at frame {f}: {error}"
             ));
@@ -4014,7 +3916,6 @@ mod tests {
             "video-source".to_string(),
             MediaInfo {
                 path: source.clone(),
-                source_fps: Some(30.0),
             },
         )]);
         let render_size = opentake_render::RenderSize::new(64, 64);
@@ -4273,13 +4174,7 @@ mod tests {
                     .push(Clip::new(format!("{id}-{copy}"), id, start, 10));
             }
             sizes.insert(id.to_string(), (64, 64));
-            media.insert(
-                id.to_string(),
-                MediaInfo {
-                    path: source,
-                    source_fps: Some(30.0),
-                },
-            );
+            media.insert(id.to_string(), MediaInfo { path: source });
         }
         timeline.tracks.push(track);
         let plan = try_build_render_plan(
@@ -4295,13 +4190,33 @@ mod tests {
             &media,
             0,
             plan.total_frames,
-            None,
-            None,
+            &MediaCancelToken::new(),
             &|done, total| reports.borrow_mut().push((done, total)),
         )
         .unwrap();
         // Two sources, each probed and decoded once.
         assert_eq!(reports.into_inner(), [(1, 4), (2, 4), (3, 4), (4, 4)]);
+        let cancel = MediaCancelToken::new();
+        let cancelled_reports = std::cell::RefCell::new(Vec::new());
+        let error = preflight_export_sources(
+            &plan,
+            &opentake_domain::MediaManifest::default(),
+            &media,
+            0,
+            plan.total_frames,
+            &cancel,
+            &|done, total| {
+                cancelled_reports.borrow_mut().push((done, total));
+                cancel.cancel();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, CANCELLED_SENTINEL);
+        assert_eq!(
+            cancelled_reports.into_inner(),
+            [(1, 4)],
+            "cancellation after probe must stop before decoding"
+        );
     }
 
     #[test]
@@ -5938,13 +5853,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("speech.wav");
         write_wav(&source, &noisy_tone(20.0, 300.0, 9));
-        let media = HashMap::from([(
-            "speech".to_string(),
-            MediaInfo {
-                path: source,
-                source_fps: None,
-            },
-        )]);
+        let media = HashMap::from([("speech".to_string(), MediaInfo { path: source })]);
         let mut clip = Clip::new("speech", "speech", 0, 600);
         clip.media_type = ClipType::Audio;
         clip.audio_denoise = Some(AudioDenoise {
@@ -6045,13 +5954,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("tone.wav");
         write_wav(&source, &noisy_tone(8.0, 440.0, 5));
-        let media = HashMap::from([(
-            "tone".to_string(),
-            MediaInfo {
-                path: source,
-                source_fps: None,
-            },
-        )]);
+        let media = HashMap::from([("tone".to_string(), MediaInfo { path: source })]);
         // Four more clips than the cap, all playing through three windows.
         let extra = 4;
         let clips = (0..MAX_OPEN_CLIP_READERS + extra)
@@ -6133,13 +6036,7 @@ mod tests {
             eprintln!("skip: ffmpeg could not encode the AAC fixture");
             return;
         }
-        let media = HashMap::from([(
-            "tone".to_string(),
-            MediaInfo {
-                path: source,
-                source_fps: None,
-            },
-        )]);
+        let media = HashMap::from([("tone".to_string(), MediaInfo { path: source })]);
         // Clips past the cap read every 2 s window through a fresh 44.1 kHz
         // AAC decode, resampled to 48 kHz; the pre-roll keeps each window
         // edge on the continuous decode.
@@ -6228,20 +6125,8 @@ mod tests {
         }
         assert_eq!(timeline.total_frames(), 1_800);
         let media = HashMap::from([
-            (
-                "first".to_string(),
-                MediaInfo {
-                    path: first,
-                    source_fps: None,
-                },
-            ),
-            (
-                "second".to_string(),
-                MediaInfo {
-                    path: second,
-                    source_fps: None,
-                },
-            ),
+            ("first".to_string(), MediaInfo { path: first }),
+            ("second".to_string(), MediaInfo { path: second }),
         ]);
         let clips = timeline
             .tracks
@@ -6322,13 +6207,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let mut clip = Clip::new("a", "fifo", 0, 300);
             clip.media_type = ClipType::Audio;
-            let media = HashMap::from([(
-                "fifo".to_string(),
-                MediaInfo {
-                    path: fifo,
-                    source_fps: None,
-                },
-            )]);
+            let media = HashMap::from([("fifo".to_string(), MediaInfo { path: fifo })]);
             let result = stream_flattened_audio(
                 &[clip],
                 &media,
@@ -6383,7 +6262,6 @@ mod tests {
             "asset-1".into(),
             MediaInfo {
                 path: PathBuf::from("/nonexistent.wav"),
-                source_fps: None,
             },
         );
         // duration 0 short-circuits before any decode is attempted.
@@ -6424,7 +6302,6 @@ mod tests {
             "asset-1".into(),
             MediaInfo {
                 path: PathBuf::from("/nonexistent.wav"),
-                source_fps: None,
             },
         );
         assert!(mix_timeline_audio(&tl, &media, None, None)
@@ -6752,6 +6629,7 @@ mod tests {
             project_root: None,
             lut_cache: &mut lut_cache,
             video_frames: &video_frames,
+            cancel: &MediaCancelToken::new(),
             materialization_error: None,
         };
         let source = |clip_id: &str| TextureSource::Text {
@@ -6773,6 +6651,28 @@ mod tests {
                 "{error}"
             );
         }
+        let video = TextureSource::Decoded {
+            media_ref: "unused".into(),
+        };
+        let interpolation = opentake_render::gpu::compositor::TextureInterpolationConfig::new(
+            30.0,
+            30.0,
+            TextureInterpolationMode::Blend,
+            opentake_render::gpu::compositor::TextureInterpolationFallback::Error,
+        )
+        .unwrap();
+        assert!(resolver
+            .resolve_with_interpolation(TextureResolveRequest {
+                source: &video,
+                source_frame: 0,
+                interpolation,
+            })
+            .is_none());
+        assert!(resolver
+            .materialization_error
+            .take()
+            .unwrap()
+            .contains("interpolation is unavailable"));
     }
 
     #[test]
