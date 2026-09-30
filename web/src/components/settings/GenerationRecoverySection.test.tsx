@@ -7,7 +7,7 @@ import { useEditorUiStore } from "../../store/uiStore";
 import { t } from "../../i18n";
 const api = vi.hoisted(() => ({ list: vi.fn(), discard: vi.fn(), open: vi.fn() }));
 vi.mock("../../lib/api", () => ({ listGenerationRecoveries: api.list, discardGenerationRecovery: api.discard }));
-vi.mock("../../store/projectActions", () => ({ openProjectPath: api.open }));
+vi.mock("../../store/projectActions", () => ({ openProjectViaDialog: api.open }));
 import { GenerationRecoverySection } from "./GenerationRecoverySection";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -18,7 +18,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   api.list.mockResolvedValue([record]);
   api.discard.mockResolvedValue([]);
-  api.open.mockResolvedValue(undefined);
+  api.open.mockResolvedValue(true);
   useEditorUiStore.setState({ settingsOpen: true });
   host = document.createElement("div");
   document.body.append(host);
@@ -28,12 +28,19 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); })
 async function render() { await act(async () => root.render(<GenerationRecoverySection />)); }
 function button(label: string) { return [...host.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === label)!; }
 
-it("opens the original project through the normal save boundary", async () => {
+it("offers the original project in the native picker and uses the normal save boundary", async () => {
   await render();
   expect(host.textContent).toContain(record.projectPath);
   await act(async () => button(t("generation.recovery.open")).click());
   expect(api.open).toHaveBeenCalledWith(record.projectPath);
   expect(useEditorUiStore.getState().settingsOpen).toBe(false);
+});
+it("keeps recovery visible when the native project picker is cancelled", async () => {
+  api.open.mockResolvedValue(false);
+  await render();
+  await act(async () => button(t("generation.recovery.open")).click());
+  expect(useEditorUiStore.getState().settingsOpen).toBe(true);
+  expect(host.textContent).toContain(record.projectPath);
 });
 it("requires a second explicit action before deleting saved results", async () => {
   await render();

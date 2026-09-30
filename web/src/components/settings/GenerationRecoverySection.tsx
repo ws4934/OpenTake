@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { discardGenerationRecovery, listGenerationRecoveries } from "../../lib/api";
 import type { GenerationRecoveryRecord } from "../../lib/types";
 import { formatBytes } from "../../lib/storageFormat";
-import { openProjectPath } from "../../store/projectActions";
+import { projectErrorMessage } from "../../lib/projectMessages";
+import { openProjectViaDialog } from "../../store/projectActions";
 import { useEditorUiStore } from "../../store/uiStore";
 import { useT } from "../../i18n";
 
@@ -43,10 +44,11 @@ export function GenerationRecoverySection() {
     setBusy(record.jobId);
     setError(null);
     try {
-      await openProjectPath(record.projectPath);
-      useEditorUiStore.getState().setSettingsOpen(false);
+      if (await openProjectViaDialog(record.projectPath)) {
+        useEditorUiStore.getState().setSettingsOpen(false);
+      }
     } catch (reason) {
-      if (alive.current) setError(String(reason));
+      if (alive.current) setError(projectErrorMessage(reason));
     } finally {
       if (alive.current) setBusy(null);
     }
