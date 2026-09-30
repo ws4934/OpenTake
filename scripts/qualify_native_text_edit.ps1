@@ -300,9 +300,12 @@ try {
     Wait-Until { @(Clip-Elements).Count -eq 2 } 'timeline copy and paste'
     Write-Output 'PASS: timeline copy and paste'
     $clip = @(Clip-Elements)[1]
-    Click-Element $clip
+    $clip.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
     $clip.SetFocus()
     Wait-Until { $clip.Current.HasKeyboardFocus } 'pasted clip keyboard focus'
+    Wait-Until {
+        [NativeEditInput]::EditItemEnabled($script:window.Current.NativeWindowHandle, 3)
+    } 'native timeline cut enabled'
     Send-Keys '^x'
     Wait-Until { @(Clip-Elements).Count -eq 1 } 'timeline cut'
     Write-Output 'PASS: timeline cut'
