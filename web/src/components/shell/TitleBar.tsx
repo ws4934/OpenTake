@@ -1,3 +1,4 @@
+import { joinNativePath, replaceNativePathSuffix } from "../../lib/nativePath";
 /**
  * Title bar (SPEC §2.8). Leading: Home, Chat, Motion Studio, and View controls.
  * Trailing: Library + Settings + Export Video + Export Subtitles + Export (interchange).
@@ -31,14 +32,6 @@ import { useT } from "../../i18n";
 import * as api from "../../lib/api";
 import type { SubtitleFormat } from "../../lib/api";
 import { saveDialog } from "../../lib/dialog";
-
-/** The open project's base name (without the `.opentake` suffix), or "Timeline".
- *  The bundle path ends in `…/Name.opentake`, so strip dir + `.opentake`. */
-function projectStem(projectPath: string | null): string {
-  if (!projectPath) return "Timeline";
-  const base = projectPath.split(/[\\/]/).pop() ?? projectPath;
-  return base.replace(/\.opentake$/i, "") || "Timeline";
-}
 
 /** The backend's message for a failed export (a string over IPC). */
 function errorText(error: unknown): string {
@@ -100,13 +93,10 @@ export function TitleBar() {
     setExportMenuOpen(false);
     const save = await saveDialog("interchange");
     if (!save) return; // outside Tauri — no save panel / file system
-    const dir = projectPath
-      ? projectPath.replace(/[\\/][^\\/]*$/, "")
-      : await api.getDefaultProjectDir().catch(() => "");
-    const sep = dir && !dir.endsWith("/") ? "/" : "";
-    const defaultPath = dir
-      ? `${dir}${sep}${projectStem(projectPath)}.${format.ext}`
-      : undefined;
+    const dir = projectPath ? "" : await api.getDefaultProjectDir().catch(() => "");
+    const defaultPath = projectPath
+      ? replaceNativePathSuffix(projectPath, ".opentake", `.${format.ext}`)
+      : dir ? joinNativePath(dir, `Timeline.${format.ext}`) : undefined;
 
     let chosen: string | null;
     try {
@@ -141,13 +131,10 @@ export function TitleBar() {
     setSubMenuOpen(false);
     const save = await saveDialog("subtitles");
     if (!save) return; // outside Tauri — no save panel / file system
-    const dir = projectPath
-      ? projectPath.replace(/[\\/][^\\/]*$/, "")
-      : await api.getDefaultProjectDir().catch(() => "");
-    const sep = dir && !dir.endsWith("/") ? "/" : "";
-    const defaultPath = dir
-      ? `${dir}${sep}${projectStem(projectPath)}.${format}`
-      : undefined;
+    const dir = projectPath ? "" : await api.getDefaultProjectDir().catch(() => "");
+    const defaultPath = projectPath
+      ? replaceNativePathSuffix(projectPath, ".opentake", `.${format}`)
+      : dir ? joinNativePath(dir, `Timeline.${format}`) : undefined;
 
     let chosen: string | null;
     try {

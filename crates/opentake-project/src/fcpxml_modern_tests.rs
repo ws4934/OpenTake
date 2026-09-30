@@ -12,7 +12,7 @@ fn entry(id: &str, name: &str, kind: ClipType, duration: f64) -> MediaManifestEn
         name: name.into(),
         kind,
         source: MediaSource::External {
-            absolute_path: format!("/media/{name}"),
+            absolute_path: format!("/media/{name}").into(),
         },
         duration,
         generation_input: None,

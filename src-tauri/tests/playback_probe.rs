@@ -295,7 +295,7 @@ fn probe_main10_playback_has_no_black_or_green_frames() {
         name: "Main10.mov".into(),
         kind: ClipType::Video,
         source: MediaSource::External {
-            absolute_path: src.to_string_lossy().into_owned(),
+            absolute_path: src.clone().into(),
         },
         duration: probe.duration_secs,
         generation_input: None,

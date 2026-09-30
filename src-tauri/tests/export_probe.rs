@@ -72,7 +72,7 @@ fn probe_timeline() -> (Timeline, MediaManifest) {
         name: "testbar.mp4".to_string(),
         kind: ClipType::Video,
         source: MediaSource::External {
-            absolute_path: testbar_path().to_string_lossy().to_string(),
+            absolute_path: testbar_path().into(),
         },
         duration: 2.0,
         generation_input: None,

@@ -191,7 +191,7 @@ mod tests {
             name: id.into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: format!("/{id}.mp4"),
+                absolute_path: format!("/{id}.mp4").into(),
             },
             duration: 1.0,
             generation_input: None,

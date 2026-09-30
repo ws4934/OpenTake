@@ -916,7 +916,7 @@ impl TauriGenerationBridge {
         terminal: Option<GenerationJob>,
     ) {
         let bridge = self.clone();
-        let project_path = binding.state().project_dir.display().to_string();
+        let project_path = opentake_domain::NativePath::new(&binding.state().project_dir).to_wire();
         let worker_job_id = job_id.to_string();
         let cancel = MediaCancelToken::new();
         let worker_cancel = cancel.clone();
@@ -1042,7 +1042,7 @@ impl TauriGenerationBridge {
         let record = OrphanedGeneration {
             job_id: job_id.to_string(),
             provider_job_id: None,
-            project_path: binding.state().project_dir.display().to_string(),
+            project_path: opentake_domain::NativePath::new(&binding.state().project_dir).to_wire(),
             recorded_at: crate::voice_revocations::unix_now_seconds(),
             held_results: Vec::new(),
             discarded: false,

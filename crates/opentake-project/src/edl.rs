@@ -184,7 +184,7 @@ mod tests {
             name: name.into(),
             kind,
             source: MediaSource::External {
-                absolute_path: format!("/media/{name}"),
+                absolute_path: format!("/media/{name}").into(),
             },
             duration,
             generation_input: None,

@@ -88,6 +88,7 @@ export async function importFolderViaDialog(): Promise<void> {
     const selected = await open({
       directory: true,
       multiple: false,
+      recursive: true,
       defaultPath: useSettingsStore.getState().defaultImportFolder ?? undefined,
     });
     if (typeof selected !== "string") return; // cancelled

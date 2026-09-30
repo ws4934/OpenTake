@@ -1329,7 +1329,7 @@ mod tests {
         );
         let mut project = Project::open(&bundle).unwrap();
         let relinked = MediaSource::External {
-            absolute_path: tmp.path().join("found.mov").to_string_lossy().into_owned(),
+            absolute_path: tmp.path().join("found.mov").into(),
         };
         project.manifest.entries[0].source = relinked.clone();
 

@@ -66,7 +66,7 @@ fn collects_external_and_internal_media_and_rewrites_sources() {
         "outside.mp4",
         ClipType::Video,
         MediaSource::External {
-            absolute_path: external_path.to_string_lossy().into_owned(),
+            absolute_path: external_path.clone().into(),
         },
     ));
 
@@ -143,7 +143,7 @@ fn deduplicates_shared_source_files() {
         "one.mp4",
         ClipType::Video,
         MediaSource::External {
-            absolute_path: shared.to_string_lossy().into_owned(),
+            absolute_path: shared.clone().into(),
         },
     ));
     manifest.entries.push(entry(
@@ -151,7 +151,7 @@ fn deduplicates_shared_source_files() {
         "two.mp4",
         ClipType::Video,
         MediaSource::External {
-            absolute_path: shared.to_string_lossy().into_owned(),
+            absolute_path: shared.clone().into(),
         },
     ));
 
@@ -289,7 +289,7 @@ fn name_collision_gets_suffixed() {
         "v.mp4",
         ClipType::Video,
         MediaSource::External {
-            absolute_path: f1.to_string_lossy().into_owned(),
+            absolute_path: f1.clone().into(),
         },
     ));
     manifest.entries.push(entry(
@@ -297,7 +297,7 @@ fn name_collision_gets_suffixed() {
         "v.mp4",
         ClipType::Video,
         MediaSource::External {
-            absolute_path: f2.to_string_lossy().into_owned(),
+            absolute_path: f2.clone().into(),
         },
     ));
 

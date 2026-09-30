@@ -38,6 +38,13 @@ import { decodeRecentProjects, projectThumbnailPath, useRecentStore } from "./re
 
 const defaultValidateRecents = useRecentStore.getState().validateRecents;
 
+it("keeps valid recents when one native encoding is malformed", () => {
+  const valid = { path: "/tmp/Good.opentake", name: "Good", openedAt: 1 };
+  expect(decodeRecentProjects(JSON.stringify([
+    { path: "opentake-path-v1:unix:zz", name: "Broken", openedAt: 1 }, valid,
+  ]))).toEqual([expect.objectContaining(valid)]);
+});
+
 const TIMELINE: Timeline = {
   fps: 30,
   width: 1920,

@@ -31,6 +31,8 @@ pub mod inpaint;
 pub mod keyframe;
 pub mod lut;
 pub mod media;
+pub mod native_path;
+pub use native_path::NativePath;
 pub mod signal;
 pub mod split;
 pub mod stabilization;

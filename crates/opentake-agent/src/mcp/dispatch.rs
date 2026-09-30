@@ -5505,11 +5505,12 @@ fn transcription_meta(
 
 fn manifest_file_name(entry: &opentake_domain::MediaManifestEntry) -> Option<String> {
     let path = match &entry.source {
-        opentake_domain::MediaSource::External { absolute_path } => absolute_path,
-        opentake_domain::MediaSource::Project { relative_path } => relative_path,
+        opentake_domain::MediaSource::External { absolute_path } => absolute_path.as_path()?,
+        opentake_domain::MediaSource::Project { relative_path } => {
+            std::path::Path::new(relative_path)
+        }
     };
-    std::path::Path::new(path)
-        .file_name()
+    path.file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
 }
@@ -6350,7 +6351,7 @@ mod tests {
             name: name.into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: format!("/{id}.mp4"),
+                absolute_path: format!("/{id}.mp4").into(),
             },
             duration: 1.0,
             generation_input: None,
@@ -6371,7 +6372,7 @@ mod tests {
         e.kind = ClipType::Audio;
         e.has_audio = Some(true);
         e.source = MediaSource::External {
-            absolute_path: format!("/{id}.mp3"),
+            absolute_path: format!("/{id}.mp3").into(),
         };
         e
     }

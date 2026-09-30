@@ -1187,7 +1187,7 @@ mod tests {
             name: name.into(),
             kind,
             source: MediaSource::External {
-                absolute_path: path.to_string_lossy().into_owned(),
+                absolute_path: path.into(),
             },
             duration,
             generation_input: None,

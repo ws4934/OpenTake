@@ -183,7 +183,12 @@ pub(crate) fn project_media_with_proxies_for_refs(
             continue;
         }
         let source_path = match &entry.source {
-            MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+            MediaSource::External { absolute_path } => {
+                let Some(path) = absolute_path.as_path() else {
+                    continue;
+                };
+                path.to_path_buf()
+            }
             MediaSource::Project { relative_path } => match project_dir {
                 Some(base) => base.join(relative_path),
                 None => continue,
@@ -384,7 +389,7 @@ mod tests {
         let mut item = entry(
             "asset",
             MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             Some((1920, 1080)),
         );
@@ -422,7 +427,7 @@ mod tests {
                 &format!("asset-{index}"),
                 MediaSource::External {
                     absolute_path: if index == 7 {
-                        original.to_string_lossy().into_owned()
+                        original.clone().into()
                     } else {
                         "/missing/unreferenced.mp4".into()
                     },

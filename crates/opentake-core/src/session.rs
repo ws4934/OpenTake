@@ -706,7 +706,7 @@ impl EditorSession {
         // state the panel derives from file existence clears automatically once
         // the source points at a real file again.
         entry.source = opentake_domain::MediaSource::External {
-            absolute_path: path.to_string_lossy().into_owned(),
+            absolute_path: path.into(),
         };
         entry.duration = probe.duration_secs;
         entry.source_width = probe.width;
@@ -811,13 +811,13 @@ impl EditorSession {
     }
 
     /// External media paths of the current manifest, without cloning it.
-    pub fn media_external_paths(&self) -> impl Iterator<Item = &str> {
+    pub fn media_external_paths(&self) -> impl Iterator<Item = &Path> {
         self.state
             .manifest
             .entries
             .iter()
             .filter_map(|entry| match &entry.source {
-                MediaSource::External { absolute_path } => Some(absolute_path.as_str()),
+                MediaSource::External { absolute_path } => absolute_path.as_path(),
                 MediaSource::Project { .. } => None,
             })
     }
@@ -1569,10 +1569,7 @@ pub(crate) fn test_media_entry(id: &str) -> opentake_domain::MediaManifestEntry 
         name: id.into(),
         kind: opentake_domain::ClipType::Video,
         source: opentake_domain::MediaSource::External {
-            absolute_path: std::env::temp_dir()
-                .join(format!("{id}.mp4"))
-                .to_string_lossy()
-                .into_owned(),
+            absolute_path: std::env::temp_dir().join(format!("{id}.mp4")).into(),
         },
         duration: 10.0,
         generation_input: None,

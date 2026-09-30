@@ -3413,7 +3413,7 @@ fn media_entry(id: &str, kind: ClipType, duration_secs: f64) -> MediaManifestEnt
         name: id.into(),
         kind,
         source: MediaSource::External {
-            absolute_path: format!("/abs/{id}"),
+            absolute_path: format!("/abs/{id}").into(),
         },
         duration: duration_secs,
         generation_input: None,

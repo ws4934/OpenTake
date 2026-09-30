@@ -158,6 +158,7 @@ pub struct TimelineSnapshotDto {
     /// The document version this snapshot was taken at.
     pub version: u64,
     /// Current project bundle path (`null` for a new unsaved project).
+    #[serde(with = "opentake_domain::native_path::optional_path")]
     pub project_path: Option<std::path::PathBuf>,
     /// Whether project mutations are blocked to preserve unknown fields.
     #[serde(rename = "compatibilityReadOnly")]
@@ -263,6 +264,11 @@ pub fn handle_project_open(
     core: &AppCore,
     path: String,
 ) -> std::result::Result<TimelineSnapshotDto, CmdError> {
+    let path = opentake_domain::native_path::decode(&path).map_err(|reason| CmdError {
+        code: "validation".into(),
+        message: reason.into(),
+        params: BTreeMap::new(),
+    })?;
     map(core.open_project(path).map(TimelineSnapshotDto::from))
 }
 
@@ -272,10 +278,18 @@ pub fn handle_project_save(
     core: &AppCore,
     path: Option<String>,
 ) -> std::result::Result<String, CmdError> {
-    let target = path.map(std::path::PathBuf::from);
+    let target = path
+        .as_deref()
+        .map(opentake_domain::native_path::decode)
+        .transpose()
+        .map_err(|reason| CmdError {
+            code: "validation".into(),
+            message: reason.into(),
+            params: BTreeMap::new(),
+        })?;
     map(core
         .save_project(target)
-        .map(|p| p.to_string_lossy().into_owned()))
+        .map(|p| opentake_domain::NativePath::from(p).to_wire()))
 }
 
 /// `project_new`: replace the session with a fresh, unsaved project and return
@@ -294,6 +308,46 @@ mod tests {
     use super::*;
     use opentake_domain::{ClipType, Timeline, Track};
     use opentake_ops::command::ClipEntry;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_project_names_survive_save_snapshot_and_reopen() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"project-\xff.opentake"));
+        let wire = opentake_domain::NativePath::new(&path).to_wire();
+        let core = AppCore::new();
+        assert_eq!(
+            handle_project_save(&core, Some(wire.clone())).unwrap(),
+            wire
+        );
+        let snapshot = serde_json::to_value(handle_get_timeline(&core)).unwrap();
+        assert_eq!(snapshot["projectPath"], wire);
+        let reopened = AppCore::new();
+        handle_project_open(&reopened, wire.clone()).unwrap();
+        assert_eq!(reopened.project_dir().as_deref(), Some(path.as_path()));
+        let source = temp.path().join("source.mp4");
+        let relinked = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"relinked-\xff.mp4"));
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&relinked, b"relinked").unwrap();
+        let probe = crate::ProbedMedia::default();
+        let entry = reopened
+            .import_media_file(&source, "source", &probe)
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&events);
+        reopened.subscribe(move |event| sink.lock().unwrap().push(event.clone()));
+        reopened
+            .relink_media_file(&entry.id, &relinked, &probe)
+            .unwrap();
+        assert!(events.lock().unwrap().iter().any(|event| {
+            matches!(event, crate::CoreEvent::ProjectSaved { path, .. } if path == &wire)
+        }));
+    }
 
     /// Stand up a core whose session has one empty video track. Seeds it by
     /// saving a hand-built project to a per-call-unique temp bundle and opening

@@ -1,3 +1,4 @@
+import { joinNativePath } from "../lib/nativePath";
 /**
  * Project lifecycle gestures driven from the Home view. "New" starts a fresh
  * session and enters the editor; "Open" picks an `.opentake` bundle (a directory
@@ -39,21 +40,14 @@ async function flushMotionStudioBeforeProjectBoundary(): Promise<void> {
   }
 }
 
-function pathSeparator(path: string): "/" | "\\" {
-  return path.lastIndexOf("\\") > path.lastIndexOf("/") ? "\\" : "/";
-}
-
 async function unusedDefaultProjectPath(defaultDir: string): Promise<string | undefined> {
   if (!defaultDir) return undefined;
-  const joiner = defaultDir.endsWith("/") || defaultDir.endsWith("\\")
-    ? ""
-    : pathSeparator(defaultDir);
   const untitled = t("home.untitled");
 
   try {
     for (let ordinal = 1; ; ordinal += 1) {
       const suffix = ordinal === 1 ? "" : ` ${ordinal}`;
-      const candidate = `${defaultDir}${joiner}${untitled}${suffix}.${PROJECT_EXT}`;
+      const candidate = joinNativePath(defaultDir, `${untitled}${suffix}.${PROJECT_EXT}`);
       if (!(await api.checkPathExists(candidate))) return candidate;
     }
   } catch {

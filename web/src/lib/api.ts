@@ -156,6 +156,13 @@ async function ensureTauri(): Promise<void> {
 
 // MARK: - Commands
 
+/** Native open results use the same lossless opaque path strings as media IPC. */
+export async function pickOpenPaths(options: import("@tauri-apps/plugin-dialog").OpenDialogOptions = {}): Promise<string | string[] | null> {
+  await ensureTauri();
+  if (!invokeImpl) return null;
+  return invokeImpl<string | string[] | null>("pick_open_paths", { options });
+}
+
 /** What a native save-dialog result will be written as; the backend grants the
  *  chosen path for this purpose only, once. */
 export type SavePurpose = "project" | "interchange" | "subtitles" | "video" | "extractAudio";

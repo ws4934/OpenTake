@@ -3872,6 +3872,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "glob",
+ "gtk",
  "http-range",
  "image",
  "libc",
@@ -3914,6 +3915,7 @@ dependencies = [
  "turbojpeg",
  "uuid",
  "velato",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
  "zip",
 ]

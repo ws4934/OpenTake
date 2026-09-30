@@ -13,7 +13,6 @@
     "core:window:allow-set-fullscreen",
     "core:window:allow-set-position",
     "core:window:allow-set-size",
-    "dialog:allow-open",
     "dialog:allow-message"
   ]
 }

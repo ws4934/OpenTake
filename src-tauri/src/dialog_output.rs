@@ -19,7 +19,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use opentake_domain::NativePath;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod native_name;
+#[cfg(windows)]
+mod windows;
 use serde::Deserialize;
+
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub(super) enum PickerKind {
+    Open { directory: bool, multiple: bool },
+    Save,
+}
 
 pub(crate) const UNAPPROVED_OUTPUT: &str =
     "output path has not been approved by a native save dialog";
@@ -81,17 +96,9 @@ impl SaveGrants {
     }
 }
 
-#[cfg(windows)]
 fn same_path(left: &Path, right: &Path) -> bool {
-    let right: PathBuf = right.components().collect();
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-#[cfg(not(windows))]
-fn same_path(left: &Path, right: &Path) -> bool {
-    let right: PathBuf = right.components().collect();
-    left == right
+    opentake_domain::native_path::identity_key(left)
+        == opentake_domain::native_path::identity_key(right)
 }
 
 /// One filter of the native save dialog.
@@ -102,6 +109,162 @@ pub struct SaveDialogFilter {
     extensions: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDialogOptions {
+    title: Option<String>,
+    default_path: Option<NativePath>,
+    #[serde(default)]
+    filters: Vec<SaveDialogFilter>,
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    directory: bool,
+    #[serde(default)]
+    recursive: bool,
+    can_create_directories: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum OpenSelection {
+    Multiple(Option<Vec<NativePath>>),
+    Single(Option<NativePath>),
+}
+
+/// Intercept native results before plugin IPC serialization and scope grants.
+/// Platform pickers retain native paths; scope grants and IPC share that result.
+#[tauri::command]
+pub async fn pick_open_paths(
+    window: tauri::Window,
+    options: OpenDialogOptions,
+) -> Result<OpenSelection, String> {
+    use tauri::Manager;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = options.directory;
+        let recursive = options.recursive;
+        let multiple = options.multiple;
+        let paths = pick_open_on_platform(&window, options)?;
+        if let Some(paths) = &paths {
+            let mut approved = paths.clone();
+            for path in paths {
+                let final_path = std::fs::canonicalize(path)
+                    .map_err(|error| format!("selected path is unavailable: {error}"))?;
+                if final_path != *path {
+                    approved.push(final_path);
+                }
+            }
+            crate::native_read_scope::allow_selections(&app, &approved, directory, recursive)?;
+        }
+        let paths = paths.map(|paths| paths.into_iter().map(NativePath::from).collect::<Vec<_>>());
+        Ok(if multiple {
+            OpenSelection::Multiple(paths)
+        } else {
+            OpenSelection::Single(paths.and_then(|mut paths| paths.pop()))
+        })
+    })
+    .await
+    .map_err(|error| format!("open dialog failed: {error}"))?
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn pick_open_on_platform(
+    window: &tauri::Window,
+    options: OpenDialogOptions,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+    let mut builder = window.app_handle().dialog().file().set_parent(window);
+    if let Some(title) = options.title {
+        builder = builder.set_title(title);
+    }
+    if let Some(path) = options.default_path {
+        let path = path.into_path_buf().map_err(str::to_owned)?;
+        if path.is_dir() {
+            builder = builder.set_directory(&path);
+        } else {
+            if let Some(parent) = path.parent() {
+                builder = builder.set_directory(parent);
+            }
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                builder = builder.set_file_name(name);
+            }
+        }
+    }
+    if let Some(can) = options.can_create_directories {
+        builder = builder.set_can_create_directories(can);
+    }
+    for filter in options.filters {
+        let extensions: Vec<_> = filter.extensions.iter().map(String::as_str).collect();
+        builder = builder.add_filter(filter.name, &extensions);
+    }
+    let chosen = match (options.directory, options.multiple) {
+        (true, true) => builder.blocking_pick_folders(),
+        (true, false) => builder.blocking_pick_folder().map(|path| vec![path]),
+        (false, true) => builder.blocking_pick_files(),
+        (false, false) => builder.blocking_pick_file().map(|path| vec![path]),
+    };
+    chosen
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| {
+                    path.simplified()
+                        .into_path()
+                        .map_err(|error| format!("open dialog returned an unusable path: {error}"))
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+#[cfg(target_os = "linux")]
+fn pick_open_on_platform(
+    window: &tauri::Window,
+    options: OpenDialogOptions,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    linux::pick(
+        window,
+        PickerKind::Open {
+            directory: options.directory,
+            multiple: options.multiple,
+        },
+        options.title,
+        options
+            .default_path
+            .map(NativePath::into_path_buf)
+            .transpose()
+            .map_err(str::to_owned)?,
+        options.filters,
+        options.can_create_directories,
+    )
+}
+
+#[cfg(windows)]
+fn pick_open_on_platform(
+    window: &tauri::Window,
+    options: OpenDialogOptions,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    // Windows Shell controls directory creation; this option is macOS-only.
+    let _ = options.can_create_directories;
+    let default_path = options
+        .default_path
+        .map(NativePath::into_path_buf)
+        .transpose()
+        .map_err(str::to_owned)?;
+    windows::pick(
+        window,
+        PickerKind::Open {
+            directory: options.directory,
+            multiple: options.multiple,
+        },
+        options.title,
+        default_path,
+        options.filters,
+    )
+}
+
 /// `pick_save_path`: show the native save dialog off the UI thread and record
 /// the chosen path as a single-use grant for `purpose`. Returns the path
 /// exactly as the dialog returned it, or `None` when the user cancelled.
@@ -110,53 +273,93 @@ pub async fn pick_save_path(
     window: tauri::Window,
     purpose: SavePurpose,
     title: Option<String>,
-    default_path: Option<String>,
+    default_path: Option<NativePath>,
     filters: Option<Vec<SaveDialogFilter>>,
 ) -> Result<Option<String>, String> {
     use tauri::Manager;
-    use tauri_plugin_dialog::DialogExt;
-    let app = window.app_handle().clone();
+    let default_path = default_path
+        .map(NativePath::into_path_buf)
+        .transpose()
+        .map_err(str::to_owned)?;
     let parent = window.clone();
     let chosen = tauri::async_runtime::spawn_blocking(move || {
-        let mut builder = app.dialog().file().set_parent(&parent);
-        if let Some(title) = title {
-            builder = builder.set_title(title);
-        }
-        if let Some(default_path) = default_path.filter(|path| !path.is_empty()) {
-            // Mirrors tauri-plugin-dialog's `set_default_path` for desktop.
-            let default_path: PathBuf = Path::new(&default_path).components().collect();
-            if default_path.is_file() || !default_path.exists() {
-                if let (Some(parent), Some(file_name)) =
-                    (default_path.parent(), default_path.file_name())
-                {
-                    if parent.components().count() > 0 {
-                        builder = builder.set_directory(parent);
-                    }
-                    builder = builder.set_file_name(file_name.to_string_lossy());
-                } else {
-                    builder = builder.set_directory(&default_path);
-                }
-            } else {
-                builder = builder.set_directory(&default_path);
-            }
-        }
-        for filter in filters.unwrap_or_default() {
-            let extensions: Vec<&str> = filter.extensions.iter().map(String::as_str).collect();
-            builder = builder.add_filter(filter.name, &extensions);
-        }
-        builder.blocking_save_file()
+        pick_save_on_platform(&parent, title, default_path, filters.unwrap_or_default())
     })
     .await
-    .map_err(|error| format!("save dialog failed: {error}"))?;
-    let Some(chosen) = chosen else {
+    .map_err(|error| format!("save dialog failed: {error}"))??;
+    let Some(path) = chosen else {
         return Ok(None);
     };
-    let path = chosen
-        .simplified()
-        .into_path()
-        .map_err(|error| format!("save dialog returned an unusable path: {error}"))?;
     window.state::<SaveGrants>().issue(&path, purpose);
-    Ok(Some(path.to_string_lossy().into_owned()))
+    Ok(Some(NativePath::from(path).to_wire()))
+}
+
+#[cfg(windows)]
+fn pick_save_on_platform(
+    window: &tauri::Window,
+    title: Option<String>,
+    default_path: Option<PathBuf>,
+    filters: Vec<SaveDialogFilter>,
+) -> Result<Option<PathBuf>, String> {
+    Ok(
+        windows::pick(window, PickerKind::Save, title, default_path, filters)?
+            .and_then(|mut paths| paths.pop()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn pick_save_on_platform(
+    window: &tauri::Window,
+    title: Option<String>,
+    default_path: Option<PathBuf>,
+    filters: Vec<SaveDialogFilter>,
+) -> Result<Option<PathBuf>, String> {
+    linux::pick(window, PickerKind::Save, title, default_path, filters, None)
+        .map(|paths| paths.and_then(|mut paths| paths.pop()))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn pick_save_on_platform(
+    window: &tauri::Window,
+    title: Option<String>,
+    default_path: Option<PathBuf>,
+    filters: Vec<SaveDialogFilter>,
+) -> Result<Option<PathBuf>, String> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+    let mut builder = window.app_handle().dialog().file().set_parent(window);
+    if let Some(title) = title {
+        builder = builder.set_title(title);
+    }
+    if let Some(path) = default_path.filter(|path| !path.as_os_str().is_empty()) {
+        let path: PathBuf = path.components().collect();
+        if path.is_file() || !path.exists() {
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                if parent.components().count() > 0 {
+                    builder = builder.set_directory(parent);
+                }
+                if let Some(name) = name.to_str() {
+                    builder = builder.set_file_name(name);
+                }
+            } else {
+                builder = builder.set_directory(&path);
+            }
+        } else {
+            builder = builder.set_directory(&path);
+        }
+    }
+    for filter in filters {
+        let extensions: Vec<_> = filter.extensions.iter().map(String::as_str).collect();
+        builder = builder.add_filter(filter.name, &extensions);
+    }
+    builder
+        .blocking_save_file()
+        .map(|path| {
+            path.simplified()
+                .into_path()
+                .map_err(|error| format!("save dialog returned an unusable path: {error}"))
+        })
+        .transpose()
 }
 
 /// What a dialog result without an allowed extension turns into.
@@ -210,14 +413,19 @@ pub(crate) fn authorize_dialog_output(
     if raw_path.is_empty() || raw_path.contains('\0') {
         return Err("output path is empty or contains a null byte".to_string());
     }
-    let raw = Path::new(raw_path);
+    let native = NativePath::from_wire(raw_path).map_err(str::to_owned)?;
+    let raw = native.local_path().map_err(str::to_owned)?;
     if !raw.is_absolute() {
         return Err("output path must be absolute".to_string());
     }
     if raw
         .components()
         .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-        || raw_path.ends_with(['/', std::path::MAIN_SEPARATOR])
+        || raw
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'))
     {
         return Err("output path must name a file without relative segments".to_string());
     }
@@ -292,7 +500,11 @@ pub(crate) fn authorize_dialog_output(
 fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || "output".to_string(),
-        |name| name.to_string_lossy().into_owned(),
+        |name| {
+            name.to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{name:?}"))
+        },
     )
 }
 
@@ -475,6 +687,46 @@ fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_save_grants_never_authorize_a_replacement_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let native = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"output-\xff.mp4"));
+        let shadow = PathBuf::from(native.to_string_lossy().as_ref());
+        let grants = granted(&native, SavePurpose::Video);
+        assert_eq!(
+            authorize_dialog_output(
+                &grants,
+                &NativePath::new(&shadow).to_wire(),
+                SavePurpose::Video,
+                rule(&["mp4"])
+            )
+            .unwrap_err(),
+            UNAPPROVED_OUTPUT
+        );
+        let output = authorize_dialog_output(
+            &grants,
+            &NativePath::new(&native).to_wire(),
+            SavePurpose::Video,
+            rule(&["mp4"]),
+        )
+        .unwrap();
+        assert_eq!(output.path, native);
+        assert!(
+            authorize_dialog_output(
+                &grants,
+                &NativePath::new(&output.path).to_wire(),
+                SavePurpose::Video,
+                rule(&["mp4"])
+            )
+            .is_err(),
+            "the native grant remains single-use"
+        );
+    }
 
     /// A grant store holding one save-dialog result.
     pub(crate) fn granted(path: &Path, purpose: SavePurpose) -> SaveGrants {

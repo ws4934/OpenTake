@@ -1728,7 +1728,12 @@ fn composite_timeline_frame_with_authority(
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
     for entry in &manifest.entries {
         let path = match &entry.source {
-            MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+            MediaSource::External { absolute_path } => {
+                let Some(path) = absolute_path.as_path() else {
+                    continue;
+                };
+                path.to_path_buf()
+            }
             MediaSource::Project { relative_path } => match &project_dir {
                 Some(base) => base.join(relative_path),
                 None => continue,
@@ -2160,7 +2165,10 @@ fn decode_source_frame(
         return Err("capture: source tab asset is not a video".to_string());
     }
     let path = match &entry.source {
-        MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+        MediaSource::External { absolute_path } => absolute_path
+            .local_path()
+            .map_err(str::to_owned)?
+            .to_path_buf(),
         MediaSource::Project { relative_path } => snapshot
             .project_dir
             .map(|base| base.join(relative_path))
@@ -2717,7 +2725,7 @@ mod tests {
             name: "gone.png".into(),
             kind: ClipType::Image,
             source: MediaSource::External {
-                absolute_path: tmp.path().join("gone.png").display().to_string(),
+                absolute_path: tmp.path().join("gone.png").into(),
             },
             duration: 0.0,
             generation_input: None,
@@ -2798,7 +2806,7 @@ mod tests {
             name: "still.png".into(),
             kind: ClipType::Image,
             source: MediaSource::External {
-                absolute_path: path.display().to_string(),
+                absolute_path: path.clone().into(),
             },
             duration: 0.0,
             generation_input: None,

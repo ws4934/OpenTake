@@ -235,12 +235,49 @@ fn external_request(token: &str, path: &Path) -> HelperRequest {
     HelperRequest {
         token: token.to_owned(),
         parent_pid: std::process::id(),
-        path: path.to_string_lossy().into_owned(),
+        path: NativePath::new(path).to_wire(),
         head_only: false,
         range: None,
         if_range: None,
         project: None,
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_names_survive_helper_ipc_and_scope_revocation() {
+    use std::os::unix::ffi::OsStrExt;
+    use tauri::Manager;
+    let directory = local_tempdir();
+    let raw = directory
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"clip-\xff.mp4"));
+    let shadow = PathBuf::from(raw.to_string_lossy().as_ref());
+    std::fs::write(&raw, b"original").unwrap();
+    std::fs::write(&shadow, b"replaced").unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(
+        crate::native_read_scope::NativeReadScope::load(directory.path().join("grants.json"))
+            .unwrap(),
+    );
+    crate::native_read_scope::allow_file(app.handle(), &raw).unwrap();
+    let scope = asset_scope_snapshot(app.handle());
+    assert!(scope.allows(&raw));
+    assert!(!scope.allows(&shadow));
+    assert!(!app.handle().asset_protocol_scope().is_allowed(&shadow));
+
+    let request = external_request("native-file", &raw);
+    let request: HelperRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let (opened, response) = helper_exchange(&request);
+    assert!(opened.error_kind.is_none());
+    let final_path =
+        opentake_domain::native_path::decode(opened.final_path.as_deref().unwrap()).unwrap();
+    assert!(paths_equal_for_authority(&final_path, &raw));
+    assert_eq!(response.body, b"original");
+    assert!(scope.allows(&final_path));
+    crate::native_read_scope::forbid_file(app.handle(), &raw).unwrap();
+    assert!(!asset_scope_snapshot(app.handle()).allows(&raw));
 }
 
 const TEST_HELPER_ENV: &str = "OPENTAKE_TEST_ASSET_HELPER";
@@ -539,7 +576,7 @@ fn current_project_authority_allows_nested_media_without_recursive_scope() {
         .unwrap()
         .expect("current retained project is nested-media authority");
     let request = HelperRequest {
-        project: HelperProjectAuthority::from_core(&authority),
+        project: Some(HelperProjectAuthority::from_core(&authority)),
         ..external_request("test-token", &media)
     };
     let (opened, response) = helper_exchange(&request);
@@ -588,7 +625,7 @@ fn symlinked_ancestor_project_read(
         .expect("the opened project path is the nested-media authority");
     assert_eq!(authority.project_path, bundle);
     let request = HelperRequest {
-        project: HelperProjectAuthority::from_core(&authority),
+        project: Some(HelperProjectAuthority::from_core(&authority)),
         ..external_request("symlinked-ancestor-token", &media)
     };
     (core, real, media, authority, request)
@@ -1561,12 +1598,11 @@ fn a_reply_larger_than_the_request_allows_is_rejected_before_allocation() {
     assert!(matches!(result, Err(IsolatedHelperError::InvalidResponse)));
 }
 
-/// A final path that is not UTF-8 cannot be authorized lexically. The helper
-/// reports it as an open error and must not wait for a decision that the
-/// parent never sends, or the next request on that helper breaks.
+/// A native final path reaches the parent without being replaced by its
+/// Unicode alias. The helper waits for authorization and remains reusable.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_non_utf8_final_path_is_refused_and_the_helper_serves_the_next_request() {
+fn a_non_utf8_final_path_is_preserved_and_the_helper_serves_the_next_request() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
@@ -1586,19 +1622,22 @@ fn a_non_utf8_final_path_is_refused_and_the_helper_serves_the_next_request() {
         let request = external_request(&pool::random_token(), &requested);
         let mut authorized = false;
         let outcome = pool
-            .exchange(&request, |_| {
+            .exchange(&request, |opened| {
+                let decoded =
+                    opentake_domain::native_path::decode(opened.final_path.as_deref().unwrap())
+                        .unwrap();
+                let expected = target.join("clip.mp4");
+                assert_eq!(decoded, expected);
+                assert_ne!(decoded, PathBuf::from(expected.to_string_lossy().as_ref()));
                 authorized = true;
                 Ok::<(), ()>(())
             })
             .await;
-        let Ok(HelperOutcome::OpenFailed(opened)) = outcome else {
-            panic!("a non-UTF-8 final path must be reported as unavailable");
+        let Ok(HelperOutcome::Served { response, .. }) = outcome else {
+            panic!("an authorized native final path must be served");
         };
-        assert!(matches!(
-            opened.error_kind,
-            Some(WireIoErrorKind::PermissionDenied)
-        ));
-        assert!(!authorized);
+        assert_eq!(response.body, b"hidden");
+        assert!(authorized);
 
         let request = external_request(&pool::random_token(), &ordinary);
         let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await;

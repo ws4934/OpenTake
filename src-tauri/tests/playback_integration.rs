@@ -110,7 +110,7 @@ fn external_entry(id: &str, path: &Path, w: i32, h: i32, fps: f64) -> MediaManif
         name: format!("{id}.mp4"),
         kind: ClipType::Video,
         source: MediaSource::External {
-            absolute_path: path.to_string_lossy().into_owned(),
+            absolute_path: path.into(),
         },
         duration: 1.0,
         generation_input: None,
@@ -359,7 +359,7 @@ fn missing_image_materialization_reaches_render_loop_instead_of_publishing_black
         name: "missing.png".into(),
         kind: ClipType::Image,
         source: MediaSource::External {
-            absolute_path: missing.to_string_lossy().into_owned(),
+            absolute_path: missing.clone().into(),
         },
         duration: 1.0,
         generation_input: None,
