@@ -198,12 +198,19 @@ impl EncodeWorkspace {
         // Disable TempDir's recursive path cleanup before retaining the handle.
         let path = builder.tempdir_in(parent).map_err(MediaError::Io)?.keep();
         let directory = open_directory_nofollow(&path)?;
-        Ok(Self {
+        let workspace = Self {
             directory,
             path,
             #[cfg(unix)]
             parent: parent_handle,
-        })
+        };
+        // Visibility is cosmetic: a volume that rejects DOS attributes must
+        // not make an otherwise valid export fail or weaken its retained lease.
+        #[cfg(windows)]
+        if let Err(error) = workspace.hide_directory() {
+            tracing::warn!(%error, "could not hide the encode workspace");
+        }
+        Ok(workspace)
     }
 
     fn path(&self) -> &Path {
@@ -293,6 +300,38 @@ impl EncodeWorkspace {
 
 #[cfg(windows)]
 impl EncodeWorkspace {
+    fn hide_directory(&self) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+        };
+        let attributes = self.directory.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return Ok(());
+        }
+        let info = FILE_BASIC_INFO {
+            FileAttributes: (attributes & !FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_HIDDEN,
+            // Zero timestamps preserve the existing values.
+            ..Default::default()
+        };
+        // SAFETY: the live attribute handle and SDK buffer have the required
+        // access, layout and lifetime for this synchronous call.
+        if unsafe {
+            SetFileInformationByHandle(
+                self.directory.as_raw_handle(),
+                FileBasicInfo,
+                (&info as *const FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn remove_directory(&self) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -1114,13 +1153,15 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
         const FILE_SHARE_READ: u32 = 0x1;
         const FILE_SHARE_WRITE: u32 = 0x2;
         const DELETE: u32 = 0x0001_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         // Without delete sharing the workspace cannot be renamed or replaced
-        // while it is retained.
+        // while it is retained. Attribute access lets this same retained handle
+        // hide the directory without reopening it with different access rights.
         options
-            .access_mode(GENERIC_READ | DELETE)
+            .access_mode(GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -2060,5 +2101,35 @@ mod tests {
     #[test]
     fn windows_cancelling_mux_wait_reaps_child() {
         assert_cancelling_mux_wait_reaps_child();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_is_hidden_and_keeps_its_retained_identity() {
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp
+            .path()
+            .join(std::ffi::OsString::from_wide(&[100, 105, 114, 45, 0xd800]));
+        std::fs::create_dir(&parent).unwrap();
+        let workspace = EncodeWorkspace::in_directory(&parent).unwrap();
+        let path = workspace.path().to_path_buf();
+        let attributes = workspace.directory.metadata().unwrap().file_attributes();
+        assert_ne!(
+            attributes & FILE_ATTRIBUTE_HIDDEN,
+            0,
+            "private workspace must be hidden on Windows"
+        );
+        assert!(
+            std::fs::rename(&path, parent.join("moved")).is_err(),
+            "the original no-delete-sharing lease must still prevent rebinding"
+        );
+        drop(workspace);
+        assert!(
+            !path.exists(),
+            "the hidden workspace is still cleaned up by its retained handle"
+        );
     }
 }
