@@ -164,6 +164,16 @@ jobs:
           cargo clippy -p opentake-tauri --no-default-features --all-targets --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'minimal-feature clippy failed' }
 
+      - name: Qualify native GTK filename selections
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GTK_USE_PORTAL: '0'
+        run: |
+          xvfb-run -a cargo test --locked -p opentake-tauri --lib \
+            dialog_output::linux::tests::native_gtk_selections_preserve_original_names \
+            -- --ignored --exact --nocapture --test-threads=1
+
       - name: Test affected crates
         env:
           PACKAGES: ${{ needs.scope.outputs.packages }}
@@ -184,13 +194,3 @@ jobs:
             }
           }
           if ($failed) { throw "tests failed: $($failed -join ', ')" }
-
-      - name: Qualify native GTK filename selections
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          GTK_USE_PORTAL: '0'
-        run: |
-          xvfb-run -a cargo test --locked -p opentake-tauri \
-            dialog_output::linux::tests::native_gtk_selections_preserve_original_names \
-            -- --ignored --exact --nocapture --test-threads=1

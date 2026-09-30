@@ -183,7 +183,8 @@ mod tests {
             PickerKind::Save,
         ] {
             let chooser = build_dialog(None, kind, None, Some(&file), false, &[], None).unwrap();
-            assert_eq!(selected_paths(&chooser, kind), vec![file.clone()]);
+            chooser.show();
+            wait_for_paths(&chooser, kind, [file.clone()].into_iter().collect());
             chooser.destroy();
         }
         let kind = PickerKind::Open {
@@ -191,7 +192,8 @@ mod tests {
             multiple: false,
         };
         let chooser = build_dialog(None, kind, None, Some(&directory), true, &[], None).unwrap();
-        assert_eq!(selected_paths(&chooser, kind), vec![directory]);
+        chooser.show();
+        wait_for_paths(&chooser, kind, [directory].into_iter().collect());
         chooser.destroy();
     }
 
@@ -203,7 +205,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let context = gtk::glib::MainContext::default();
         loop {
-            while context.pending() {
+            // A busy GTK source must not prevent the timeout from being checked.
+            for _ in 0..32 {
+                if !context.pending() {
+                    break;
+                }
                 context.iteration(false);
             }
             let paths: std::collections::HashSet<_> =
