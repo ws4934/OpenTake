@@ -26,6 +26,7 @@ use crate::decode::pcm::{PcmBuffer, PcmFormat, PcmSpec};
 use crate::error::{MediaError, Result};
 use crate::ff::SpawnCounted;
 use crate::frame::RgbaFrame;
+use crate::process_tree::{configure_command, ProcessTree};
 
 /// Build the ffmpeg arg list for encoding a raw-RGBA frame stream (read from
 /// stdin) to `out` with `preset`. Pure so the CLI contract is testable.
@@ -144,6 +145,7 @@ pub type EncodeProgressCallback = dyn Fn(usize, usize);
 /// ([`VideoEncoder::finish_in_workspace`]).
 pub struct VideoEncoder {
     child: ffmpeg_sidecar::child::FfmpegChild,
+    process_tree: ProcessTree,
     stdin: Option<std::process::ChildStdin>,
     output_pump: Option<JoinHandle<Result<()>>>,
     stderr_pump: Option<JoinHandle<Result<Vec<u8>>>>,
@@ -450,16 +452,15 @@ impl VideoEncoder {
             ))
             .as_inner_mut()
             .current_dir(workspace.path());
-        let mut child = command
-            .spawn_counted()
-            .map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
+        let (mut child, mut process_tree) =
+            spawn_encoder(&mut command).map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
         let stdin = child.take_stdin();
         let stdout = child.take_stdout().ok_or_else(|| {
-            terminate_child(&mut child);
+            terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("encoder stdout pipe missing".to_string())
         })?;
         let stderr = child.take_stderr().ok_or_else(|| {
-            terminate_child(&mut child);
+            terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("encoder stderr pipe missing".to_string())
         })?;
         let output_pump = match thread::Builder::new()
@@ -468,7 +469,7 @@ impl VideoEncoder {
         {
             Ok(pump) => pump,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut process_tree);
                 return Err(MediaError::Encode(format!(
                     "spawn encoder output pump for {}: {error}",
                     out_hint.display()
@@ -481,7 +482,7 @@ impl VideoEncoder {
         {
             Ok(pump) => pump,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut process_tree);
                 let _ = join_named_pump(output_pump, "encoder output");
                 return Err(MediaError::Encode(format!(
                     "spawn encoder stderr pump: {error}"
@@ -490,6 +491,7 @@ impl VideoEncoder {
         };
         Ok(VideoEncoder {
             child,
+            process_tree,
             stdin,
             output_pump: Some(output_pump),
             stderr_pump: Some(stderr_pump),
@@ -764,7 +766,7 @@ impl VideoEncoder {
         let mut polls = 0_usize;
         loop {
             if cancel.checkpoint() {
-                terminate_child(&mut self.child);
+                terminate_child(&mut self.child, &mut self.process_tree);
                 self.child_reaped = true;
                 let _ = self.join_output_pump();
                 return Err(MediaError::Cancelled);
@@ -772,6 +774,8 @@ impl VideoEncoder {
             match self.child.as_inner_mut().try_wait() {
                 Ok(Some(status)) => {
                     self.child_reaped = true;
+                    self.process_tree.terminate().map_err(MediaError::Io)?;
+                    self.process_tree.disarm();
                     self.join_output_pump()?;
                     return Ok(status);
                 }
@@ -808,7 +812,7 @@ impl VideoEncoder {
     fn reap_child(&mut self) {
         self.stdin.take();
         if !self.child_reaped {
-            terminate_child(&mut self.child);
+            terminate_child(&mut self.child, &mut self.process_tree);
             self.child_reaped = true;
         }
         let _ = self.join_output_pump();
@@ -889,15 +893,14 @@ impl VideoEncoder {
             .args(args)
             .as_inner_mut()
             .current_dir(self.workspace_path()?);
-        let mut child = command
-            .spawn_counted()
+        let (mut child, mut process_tree) = spawn_encoder(&mut command)
             .map_err(|e| MediaError::Encode(format!("mux spawn: {e}")))?;
         let stdout = child.take_stdout().ok_or_else(|| {
-            terminate_child(&mut child);
+            terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("mux stdout pipe missing".to_string())
         })?;
         let stderr = child.take_stderr().ok_or_else(|| {
-            terminate_child(&mut child);
+            terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("mux stderr pipe missing".to_string())
         })?;
         let pump = match thread::Builder::new()
@@ -906,7 +909,7 @@ impl VideoEncoder {
         {
             Ok(pump) => pump,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut process_tree);
                 return Err(MediaError::Encode(format!(
                     "spawn mux output pump: {error}"
                 )));
@@ -918,7 +921,7 @@ impl VideoEncoder {
         {
             Ok(pump) => pump,
             Err(error) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut process_tree);
                 let _ = join_named_pump(pump, "mux output");
                 return Err(MediaError::Encode(format!(
                     "spawn mux stderr pump: {error}"
@@ -928,6 +931,7 @@ impl VideoEncoder {
         progress.report(MUX_WAIT_START);
         let (status, stderr_tail) = wait_external_child(
             &mut child,
+            &mut process_tree,
             pump,
             stderr_pump,
             cancel,
@@ -1242,6 +1246,7 @@ fn write_pcm_s16le_cancellable(
 /// Wait for the mux child; returns its exit status and the end of its stderr.
 fn wait_external_child(
     child: &mut ffmpeg_sidecar::child::FfmpegChild,
+    process_tree: &mut ProcessTree,
     output_pump: JoinHandle<Result<()>>,
     stderr_pump: JoinHandle<Result<Vec<u8>>>,
     cancel: &MediaCancelToken,
@@ -1254,13 +1259,15 @@ fn wait_external_child(
     let mut polls = 0_usize;
     loop {
         if cancel.checkpoint() {
-            terminate_child(child);
+            terminate_child(child, process_tree);
             let _ = join_named_pump(output_pump, "mux output");
             let _ = join_named_pump(stderr_pump, "mux stderr");
             return Err(MediaError::Cancelled);
         }
         match child.as_inner_mut().try_wait() {
             Ok(Some(status)) => {
+                process_tree.terminate().map_err(MediaError::Io)?;
+                process_tree.disarm();
                 let output = join_named_pump(output_pump, "mux output");
                 let stderr = join_named_pump(stderr_pump, "mux stderr");
                 output?;
@@ -1276,7 +1283,7 @@ fn wait_external_child(
                 thread::sleep(ENCODE_POLL_INTERVAL);
             }
             Err(error) => {
-                terminate_child(child);
+                terminate_child(child, process_tree);
                 let _ = join_named_pump(output_pump, "mux output");
                 let _ = join_named_pump(stderr_pump, "mux stderr");
                 return Err(MediaError::Io(error));
@@ -1290,9 +1297,30 @@ fn join_named_pump<T>(pump: JoinHandle<Result<T>>, name: &str) -> Result<T> {
         .map_err(|_| MediaError::Encode(format!("{name} pump panicked")))?
 }
 
-fn terminate_child(child: &mut ffmpeg_sidecar::child::FfmpegChild) {
+fn spawn_encoder(
+    command: &mut ffmpeg_sidecar::command::FfmpegCommand,
+) -> std::io::Result<(ffmpeg_sidecar::child::FfmpegChild, ProcessTree)> {
+    configure_command(command.as_inner_mut());
+    let mut child = command.spawn_counted()?;
+    match ProcessTree::attach(child.as_inner_mut().id()) {
+        Ok(tree) => Ok((child, tree)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+fn terminate_child(child: &mut ffmpeg_sidecar::child::FfmpegChild, process_tree: &mut ProcessTree) {
+    // Descendants can retain stdout/stderr after their parent exits. Terminate
+    // the entire tree before waiting for the parent or joining either pump.
+    if let Err(error) = process_tree.terminate() {
+        tracing::error!(%error, "failed to terminate encoder process tree");
+    }
     let _ = child.kill();
     let _ = child.wait();
+    process_tree.disarm();
 }
 
 fn report_progress(progress: Option<&EncodeProgressCallback>, done: usize) {
@@ -1312,6 +1340,133 @@ mod tests {
             .args(["-p", &pid.to_string()])
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum TreeExit {
+        CancelEncode,
+        DropEncode,
+        CancelMux,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_encoder_terminates_descendants_holding_its_pipes() {
+        assert_encoder_tree_cleanup(TreeExit::CancelEncode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_encoder_terminates_descendants_holding_its_pipes() {
+        assert_encoder_tree_cleanup(TreeExit::DropEncode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_mux_terminates_descendants_holding_its_pipes() {
+        assert_encoder_tree_cleanup(TreeExit::CancelMux);
+    }
+
+    #[cfg(unix)]
+    fn assert_encoder_tree_cleanup(exit: TreeExit) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pids = temp.path().join("pids");
+        let script = temp.path().join("encoder-helper");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 60 &\nprintf '%s %s' \"$$\" \"$!\" > '{}'\nwait\n",
+                pids.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = temp.path().join("movie.mp4");
+        let cancel = MediaCancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if !matches!(exit, TreeExit::CancelMux) {
+                crate::ff::test_seams::override_ffmpeg(Some(script.clone().into_os_string()));
+            }
+            let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+            let mut encoder = VideoEncoder::new_in_workspace(&output, 2, 2, 30, &preset).unwrap();
+            let result = match exit {
+                TreeExit::DropEncode => {
+                    drop_rx.recv().unwrap();
+                    drop(encoder);
+                    Ok(())
+                }
+                TreeExit::CancelEncode => encoder
+                    .finish_in_workspace(&worker_cancel, None)
+                    .map(|_| ()),
+                TreeExit::CancelMux => {
+                    encoder
+                        .push_frame(&RgbaFrame::new(2, 2, vec![0; 16]))
+                        .unwrap();
+                    encoder
+                        .push_audio_chunk(
+                            PcmSpec {
+                                sample_rate: 48_000,
+                                channels: 1,
+                                format: PcmFormat::F32,
+                            },
+                            &[0.0; 1600],
+                            &worker_cancel,
+                        )
+                        .unwrap();
+                    crate::ff::test_seams::override_ffmpeg(Some(script.into_os_string()));
+                    encoder
+                        .finish_in_workspace(&worker_cancel, None)
+                        .map(|_| ())
+                }
+            };
+            done_tx.send(result.map(|_| ())).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let members = loop {
+            let text = std::fs::read_to_string(&pids).unwrap_or_default();
+            let members: Vec<u32> = text
+                .split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if members.len() == 2 || Instant::now() >= deadline {
+                break members;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        cancel.cancel();
+        if matches!(exit, TreeExit::DropEncode) {
+            drop_tx.send(()).unwrap();
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release inherited pipes even on a regression, then join the worker
+        // before asserting so the test never leaves a 60-second helper alive.
+        if result.is_err() {
+            for pid in &members {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(members.len(), 2, "helper and descendant started");
+        let expected = match exit {
+            TreeExit::DropEncode => matches!(result, Ok(Ok(()))),
+            _ => matches!(result, Ok(Err(MediaError::Cancelled))),
+        };
+        assert!(
+            expected,
+            "cleanup must close descendant-held pipes promptly: {result:?}"
+        );
     }
 
     #[test]
@@ -1839,21 +1994,21 @@ mod tests {
             crate::ff::ffmpeg_available(),
             "mux cancellation test requires FFmpeg"
         );
-        let mut child = crate::ff::ffmpeg()
-            .args([
-                "-re",
-                "-f",
-                "lavfi",
-                "-i",
-                "anullsrc=r=48000:cl=mono",
-                "-t",
-                "30",
-                "-f",
-                "null",
-                "-",
-            ])
-            .spawn()
-            .expect("spawn blocking mux-like FFmpeg");
+        let mut command = crate::ff::ffmpeg();
+        command.args([
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "30",
+            "-f",
+            "null",
+            "-",
+        ]);
+        let (mut child, mut process_tree) =
+            spawn_encoder(&mut command).expect("spawn blocking mux-like FFmpeg");
         let stdout = child.take_stdout().expect("FFmpeg stdout");
         let stderr = child.take_stderr().expect("FFmpeg stderr");
         let output_pump = std::thread::spawn(move || drain_stdout(stdout));
@@ -1869,6 +2024,7 @@ mod tests {
             };
             let result = wait_external_child(
                 &mut child,
+                &mut process_tree,
                 output_pump,
                 stderr_pump,
                 &worker_cancel,
