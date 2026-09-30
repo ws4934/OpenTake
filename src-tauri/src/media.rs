@@ -10014,6 +10014,9 @@ mod tests {
 
     #[test]
     fn delayed_relink_does_not_block_identity_changes_or_commit_stale_media() {
+        // Channels establish ordering; this deadline only detects a deadlock.
+        // Save As includes filesystem work, so it has no subsecond time budget.
+        let completion_deadline = Duration::from_secs(10);
         for change in ["new_project", "save_as", "media_change"] {
             let temp = tempfile::tempdir().unwrap();
             let (core, bundle, _source, id) = saved_core_with_media(temp.path());
@@ -10031,7 +10034,7 @@ mod tests {
                     Ok(ProbedMedia::default())
                 })
             });
-            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            started_rx.recv_timeout(completion_deadline).unwrap();
             let changed_core = Arc::clone(&core);
             let other = temp.path().join("Other.opentake");
             let extra = temp.path().join("extra.mp4");
@@ -10054,7 +10057,7 @@ mod tests {
                 }
                 changed_tx.send(changed_core.runtime_snapshot()).unwrap();
             });
-            let changed = changed_rx.recv_timeout(Duration::from_millis(250));
+            let changed = changed_rx.recv_timeout(completion_deadline);
             resume_tx.send(()).unwrap();
             transition.join().unwrap();
             let error = worker
