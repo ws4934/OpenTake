@@ -28,8 +28,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use opentake_domain::LutReference;
 use opentake_media::decode::{
@@ -60,9 +61,10 @@ const STATIC_CACHE_CAP: usize = 64;
 /// served from short forward-decoded windows instead: one decode process per
 /// window rather than one per frame.
 const REVERSE_WINDOW_FRAMES: i64 = 16;
-/// Request the next (earlier) window once fewer than this many requested
-/// frames remain below the current target.
-const REVERSE_PREFETCH_FRAMES: i64 = 8;
+/// Start the next decode as soon as the current window is buffered. Long-GOP
+/// seeks need the full window's playback time, rather than half of it.
+const REVERSE_PREFETCH_FRAMES: i64 = REVERSE_WINDOW_FRAMES;
+const REVERSE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One active video clip's continuous-decode state. Created when a clip first
 /// appears in a frame plan, dropped (after a cooperative stop) when it leaves.
@@ -173,6 +175,58 @@ fn spawn_reverse_window(
     })
 }
 
+/// Prepare the first picture and its earlier frames in one bounded decode.
+/// An exact single-frame seek followed by another window seek would replay the
+/// same GOP and leave the first playback ticks with no earlier picture ready.
+fn bootstrap_reverse_window(
+    request: &VideoStreamRequest,
+    target: i64,
+    cancel: &MediaCancelToken,
+) -> Result<(ReverseWindows<VideoStream>, StreamVideoFrame), String> {
+    let start = (target + 1 - REVERSE_WINDOW_FRAMES).max(0);
+    let stream = spawn_reverse_window(request, start, target + 1)?;
+    let deadline = Instant::now() + REVERSE_BOOTSTRAP_TIMEOUT;
+    let mut frames = BTreeMap::new();
+    loop {
+        if cancel.is_cancelled() {
+            stream.request_stop();
+            return Err("playback reverse bootstrap cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            stream.request_stop();
+            return Err("playback reverse bootstrap timed out".into());
+        }
+        match stream.receiver().recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(frame)) if frame.source_frame == target => {
+                return Ok((
+                    ReverseWindows {
+                        frames,
+                        inflight: Some(stream),
+                        coverage: (start, target + 1),
+                    },
+                    frame,
+                ));
+            }
+            Ok(Ok(frame)) if (start..target).contains(&frame.source_frame) => {
+                frames.insert(frame.source_frame, frame);
+            }
+            Ok(Ok(frame)) => {
+                return Err(format!(
+                    "playback reverse bootstrap skipped frame {target} (next {})",
+                    frame.source_frame
+                ));
+            }
+            Ok(Err(error)) => return Err(format!("playback reverse bootstrap failed: {error}")),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "playback reverse bootstrap ended before frame {target}"
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// Serves a reversed clip's descending source frames. Each window decodes
 /// source frames `[start, end)` forward in the background; the render thread
 /// only drains finished frames and hands them out in descending order, and
@@ -189,6 +243,7 @@ struct ReverseWindows<S> {
 
 impl<S: FrameSupply> ReverseWindows<S> {
     /// Start a chain at the synchronously bootstrapped `source_frame`.
+    #[cfg(test)]
     fn new(source_frame: i64) -> Self {
         ReverseWindows {
             frames: BTreeMap::new(),
@@ -564,9 +619,8 @@ impl<'d, 's> StreamingResolver<'d, 's> {
     /// each clip's current texture. Must run before `render_to_rgba`.
     ///
     /// 1. Stop streams whose clip is no longer on screen.
-    /// 2. Decode each newly-visible clip's exact target synchronously, then
-    ///    spawn its forward stream from the following source frame (reversed
-    ///    clips request earlier windows on demand instead).
+    /// 2. Prepare the exact target and a stream for each newly-visible clip.
+    ///    Reversed clips also buffer their first window before playback starts.
     /// 3. Advance every active stream to its target and stash the resulting
     ///    texture in the per-frame lookup.
     pub fn sync_active(&mut self, plan: &FramePlan) -> Result<(), String> {
@@ -603,15 +657,41 @@ impl<'d, 's> StreamingResolver<'d, 's> {
                 &t.clip_id,
                 &t.media_ref,
                 || {
-                    let request = bootstrap_frame_request(t.source_frame, timeline_fps, render_box);
-                    let (_, frame) =
-                        decode_frame_at_cancellable(&media_path, &request, &self.state.cancel)
-                            .map_err(|error| {
-                                format!(
-                        "playback bootstrap decode failed for {} at source frame {}: {error}",
-                        t.media_ref, t.source_frame
-                    )
-                            })?;
+                    let mut req = VideoStreamRequest::new(media_path, timeline_fps);
+                    req.max_size = render_box;
+                    let (decoder, frame) = if reversed {
+                        let (windows, first) =
+                            bootstrap_reverse_window(&req, t.source_frame, &self.state.cancel)?;
+                        (
+                            ClipDecoder::Reverse {
+                                windows,
+                                request: req,
+                            },
+                            first.frame,
+                        )
+                    } else {
+                        let request =
+                            bootstrap_frame_request(t.source_frame, timeline_fps, render_box);
+                        let (_, frame) = decode_frame_at_cancellable(&req.path, &request, &self.state.cancel)
+                            .map_err(|error| format!(
+                                "playback bootstrap decode failed for {} at source frame {}: {error}",
+                                t.media_ref, t.source_frame
+                            ))?;
+                        req.start_frame = t.source_frame.max(0).saturating_add(1);
+                        let stream = spawn_video_stream(req).map_err(|error| {
+                            format!(
+                            "playback bootstrap stream failed for {} at source frame {}: {error}",
+                            t.media_ref, t.source_frame
+                        )
+                        })?;
+                        (
+                            ClipDecoder::Forward {
+                                stream,
+                                pending: None,
+                            },
+                            frame,
+                        )
+                    };
                     let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
                     let texture = Rc::new(upload_rgba(
                         self.device,
@@ -620,28 +700,6 @@ impl<'d, 's> StreamingResolver<'d, 's> {
                         false,
                         Some("playback-bootstrap"),
                     ));
-
-                    let mut req = VideoStreamRequest::new(media_path, timeline_fps);
-                    req.timeline_fps = timeline_fps;
-                    req.max_size = render_box;
-                    let decoder = if reversed {
-                        ClipDecoder::Reverse {
-                            windows: ReverseWindows::new(t.source_frame),
-                            request: req,
-                        }
-                    } else {
-                        req.start_frame = t.source_frame.max(0).saturating_add(1);
-                        let stream = spawn_video_stream(req).map_err(|error| {
-                            format!(
-                            "playback bootstrap stream failed for {} at source frame {}: {error}",
-                            t.media_ref, t.source_frame
-                        )
-                        })?;
-                        ClipDecoder::Forward {
-                            stream,
-                            pending: None,
-                        }
-                    };
                     Ok(ClipStream::new(decoder, texture, t.source_frame))
                 },
             )?;
@@ -1460,6 +1518,24 @@ mod tests {
             rx,
             stopped: stopped.clone(),
         }
+    }
+
+    #[test]
+    fn reverse_prefetch_uses_the_full_buffered_window_as_decode_lead() {
+        let stopped = Rc::new(std::cell::Cell::new(0));
+        let mut spawned = Vec::new();
+        let mut windows = ReverseWindows::new(63);
+        for target in [63, 62] {
+            windows
+                .advance(target, 63, |start, end| {
+                    spawned.push((start, end));
+                    Ok(finished_window(start, end, &stopped))
+                })
+                .unwrap();
+        }
+        assert_eq!(spawned, [(47, 63), (31, 47)]);
+        assert!(windows.frames.len() < REVERSE_WINDOW_FRAMES as usize);
+        assert_eq!(stopped.get(), 0);
     }
 
     #[test]
