@@ -114,7 +114,7 @@ fn build_dialog(
         for extension in &filter.extensions {
             native.add_pattern(&format!("*.{extension}"));
         }
-        dialog.add_filter(&native);
+        dialog.add_filter(native);
     }
     Ok(dialog)
 }
