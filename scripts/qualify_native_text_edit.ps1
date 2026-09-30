@@ -128,7 +128,7 @@ function Folder-Dialog {
         )
     )
     [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
-        [System.Windows.Automation.TreeScope]::Children, $condition
+        [System.Windows.Automation.TreeScope]::Descendants, $condition
     )
 }
 
