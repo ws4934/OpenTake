@@ -40,7 +40,8 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync
 # `default-features = false` drops the `download_ffmpeg` feature, whose ureq +
 # rustls + zip/tar/xz2 stack is the crate's only HTTP/TLS dependency and is dead
 # weight for us; the FfmpegCommand command/parse API lives in the always-on core.
-ffmpeg-sidecar = { version = "2", default-features = false }
+# Keep the retained-stdin compatibility patch selected until upstream supports it.
+ffmpeg-sidecar = { version = "=2.5.2", default-features = false }
 
 # Image decode/scale + JPEG sprite encode (image thumbnails, sprite cache,
 # SigLIP squash-resize). Default features pull readers we do not need; keep it lean.
