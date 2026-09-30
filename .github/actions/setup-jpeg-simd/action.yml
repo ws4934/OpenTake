@@ -1,0 +1,13 @@
+name: Set up JPEG SIMD assembler
+description: Make NASM available for the statically bundled x86 JPEG encoder
+runs:
+  using: composite
+  steps:
+    - if: runner.os != 'Windows'
+      shell: bash
+      run: bash "${{ github.action_path }}/../../../scripts/setup_jpeg_simd.sh"
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        pwsh -File "${{ github.action_path }}/../../../scripts/setup_jpeg_simd.ps1"
+        if ($LASTEXITCODE -ne 0) { throw 'JPEG SIMD setup failed' }

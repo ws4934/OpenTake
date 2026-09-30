@@ -298,7 +298,7 @@ SHA_BOUND_JOB_CONTRACTS = (
         before_reassert_name="Re-assert immutable Windows product source before gates",
         after_reassert_name="Re-assert immutable Windows product source after gates",
         first_gate_name="Rust formatting",
-        job_sha256="e660a84d438c1828b7aa534cde2047427c179bcd20ae197fba3c8faa767aa968",
+        job_sha256="3200dec776606d53b4bdcd48e2381461edfa0e814eabbed4e17df77775d4f0bd",
         step_identities=(
             "name:Validate immutable SHA input",
             f"uses:{_pinned_action('actions/checkout')}",
@@ -334,7 +334,7 @@ SHA_BOUND_JOB_CONTRACTS = (
         before_reassert_name="Re-assert immutable Windows security source before gates",
         after_reassert_name="Re-assert immutable Windows security source after gates",
         first_gate_name="Portable FFmpeg cancellation lifecycle",
-        job_sha256="d556b3d8c5d0c895b3e164194f2c6e3c046167938e901f9f287113b8d6ff5a96",
+        job_sha256="20fe3a66f6b2e55c8409a8c2c673094ac3b9d11a638352805038d494d5275b61",
         step_identities=(
             "name:Validate immutable Windows security SHA input",
             f"uses:{_pinned_action('actions/checkout')}",
@@ -359,7 +359,7 @@ SHA_BOUND_JOB_CONTRACTS = (
         before_reassert_name="Re-assert immutable Windows library source before gates",
         after_reassert_name="Re-assert immutable Windows library source after gates",
         first_gate_name="Test retained-handle and junction defenses",
-        job_sha256="1207afe5e7582db13cc0f7ed950d72aa3bc1fc6b890c67039e4b728cc6146264",
+        job_sha256="6fd4af9cdcbbc9fc6fa1d7a059bac652b383a881dd710e1689edd4cd566424ec",
         step_identities=(
             "name:Validate immutable Windows library SHA input",
             f"uses:{_pinned_action('actions/checkout')}",

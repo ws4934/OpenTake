@@ -1,0 +1,72 @@
+name: Preview JPEG qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src-tauri/src/jpeg.rs'
+      - 'crates/opentake-render/src/source.rs'
+      - '.github/workflows/preview-jpeg-qualification.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reference-jpeg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-jpeg-simd
+      - name: Record the reference machine
+        run: |
+          lscpu
+          rustc --version
+      - name: Benchmark the shipped encoder and enforce the 720p budget
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tomllib
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          probe = Path(os.environ['RUNNER_TEMP']) / 'preview-jpeg-probe'
+          (probe / 'src').mkdir(parents=True)
+          packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
+          versions = {p['name']: p['version'] for p in packages}
+          (probe / 'Cargo.toml').write_text(
+              '[package]\nname = "opentake-preview-jpeg-probe"\n'
+              'version = "0.0.0"\nedition = "2021"\n'
+              '[dependencies]\n'
+              f'turbojpeg = {{ version = "={versions["turbojpeg"]}", default-features = false, features = ["cmake", "require-simd"] }}\n'
+              f'image = {{ version = "={versions["image"]}", default-features = false, features = ["png", "jpeg"] }}\n'
+          )
+          # Compile the actual frame and encoder modules, including their
+          # existing benchmark, without unrelated GUI/GPU/inference dependencies.
+          source = json.dumps(str(root / 'crates/opentake-render/src/source.rs'))
+          encoder = json.dumps(str(root / 'src-tauri/src/jpeg.rs'))
+          (probe / 'src/lib.rs').write_text(
+              '#![allow(dead_code)]\nextern crate self as opentake_render;\n'
+              f'#[path = {source}] mod source;\npub use source::DecodedFrame;\n'
+              f'#[path = {encoder}] mod jpeg;\n'
+          )
+          result = subprocess.run([
+              'cargo', 'test', '--manifest-path', str(probe / 'Cargo.toml'),
+              '--release', '--lib', 'jpeg::tests::bench_preview_jpeg_encoders',
+              '--', '--exact', '--ignored', '--nocapture',
+          ], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          print(result.stdout, flush=True)
+          result.check_returncode()
+          timings = re.findall(
+              r'1280x720 (noisy|smooth):.*-> preview encoder ([0-9.]+) ms', result.stdout
+          )
+          if {content for content, _ in timings} != {'noisy', 'smooth'}:
+              raise SystemExit('Both 720p benchmark cases must run')
+          for content, elapsed in timings:
+              if float(elapsed) >= 10:
+                  raise SystemExit(f'720p {content} exceeded the 10 ms budget: {elapsed} ms')

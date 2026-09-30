@@ -162,7 +162,14 @@ APPROVED_SIMPLE_RUNS = {
     ("macos_arm64", "Verify pinned sidecar supply"): "ruby scripts/tests/packaged-sidecars-test.rb --name packaged_macos_windows_sidecars_resolve_and_execute",
     ("macos_arm64", "Install locked Web dependencies"): "pnpm -C web install --frozen-lockfile",
     ("macos_arm64", "Build ad-hoc Tauri app, DMG, and signed updater"): "./web/node_modules/.bin/tauri build --ci --target aarch64-apple-darwin --bundles app,dmg --config '{\"bundle\":{\"createUpdaterArtifacts\":true,\"macOS\":{\"signingIdentity\":\"-\"}}}'",
-    ("windows_x64", "Install Rust toolchain"): "rustup component add rustfmt clippy",
+    ("windows_x64", "Install Rust toolchain"): """rustup component add rustfmt clippy
+if ($LASTEXITCODE -ne 0) { throw 'Rust component installation failed' }
+# Immutable recovery sources before the native codec do not need NASM.
+if (Select-String -Path Cargo.lock -Pattern '^name = "turbojpeg-sys"$' -Quiet) {
+  pwsh -File scripts/setup_jpeg_simd.ps1
+  if ($LASTEXITCODE -ne 0) { throw 'JPEG SIMD setup failed' }
+}
+""",
     ("windows_x64", "Verify pinned sidecar supply"): "ruby scripts/tests/packaged-sidecars-test.rb --name packaged_macos_windows_sidecars_resolve_and_execute",
     ("windows_x64", "Install locked Web dependencies"): "pnpm -C web install --frozen-lockfile",
     ("windows_x64", "Rust workspace clippy"): "cargo clippy --workspace --all-targets -- -D warnings",
@@ -179,7 +186,7 @@ APPROVED_COMPLEX_RUN_SHA256 = {
     ("validate", "Reassert exact source after validation"): "953657d26d2eda8490c18e7030c66ddb19aba64a5c8b19808da9a853fd1bfdd2",
     ("quality", "Assert exact checked-out SHA"): "ff0b148eecdf8603712586a6c4a05e752df0b36b5c97a366760f6cba10e58ddd",
     ("quality", "Free disk space"): "5848415c4d0e696f46965d62a2e17c8b7a0dd45ae600d28102af0b04108d9bf6",
-    ("quality", "Install system deps (ffmpeg + Tauri/GTK)"): "ee466d2d3fff1c3703d50f9dabe4d21e1cee4b399924d064c6d2714dae34d16b",
+    ("quality", "Install system deps (ffmpeg + Tauri/GTK)"): "68eff260574133e437ed09c9bd44e89b589dcc2b033469d7be25f1365ec05b67",
     ("quality", "Audit Motion Canvas dependencies and licenses"): "a3517fae1a8663e519138196c9f3721d8f4df19ac8f115c49a079c4aaa60c8b3",
     ("quality", "Test and reproduce Motion Canvas runner"): "8bcd55de9b045f9d7be6343163a5422cba0ab545f7844da50ca1a7c8623fe640",
     ("quality", "Validate Windows and release workflow contracts"): "cb9d3625194c0827915a05a79643547477241cabb1032a4c45485e73717d3c34",
@@ -222,9 +229,9 @@ APPROVED_COMPLEX_RUN_SHA256 = {
 
 APPROVED_JOB_SHA256 = {
     "validate": "9dac25c2b76e56677452e781bd5f163c423891646ee5965611d917498cda5fc1",
-    "quality": "5204e0241bbc8c35f2a59d93d6b8d584b3ae7aa5c640a7d5062da168fc2b7f08",
+    "quality": "faafad59a9c47962e970e149fca6be0d7ff80b10593c241a98ca3042153be99e",
     "macos_arm64": "1785d765c96278190c25e312c9e610070619e17b7b2b0d922f0bd234501df525",
-    "windows_x64": "63bd70d85e40a3f1177e9059d4674d7f93d4502181fc378f7706e839af953378",
+    "windows_x64": "d34832e175af5f3fdad4db694a8e186bfbe4757a070bdf1cf8d654b0d5b031ed",
     "publish": "ea3fe6d18a94c0850d3ac7f21c4e23fb8fcf572189f77f659e5b34eab776bd85",
 }
 
@@ -1606,7 +1613,7 @@ def validate_workflow(workflow: str) -> list[str]:
     quality_ok = quality_ok and _has_command(
         system_deps,
         (
-            "sudo", "apt-get", "install", "-y", "ffmpeg", "libwebkit2gtk-4.1-dev",
+            "sudo", "apt-get", "install", "-y", "ffmpeg", "nasm", "libwebkit2gtk-4.1-dev",
             "libgtk-3-dev", "libayatana-appindicator3-dev", "librsvg2-dev",
             "libasound2-dev", "libglib2.0-dev", "libsoup-3.0-dev", "patchelf",
             "pkg-config", "fonts-dejavu-core",

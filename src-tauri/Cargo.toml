@@ -55,8 +55,6 @@ opentake-motion = { workspace = true, features = ["chromium"] }
 # Preview composite frames are returned to the WebView as a base64 PNG data URL;
 # the agent's `inspect_timeline` bridge encodes composited frames as JPEG.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# Preview and playback JPEG frames: SIMD encoder that takes RGBA directly.
-jpeg-encoder = { version = "0.7", features = ["simd"] }
 base64 = "0.22"
 minisign-verify = "=0.2.5"
 same-file = "1.0.6"
@@ -95,6 +93,7 @@ bytes = { version = "1", optional = true }
 # CoreAudio on macOS, ALSA on Linux (CI installs libasound2-dev for the
 # playback-engine job). Off by default with the rest of the feature.
 cpal = { version = "0.15", optional = true }
+turbojpeg = { version = "=1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 
 # macOS trackpad haptics for snap feedback (1:1 with upstream's
 # NSHapticFeedbackManager). objc2-app-kit 0.3 is already in the lockfile via
