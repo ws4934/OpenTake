@@ -210,6 +210,10 @@ try {
     Qualify-Text $script:textarea 'textarea'
     Click-Element (Find-Names @('Add Text', '添加文本'))
     Wait-Until { @(Clip-Elements).Count -eq 1 } 'one added timeline clip'
+    $clip = @(Clip-Elements)[0]
+    Click-Element $clip
+    $clip.SetFocus()
+    Wait-Until { $clip.Current.HasKeyboardFocus } 'timeline clip keyboard focus'
     Send-Keys '^c'
     Click-Element (Find-Names @('Jump to End', '跳到结尾'))
     Send-Keys '^v'
