@@ -94,6 +94,11 @@ export function clipRect(
   };
 }
 
+/** The whole frame currently displayed by the fractional playback clock. */
+export function playheadFrame(activeFrame: number): number {
+  return Math.max(0, Math.trunc(activeFrame));
+}
+
 /** frameAt(x): truncating, clamped at 0 (TimelineGeometry.swift:71-73). */
 export function frameAt(x: number, pixelsPerFrame: number): number {
   return Math.max(0, Math.trunc(x / pixelsPerFrame));

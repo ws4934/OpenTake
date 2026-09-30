@@ -26,6 +26,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { useEditorUiStore } from "../../store/uiStore";
 import * as edit from "../../store/editActions";
 import { snapFrame } from "../../lib/keyframeSnap";
+import { playheadFrame } from "../../lib/geometry";
 import { LAYOUT } from "../../lib/theme";
 import type {
   AnimPair,
@@ -96,7 +97,7 @@ export function KeyframesLaneRow({
   onSnapChange?: (absFrame: number | null) => void;
 }) {
   const activeFrame = useEditorUiStore((s) => s.activeFrame);
-  const editFrame = Math.round(activeFrame);
+  const editFrame = playheadFrame(activeFrame);
   const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
   const pushToast = useEditorUiStore((s) => s.pushToast);
   const track = getTrack(clip, property);

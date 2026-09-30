@@ -11,7 +11,8 @@ import { useEditorUiStore } from "./uiStore";
 import { useProjectStore } from "./projectStore";
 import { refreshMedia } from "./mediaStore";
 import { fitTransformForMedia, trimToPlayheadEdits } from "../lib/clip";
-import type { TrackDropTarget } from "../lib/geometry";
+import { playheadFrame, type TrackDropTarget } from "../lib/geometry";
+export { playheadFrame as playheadEditFrame } from "../lib/geometry";
 import { validRange, type TimelineRange } from "../lib/timelineRange";
 import { planNudge } from "../lib/timelineNudge";
 import { buildInsertPlan, type InsertPlan } from "../lib/timelineInsert";
@@ -560,7 +561,7 @@ export async function freezeClipAtPlayhead(
   clip: Clip,
   durationFrames: number = DEFAULT_FREEZE_FRAMES,
 ) {
-  const playhead = Math.round(useEditorUiStore.getState().activeFrame);
+  const playhead = playheadFrame(useEditorUiStore.getState().activeFrame);
   const inside = playhead > clip.startFrame && playhead < clip.startFrame + clip.durationFrames;
   const atFrame = inside ? playhead : clip.startFrame + Math.floor(clip.durationFrames / 2);
   return freezeFrame(clip.id, atFrame, durationFrames);
@@ -923,7 +924,7 @@ export async function redo() {
  *  clip the playhead doesn't intersect is a no-op in the core. */
 export async function splitAtPlayhead() {
   const ui = useEditorUiStore.getState();
-  const frame = Math.round(ui.activeFrame);
+  const frame = playheadFrame(ui.activeFrame);
   if (ui.selectedClipIds.size === 0) return;
   const ids = clipsUnderPlayhead().map((clip) => clip.id);
   await splitClips(ids, frame);
@@ -933,7 +934,7 @@ export async function splitAtPlayhead() {
  *  edits are selection-driven; an empty selection intentionally yields none. */
 function clipsUnderPlayhead(): Clip[] {
   const ui = useEditorUiStore.getState();
-  const frame = Math.round(ui.activeFrame);
+  const frame = playheadFrame(ui.activeFrame);
   const selected = new Set(ui.selectedClipIds);
   if (selected.size === 0) return [];
   const out: Clip[] = [];
@@ -950,14 +951,14 @@ function clipsUnderPlayhead(): Clip[] {
 /** Trim each target clip's IN point to the playhead (Q / Toolbar `[` — 剪映
  *  "删除播放头左侧"). The right edge stays put; the left part is removed. */
 export async function trimStartToPlayhead() {
-  const frame = Math.round(useEditorUiStore.getState().activeFrame);
+  const frame = playheadFrame(useEditorUiStore.getState().activeFrame);
   await trimClips(trimToPlayheadEdits(clipsUnderPlayhead(), frame, "left"));
 }
 
 /** Trim each target clip's OUT point to the playhead (W / Toolbar `]` — 剪映
  *  "删除播放头右侧"). The left edge stays put; the right part is removed. */
 export async function trimEndToPlayhead() {
-  const frame = Math.round(useEditorUiStore.getState().activeFrame);
+  const frame = playheadFrame(useEditorUiStore.getState().activeFrame);
   await trimClips(trimToPlayheadEdits(clipsUnderPlayhead(), frame, "right"));
 }
 
@@ -1773,11 +1774,6 @@ const DEFAULT_TEXT_STYLE: TextStyle = {
   },
 };
 
-/** Editing uses the nearest whole frame, including during fractional WebKit playback. */
-export function playheadEditFrame(activeFrame: number): number {
-  return Math.max(0, Math.round(activeFrame));
-}
-
 /** Add a text clip at the playhead on a fresh top track. Selects the new clip
  *  afterwards so the Inspector opens its Text tab. Used by the Toolbar "T"
  *  button.
@@ -1790,7 +1786,7 @@ export function playheadEditFrame(activeFrame: number): number {
  *  would clear to make room for the new text clip (#194). */
 export async function addTextClip() {
   const ui = useEditorUiStore.getState();
-  const startFrame = playheadEditFrame(ui.activeFrame);
+  const startFrame = playheadFrame(ui.activeFrame);
   const timeline = currentTimeline();
 
   const durationFrames = durationSecondsToFrames(DEFAULT_TEXT_SECONDS, timeline.fps);
@@ -1900,7 +1896,7 @@ export async function pasteClipsAtPlayhead() {
   if (!cb.hasContent || cb.entries.length === 0) return;
   const ui = useEditorUiStore.getState();
   const tl = currentTimeline();
-  const offset = playheadEditFrame(ui.activeFrame) - cb.sourceFirstFrame;
+  const offset = playheadFrame(ui.activeFrame) - cb.sourceFirstFrame;
   const entries: PasteClipEntryReq[] = [];
   for (const e of cb.entries) {
     if (e.sourceTrackIndex >= tl.tracks.length) continue;

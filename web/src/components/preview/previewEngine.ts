@@ -375,7 +375,7 @@ export function settlePausedPlayheadFrame(
   frozenFrame: number | null,
 ): number {
   const authoritative = Number.isFinite(activeFrame)
-    ? Math.max(0, Math.floor(activeFrame))
+    ? playbackFrameFromActiveFrame(activeFrame)
     : 0;
   if (frozenFrame === null || !Number.isFinite(frozenFrame)) return authoritative;
   return Math.max(authoritative, Math.max(0, Math.floor(frozenFrame)));
@@ -562,7 +562,7 @@ export function useTimelinePlaybackEngine(): void {
         nativeIdentity.projectEpoch === project.projectEpoch &&
         nativeIdentity.timelineVersion === project.timelineVersion;
       if (prev.isPlaying && !nativeDrovePreviousPlay) {
-        const visual = activeVideoForPausedSnap(tl, Math.max(0, Math.floor(activeFrame)));
+        const visual = activeVideoForPausedSnap(tl, playbackFrameFromActiveFrame(activeFrame));
         const el = visual ? previewElements.get(previewElementKey(visual)) : null;
         const frozenFrame = pausedPlayheadFrameFromFrozenVideo(
           visual,
@@ -570,7 +570,7 @@ export function useTimelinePlaybackEngine(): void {
           fps,
         );
         const pausedFrame = settlePausedPlayheadFrame(activeFrame, frozenFrame);
-        if (pausedFrame !== Math.max(0, Math.floor(activeFrame))) {
+        if (pausedFrame !== playbackFrameFromActiveFrame(activeFrame)) {
           useEditorUiStore.getState().setActiveFrame(pausedFrame);
         }
       } else if (
@@ -586,7 +586,7 @@ export function useTimelinePlaybackEngine(): void {
           wasScrubbing: prev.isScrubbing,
         })
       ) {
-        syncPausedTo(tl, Math.max(0, Math.floor(activeFrame)), fps);
+        syncPausedTo(tl, playbackFrameFromActiveFrame(activeFrame), fps);
       }
     }
     previousTransportState.current = { isPlaying, isScrubbing };
@@ -628,7 +628,7 @@ export function useTimelinePlaybackEngine(): void {
         ui.setActiveFrame(current.frame);
       });
 
-      const startFrame = Math.max(0, Math.floor(useEditorUiStore.getState().activeFrame));
+      const startFrame = playbackFrameFromActiveFrame(useEditorUiStore.getState().activeFrame);
       const listenerReady = nativeFrameListenerLeaseRef.current?.ensureReady();
       if (!listenerReady) {
         disposed = true;
@@ -686,7 +686,7 @@ export function useTimelinePlaybackEngine(): void {
         void nativePlaybackController.cleanup(
           current,
           action,
-          Math.max(0, Math.floor(ui.activeFrame)),
+          playbackFrameFromActiveFrame(ui.activeFrame),
         );
       };
     }
@@ -759,7 +759,7 @@ export function useTimelinePlaybackEngine(): void {
       // SCRUB takes priority over play: live-seek to the scrub frame and never
       // advance the playhead (the user owns it during a drag).
       if (ui.isScrubbing) {
-        scrubTo(tl, Math.max(0, Math.floor(ui.activeFrame)), fps);
+        scrubTo(tl, playbackFrameFromActiveFrame(ui.activeFrame), fps);
         lastTs = null;
         lastSet = null;
         raf = requestAnimationFrame(tick);
@@ -851,7 +851,7 @@ export function useTimelinePlaybackEngine(): void {
           lastEngineFrame: lastEngineFrameRef.current,
         })
       ) {
-        lastEngineFrameRef.current = Math.max(0, Math.floor(activeFrame));
+        lastEngineFrameRef.current = playbackFrameFromActiveFrame(activeFrame);
         void nativePlaybackController.seek(identity, activeFrame);
       }
     };
