@@ -2324,6 +2324,9 @@ fn capture_freeze_frame_workflow(
     std::fs::create_dir_all(&captures_dir).map_err(|e| format!("create captures dir: {e}"))?;
     let png_path = freeze_capture_png_path(&captures_dir, clip_id, at_frame);
     let bytes = encode_png_bytes(&composite)?;
+    if cancel.is_cancelled() {
+        return Err("freeze-frame capture cancelled by a project transition".into());
+    }
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2338,7 +2341,13 @@ fn capture_freeze_frame_workflow(
         .and_then(|()| output.sync_all())
         .map_err(|e| format!("write freeze png: {e}"))?;
     drop(output);
-    let probe = crate::media::probe_media(engine, &png_path);
+    // This PNG was just encoded from our own readback. Its metadata is known;
+    // another ffprobe would add an uncancellable subprocess to preparation.
+    let probe = opentake_core::ProbedMedia {
+        width: Some(i32::try_from(composite.width).map_err(|error| error.to_string())?),
+        height: Some(i32::try_from(composite.height).map_err(|error| error.to_string())?),
+        ..Default::default()
+    };
     let name = png_path
         .file_stem()
         .map(|value| value.to_string_lossy().into_owned())
