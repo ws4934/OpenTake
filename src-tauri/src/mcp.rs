@@ -813,7 +813,8 @@ impl TauriMotionDocumentOperation {
         if let Some(notify) = &self.notify {
             notify(&MotionDocumentChange {
                 project_epoch: self.authority.project_epoch,
-                project_path: self.authority.project_path.to_string_lossy().into_owned(),
+                project_path: opentake_domain::NativePath::new(&self.authority.project_path)
+                    .to_wire(),
                 summary: MotionDocumentChangeSummary {
                     id: document.summary.document_id.clone(),
                     title: document.summary.title.clone(),
@@ -1969,7 +1970,7 @@ impl TauriMediaBridge {
             .project_dir
             .clone()
             .ok_or_else(|| BridgeError::new("No project is open; cannot import source.path"))?;
-        let file_url = PathBuf::from(path);
+        let file_url = opentake_domain::native_path::decode(path).map_err(BridgeError::new)?;
         let meta = std::fs::symlink_metadata(&file_url).map_err(|_| {
             BridgeError::new(
                 "MCP_SOURCE_PATH_UNREADABLE: source.path does not exist or is not readable",
@@ -3287,7 +3288,12 @@ fn project_media(
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
     for entry in &manifest.entries {
         let path = match &entry.source {
-            MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+            MediaSource::External { absolute_path } => {
+                let Some(path) = absolute_path.as_path() else {
+                    continue;
+                };
+                path.to_path_buf()
+            }
             MediaSource::Project { relative_path } => match project_dir {
                 Some(base) => base.join(relative_path),
                 None => continue,
@@ -5598,7 +5604,7 @@ mod tests {
             name: id.into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: path.to_string_lossy().into_owned(),
+                absolute_path: path.into(),
             },
             duration: 2.0,
             generation_input: None,

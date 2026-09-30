@@ -1,3 +1,4 @@
+import { joinNativePath, nativePathName, replaceNativePathSuffix } from "../../lib/nativePath";
 /**
  * ExportDialog (SPEC §2.4 / #112). Modal shown from the title bar to render the
  * whole timeline to a real video file via the `export_video` backend command
@@ -65,14 +66,14 @@ export function withMp4Ext(path: string): string {
 }
 
 /**
- * Default export filename: the open project's base name with the codec's
+ * Default export display label: the open project's base name with the codec's
  * container extension, falling back to "Timeline.<ext>" for an unsaved
  * project. The bundle path ends in `…/Name.opentake`, so strip the directory
  * and the `.opentake` suffix.
  */
 export function defaultExportName(projectPath: string | null, ext: string): string {
   if (!projectPath) return `Timeline.${ext}`;
-  const base = projectPath.split(/[\\/]/).pop() ?? projectPath;
+  const base = nativePathName(projectPath);
   const stem = base.replace(/\.opentake$/i, "");
   return `${stem || "Timeline"}.${ext}`;
 }
@@ -266,13 +267,10 @@ export function ExportDialog() {
     }
     const ext = extForCodec(codec);
     const projectPath = useProjectStore.getState().projectPath;
-    const dir = projectPath
-      ? projectPath.replace(/[\\/][^\\/]*$/, "")
-      : await api.getDefaultProjectDir().catch(() => "");
-    const sep = dir && !dir.endsWith("/") ? "/" : "";
-    const defaultPath = dir
-      ? `${dir}${sep}${defaultExportName(projectPath, ext)}`
-      : undefined;
+    const dir = projectPath ? "" : await api.getDefaultProjectDir().catch(() => "");
+    const defaultPath = projectPath
+      ? replaceNativePathSuffix(projectPath, ".opentake", `.${ext}`)
+      : dir ? joinNativePath(dir, `Timeline.${ext}`) : undefined;
 
     let chosen: string | null;
     try {

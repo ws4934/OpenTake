@@ -313,7 +313,7 @@ fn build_manifest_with_audio(
         name: "test.mp4".into(),
         kind: ClipType::Video,
         source: MediaSource::External {
-            absolute_path: media_path.to_string_lossy().into_owned(),
+            absolute_path: media_path.into(),
         },
         duration: 1.0,
         generation_input: None,
@@ -378,7 +378,7 @@ fn export_rejects_missing_image_overlay_before_creating_output() {
     image_entry.name = "removed.png".into();
     image_entry.kind = ClipType::Image;
     image_entry.source = MediaSource::External {
-        absolute_path: missing_image.to_string_lossy().into_owned(),
+        absolute_path: missing_image.clone().into(),
     };
     manifest.entries.push(image_entry);
     assert_preflight_rejects_source(&timeline, &manifest, &dir.path().join("out.mp4"), "image-2");

@@ -1,3 +1,4 @@
+import { nativePathName } from "../lib/nativePath";
 /**
  * 全局素材库 store(#56)。与 `mediaStore`(项目内媒体)彼此独立:这里持有的是
  * 跨项目的全局收藏库镜像,真值在 Rust(#54 存储 + #55 命令)。store 只保存条目列表 +
@@ -330,7 +331,7 @@ export function selectEntries(
 /** 从 source 绝对路径取文件名(用于显示/搜索);缺省返回空串。 */
 export function sourceName(source: string | undefined): string {
   if (!source) return "";
-  const base = source.split(/[\\/]/).pop();
+  const base = nativePathName(source);
   return base ?? source;
 }
 

@@ -66,7 +66,7 @@ fn agent_undo_scope(key: &SessionKey) -> String {
     format!(
         "opentake:chat:{}:{}:{}",
         key.project_epoch,
-        key.project_dir.to_string_lossy(),
+        opentake_domain::NativePath::new(&key.project_dir).to_wire(),
         key.session_id
     )
 }
@@ -359,7 +359,17 @@ impl ChatState {
                     project_epoch,
                 } => (
                     *project_epoch,
-                    (!path.is_empty()).then(|| PathBuf::from(path)),
+                    if path.is_empty() {
+                        None
+                    } else {
+                        match opentake_domain::native_path::decode(path) {
+                            Ok(path) => Some(path),
+                            Err(error) => {
+                                eprintln!("[chat] invalid project event path: {error}");
+                                return;
+                            }
+                        }
+                    },
                 ),
                 _ => return,
             };
@@ -422,7 +432,10 @@ impl ChatState {
     ) -> Result<ChatProjectContext, String> {
         let project = self.project_context()?;
         if project.project_epoch != expected_project_epoch
-            || project.project_dir.as_path() != std::path::Path::new(expected_project_path)
+            || project.project_dir.as_path()
+                != opentake_domain::native_path::decode(expected_project_path)
+                    .map_err(str::to_owned)?
+                    .as_path()
         {
             return Err("stale Agent chat project identity".to_string());
         }
@@ -839,7 +852,8 @@ impl EmitLoop for AppEmitter {
                     "chat_delta",
                     BlockDeltaPayload {
                         project_epoch: self.project.project_epoch,
-                        project_path: self.project.project_dir.to_string_lossy().into_owned(),
+                        project_path: opentake_domain::NativePath::new(&self.project.project_dir)
+                            .to_wire(),
                         session_id,
                         message_id,
                         sequence,
@@ -862,7 +876,8 @@ impl EmitLoop for AppEmitter {
                     "chat_tool_call",
                     BlockUpsertPayload {
                         project_epoch: self.project.project_epoch,
-                        project_path: self.project.project_dir.to_string_lossy().into_owned(),
+                        project_path: opentake_domain::NativePath::new(&self.project.project_dir)
+                            .to_wire(),
                         session_id,
                         message_id,
                         sequence,
@@ -903,7 +918,8 @@ impl EmitLoop for AppEmitter {
                     "chat_done",
                     DonePayload {
                         project_epoch: self.project.project_epoch,
-                        project_path: self.project.project_dir.to_string_lossy().into_owned(),
+                        project_path: opentake_domain::NativePath::new(&self.project.project_dir)
+                            .to_wire(),
                         session_id,
                         message_id,
                         sequence,
@@ -1433,7 +1449,8 @@ pub fn chat_cancel(
 ) -> Result<(), String> {
     state.cancel_turn(&SessionKey {
         project_epoch: expected_project_epoch,
-        project_dir: PathBuf::from(expected_project_path),
+        project_dir: opentake_domain::native_path::decode(&expected_project_path)
+            .map_err(str::to_owned)?,
         session_id,
     })
 }

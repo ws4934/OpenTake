@@ -45,7 +45,7 @@ pub enum GenerationJobStatus {
 #[serde(rename_all = "camelCase")]
 pub enum MediaSource {
     #[serde(rename_all = "camelCase")]
-    External { absolute_path: String },
+    External { absolute_path: crate::NativePath },
     #[serde(rename_all = "camelCase")]
     Project { relative_path: String },
 }
@@ -547,7 +547,9 @@ impl<'a> MediaResolver<'a> {
     pub fn expected_path(&self, asset_id: &str) -> Option<PathBuf> {
         let entry = self.entry(asset_id)?;
         match &entry.source {
-            MediaSource::External { absolute_path } => Some(PathBuf::from(absolute_path)),
+            MediaSource::External { absolute_path } => {
+                absolute_path.as_path().map(Path::to_path_buf)
+            }
             MediaSource::Project { relative_path } => {
                 self.project_base.map(|base| base.join(relative_path))
             }
@@ -575,6 +577,7 @@ pub enum GenerationStatus {
 #[serde(rename_all = "camelCase")]
 pub struct MediaAsset {
     pub id: String,
+    #[serde(with = "crate::native_path::path")]
     pub url: PathBuf,
     #[serde(rename = "type")]
     pub kind: ClipType,
@@ -599,7 +602,11 @@ pub struct MediaAsset {
     pub generation_status: GenerationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::native_path::optional_path"
+    )]
     pub pending_download_url: Option<PathBuf>,
     #[serde(
         rename = "cachedRemoteURL",
@@ -736,7 +743,7 @@ impl MediaAsset {
             .and_then(portable_bundle_relative_path)
             .map_or_else(
                 || MediaSource::External {
-                    absolute_path: self.url.to_string_lossy().into_owned(),
+                    absolute_path: self.url.clone().into(),
                 },
                 |relative_path| MediaSource::Project { relative_path },
             );
@@ -787,7 +794,7 @@ mod tests {
     #[test]
     fn media_source_external_wire_format() {
         let s = MediaSource::External {
-            absolute_path: "/abs/x.mp4".to_string(),
+            absolute_path: "/abs/x.mp4".into(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, r#"{"external":{"absolutePath":"/abs/x.mp4"}}"#);
@@ -1234,7 +1241,7 @@ mod tests {
             assert_eq!(
                 e.source,
                 MediaSource::External {
-                    absolute_path: url.to_string_lossy().into_owned()
+                    absolute_path: url.clone().into()
                 },
                 "{name}"
             );
@@ -1248,7 +1255,10 @@ mod tests {
 
         let url =
             Path::new("/proj.opentake/media").join(std::ffi::OsStr::from_bytes(b"clip\xff.png"));
-        let a = MediaAsset::new("a", url, ClipType::Image, "clip", 0.0);
+        let a = MediaAsset::new("a", &url, ClipType::Image, "clip", 0.0);
+        let runtime_json = serde_json::to_string(&a).unwrap();
+        let restored_runtime: MediaAsset = serde_json::from_str(&runtime_json).unwrap();
+        assert_eq!(restored_runtime.url, url);
 
         let e = a.to_manifest_entry(Some(Path::new("/proj.opentake")), 0.0);
 
@@ -1257,6 +1267,12 @@ mod tests {
             "{:?}",
             e.source
         );
+        let json = serde_json::to_string(&e).unwrap();
+        let restored: MediaManifestEntry = serde_json::from_str(&json).unwrap();
+        let MediaSource::External { absolute_path } = restored.source else {
+            panic!("an unportable name must stay external");
+        };
+        assert_eq!(absolute_path.into_path_buf().unwrap(), url);
     }
 
     #[test]

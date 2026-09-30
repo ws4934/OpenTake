@@ -43,6 +43,7 @@ mod media_pressure;
 mod media_tools;
 pub mod motion;
 mod motion_documents;
+mod native_read_scope;
 mod public_net;
 // Public for the same reason as `export`: integration acceptance drives the
 // standalone compositing path against a generated project snapshot.
@@ -156,6 +157,18 @@ pub fn run() {
                 }
             }
             app.manage(close_coordinator::CloseCoordinator::default());
+            app.manage(
+                native_read_scope::NativeReadScope::load(
+                    app.path().app_data_dir()?.join("native-read-grants.json"),
+                )
+                .map_err(std::io::Error::other)?,
+            );
+            for root in safe_asset_protocol::application_owned_asset_roots(app.handle()) {
+                if root.to_str().is_none() {
+                    native_read_scope::allow_directory(app.handle(), &root, true)
+                        .map_err(std::io::Error::other)?;
+                }
+            }
             // Keep a Dock icon + normal app behavior while the window is hidden,
             // so the user can reopen from the Dock (upstream: NSApp .regular).
             #[cfg(target_os = "macos")]
@@ -422,6 +435,7 @@ pub fn run() {
             commands::project_save,
             commands::get_default_project_dir,
             dialog_output::pick_save_path,
+            dialog_output::pick_open_paths,
             commands::export_xmeml,
             commands::export_fcpxml,
             commands::export_fcpxml_modern,

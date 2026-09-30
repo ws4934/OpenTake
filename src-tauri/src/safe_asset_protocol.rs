@@ -10,6 +10,7 @@
 //! authorizes that identity before any byte is read, and only bounded bodies
 //! are served.
 
+use opentake_domain::NativePath;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -56,8 +57,8 @@ const MAX_FULL_IMAGE_BODY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_DEADLINE: Duration = Duration::from_secs(1);
-const MAX_HELPER_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_HELPER_METADATA_BYTES: usize = 64 * 1024;
+const MAX_HELPER_REQUEST_BYTES: usize = 256 * 1024;
+const MAX_HELPER_METADATA_BYTES: usize = 256 * 1024;
 const MAX_HELPER_BODY_BYTES: usize = MAX_FULL_IMAGE_BODY_BYTES as usize;
 const HELPER_ARG: &str = "--opentake-internal-safe-asset-helper-v1";
 const HELPER_TOKEN_ENV: &str = "OPENTAKE_INTERNAL_ASSET_TOKEN";
@@ -234,18 +235,11 @@ async fn response_for_request<R: Runtime>(
     } else {
         None
     };
-    let Some(path_text) = path.to_str() else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "local asset path is not UTF-8",
-            None,
-        );
-    };
     let token = pool::random_token();
     let helper_request = HelperRequest {
         token: token.clone(),
         parent_pid: std::process::id(),
-        path: path_text.to_owned(),
+        path: NativePath::from(path).to_wire(),
         head_only: request.method() == Method::HEAD,
         range: request
             .headers()
@@ -259,7 +253,7 @@ async fn response_for_request<R: Runtime>(
             .map(str::to_owned),
         project: project_authority
             .as_ref()
-            .and_then(HelperProjectAuthority::from_core),
+            .map(HelperProjectAuthority::from_core),
     };
     let outcome = pool
         .exchange(&helper_request, |opened| {
@@ -333,41 +327,29 @@ fn opentake_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .skip(1)
         .find(|ancestor| {
-            ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    #[cfg(target_os = "windows")]
-                    {
-                        name.to_ascii_lowercase().ends_with(".opentake")
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        name.ends_with(".opentake")
-                    }
-                })
+            ancestor.file_name().is_some_and(|name| {
+                #[cfg(windows)]
+                {
+                    name.as_encoded_bytes()
+                        .to_ascii_lowercase()
+                        .ends_with(b".opentake")
+                }
+                #[cfg(not(windows))]
+                {
+                    name.as_encoded_bytes().ends_with(b".opentake")
+                }
+            })
         })
         .map(normalized_path)
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    if let Some(path) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) {
-        return PathBuf::from(path).components().collect();
-    }
-    path.components().collect()
+    opentake_domain::native_path::normalize(path)
 }
 
-#[cfg(target_os = "windows")]
 fn paths_equal_for_authority(left: &Path, right: &Path) -> bool {
-    normalized_path(left)
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&normalized_path(right).to_string_lossy())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn paths_equal_for_authority(left: &Path, right: &Path) -> bool {
-    normalized_path(left) == normalized_path(right)
+    opentake_domain::native_path::identity_key(left)
+        == opentake_domain::native_path::identity_key(right)
 }
 
 fn relative_to_authority(path: &Path, root: &Path) -> Option<PathBuf> {
@@ -385,10 +367,10 @@ fn relative_to_authority(path: &Path, root: &Path) -> Option<PathBuf> {
             .all(|(path_component, root_component)| {
                 #[cfg(target_os = "windows")]
                 {
-                    path_component
-                        .as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
+                    paths_equal_for_authority(
+                        Path::new(path_component.as_os_str()),
+                        Path::new(root_component.as_os_str()),
+                    )
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -485,20 +467,10 @@ fn non_project_final_path_is_authorized<R: Runtime>(
     }
 }
 
-#[cfg(target_os = "windows")]
-type AuthorityKey = String;
-#[cfg(not(target_os = "windows"))]
 type AuthorityKey = PathBuf;
 
-/// Hash key with the equality of [`paths_equal_for_authority`].
-#[cfg(target_os = "windows")]
 fn authority_key(path: &Path) -> AuthorityKey {
-    normalized_path(path).to_string_lossy().to_ascii_lowercase()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn authority_key(path: &Path) -> AuthorityKey {
-    normalized_path(path)
+    opentake_domain::native_path::identity_key(path)
 }
 
 /// External media paths of one manifest revision, keyed for O(1) lookups.
@@ -542,7 +514,7 @@ fn external_media_index(core: &AppCore) -> Arc<ExternalMediaIndex> {
     index
 }
 
-fn application_owned_asset_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+pub(crate) fn application_owned_asset_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
     let resolver = app.path();
     let mut roots = Vec::with_capacity(3);
     if let Ok(path) = resolver.app_cache_dir() {
@@ -568,10 +540,16 @@ fn decode_request_path(uri_path: &str) -> Result<PathBuf, &'static str> {
     let decoded = percent_decode(encoded.as_bytes())
         .decode_utf8()
         .map_err(|_| "local asset path is not valid UTF-8")?;
-    if decoded.is_empty() || decoded.len() > MAX_PATH_BYTES || decoded.as_bytes().contains(&0) {
+    if decoded.is_empty()
+        || decoded.len() > MAX_PATH_BYTES * 4 + 64
+        || decoded.as_bytes().contains(&0)
+    {
         return Err("local asset path length is invalid");
     }
-    let path = PathBuf::from(decoded.as_ref());
+    let path = NativePath::from_wire(decoded.as_ref())?.into_path_buf()?;
+    if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
+        return Err("local asset path length is invalid");
+    }
     if !path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -834,6 +812,7 @@ pub(crate) fn validate_resident_home_thumbnail(thumbnail: &Path) -> std::io::Res
     Ok(final_path)
 }
 
+#[cfg(test)]
 pub(crate) fn scope_allows_lexical_path(scope: &Scope, path: &Path) -> bool {
     let normalized: PathBuf = path.components().collect();
     let options = scope_match_options();

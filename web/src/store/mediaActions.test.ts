@@ -212,6 +212,7 @@ describe("mediaActions import warmup", () => {
     expect(srv.open).toHaveBeenCalledWith({
       directory: true,
       multiple: false,
+      recursive: true,
       defaultPath: "/tmp/default-imports",
     });
     expect(srv.open.mock.calls[0]?.[0]).not.toHaveProperty("filters");

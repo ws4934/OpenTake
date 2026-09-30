@@ -22,7 +22,7 @@ use crate::layout;
 /// join the original string onto a base directory.
 pub(crate) fn offline_source() -> MediaSource {
     MediaSource::External {
-        absolute_path: String::new(),
+        absolute_path: Default::default(),
     }
 }
 

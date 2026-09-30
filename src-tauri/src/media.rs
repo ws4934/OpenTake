@@ -44,7 +44,7 @@ use opentake_core::{
 };
 use opentake_domain::{
     AudioDenoise, Clip, ClipType, DenoiseMode, GenerationInput, GenerationJobStatus,
-    LoudnessNormalization, MediaManifest, MediaManifestEntry, MediaProxy, MediaSource,
+    LoudnessNormalization, MediaManifest, MediaManifestEntry, MediaProxy, MediaSource, NativePath,
     StabilizationTrack, Timeline,
 };
 use opentake_media::library::{FavoriteRequest, LibraryStore, PreparedFavorite};
@@ -534,9 +534,12 @@ impl MediaItemDto {
         favorite: bool,
     ) -> Self {
         let resolved = resolve_source_path(entry, project_dir);
-        let path = resolved
-            .as_deref()
-            .map(|path| path.to_string_lossy().into_owned());
+        let path = match &entry.source {
+            MediaSource::External { absolute_path } => Some(absolute_path.to_wire()),
+            MediaSource::Project { .. } => resolved
+                .as_deref()
+                .map(|path| NativePath::new(path).to_wire()),
+        };
         let source_metadata = resolved.as_deref().and_then(|path| {
             std::fs::symlink_metadata(path).ok().filter(|metadata| {
                 crate::fs_availability::is_materialized_regular_file_metadata(path, metadata)
@@ -571,11 +574,13 @@ impl MediaItemDto {
         // cloud-only placeholder. Pending generation placeholders intentionally
         // have no file yet and are not "offline".
         // An unresolvable (e.g. remote-only) source is not flagged missing.
+        let foreign_source = matches!(&entry.source, MediaSource::External { absolute_path } if absolute_path.as_path().is_none());
         let missing = !generation_pending
-            && resolved
-                .as_ref()
-                .map(|_| source_metadata.is_none())
-                .unwrap_or(false);
+            && (foreign_source
+                || resolved
+                    .as_ref()
+                    .map(|_| source_metadata.is_none())
+                    .unwrap_or(false));
         let thumbnail = if missing {
             None
         } else {
@@ -604,7 +609,7 @@ impl MediaItemDto {
             path,
             proxy_path: resolved_proxy
                 .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+                .map(|path| NativePath::new(path).to_wire()),
             proxy_width: entry.proxy.as_ref().map(|proxy| proxy.width),
             proxy_height: entry.proxy.as_ref().map(|proxy| proxy.height),
             thumbnail,
@@ -624,7 +629,7 @@ impl MediaItemDto {
 /// external assets are absolute; project-relative assets join the bundle base.
 fn resolve_source_path(entry: &MediaManifestEntry, project_dir: Option<&Path>) -> Option<PathBuf> {
     match &entry.source {
-        MediaSource::External { absolute_path } => Some(PathBuf::from(absolute_path)),
+        MediaSource::External { absolute_path } => absolute_path.as_path().map(Path::to_path_buf),
         MediaSource::Project { relative_path } => project_dir.map(|base| base.join(relative_path)),
     }
 }
@@ -634,7 +639,10 @@ fn source_path_for_entry(
     project_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     match &entry.source {
-        MediaSource::External { absolute_path } => Ok(PathBuf::from(absolute_path)),
+        MediaSource::External { absolute_path } => absolute_path
+            .local_path()
+            .map(Path::to_path_buf)
+            .map_err(str::to_owned),
         MediaSource::Project { relative_path } => project_dir
             .map(|base| base.join(relative_path))
             .ok_or_else(|| "project not saved; cannot resolve media path".into()),
@@ -956,7 +964,7 @@ fn cached_thumbnail_path_for_entry(
         .flatten()?
         .into_dimensions()
         .ok()?;
-    Some(poster_path.to_string_lossy().into_owned())
+    Some(NativePath::new(&poster_path).to_wire())
 }
 
 fn poster_target_time(time_secs: Option<f64>) -> f64 {
@@ -1073,10 +1081,8 @@ fn thumbnail_dto_for_sprite(
     ThumbnailDto {
         media_ref: entry.id.clone(),
         kind: entry.kind,
-        thumbnail_path: poster
-            .is_file()
-            .then(|| poster.to_string_lossy().into_owned()),
-        sprite_path: Some(sprite_path.to_string_lossy().into_owned()),
+        thumbnail_path: poster.is_file().then(|| NativePath::new(poster).to_wire()),
+        sprite_path: Some(NativePath::new(sprite_path).to_wire()),
         tile_width: Some(meta.tile_width),
         tile_height: Some(meta.tile_height),
         columns: Some(meta.columns),
@@ -1184,9 +1190,9 @@ fn generate_thumbnail_for_entry(
             Ok(ThumbnailDto {
                 media_ref: entry.id.clone(),
                 kind: entry.kind,
-                thumbnail_path: Some(poster_path.to_string_lossy().into_owned()),
+                thumbnail_path: Some(NativePath::new(&poster_path).to_wire()),
                 sprite_path: if include_sprite && sprite_path.is_file() {
-                    Some(sprite_path.to_string_lossy().into_owned())
+                    Some(NativePath::new(&sprite_path).to_wire())
                 } else {
                     None
                 },
@@ -1223,7 +1229,7 @@ fn generate_thumbnail_for_entry(
             Ok(ThumbnailDto {
                 media_ref: entry.id.clone(),
                 kind: entry.kind,
-                thumbnail_path: Some(poster_path.to_string_lossy().into_owned()),
+                thumbnail_path: Some(NativePath::new(&poster_path).to_wire()),
                 sprite_path: None,
                 tile_width,
                 tile_height,
@@ -1283,9 +1289,9 @@ fn cached_thumbnail_for_entry(
             Some(Ok(ThumbnailDto {
                 media_ref: entry.id.clone(),
                 kind: entry.kind,
-                thumbnail_path: Some(poster_path.to_string_lossy().into_owned()),
+                thumbnail_path: Some(NativePath::new(&poster_path).to_wire()),
                 sprite_path: if include_sprite && sprite_path.is_file() {
-                    Some(sprite_path.to_string_lossy().into_owned())
+                    Some(NativePath::new(&sprite_path).to_wire())
                 } else {
                     None
                 },
@@ -1313,7 +1319,7 @@ fn cached_thumbnail_for_entry(
             Some(Ok(ThumbnailDto {
                 media_ref: entry.id.clone(),
                 kind: entry.kind,
-                thumbnail_path: Some(poster_path.to_string_lossy().into_owned()),
+                thumbnail_path: Some(NativePath::new(&poster_path).to_wire()),
                 sprite_path: None,
                 tile_width,
                 tile_height,
@@ -1451,7 +1457,11 @@ impl SavedMediaMetadata {
 pub(crate) fn display_name(path: &Path) -> String {
     path.file_stem()
         .or_else(|| path.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|name| {
+            name.to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{name:?}"))
+        })
         .unwrap_or_default()
 }
 
@@ -1459,7 +1469,11 @@ pub(crate) fn display_name(path: &Path) -> String {
 /// sees in a picker (mirrors upstream `url.lastPathComponent` in the toast).
 fn display_file_name(path: &Path) -> String {
     path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|name| {
+            name.to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{name:?}"))
+        })
         .unwrap_or_default()
 }
 
@@ -1788,7 +1802,10 @@ fn import_folder_impl_with_verify_hook(
     let project_dir = core
         .project_dir()
         .ok_or_else(|| "no project open".to_string())?;
-    let root = PathBuf::from(&path);
+    let root = NativePath::from_wire(&path)
+        .map_err(str::to_owned)?
+        .into_path_buf()
+        .map_err(str::to_owned)?;
     let recursive = recursive.unwrap_or(false);
     let mut planning_checkpoint = |_| {};
     let prepared = prepare_directory_import(
@@ -2662,16 +2679,14 @@ fn is_single_normal_component(name: &OsStr) -> bool {
 }
 
 fn is_hidden_name(name: &OsStr) -> bool {
-    name.to_str()
-        .map(|name| name.starts_with('.'))
-        .unwrap_or(false)
+    name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 fn directory_entry_name_cmp(left: &OsStr, right: &OsStr) -> std::cmp::Ordering {
     left.to_string_lossy()
         .to_lowercase()
         .cmp(&right.to_string_lossy().to_lowercase())
-        .then_with(|| left.to_string_lossy().cmp(&right.to_string_lossy()))
+        .then_with(|| left.cmp(right))
 }
 
 /// Admit posters using one post-commit snapshot. A full queue reports Busy to
@@ -2732,10 +2747,12 @@ fn schedule_committed_posters_with_snapshot(
 
 /// Directory display name (its last path component), falling back to "folder".
 fn dir_name(dir: &Path) -> String {
-    dir.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "folder".to_string())
+    let name = display_file_name(dir);
+    if name.is_empty() {
+        "folder".into()
+    } else {
+        name
+    }
 }
 
 /// One directory's visible media files + subdirectories (each sorted by
@@ -2871,7 +2888,10 @@ fn prepare_explicit_import_batch(
     let mut sources = Vec::new();
     let mut skipped = Vec::new();
     for path_text in paths {
-        let requested_path = PathBuf::from(path_text);
+        let requested_path = NativePath::from_wire(path_text)
+            .map_err(str::to_owned)?
+            .into_path_buf()
+            .map_err(str::to_owned)?;
         let Ok(source) = RetainedExplicitImportSource::open(&requested_path) else {
             skipped.push(display_file_name(&requested_path));
             continue;
@@ -3071,7 +3091,7 @@ pub async fn toggle_favorite(
             &asset_id,
             favorite,
             expected_project_epoch,
-            Path::new(&expected_project_path),
+            &opentake_domain::native_path::decode(&expected_project_path).map_err(str::to_owned)?,
         )
     })
     .await
@@ -3314,7 +3334,7 @@ pub async fn sync_project_favorites(
             library.store()?,
             legacy_asset_ids,
             expected_project_epoch,
-            Path::new(&expected_project_path),
+            &opentake_domain::native_path::decode(&expected_project_path).map_err(str::to_owned)?,
         )
     })
     .await
@@ -3802,7 +3822,7 @@ fn save_clip_as_media_workflow_from_snapshot(
     let metadata = match ext {
         "mp4" => {
             let req = crate::export::ExportRequest {
-                out_path: out_path.to_string_lossy().into_owned(),
+                out_path: NativePath::new(&out_path).to_wire(),
                 codec: crate::export::ExportCodec::H264,
                 quality: crate::export::ExportQuality::P1080,
             };
@@ -3883,7 +3903,10 @@ fn validate_extract_output(out_path: &str) -> Result<PathBuf, String> {
     if out_path.contains('\0') {
         return Err("output path contains null byte".into());
     }
-    let output = PathBuf::from(out_path);
+    let output = NativePath::from_wire(out_path)
+        .map_err(str::to_owned)?
+        .into_path_buf()
+        .map_err(str::to_owned)?;
     if !output.is_absolute() {
         return Err(format!(
             "output path must be absolute: {}",
@@ -3920,7 +3943,7 @@ fn authorize_extract_output(
             foreign: crate::dialog_output::ForeignExtension::Reject,
         },
     )?;
-    validate_extract_output(&output.path.to_string_lossy())?;
+    validate_extract_output(&NativePath::from(output.path.as_path()).to_wire())?;
     crate::dialog_output::ensure_replaceable_regular_file(&output.path)?;
     Ok(output)
 }
@@ -3979,7 +4002,10 @@ fn extract_audio_blocking(
         .find(|e| e.id == media_id)
         .ok_or_else(|| format!("unknown media id: {media_id}"))?;
     let input = match &entry.source {
-        MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+        MediaSource::External { absolute_path } => absolute_path
+            .local_path()
+            .map_err(str::to_owned)?
+            .to_path_buf(),
         MediaSource::Project { relative_path } => match snapshot.project_dir {
             Some(base) => base.join(relative_path),
             None => return Err("project not saved; cannot resolve media path".into()),
@@ -4000,7 +4026,7 @@ fn extract_audio_blocking(
         return Err(error.to_string());
     }
     crate::dialog_output::publish_staged(&staging, &output)?;
-    Ok(output.path.to_string_lossy().into_owned())
+    Ok(NativePath::new(&output.path).to_wire())
 }
 
 /// `relink_media`: point a missing/offline asset at a newly chosen file, KEEPING
@@ -4032,7 +4058,10 @@ pub async fn relink_media<R: Runtime>(
                     &app.state::<crate::updater::InstallAdmissionGate>(),
                 )?;
                 context.ensure_project(core.project_revision().project_epoch)?;
-                let new = PathBuf::from(&new_path);
+                let new = NativePath::from_wire(&new_path)
+                    .map_err(str::to_owned)?
+                    .into_path_buf()
+                    .map_err(str::to_owned)?;
                 if !new.is_file() {
                     return Err(format!("file not found: {new_path}"));
                 }
@@ -4469,8 +4498,7 @@ fn preview_poster_blocking(
     let target = poster_target_time(time_secs);
     let cached_path = preview_poster_path_for(media.engine().cache_root(), &key, target);
     if let Some(cached) = read_cached_poster(&cached_path, target) {
-        return cached
-            .map(|(poster_path, _, _, _)| Some(poster_path.to_string_lossy().into_owned()));
+        return cached.map(|(poster_path, _, _, _)| Some(NativePath::new(&poster_path).to_wire()));
     }
     let _activity = media.begin_cache_write()?;
     let (poster_path, _, _, _) =
@@ -4481,7 +4509,7 @@ fn preview_poster_blocking(
             );
             e
         })?;
-    Ok(Some(poster_path.to_string_lossy().into_owned()))
+    Ok(Some(NativePath::new(&poster_path).to_wire()))
 }
 
 /// `get_waveform`: normalized waveform buckets (`0 = loud, 1 = silence`) for the
@@ -4529,7 +4557,10 @@ fn get_waveform_blocking(
         .find(|e| e.id == media_ref)
         .ok_or_else(|| format!("media not found: {media_ref}"))?;
     let path = match &entry.source {
-        MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+        MediaSource::External { absolute_path } => absolute_path
+            .local_path()
+            .map_err(str::to_owned)?
+            .to_path_buf(),
         MediaSource::Project { relative_path } => match snapshot.project_dir {
             Some(base) => base.join(relative_path),
             None => return Err("project not saved; cannot resolve media path".into()),
@@ -5359,18 +5390,13 @@ fn grant_proxy_asset_file<R: Runtime>(app: &AppHandle<R>, path: &Path) -> Result
     if !crate::fs_availability::is_materialized_regular_file(path) {
         return Err("media_proxy_scope_materialized_file_required".to_string());
     }
-    app.asset_protocol_scope()
-        .allow_file(path)
+    crate::native_read_scope::allow_file(app, path)
         .map_err(|error| format!("media_proxy_scope_grant_failed:{error}"))
 }
 
 fn revoke_proxy_asset_file<R: Runtime>(app: &AppHandle<R>, path: &Path) {
-    let scope = app.asset_protocol_scope();
-    // persisted-scope writes on PathAllowed events. Add the exact-file deny
-    // first, then re-emit the exact allow so both patterns are durably saved;
-    // deny precedence keeps the removed path inaccessible after restart.
-    if scope.forbid_file(path).is_ok() {
-        let _ = scope.allow_file(path);
+    if let Err(error) = crate::native_read_scope::forbid_file(app, path) {
+        eprintln!("[media] could not revoke proxy read permission: {error}");
     }
 }
 
@@ -5378,8 +5404,24 @@ fn grant_catalog_proxy_asset_scope<R: Runtime>(app: &AppHandle<R>, catalog: &mut
     let snapshot = crate::safe_asset_protocol::asset_scope_snapshot(app);
     let mut granted = std::collections::HashSet::new();
     for item in &mut catalog.items {
-        let Some(path) = item.proxy_path.as_deref().map(Path::new) else {
+        let Some(raw) = item.proxy_path.as_deref() else {
             continue;
+        };
+        let path = match NativePath::from_wire(raw) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("[media] invalid proxy path: {error}");
+                item.proxy_path = None;
+                continue;
+            }
+        };
+        let path = match path.local_path() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("[media] unavailable proxy path: {error}");
+                item.proxy_path = None;
+                continue;
+            }
         };
         if snapshot.forbids(path) {
             item.proxy_path = None;
@@ -5566,7 +5608,7 @@ fn create_media_proxy_blocking_with<R: Runtime>(
     }
     Ok(MediaProxyDto {
         asset_id,
-        path: output.to_string_lossy().into_owned(),
+        path: NativePath::from(output.as_path()).to_wire(),
         source_sha256: created.source_sha256,
         width: created.width,
         height: created.height,
@@ -5770,8 +5812,63 @@ mod tests {
     use std::fs;
     use std::io::Write;
 
+    #[cfg(unix)]
+    #[test]
+    fn native_hidden_names_remain_hidden() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(is_hidden_name(OsStr::from_bytes(b".hidden-\xff.mp4")));
+        assert!(!is_hidden_name(OsStr::from_bytes(b"visible-\xff.mp4")));
+    }
+
     fn engine_for(tmp: &Path) -> MediaEngine {
         MediaEngine::new(tmp.join("cache"), tmp.join("models"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn import_and_reopen_preserve_native_sources_and_their_distinct_aliases() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join(OsStr::from_bytes(b"clip-\xff.png"));
+        let shadow = PathBuf::from(native.to_string_lossy().as_ref());
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 255, 0, 255]))
+            .save(&native)
+            .unwrap();
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&shadow)
+            .unwrap();
+        let core = AppCore::new();
+        let bundle = temp.path().join("Native.opentake");
+        core.save_project(Some(bundle.clone())).unwrap();
+        let scheduler = prewarm::PrewarmScheduler::new(core.project_revision().project_epoch);
+        let catalog = import_media_impl(
+            &core,
+            &engine_for(temp.path()),
+            &scheduler,
+            vec![
+                NativePath::new(&native).to_wire(),
+                NativePath::new(&shadow).to_wire(),
+            ],
+        )
+        .unwrap();
+        assert!(catalog.skipped.is_empty(), "{:?}", catalog.skipped);
+        assert_eq!(catalog.items.len(), 2);
+        assert_ne!(catalog.items[0].id, catalog.items[1].id);
+        let paths: HashSet<_> = catalog
+            .items
+            .iter()
+            .map(|item| {
+                opentake_domain::native_path::decode(item.path.as_deref().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(paths, HashSet::from([native.clone(), shadow.clone()]));
+        let reopened = AppCore::new();
+        reopened.open_project(bundle).unwrap();
+        let catalog = MediaListDto::from_core(&reopened, None);
+        assert_eq!(catalog.items.len(), 2);
+        assert!(catalog.items.iter().all(|item| !item.missing));
+        let paths: HashSet<_> = reopened.external_media_paths().1.into_iter().collect();
+        assert_eq!(paths, HashSet::from([native, shadow]));
     }
 
     fn touch(path: &Path) {
@@ -5788,7 +5885,7 @@ mod tests {
             name: "source".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 1.0,
             generation_input: None,
@@ -7085,7 +7182,7 @@ mod tests {
             name: "source".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 0.0,
             generation_input: None,
@@ -7256,7 +7353,7 @@ mod tests {
             name: "speech".into(),
             kind: ClipType::Audio,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 10.0,
             generation_input: None,
@@ -7381,7 +7478,7 @@ mod tests {
             name: "scene".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 10.0,
             generation_input: None,
@@ -7949,7 +8046,7 @@ mod tests {
             name: "clip".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 3.0,
             generation_input: None,
@@ -7984,7 +8081,7 @@ mod tests {
             name: "blocking-source".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 1.0,
             generation_input: None,
@@ -8220,7 +8317,7 @@ mod tests {
             name: "clip".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 60.0 * 60.0,
             generation_input: None,
@@ -8927,7 +9024,9 @@ mod tests {
             .entries
             .iter()
             .map(|entry| match &entry.source {
-                MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+                MediaSource::External { absolute_path } => {
+                    absolute_path.local_path().unwrap().to_path_buf()
+                }
                 MediaSource::Project { .. } => panic!("directory import must retain exact sources"),
             })
             .collect::<HashSet<_>>();
@@ -9123,7 +9222,7 @@ mod tests {
                 name: id.into(),
                 kind: ClipType::Video,
                 source: MediaSource::External {
-                    absolute_path: format!("/abs/{id}.mp4"),
+                    absolute_path: format!("/abs/{id}.mp4").into(),
                 },
                 duration: 2.0,
                 generation_input: None,
@@ -10110,7 +10209,7 @@ mod tests {
         assert_eq!(
             entry.source,
             MediaSource::External {
-                absolute_path: moved.to_string_lossy().into_owned()
+                absolute_path: moved.clone().into()
             }
         );
     }

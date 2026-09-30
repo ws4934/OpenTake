@@ -24,12 +24,12 @@ pub(super) struct HelperProjectAuthority {
 }
 
 impl HelperProjectAuthority {
-    pub(super) fn from_core(authority: &ProjectAssetAuthority) -> Option<Self> {
-        Some(Self {
+    pub(super) fn from_core(authority: &ProjectAssetAuthority) -> Self {
+        Self {
             project_epoch: authority.project_epoch,
-            project_path: authority.project_path.to_str()?.to_owned(),
+            project_path: NativePath::from(authority.project_path.as_path()).to_wire(),
             root_identity: authority.root_identity,
-        })
+        }
     }
 }
 
@@ -201,7 +201,10 @@ pub(super) fn authorize_opened_asset<R: Runtime>(
             None,
         )));
     };
-    let final_path = Path::new(final_path);
+    let final_path = NativePath::from_wire(final_path).map_err(|_| Box::new(outside_scope()))?;
+    let final_path = final_path
+        .local_path()
+        .map_err(|_| Box::new(outside_scope()))?;
     if let Some(expected) = expected_project {
         // The helper re-opened the bundle, required this exact retained root
         // identity and opened every asset component no-follow beneath it, so
@@ -605,9 +608,15 @@ pub(super) struct OpenedAsset {
 }
 
 pub(super) fn open_helper_asset(request: &HelperRequest) -> std::io::Result<OpenedAsset> {
-    let path = PathBuf::from(&request.path);
+    let path = NativePath::from_wire(&request.path)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?
+        .into_path_buf()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     let (file, final_path, project_root_identity) = if let Some(project) = &request.project {
-        let project_path = PathBuf::from(&project.project_path);
+        let project_path = NativePath::from_wire(&project.project_path)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?
+            .into_path_buf()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         let relative = relative_to_authority(&path, &project_path).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -656,15 +665,10 @@ pub(super) fn opened_metadata(
     match opened {
         Ok(opened) => OpenedMetadata {
             token: request.token.clone(),
-            final_path: opened.final_path.to_str().map(str::to_owned),
+            final_path: Some(NativePath::from(opened.final_path.as_path()).to_wire()),
             etag: Some(opened.etag.clone()),
             project_root_identity: opened.project_root_identity,
-            // A non-UTF-8 final path cannot be authorized lexically.
-            error_kind: opened
-                .final_path
-                .to_str()
-                .is_none()
-                .then_some(WireIoErrorKind::PermissionDenied),
+            error_kind: None,
         },
         Err(error) => OpenedMetadata {
             token: request.token.clone(),
@@ -713,7 +717,7 @@ pub(super) fn serve_helper_asset(request: &HelperRequest, opened: OpenedAsset) -
             IsolatedResponse {
                 metadata: HelperResponseMetadata {
                     token: request.token.clone(),
-                    final_path: final_path.to_str().map(str::to_owned),
+                    final_path: Some(NativePath::from(final_path).to_wire()),
                     project_root_identity,
                     status: parts.status.as_u16(),
                     headers,

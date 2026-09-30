@@ -555,7 +555,7 @@ fn library_import_to_project_with_hook(
     Ok(LibraryImportDto {
         id: entry.id,
         name: entry.name,
-        path: imported.path.to_string_lossy().into_owned(),
+        path: opentake_domain::NativePath::new(&imported.path).to_wire(),
         warning,
     })
 }

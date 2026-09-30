@@ -39,7 +39,7 @@ fn external_entry(id: &str, name: &str, source: &Path) -> MediaManifestEntry {
         name: name.into(),
         kind: ClipType::Video,
         source: MediaSource::External {
-            absolute_path: source.to_string_lossy().into_owned(),
+            absolute_path: source.into(),
         },
         duration: 1.0,
         generation_input: None,
@@ -183,7 +183,9 @@ fn unknown_project_media_mutations_are_rejected_without_manifest_change() {
     assert_eq!(core.media(), before);
 
     let original_source = match &before.entries[0].source {
-        MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+        MediaSource::External { absolute_path } => {
+            absolute_path.local_path().unwrap().to_path_buf()
+        }
         other => panic!("fixture source must be external: {other:?}"),
     };
     assert_compatibility_error(

@@ -1,3 +1,4 @@
+import { displayNativePath } from "../../lib/nativePath";
 import { useEffect, useRef, useState } from "react";
 import { discardGenerationRecovery, listGenerationRecoveries } from "../../lib/api";
 import type { GenerationRecoveryRecord } from "../../lib/types";
@@ -86,7 +87,7 @@ export function GenerationRecoverySection() {
       {!error && records?.length === 0 && <p>{t("generation.recovery.empty")}</p>}
       {records?.map(record => (
         <div key={record.jobId} style={{ display: "grid", gap: 4, borderTop: "1px solid var(--border-primary)", paddingTop: 8 }}>
-          <strong style={{ fontSize: "var(--fs-xs)", overflowWrap: "anywhere" }}>{record.projectPath}</strong>
+          <strong style={{ fontSize: "var(--fs-xs)", overflowWrap: "anywhere" }}>{displayNativePath(record.projectPath)}</strong>
           <span style={{ fontSize: "var(--fs-xs)", color: "var(--text-tertiary)" }}>
             {new Date(record.recordedAt * 1000).toLocaleString()} · {t("generation.recovery.results", { count: record.resultCount })} · {formatBytes(record.byteSize)}
           </span>

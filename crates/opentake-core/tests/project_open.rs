@@ -596,7 +596,7 @@ fn unportable_bundle_media_imports_as_external_and_the_project_reopens() {
         core.save_project(None).expect("save after import");
 
         let expected = MediaSource::External {
-            absolute_path: file.to_string_lossy().into_owned(),
+            absolute_path: file.clone().into(),
         };
         assert_eq!(entry.source, expected, "{name}");
         let reopened = AppCore::new();
@@ -649,7 +649,8 @@ fn offline_media_is_never_resolved_and_core_saves_keep_its_original_path() {
     assert!(media.entries.iter().all(|entry| match &entry.source {
         MediaSource::Project { relative_path } =>
             opentake_domain::is_safe_project_asset_relative_path(relative_path),
-        MediaSource::External { absolute_path } => absolute_path.is_empty(),
+        MediaSource::External { absolute_path } =>
+            absolute_path.local_path().unwrap().as_os_str().is_empty(),
     }));
     assert_eq!(
         media.entries[1].source,

@@ -71,12 +71,14 @@ fn home_probe_coordinator() -> &'static HomeProbeCoordinator {
 #[serde(rename_all = "camelCase")]
 struct ProjectEntry {
     id: String,
+    #[serde(with = "opentake_domain::native_path::path")]
     path: PathBuf,
     created_at: u64,
     last_opened_at: u64,
     #[serde(default)]
     modified_at: u64,
     #[serde(default)]
+    #[serde(with = "opentake_domain::native_path::optional_path")]
     thumbnail_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bundle_identity: Option<ProjectBundleIdentity>,
@@ -90,6 +92,7 @@ pub struct HomeProjectEntry {
     created_at: u64,
     opened_at: u64,
     modified_at: u64,
+    #[serde(with = "opentake_domain::native_path::optional_path")]
     thumbnail_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<HomeProjectPreview>,
@@ -251,7 +254,10 @@ impl ProjectRegistry {
     fn merge_legacy(&mut self, legacy: &[LegacyRecentProject]) -> Result<(), String> {
         let mut next = self.entries.clone();
         for item in legacy.iter().take(MAX_RECENT_PROJECTS) {
-            let Ok(path) = validated_project_path(Path::new(&item.path)) else {
+            let Ok(path) = opentake_domain::native_path::decode(&item.path)
+                .map_err(str::to_owned)
+                .and_then(|path| validated_project_path(&path))
+            else {
                 continue;
             };
             if next.iter().any(|entry| same_path(&entry.path, &path)) {
@@ -262,7 +268,7 @@ impl ProjectRegistry {
             let legacy_thumbnail = item
                 .thumbnail_path
                 .as_ref()
-                .map(PathBuf::from)
+                .and_then(|path| opentake_domain::native_path::decode(path).ok())
                 .filter(|candidate| candidate == &expected_thumbnail);
             next.push(ProjectEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -397,7 +403,7 @@ fn home_entry(
     offline: bool,
 ) -> HomeProjectEntry {
     HomeProjectEntry {
-        path: entry.path.to_string_lossy().into_owned(),
+        path: opentake_domain::NativePath::from(entry.path.as_path()).to_wire(),
         name: project_name(&entry.path),
         created_at: entry.created_at,
         opened_at: entry.last_opened_at,
@@ -562,13 +568,14 @@ fn authorize_home_thumbnail<R: tauri::Runtime>(app: &AppHandle<R>, thumbnail: &P
         return false;
     };
     let snapshot = crate::safe_asset_protocol::asset_scope_snapshot(app);
-    let scope = app.asset_protocol_scope();
-    if !snapshot.has_exact_file_grant(thumbnail) && scope.allow_file(thumbnail).is_err() {
+    if !snapshot.has_exact_file_grant(thumbnail)
+        && crate::native_read_scope::allow_file(app, thumbnail).is_err()
+    {
         return false;
     }
     same_path(thumbnail, &final_path)
         || snapshot.has_exact_file_grant(&final_path)
-        || scope.allow_file(final_path).is_ok()
+        || crate::native_read_scope::allow_file(app, &final_path).is_ok()
 }
 
 async fn probe_project_entries_bounded<F>(
@@ -628,11 +635,8 @@ where
 }
 
 fn validated_project_path(path: &Path) -> Result<PathBuf, String> {
-    let display = path.to_string_lossy();
-    if display.is_empty()
-        || display.len() > MAX_PROJECT_PATH_BYTES
-        || display.as_bytes().contains(&0)
-    {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_PROJECT_PATH_BYTES || bytes.contains(&0) {
         return Err("project path is empty or exceeds the supported length".into());
     }
     if !path.is_absolute() {
@@ -686,15 +690,8 @@ fn path_identity_key(path: &Path) -> String {
             }
             result
         });
-    let key = normalized.to_string_lossy().into_owned();
-    #[cfg(target_os = "windows")]
-    {
-        key.strip_prefix(r"\\?\").unwrap_or(&key).to_lowercase()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        key
-    }
+    opentake_domain::NativePath::from(opentake_domain::native_path::identity_key(&normalized))
+        .to_wire()
 }
 
 fn normalize_entries(entries: &mut Vec<ProjectEntry>) {
@@ -706,10 +703,13 @@ fn normalize_entries(entries: &mut Vec<ProjectEntry>) {
 
 fn project_name(path: &Path) -> String {
     path.file_stem()
-        .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("Untitled")
-        .to_string()
+        .map(|name| {
+            name.to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{name:?}"))
+        })
+        .unwrap_or_else(|| "Untitled".into())
 }
 
 fn persist_entries(path: &Path, entries: &[ProjectEntry]) -> Result<(), String> {
@@ -798,19 +798,16 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let (program, arguments): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        let (program, arguments): (&str, Vec<OsString>) = if cfg!(target_os = "macos") {
             if path.exists() {
-                (
-                    "open",
-                    vec!["-R".into(), path.to_string_lossy().into_owned()],
-                )
+                ("open", vec!["-R".into(), path.as_os_str().to_owned()])
             } else {
                 let parent = path.parent().unwrap_or(path);
-                ("open", vec![parent.to_string_lossy().into_owned()])
+                ("open", vec![parent.as_os_str().to_owned()])
             }
         } else {
             let target = path.parent().unwrap_or(path);
-            ("xdg-open", vec![target.to_string_lossy().into_owned()])
+            ("xdg-open", vec![target.as_os_str().to_owned()])
         };
         let status = Command::new(program)
             .args(arguments)
@@ -827,11 +824,21 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 fn move_project_to_trash(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        use objc2_foundation::{NSFileManager, NSString, NSURL};
+        use objc2_foundation::{NSFileManager, NSURL};
+        use std::os::unix::ffi::OsStrExt;
 
-        let path_string = path.to_string_lossy();
-        let path_string = NSString::from_str(&path_string);
-        let url = NSURL::fileURLWithPath(&path_string);
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| "project path contains NUL")?;
+        // SAFETY: the filesystem representation is NUL-terminated and remains
+        // alive for the call; NSURL copies it into its own file URL.
+        let url = unsafe {
+            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+                std::ptr::NonNull::new(path_bytes.as_ptr().cast_mut())
+                    .expect("CString has a non-null buffer"),
+                true,
+                None,
+            )
+        };
         NSFileManager::defaultManager()
             .trashItemAtURL_resultingItemURL_error(&url, None)
             .map_err(|error| format!("system trash operation failed: {error}"))
@@ -1120,10 +1127,39 @@ const MAX_TRASH_NAME_BYTES: usize = 255;
 /// path component.
 fn trash_quarantine_name(original: &OsStr, token: &str) -> OsString {
     let suffix = format!(" (Deleted {token}).opentake");
-    let stem = Path::new(original)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let stem = Path::new(original).file_stem().unwrap_or_default();
+    let Some(stem) = stem.to_str() else {
+        // Shorten native names in their own units without creating a different
+        // replacement-character name in the trash.
+        #[cfg(unix)]
+        let mut units = {
+            use std::os::unix::ffi::OsStrExt;
+            stem.as_bytes().to_vec()
+        };
+        #[cfg(windows)]
+        let mut units = {
+            use std::os::windows::ffi::OsStrExt;
+            stem.encode_wide().collect::<Vec<_>>()
+        };
+        let start = units
+            .iter()
+            .position(|unit| u32::from(*unit) != 46)
+            .unwrap_or(units.len());
+        units.drain(..start);
+        units.truncate(MAX_TRASH_NAME_BYTES.saturating_sub(suffix.len()));
+        #[cfg(unix)]
+        let mut name = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(units)
+        };
+        #[cfg(windows)]
+        let mut name = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&units)
+        };
+        name.push(suffix);
+        return name;
+    };
     let stem = stem.trim_start_matches('.');
     let mut end = stem
         .len()
@@ -1256,23 +1292,21 @@ pub async fn home_projects_sync(
     let activity = crate::updater::begin_mutating_activity(
         &app.state::<crate::updater::InstallAdmissionGate>(),
     )?;
-    let scope = app.asset_protocol_scope();
-    let registry_scope = scope.clone();
+    let registry_scope = crate::safe_asset_protocol::asset_scope_snapshot(&app);
     let probe_app = app.clone();
     let registry_entries = tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
         let authorized_legacy = entries
             .into_iter()
             .filter(|entry| {
-                let path = Path::new(&entry.path);
-                validated_project_path(path).is_ok()
-                    && crate::safe_asset_protocol::scope_allows_lexical_path(&registry_scope, path)
+                let Ok(path) = opentake_domain::native_path::decode(&entry.path) else {
+                    return false;
+                };
+                validated_project_path(&path).is_ok() && registry_scope.allows(&path)
             })
             .collect::<Vec<_>>();
         with_registry(&app, |registry| {
-            registry.retain_authorized(|path| {
-                crate::safe_asset_protocol::scope_allows_lexical_path(&registry_scope, path)
-            })?;
+            registry.retain_authorized(|path| registry_scope.allows(path))?;
             registry.merge_legacy(&authorized_legacy)?;
             Ok(registry.entries_snapshot())
         })
@@ -1304,9 +1338,10 @@ pub async fn home_project_register(
     )?;
     tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
-        let path = validated_project_path(Path::new(&path))?;
-        let scope = app.asset_protocol_scope();
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, &path) {
+        let path = validated_project_path(
+            &opentake_domain::native_path::decode(&path).map_err(str::to_owned)?,
+        )?;
+        if !crate::safe_asset_protocol::asset_scope_snapshot(&app).allows(&path) {
             return Err("project path has not been approved by a native file dialog".into());
         }
         let bundle_identity = capture_registered_bundle_identity(&path)?;
@@ -1326,7 +1361,9 @@ pub async fn home_project_remove(app: AppHandle, path: String) -> Result<(), Str
     tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
         with_registry(&app, |registry| {
-            registry.remove(Path::new(&path)).map(|_| ())
+            registry
+                .remove(&opentake_domain::native_path::decode(&path).map_err(str::to_owned)?)
+                .map(|_| ())
         })
     })
     .await
@@ -1340,11 +1377,10 @@ pub async fn home_project_trash(app: AppHandle, path: String) -> Result<(), Stri
     )?;
     tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
-        let path = validated_project_path(Path::new(&path))?;
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(
-            &app.asset_protocol_scope(),
-            &path,
-        ) {
+        let path = validated_project_path(
+            &opentake_domain::native_path::decode(&path).map_err(str::to_owned)?,
+        )?;
+        if !crate::safe_asset_protocol::asset_scope_snapshot(&app).allows(&path) {
             return Err("project path has not been approved by a native file dialog".into());
         }
         let registered = with_registry(&app, |registry| registry.registered_entry(&path))?;
@@ -1360,11 +1396,10 @@ pub async fn home_project_trash(app: AppHandle, path: String) -> Result<(), Stri
 #[tauri::command]
 pub async fn home_project_reveal(app: AppHandle, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let path = validated_project_path(Path::new(&path))?;
-        if !crate::safe_asset_protocol::scope_allows_lexical_path(
-            &app.asset_protocol_scope(),
-            &path,
-        ) {
+        let path = validated_project_path(
+            &opentake_domain::native_path::decode(&path).map_err(str::to_owned)?,
+        )?;
+        if !crate::safe_asset_protocol::asset_scope_snapshot(&app).allows(&path) {
             return Err("project path has not been approved by a native file dialog".into());
         }
         let registered = with_registry(&app, |registry| registry.registered_path(&path))?;
@@ -1636,6 +1671,29 @@ mod tests {
             Path::new("/projects")
         };
         assert!(validated_project_path(&projects.join(long)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_names_preserve_original_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let original = OsStr::from_bytes(b".Film-\xff.opentake");
+        let name = trash_quarantine_name(original, "3f2a");
+        assert_eq!(name.as_bytes(), b"Film-\xff (Deleted 3f2a).opentake");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trash_names_preserve_original_utf16_units() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<_> = ".Film-".encode_utf16().collect();
+        units.push(0xd800);
+        units.extend(".opentake".encode_utf16());
+        let name = trash_quarantine_name(&OsString::from_wide(&units), "3f2a");
+        let mut expected: Vec<_> = "Film-".encode_utf16().collect();
+        expected.push(0xd800);
+        expected.extend(" (Deleted 3f2a).opentake".encode_utf16());
+        assert_eq!(name.encode_wide().collect::<Vec<_>>(), expected);
     }
 
     #[cfg(unix)]

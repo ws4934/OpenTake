@@ -391,7 +391,7 @@ pub async fn search_index_start(
     let (assets, plan) = with_verified_index_assets(
         &core,
         expected_project_epoch,
-        Path::new(&expected_project_path),
+        &opentake_domain::native_path::decode(&expected_project_path).map_err(str::to_owned)?,
         |assets| {
             let spec = search_config::embedder_spec();
             let source_identity = assets
@@ -432,7 +432,8 @@ pub async fn search_index_start(
         assets: std::sync::Arc::new(assets),
     };
     let core = core.inner().clone();
-    let expected_project_path = PathBuf::from(expected_project_path);
+    let expected_project_path =
+        opentake_domain::native_path::decode(&expected_project_path).map_err(str::to_owned)?;
     let stale = move || {
         !core.project_asset_authority().is_some_and(|authority| {
             authority.project_epoch == expected_project_epoch
