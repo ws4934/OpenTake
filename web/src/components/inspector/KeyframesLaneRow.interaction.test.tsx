@@ -246,7 +246,7 @@ it("disables lane stamping while the playhead is outside the clip", async () => 
 });
 
 it("normalizes a fractional playback frame before stamping", async () => {
-  await act(async () => useEditorUiStore.setState({ activeFrame: 100.4 }));
+  await act(async () => useEditorUiStore.setState({ activeFrame: 100.8 }));
   const stamp = container.querySelector<HTMLButtonElement>("[data-keyframe-stamp]")!;
 
   await act(async () => stamp.click());

@@ -40,7 +40,7 @@ use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::media::MediaState;
 use crate::voice_revocations::{unix_now_seconds, PendingVoiceRevocation, VoiceRevocationStore};
@@ -1309,14 +1309,18 @@ pub struct GenerateMatteResultDto {
 }
 
 #[tauri::command]
-pub fn matting_model_status(media: State<'_, MediaState>) -> MattingModelStatusDto {
-    let installed = verify_rvm_model(media.engine().models_dir()).is_ok();
-    MattingModelStatusDto {
-        installed,
-        model: opentake_media::analysis::RVM_MODEL_ID.to_string(),
-        bytes: opentake_media::analysis::RVM_MODEL_BYTES,
-        sha256: opentake_media::analysis::RVM_MODEL_SHA256.to_string(),
-    }
+pub async fn matting_model_status(app: AppHandle) -> Result<MattingModelStatusDto, String> {
+    crate::media::run_background_io("matting model status", move || {
+        let media = app.state::<MediaState>();
+        let installed = verify_rvm_model(media.engine().models_dir()).is_ok();
+        Ok(MattingModelStatusDto {
+            installed,
+            model: opentake_media::analysis::RVM_MODEL_ID.to_string(),
+            bytes: opentake_media::analysis::RVM_MODEL_BYTES,
+            sha256: opentake_media::analysis::RVM_MODEL_SHA256.to_string(),
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1348,7 +1352,7 @@ pub async fn download_matting_model(
         .map_err(|error| error.to_string());
     state.finish(&token);
     result?;
-    Ok(matting_model_status(media))
+    matting_model_status(app).await
 }
 
 #[tauri::command]

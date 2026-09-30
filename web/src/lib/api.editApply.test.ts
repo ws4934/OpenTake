@@ -66,6 +66,41 @@ describe("edit_apply production IPC envelope", () => {
     expect(mocks.invoke).toHaveBeenNthCalledWith(2, "redo", identity);
   });
 
+  it("prepares a freeze frame before the synchronous revision-bound edit", async () => {
+    let completePreparation!: (ticket: string) => void;
+    mocks.invoke.mockImplementationOnce(() => new Promise<string>((resolve) => {
+      completePreparation = resolve;
+    }));
+    const { editApply } = await import("./api");
+    const command = { type: "freezeFrame" as const, clipId: "clip-a", atFrame: 15, durationFrames: 30 };
+    const pending = editApply(command, expected);
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, "prepare_freeze_frame", {
+      command,
+      expectedProjectEpoch: 7,
+      expectedProjectPath: "/tmp/project-a.opentake",
+      expectedTimelineVersion: 8,
+    });
+    completePreparation("opaque-preparation");
+    await pending;
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, "edit_apply", {
+      command,
+      preparationId: "opaque-preparation",
+      expectedProjectEpoch: 7,
+      expectedProjectPath: "/tmp/project-a.opentake",
+      expectedTimelineVersion: 8,
+    });
+  });
+
+  it("does not submit an edit after freeze-frame preparation fails", async () => {
+    mocks.invoke.mockRejectedValueOnce({ code: "validation", message: "project changed" });
+    const { editApply } = await import("./api");
+    await expect(editApply({ type: "freezeFrame", clipId: "clip-a", atFrame: 15, durationFrames: 30 }, expected))
+      .rejects.toMatchObject({ code: "validation", message: "project changed" });
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(mocks.invoke.mock.calls[0][0]).toBe("prepare_freeze_frame");
+  });
+
   it("binds project save and save-as to the initiating project identity", async () => {
     const { projectSave } = await import("./api");
 

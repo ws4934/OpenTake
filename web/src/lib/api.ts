@@ -319,12 +319,19 @@ export async function editApply(
 ): Promise<EditResult> {
   await ensureTauri();
   if (invokeImpl) {
-    return invokeImpl<EditResult>("edit_apply", {
-      command,
-      ...editIdentityArgs(expected),
-    }).catch((error: unknown) => {
+    try {
+      const identity = editIdentityArgs(expected);
+      const preparationId = command.type === "freezeFrame"
+        ? await invokeImpl<string>("prepare_freeze_frame", { command, ...identity })
+        : undefined;
+      return await invokeImpl<EditResult>("edit_apply", {
+        command,
+        ...identity,
+        ...(preparationId === undefined ? {} : { preparationId }),
+      });
+    } catch (error: unknown) {
       throw asTauriCommandError(error);
-    });
+    }
   }
   return fallback.editApply(command);
 }

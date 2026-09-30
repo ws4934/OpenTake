@@ -1562,47 +1562,48 @@ fn begin_edit_activity(
 #[allow(clippy::too_many_arguments)] // Tauri IPC injects states and request identity separately
 pub fn edit_apply(
     core: State<'_, AppCore>,
-    render: State<'_, crate::render::RenderState>,
-    media: State<'_, crate::media::MediaState>,
+    preparations: State<'_, crate::freeze_frame::FreezeFramePreparations>,
     admission: State<'_, crate::updater::InstallAdmissionGate>,
     command: EditRequest,
+    preparation_id: Option<String>,
     expected_project_epoch: u64,
     expected_timeline_version: u64,
     expected_project_path: Option<String>,
 ) -> Result<EditResultDto, CmdError> {
     let _admission = begin_edit_activity(&admission)?;
-    let mut prepared_freeze_path = None;
+    let mut prepared_freeze = None;
     let cmd = match command {
         EditRequest::FreezeFrame {
             clip_id,
             at_frame,
             duration_frames,
         } => {
-            // Save As/project replacement takes the write side. Retain the read
-            // lease while freeze-frame preparation reads external/render state,
-            // then release it before the core emits post-commit events. If a
-            // transition wins after capture, the atomic revision/path check
-            // below rejects the prepared command.
-            let prepared = {
-                let _identity = core.lock_project_identity_workflow();
-                validate_freeze_frame_request(&core, &clip_id, at_frame, duration_frames)
-                    .map_err(validation_error)?;
-                crate::render::capture_freeze_frame(&core, &render, &media, &clip_id, at_frame)
-                    .map_err(|error| {
-                        eprintln!("freeze-frame capture failed: {error}");
-                        internal_error("Freeze-frame capture failed")
-                    })?
+            let ticket = preparation_id.as_deref().ok_or_else(|| {
+                validation_error("freezeFrame requires a background capture preparation".into())
+            })?;
+            let binding = crate::freeze_frame::FreezeBinding {
+                revision: ProjectRevision {
+                    project_epoch: expected_project_epoch,
+                    version: expected_timeline_version,
+                },
+                project_path: expected_project_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from),
+                clip_id: clip_id.clone(),
+                at_frame,
+                duration_frames,
             };
-            // The identity lease is deliberately gone before the command can
-            // emit TimelineChanged/MediaChanged. The final revision/path check
-            // below is still authoritative and shares the edit's core lock.
-            prepared_freeze_path = Some(prepared.path);
-            EditCommand::RegisterMediaAndFreezeFrame {
-                media: prepared.media,
+            let prepared = preparations
+                .take(ticket, &binding)
+                .map_err(validation_error)?;
+            let command = EditCommand::RegisterMediaAndFreezeFrame {
+                media: prepared.media.clone(),
                 clip_id,
                 at_frame,
                 duration_frames,
-            }
+            };
+            prepared_freeze = Some(prepared);
+            command
         }
         other => other.into_command().map_err(validation_error)?,
     };
@@ -1615,14 +1616,9 @@ pub fn edit_apply(
         expected_project_path.as_deref().map(std::path::Path::new),
         cmd,
     );
-    if result.is_err() {
-        if let Some(path) = prepared_freeze_path {
-            if let Err(error) = std::fs::remove_file(&path) {
-                eprintln!(
-                    "failed to remove rejected freeze-frame capture {}: {error}",
-                    path.display()
-                );
-            }
+    if result.is_ok() {
+        if let Some(prepared) = prepared_freeze.as_mut() {
+            prepared.retain_after_commit();
         }
     }
     result
@@ -1650,7 +1646,7 @@ fn internal_error(message: impl Into<String>) -> CmdError {
     }
 }
 
-fn validate_freeze_frame_request(
+pub(crate) fn validate_freeze_frame_request(
     core: &AppCore,
     clip_id: &str,
     at_frame: i32,

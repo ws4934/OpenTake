@@ -574,8 +574,8 @@ export function useKeyboardShortcuts() {
             ui.setToolMode(command.tool);
             return;
           case "markRange":
-            if (command.edge === "start") ui.markRangeStart(Math.round(ui.activeFrame));
-            else ui.markRangeEnd(Math.round(ui.activeFrame));
+            if (command.edge === "start") ui.markRangeStart(edit.playheadEditFrame(ui.activeFrame));
+            else ui.markRangeEnd(edit.playheadEditFrame(ui.activeFrame));
             return;
           case "trimStart":
             edit.runTimelineEdit(edit.trimStartToPlayhead());

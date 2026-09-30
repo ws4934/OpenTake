@@ -10,6 +10,8 @@
  * frame instead of switching to a separate ffmpeg/PNG render path.
  */
 
+export { playheadFrame as playbackFrameFromActiveFrame } from "../../lib/geometry";
+import { playheadFrame } from "../../lib/geometry";
 import { volumeAt } from "../../lib/clip";
 import type { Clip, Timeline, Track } from "../../lib/types";
 
@@ -40,11 +42,6 @@ export interface ActiveMedia {
   clip: Clip;
   track: Track;
   trackIndex: number;
-}
-
-/** Bucket the fractional playback clock to the frame the preview actually renders. */
-export function playbackFrameFromActiveFrame(activeFrame: number): number {
-  return Math.max(0, Math.floor(activeFrame));
 }
 
 /** Whether a clip covers `frame` on its track ([start, start+duration)). */
@@ -208,5 +205,5 @@ export function isExternalSeekWhilePlaying(args: {
 }): boolean {
   if (args.lastEngineFrame === null) return false;
   const eps = args.epsilonFrames ?? 2;
-  return Math.abs(Math.floor(args.activeFrame) - args.lastEngineFrame) > eps;
+  return Math.abs(playheadFrame(args.activeFrame) - args.lastEngineFrame) > eps;
 }

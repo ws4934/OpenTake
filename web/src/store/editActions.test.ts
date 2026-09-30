@@ -19,6 +19,7 @@ import type {
   Timeline,
   Track,
   Transform,
+  TrimEditReq,
 } from "../lib/types";
 
 const srv = vi.hoisted(() => {
@@ -75,6 +76,7 @@ const srv = vi.hoisted(() => {
     }>;
     trackIndex?: number;
     atFrame?: number;
+    edits?: TrimEditReq[];
     clipIds?: string[];
     ranges?: Array<{ start: number; end: number }>;
     a?: number;
@@ -462,6 +464,10 @@ import {
   mediaDurationFrames,
   momentDurationFrames,
   pasteClipsAtPlayhead,
+  freezeClipAtPlayhead,
+  splitAtPlayhead,
+  trimStartToPlayhead,
+  trimEndToPlayhead,
   rippleDeleteMarkedRange,
   rippleDeleteSelectedClips,
   rippleDeleteSelectedGap,
@@ -959,7 +965,7 @@ describe("addMediaToTimeline", () => {
 
     const command = srv.state.commands.at(-1);
     expect(command?.type).toBe("pasteClips");
-    expect(command?.entries?.map((entry) => entry.startFrame)).toEqual([51, 121]);
+    expect(command?.entries?.map((entry) => entry.startFrame)).toEqual([50, 120]);
     expect(command?.entries?.every((entry) => Number.isInteger(entry.startFrame))).toBe(true);
   });
 
@@ -977,6 +983,43 @@ describe("addMediaToTimeline", () => {
     await swapTracks(0, 1);
 
     expect(srv.state.tracks.map((track) => track.id)).toEqual(["t2", "t1"]);
+  });
+});
+
+describe("edits at the displayed playback frame", () => {
+  beforeEach(async () => {
+    srv.reset();
+    setMirror(EMPTY, 0, 1);
+    await addMediaToTimeline(video("seed"));
+    const clip = useProjectStore.getState().timeline.tracks[0].clips[0];
+    useEditorUiStore.setState({
+      activeFrame: 50.8,
+      currentFrame: 50,
+      selectedClipIds: new Set([clip.id]),
+    });
+  });
+
+  it("splits the selected clip at the displayed frame", async () => {
+    await splitAtPlayhead();
+    expect(srv.state.commands.at(-1)).toMatchObject({ type: "splitClips", atFrame: 50 });
+  });
+
+  it.each([
+    ["in", trimStartToPlayhead, 50, 0],
+    ["out", trimEndToPlayhead, 0, 10],
+  ] as const)("trims the %s point at the displayed frame", async (_edge, action, start, end) => {
+    await action();
+    expect(srv.state.commands.at(-1)).toMatchObject({
+      type: "trimClips",
+      edits: [{ trimStartFrame: start, trimEndFrame: end }],
+    });
+  });
+
+  it("freezes the displayed final frame instead of the clip midpoint", async () => {
+    const clip = useProjectStore.getState().timeline.tracks[0].clips[0];
+    useEditorUiStore.setState({ activeFrame: 59.8, currentFrame: 59 });
+    await freezeClipAtPlayhead(clip);
+    expect(srv.state.commands.at(-1)).toMatchObject({ type: "freezeFrame", atFrame: 59 });
   });
 });
 
@@ -1237,7 +1280,7 @@ describe("addTextClip (Toolbar 'T' button)", () => {
   });
 
   it("sends an integer start frame when playback is between frames", async () => {
-    useEditorUiStore.setState({ activeFrame: 123.4, currentFrame: 123 });
+    useEditorUiStore.setState({ activeFrame: 123.8, currentFrame: 123 });
 
     await addTextClip();
 

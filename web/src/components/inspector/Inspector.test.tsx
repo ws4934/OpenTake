@@ -320,7 +320,7 @@ describe("Inspector completion surface", () => {
     useEditorUiStore.setState({
       selectedClipIds: new Set([clip.id]),
       inspectorTab: "video",
-      activeFrame: 110.4,
+      activeFrame: 110.8,
     });
     const upsert = vi.spyOn(edit, "upsertKeyframe").mockResolvedValue();
     const remove = vi.spyOn(edit, "removeKeyframe").mockResolvedValue();
