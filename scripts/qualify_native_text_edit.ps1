@@ -30,6 +30,18 @@ function Wait-Until([scriptblock]$Check, [string]$Description) {
         }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
+    $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Children,
+        [System.Windows.Automation.Condition]::TrueCondition
+    )
+    foreach ($visible in $windows) {
+        if ($visible.Current.ProcessId -ne $script:process.Id) { continue }
+        Write-Output "Window: $($visible.Current.Name), class=$($visible.Current.ClassName)"
+        foreach ($element in $visible.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition)) {
+            Write-Output "UI: $($element.Current.ControlType.ProgrammaticName) | $($element.Current.Name) | $($element.Current.AutomationId)"
+        }
+    }
     throw "Timed out: $Description"
 }
 
