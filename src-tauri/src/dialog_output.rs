@@ -21,9 +21,18 @@ use std::time::{Duration, Instant};
 
 use opentake_domain::NativePath;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
 use serde::Deserialize;
+
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub(super) enum PickerKind {
+    Open { directory: bool, multiple: bool },
+    Save,
+}
 
 pub(crate) const UNAPPROVED_OUTPUT: &str =
     "output path has not been approved by a native save dialog";
@@ -157,7 +166,7 @@ pub async fn pick_open_paths(
     .map_err(|error| format!("open dialog failed: {error}"))?
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn pick_open_on_platform(
     window: &tauri::Window,
     options: OpenDialogOptions,
@@ -208,6 +217,28 @@ fn pick_open_on_platform(
         .transpose()
 }
 
+#[cfg(target_os = "linux")]
+fn pick_open_on_platform(
+    window: &tauri::Window,
+    options: OpenDialogOptions,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    linux::pick(
+        window,
+        PickerKind::Open {
+            directory: options.directory,
+            multiple: options.multiple,
+        },
+        options.title,
+        options
+            .default_path
+            .map(NativePath::into_path_buf)
+            .transpose()
+            .map_err(str::to_owned)?,
+        options.filters,
+        options.can_create_directories,
+    )
+}
+
 #[cfg(windows)]
 fn pick_open_on_platform(
     window: &tauri::Window,
@@ -222,7 +253,7 @@ fn pick_open_on_platform(
         .map_err(str::to_owned)?;
     windows::pick(
         window,
-        windows::Kind::Open {
+        PickerKind::Open {
             directory: options.directory,
             multiple: options.multiple,
         },
@@ -269,12 +300,23 @@ fn pick_save_on_platform(
     filters: Vec<SaveDialogFilter>,
 ) -> Result<Option<PathBuf>, String> {
     Ok(
-        windows::pick(window, windows::Kind::Save, title, default_path, filters)?
+        windows::pick(window, PickerKind::Save, title, default_path, filters)?
             .and_then(|mut paths| paths.pop()),
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn pick_save_on_platform(
+    window: &tauri::Window,
+    title: Option<String>,
+    default_path: Option<PathBuf>,
+    filters: Vec<SaveDialogFilter>,
+) -> Result<Option<PathBuf>, String> {
+    linux::pick(window, PickerKind::Save, title, default_path, filters, None)
+        .map(|paths| paths.and_then(|mut paths| paths.pop()))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn pick_save_on_platform(
     window: &tauri::Window,
     title: Option<String>,

@@ -18,13 +18,7 @@ use ::windows::Win32::UI::Shell::{
     FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
 
-use super::SaveDialogFilter;
-
-#[derive(Clone, Copy)]
-pub(super) enum Kind {
-    Open { directory: bool, multiple: bool },
-    Save,
-}
+use super::{PickerKind as Kind, SaveDialogFilter};
 
 struct Apartment;
 impl Apartment {
@@ -234,7 +228,12 @@ mod tests {
         ]));
         std::fs::write(&path, b"native name").unwrap();
         let returned = shell_path(&shell_item(&path).unwrap()).unwrap();
-        assert_eq!(returned, path);
+        assert_eq!(returned.file_name(), path.file_name());
+        assert_eq!(std::fs::read(&returned).unwrap(), b"native name");
+        assert_eq!(
+            std::fs::canonicalize(&returned).unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
         assert_ne!(returned, PathBuf::from(path.to_string_lossy().as_ref()));
     }
 }

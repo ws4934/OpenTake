@@ -3872,6 +3872,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "glob",
+ "gtk",
  "http-range",
  "image",
  "libc",

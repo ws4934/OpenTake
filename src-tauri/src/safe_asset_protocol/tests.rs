@@ -1598,12 +1598,11 @@ fn a_reply_larger_than_the_request_allows_is_rejected_before_allocation() {
     assert!(matches!(result, Err(IsolatedHelperError::InvalidResponse)));
 }
 
-/// A final path that is not UTF-8 cannot be authorized lexically. The helper
-/// reports it as an open error and must not wait for a decision that the
-/// parent never sends, or the next request on that helper breaks.
+/// A native final path reaches the parent without being replaced by its
+/// Unicode alias. The helper waits for authorization and remains reusable.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_non_utf8_final_path_is_refused_and_the_helper_serves_the_next_request() {
+fn a_non_utf8_final_path_is_preserved_and_the_helper_serves_the_next_request() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
@@ -1623,19 +1622,22 @@ fn a_non_utf8_final_path_is_refused_and_the_helper_serves_the_next_request() {
         let request = external_request(&pool::random_token(), &requested);
         let mut authorized = false;
         let outcome = pool
-            .exchange(&request, |_| {
+            .exchange(&request, |opened| {
+                let decoded =
+                    opentake_domain::native_path::decode(opened.final_path.as_deref().unwrap())
+                        .unwrap();
+                let expected = target.join("clip.mp4");
+                assert_eq!(decoded, expected);
+                assert_ne!(decoded, PathBuf::from(expected.to_string_lossy().as_ref()));
                 authorized = true;
                 Ok::<(), ()>(())
             })
             .await;
-        let Ok(HelperOutcome::OpenFailed(opened)) = outcome else {
-            panic!("a non-UTF-8 final path must be reported as unavailable");
+        let Ok(HelperOutcome::Served { response, .. }) = outcome else {
+            panic!("an authorized native final path must be served");
         };
-        assert!(matches!(
-            opened.error_kind,
-            Some(WireIoErrorKind::PermissionDenied)
-        ));
-        assert!(!authorized);
+        assert_eq!(response.body, b"hidden");
+        assert!(authorized);
 
         let request = external_request(&pool::random_token(), &ordinary);
         let outcome = pool.exchange(&request, |_| Ok::<(), ()>(())).await;

@@ -90,6 +90,7 @@ jobs:
             libsoup-3.0-dev \
             patchelf \
             pkg-config \
+            xvfb \
             fonts-dejavu-core
 
       - name: Install Rust components
@@ -183,3 +184,13 @@ jobs:
             }
           }
           if ($failed) { throw "tests failed: $($failed -join ', ')" }
+
+      - name: Qualify native GTK filename selections
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GTK_USE_PORTAL: '0'
+        run: |
+          xvfb-run -a cargo test --locked -p opentake-tauri \
+            dialog_output::linux::tests::native_gtk_selections_preserve_original_names \
+            -- --ignored --exact --nocapture --test-threads=1

@@ -766,14 +766,21 @@ fn persist_entries(path: &Path, entries: &[ProjectEntry]) -> Result<(), String> 
 /// cannot contain `"`.
 #[cfg(any(target_os = "windows", test))]
 fn explorer_select_argument(path: &Path) -> Result<OsString, String> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| "project path is not valid Unicode".to_string())?;
-    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
-    if text.contains('"') {
-        return Err("project path contains a quote character".into());
+    #[cfg(windows)]
+    let text = opentake_domain::native_path::normalize(path).into_os_string();
+    #[cfg(unix)]
+    let text = {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = path.as_os_str().as_bytes();
+        OsString::from_vec(bytes.strip_prefix(br"\\?\").unwrap_or(bytes).to_vec())
+    };
+    if text.as_encoded_bytes().contains(&b'"') || text.as_encoded_bytes().contains(&0) {
+        return Err("project path contains invalid command-line characters".into());
     }
-    Ok(OsString::from(format!("/select,\"{text}\"")))
+    let mut argument = OsString::from("/select,\"");
+    argument.push(text);
+    argument.push("\"");
+    Ok(argument)
 }
 
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
@@ -1787,6 +1794,34 @@ mod tests {
             OsString::from(r#"/select,"C:\Long Projects\c.opentake""#)
         );
         assert!(explorer_select_argument(Path::new(r#"C:\bad"name.opentake"#)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explorer_arguments_preserve_native_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let argument = explorer_select_argument(Path::new(OsStr::from_bytes(
+            b"/projects/film-\xff.opentake",
+        )))
+        .unwrap();
+        assert_eq!(
+            argument.as_bytes(),
+            b"/select,\"/projects/film-\xff.opentake\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_arguments_preserve_native_utf16_units() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<_> = r"\\?\C:\projects\film-".encode_utf16().collect();
+        units.push(0xd800);
+        units.extend(".opentake".encode_utf16());
+        let argument = explorer_select_argument(Path::new(&OsString::from_wide(&units))).unwrap();
+        let mut expected: Vec<_> = r#"/select,"C:\projects\film-"#.encode_utf16().collect();
+        expected.push(0xd800);
+        expected.extend(".opentake\"".encode_utf16());
+        assert_eq!(argument.encode_wide().collect::<Vec<_>>(), expected);
     }
 
     #[cfg(target_os = "windows")]
