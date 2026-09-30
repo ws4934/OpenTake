@@ -1275,10 +1275,13 @@ mod tests {
             old_gate.clone(),
             100,
             old_publish,
-            slow_encode,
+            crate::jpeg::encode_rgba_jpeg,
         );
+        let (started, release) = hold_first_encode(&old_sink);
         old_sink.push_frame(10, solid(4, 4));
-        std::thread::sleep(Duration::from_millis(20));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old frame is held before teardown");
         old_sink.push_frame(11, solid(4, 4));
 
         // Session teardown closes the old gate before the replacement starts.
@@ -1302,8 +1305,13 @@ mod tests {
                 .frame(),
             3
         );
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(old_published.try_recv().is_err());
+        release.send(()).unwrap();
+        // Disconnect proves the old worker has finished, including any stale
+        // commit attempt; a timeout could hide a worker that has not run yet.
+        assert!(matches!(
+            old_published.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
         assert!(latest
             .lookup(&FrameQuery::new(5, 1, "old-session", 0, 0))
             .is_none());
