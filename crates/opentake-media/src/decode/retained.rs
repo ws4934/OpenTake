@@ -450,17 +450,31 @@ mod tests {
             done_tx.send(result).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !(pids.exists() && std::fs::read_to_string(&pids).unwrap().lines().count() == 2)
-            && Instant::now() < deadline
-        {
+        // The helper can publish its PIDs before its parent has attached the
+        // process tree or started the readers. Both sides must be ready.
+        let ready = loop {
+            let helper_ready =
+                std::fs::read_to_string(&pids).is_ok_and(|text| text.lines().count() == 2);
+            if helper_ready
+                && cancel.spawned_child_count() == 1
+                && cancel.active_reader_count() == 2
+            {
+                break true;
+            }
+            if Instant::now() >= deadline || worker.is_finished() {
+                break false;
+            }
             thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(cancel.spawned_child_count(), 1, "decoder spawned");
+        };
+        // Clean up even if readiness fails, before reporting any assertion.
         cancel.cancel();
-        let result = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("cancelled retained decode returns promptly");
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
         worker.join().unwrap();
+        assert!(
+            ready,
+            "decoder and readers did not become ready: {result:?}"
+        );
+        let result = result.expect("cancelled retained decode returns promptly");
         assert!(matches!(result, Err(MediaError::Cancelled)), "{result:?}");
         assert_eq!(cancel.active_reader_count(), 0, "readers joined");
 
