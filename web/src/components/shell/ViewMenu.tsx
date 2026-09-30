@@ -255,10 +255,23 @@ export interface ApplicationMenuStateSnapshot {
 }
 
 function nativeAccelerator(entry: ApplicationMenuSpecEntry): string | undefined {
+  // Windows translates native accelerators against the focused WebView child.
+  // Keep Edit keys on the existing DOM route instead of consuming them before
+  // it can update the document; native menu clicks still use the same actions.
+  if (/Win/i.test(navigator.platform) && entry.group === "edit") return undefined;
   if (entry.id === "settings") return "CmdOrCtrl+Comma";
   if (entry.id === "maximizeFocused") return "Backquote";
   if (entry.id === "shortcuts") return "CmdOrCtrl+Shift+Slash";
   return entry.accelerator;
+}
+
+function nativeMenuText(id: string, labelKey: string): string {
+  const text = t(labelKey);
+  const entry = APPLICATION_MENU_SPEC.find((entry) => entry.id === id);
+  if (/Win/i.test(navigator.platform) && entry?.group === "edit" && entry.accelerator) {
+    return `${text}\t${entry.accelerator.replace("CmdOrCtrl", "Ctrl")}`;
+  }
+  return text;
 }
 
 export function applicationMenuStateSnapshot(): ApplicationMenuStateSnapshot {
@@ -348,7 +361,7 @@ async function applyNativeApplicationMenuText(
   handles: NativeApplicationMenuHandles,
 ): Promise<void> {
   await Promise.all(
-    [...handles.texts.values()].map(({ item, labelKey }) => item.setText(t(labelKey))),
+    [...handles.texts].map(([id, { item, labelKey }]) => item.setText(nativeMenuText(id, labelKey))),
   );
 }
 
@@ -366,7 +379,7 @@ async function installNativeApplicationMenu(): Promise<() => void> {
     const entry = entries.get(id)!;
     const item = await MenuItem.new({
       id,
-      text: t(entry.labelKey),
+      text: nativeMenuText(id, entry.labelKey),
       enabled: entry.kind !== "disabled",
       accelerator: nativeAccelerator(entry),
       action: () => runApplicationMenuCommand(id),

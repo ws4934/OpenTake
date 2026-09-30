@@ -8,6 +8,8 @@ const native = vi.hoisted(() => {
   type Item = {
     id: string;
     predefined?: string;
+    accelerator?: string;
+    text?: string;
     children: Item[];
     setEnabled: ReturnType<typeof vi.fn>;
     setText: ReturnType<typeof vi.fn>;
@@ -15,10 +17,12 @@ const native = vi.hoisted(() => {
     setAsAppMenu: ReturnType<typeof vi.fn>;
   };
   const state = { menu: null as Item | null, menus: [] as Item[], predefined: [] as string[] };
-  function item(options: { id?: string; items?: Item[]; item?: string }): Item {
+  function item(options: { id?: string; items?: Item[]; item?: string; accelerator?: string; text?: string }): Item {
     const handle: Item = {
       id: options.id ?? options.item ?? "predefined",
       predefined: options.item,
+      accelerator: options.accelerator,
+      text: options.text,
       children: options.items ?? [],
       setEnabled: vi.fn().mockResolvedValue(undefined),
       setText: vi.fn().mockResolvedValue(undefined),
@@ -117,5 +121,11 @@ describe("native text editing menu", () => {
     await vi.waitFor(() => expect(documentMenu.children[0]!.setEnabled).toHaveBeenLastCalledWith(false));
     expect(menu.children[2]).toBe(documentMenu);
     expect(native.state.predefined).not.toContain("Undo");
+    const copy = documentMenu.children.find((item) => item.id === "copy")!;
+    expect(copy.accelerator).toBeUndefined();
+    expect(copy.text).toContain("\tCtrl+C");
+    await vi.waitFor(() => expect(copy.setText).toHaveBeenLastCalledWith(
+      expect.stringContaining("\tCtrl+C"),
+    ));
   });
 });
