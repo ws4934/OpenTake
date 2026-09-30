@@ -154,6 +154,11 @@ try {
     if (-not [NativeEditInput]::SetForegroundWindow($script:window.Current.NativeWindowHandle)) {
         throw 'Cannot activate the qualification application'
     }
+    # Each runner starts with a fresh WebView profile. The first-run notice
+    # covers the launcher, so dismiss it through its real UI before opening.
+    Wait-Until { $null -ne (Find-Names @('Get started', '开始')) } 'first-run welcome notice'
+    Click-Element (Find-Names @('Get started', '开始'))
+    Wait-Until { $null -eq (Find-Names @('Get started', '开始')) } 'welcome notice dismissed'
     Wait-Until { $null -ne (Find-Names @('Open Project', '打开项目')) } 'frontend readiness'
     Click-Element (Find-Names @('Open Project', '打开项目'))
     $script:dialog = $null
