@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::source::DecodedFrame;
 use opentake_domain::CubeLut;
@@ -17,7 +18,8 @@ use opentake_domain::CubeLut;
 /// in-flight draw can share it.
 pub struct GpuTexture {
     pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
+    /// Stable shared view identity, independent of moves of the texture owner.
+    pub view: Arc<wgpu::TextureView>,
     pub width: u32,
     pub height: u32,
 }
@@ -25,7 +27,8 @@ pub struct GpuTexture {
 /// A filterable 3D LUT texture plus its bindable D3 view.
 pub struct GpuLutTexture {
     pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
+    /// Stable shared view identity, independent of moves of the texture owner.
+    pub view: Arc<wgpu::TextureView>,
     pub size: u32,
     pub domain_min: [f32; 3],
     pub domain_max: [f32; 3],
@@ -99,7 +102,7 @@ pub(crate) fn upload_lut_table_3d(
     });
     GpuLutTexture {
         texture,
-        view,
+        view: Arc::new(view),
         size: lut_size,
         domain_min,
         domain_max,
@@ -165,7 +168,7 @@ pub fn upload_rgba(
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     GpuTexture {
         texture,
-        view,
+        view: Arc::new(view),
         width: frame.width,
         height: frame.height,
     }

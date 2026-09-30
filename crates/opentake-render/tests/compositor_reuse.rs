@@ -186,6 +186,7 @@ fn warm_cache_creates_targets_once_per_size() {
     assert_eq!(warm.render_targets_created, 1);
     assert_eq!(warm.readback_buffers_created, 1);
     assert_eq!(warm.uniform_buffers_created, LAYERS);
+    assert_eq!(warm.bind_groups_created, LAYERS);
 
     // A size change rebuilds the size-keyed targets exactly once; the uniform
     // pool is size-independent and is kept.
@@ -196,6 +197,7 @@ fn warm_cache_creates_targets_once_per_size() {
     assert_eq!(resized.render_targets_created, 2);
     assert_eq!(resized.readback_buffers_created, 2);
     assert_eq!(resized.uniform_buffers_created, LAYERS);
+    assert_eq!(resized.bind_groups_created, LAYERS);
 }
 
 #[test]
@@ -260,4 +262,78 @@ fn concurrent_renders_on_one_compositor_match() {
 fn compositor_stays_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Compositor>();
+}
+
+#[test]
+fn changed_sources_and_empty_frames_invalidate_binding_slots() {
+    let Some(dev) = device_or_skip("changed_sources_and_empty_frames_invalidate_binding_slots")
+    else {
+        return;
+    };
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = PreloadedResolver::new(&dev.device, &dev.queue, 32, 18);
+    let first = render(&compositor, &dev, &mut resolver, SMALL);
+    let old_view = std::sync::Arc::downgrade(&resolver.textures["asset0"].view);
+    let replacement = DecodedFrame::new(32, 18, [255, 0, 255, 255].repeat(32 * 18), true);
+    resolver.textures.insert(
+        "asset0".into(),
+        Rc::new(upload_rgba(
+            &dev.device,
+            &dev.queue,
+            &replacement,
+            false,
+            None,
+        )),
+    );
+    assert!(
+        old_view.upgrade().is_none(),
+        "cache must not retain the source wrapper"
+    );
+    let changed = render(&compositor, &dev, &mut resolver, SMALL);
+    assert_ne!(changed, first);
+    assert_eq!(
+        changed,
+        render(&Compositor::new(&dev.device), &dev, &mut resolver, SMALL)
+    );
+    assert_eq!(compositor.resource_stats().bind_groups_created, LAYERS + 1);
+
+    let empty = Timeline::new();
+    let plan = build_render_plan(&empty, SMALL, &Metrics);
+    compositor
+        .render_to_rgba(
+            &dev.device,
+            &dev.queue,
+            SMALL,
+            &plan.frame(&empty, 0),
+            &mut resolver,
+        )
+        .unwrap();
+    assert_eq!(render(&compositor, &dev, &mut resolver, SMALL), changed);
+    assert_eq!(
+        compositor.resource_stats().bind_groups_created,
+        2 * LAYERS + 1
+    );
+}
+
+#[test]
+fn cached_bindings_still_apply_changed_uniforms() {
+    let Some(dev) = device_or_skip("cached_bindings_still_apply_changed_uniforms") else {
+        return;
+    };
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = PreloadedResolver::new(&dev.device, &dev.queue, 32, 18);
+    let first = render(&compositor, &dev, &mut resolver, SMALL);
+    let mut timeline = four_layer_timeline(SMALL);
+    timeline.tracks[0].clips[0].opacity = 0.1;
+    let plan = build_render_plan(&timeline, SMALL, &Metrics);
+    let frame = plan.frame(&timeline, 0);
+    let warm = compositor
+        .render_to_rgba(&dev.device, &dev.queue, SMALL, &frame, &mut resolver)
+        .unwrap();
+    let cold = Compositor::new(&dev.device)
+        .render_to_rgba(&dev.device, &dev.queue, SMALL, &frame, &mut resolver)
+        .unwrap();
+    assert_ne!(warm.rgba, first);
+    assert_eq!(warm.rgba, cold.rgba);
+    assert_eq!(compositor.resource_stats().bind_groups_created, LAYERS);
 }

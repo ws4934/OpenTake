@@ -781,7 +781,7 @@ impl LottieMaterializer {
             key,
             GpuTexture {
                 texture,
-                view,
+                view: view.into(),
                 width,
                 height,
             },
