@@ -196,12 +196,19 @@ impl EncodeWorkspace {
         // Disable TempDir's recursive path cleanup before retaining the handle.
         let path = builder.tempdir_in(parent).map_err(MediaError::Io)?.keep();
         let directory = open_directory_nofollow(&path)?;
-        Ok(Self {
+        let workspace = Self {
             directory,
             path,
             #[cfg(unix)]
             parent: parent_handle,
-        })
+        };
+        // Visibility is cosmetic: a volume that rejects DOS attributes must
+        // not make an otherwise valid export fail or weaken its retained lease.
+        #[cfg(windows)]
+        if let Err(error) = workspace.hide_directory() {
+            tracing::warn!(%error, "could not hide the encode workspace");
+        }
+        Ok(workspace)
     }
 
     fn path(&self) -> &Path {
@@ -291,6 +298,57 @@ impl EncodeWorkspace {
 
 #[cfg(windows)]
 impl EncodeWorkspace {
+    fn hide_directory(&self) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, ReOpenFile, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_ATTRIBUTES,
+        };
+        let attributes = self.directory.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return Ok(());
+        }
+        // Reopen the retained object, never its mutable pathname. Share-delete
+        // permits the original handle's DELETE access without changing its lease.
+        // SAFETY: the original handle is live; backup semantics permit a directory.
+        let handle = unsafe {
+            ReOpenFile(
+                self.directory.as_raw_handle(),
+                FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: ReOpenFile returned a new valid handle owned by this scope.
+        let writable = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let info = FILE_BASIC_INFO {
+            FileAttributes: (attributes & !FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_HIDDEN,
+            // Zero timestamps preserve the existing values.
+            ..Default::default()
+        };
+        // SAFETY: the live attribute handle and SDK buffer have the required
+        // access, layout and lifetime for this synchronous call.
+        if unsafe {
+            SetFileInformationByHandle(
+                writable.as_raw_handle(),
+                FileBasicInfo,
+                (&info as *const FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn remove_directory(&self) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
