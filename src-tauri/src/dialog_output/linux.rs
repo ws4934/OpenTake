@@ -161,25 +161,10 @@ mod tests {
         .unwrap();
         chooser.show();
         assert!(chooser.select_filename(&file));
+        wait_for_paths(&chooser, kind, [file.clone()].into_iter().collect());
         assert!(chooser.select_filename(&shadow));
         let expected: std::collections::HashSet<_> = [file.clone(), shadow].into_iter().collect();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let context = gtk::glib::MainContext::default();
-        loop {
-            while context.pending() {
-                context.iteration(false);
-            }
-            let paths: std::collections::HashSet<_> =
-                selected_paths(&chooser, kind).into_iter().collect();
-            if paths == expected {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "native GTK selection mismatch: {paths:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_paths(&chooser, kind, expected);
         chooser.destroy();
 
         for kind in [
@@ -200,6 +185,30 @@ mod tests {
         let chooser = build_dialog(None, kind, None, Some(&directory), true, &[], None).unwrap();
         assert_eq!(selected_paths(&chooser, kind), vec![directory]);
         chooser.destroy();
+    }
+
+    fn wait_for_paths(
+        chooser: &gtk::FileChooserNative,
+        kind: PickerKind,
+        expected: std::collections::HashSet<PathBuf>,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let context = gtk::glib::MainContext::default();
+        loop {
+            while context.pending() {
+                context.iteration(false);
+            }
+            let paths: std::collections::HashSet<_> =
+                selected_paths(chooser, kind).into_iter().collect();
+            if paths == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native GTK selection mismatch: {paths:?}, expected {expected:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
