@@ -59,7 +59,10 @@ beforeEach(() => {
   vi.mocked(openDialog).mockResolvedValue(open);
   open.mockResolvedValue(null);
   vi.mocked(api.importMedia).mockResolvedValue({ items: [], folders: [] });
-  vi.mocked(api.getMedia).mockResolvedValue({ items: [], folders: [] });
+  vi.mocked(api.getMedia).mockImplementation(async () => ({
+    items: useMediaStore.getState().items,
+    folders: useMediaStore.getState().folders,
+  }));
   vi.mocked(addMediaToTimeline).mockReset().mockResolvedValue(undefined);
   host = document.createElement("div");
   document.body.append(host);
@@ -160,12 +163,13 @@ describe("Sticker panel", () => {
     });
     let newImport!: ReturnType<typeof beginMediaImport>;
     await act(async () => { newImport = beginMediaImport(); });
+    const currentProjectReads = vi.mocked(api.getMedia).mock.calls.length;
     await act(async () => {
       picked.resolve(["/old.png"]);
       imported.resolve({ items: [sticker("old-project")], folders: [] });
     });
     expect(api.importMedia).toHaveBeenCalledTimes(stage === "picker" ? 0 : 1);
-    expect(api.getMedia).not.toHaveBeenCalled();
+    expect(api.getMedia).toHaveBeenCalledTimes(currentProjectReads);
     expect(card("new-project")).not.toBeNull();
     expect(card("old-project")).toBeNull();
     expect(useMediaStore.getState().importing).toBe(true);

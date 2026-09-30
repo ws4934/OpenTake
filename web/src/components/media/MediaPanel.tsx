@@ -35,7 +35,6 @@ import {
   endMediaImport,
   refreshMedia,
   applyMediaErrorForProject,
-  applyMediaListForProject,
   captureMediaProjectIdentity,
   isCurrentMediaProject,
   useMediaStore,
@@ -103,7 +102,7 @@ import { TransitionTab } from "./TransitionTab";
 import { CaptionsTab } from "./CaptionsTab";
 import { SmartPackTab } from "./SmartPackTab";
 import { MediaSearchResults } from "./MediaSearch";
-import { applyFavoriteMigrationOutcome, migrateLocalFavorites } from "./favorites";
+import { applyFavoriteMigrationOutcome, migrateLocalFavorites, refreshFavoriteMedia } from "./favorites";
 import { LibraryEntryGrid } from "./LibraryView";
 import { EFFECT_REGISTRY, newAdvertisedEffect, type AdvertisedEffectName } from "../../lib/effects";
 
@@ -2026,8 +2025,8 @@ export function MediaListRow({
           assetId={item.id}
           favorite={favorite}
           title={favorite ? t("media.unfavorite") : t("media.favorite")}
-          onSuccess={async (media, project) => {
-            if (!applyMediaListForProject(project, media)) return;
+          onSuccess={async (_media, project) => {
+            if (!await refreshFavoriteMedia(project)) return;
             await useLibraryStore.getState().refresh();
           }}
           onError={(message, project) => {
@@ -2890,7 +2889,7 @@ export function MediaCard({
         )}
         {/* Offline overlay: the source file is missing. Relink keeps the asset
             id, so the timeline clips referencing it recover (no re-import). */}
-        {item.missing && (
+        {item.missing && !generationActive && !generationFailed && (
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -2939,8 +2938,8 @@ export function MediaCard({
           assetId={item.id}
           favorite={favorite}
           title={favorite ? t("media.unfavorite") : t("media.favorite")}
-          onSuccess={async (media, project) => {
-            if (!applyMediaListForProject(project, media)) return;
+          onSuccess={async (_media, project) => {
+            if (!await refreshFavoriteMedia(project)) return;
             await useLibraryStore.getState().refresh();
           }}
           onError={(message, project) => {

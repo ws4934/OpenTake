@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { FavoriteSyncResult } from "../../lib/types";
 
-const { syncProjectFavorites } = vi.hoisted(() => ({
+const { syncProjectFavorites, getMedia } = vi.hoisted(() => ({
   syncProjectFavorites: vi.fn(),
+  getMedia: vi.fn(),
 }));
-vi.mock("../../lib/api", () => ({ syncProjectFavorites }));
+vi.mock("../../lib/api", () => ({ syncProjectFavorites, getMedia }));
 
 function makeLocalStorage(): Storage {
   const map = new Map<string, string>();
@@ -49,6 +51,26 @@ describe("migrateLocalFavorites", () => {
       migratedLegacyAssetIds: [],
       failures: [],
     });
+    getMedia.mockReset().mockResolvedValue({ items: [], folders: [] });
+  });
+
+  it("keeps a recovered result when a pre-completion favorite catalog arrives late", async () => {
+    const { migrateLocalFavorites, applyFavoriteMigrationOutcome } = await import("./favorites");
+    const { useMediaStore } = await import("../../store/mediaStore");
+    const project = await setCurrentProject(31, "/recovered.opentake");
+    const ready = { id: "held", name: "Held", type: "image" as const, duration: 0, hasAudio: false, generationStatus: "none" as const };
+    const downloading = { ...ready, generationStatus: "downloading" as const, generationProgress: 0.8 };
+    const pending = deferred<FavoriteSyncResult>();
+    syncProjectFavorites.mockReturnValueOnce(pending.promise);
+    const migration = migrateLocalFavorites([downloading], project);
+
+    // Recovery publishes Ready while the favorite command's older DTO is in flight.
+    useMediaStore.setState({ items: [ready] });
+    getMedia.mockResolvedValueOnce({ items: [{ ...ready, favorite: true }], folders: [] });
+    pending.resolve({ media: { items: [downloading], folders: [] }, migratedLegacyAssetIds: [], failures: [] });
+    applyFavoriteMigrationOutcome(project, await migration);
+
+    expect(useMediaStore.getState().items[0]).toMatchObject({ generationStatus: "none", favorite: true });
   });
 
   it("sends only current-project legacy ids and removes only confirmed migrations", async () => {
@@ -184,10 +206,6 @@ describe("migrateLocalFavorites", () => {
     expect(
       applyFavoriteMigrationOutcome(projectA, {
         synced: true,
-        media: {
-          items: [{ id: "late-a", name: "A", type: "video", duration: 1, hasAudio: false }],
-          folders: [{ id: "folder-a", name: "A" }],
-        },
         failures: [{ assetId: "late-a", message: "A failure" }],
       }),
     ).toBe(false);

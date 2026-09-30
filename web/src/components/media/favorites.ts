@@ -1,9 +1,9 @@
 import * as api from "../../lib/api";
-import type { FavoriteSyncFailure, MediaList } from "../../lib/types";
+import type { FavoriteSyncFailure } from "../../lib/types";
 import {
   applyMediaErrorForProject,
-  applyMediaListForProject,
   isCurrentMediaProject,
+  refreshMedia,
   type MediaProjectIdentity,
 } from "../../store/mediaStore";
 
@@ -33,7 +33,6 @@ function removeMigratedLegacyIds(ids: ReadonlyArray<string>): void {
 
 export interface FavoriteMigrationOutcome {
   synced: boolean;
-  media?: MediaList;
   failures: FavoriteSyncFailure[];
 }
 
@@ -41,6 +40,14 @@ const completedProjects = new Set<string>();
 const inFlight = new Map<string, Promise<FavoriteMigrationOutcome>>();
 const retryAfter = new Map<string, number>();
 const RETRY_BACKOFF_MS = 250;
+
+/** Read after the favorite command finishes so its older catalog cannot
+ * replace a concurrently recovered result. False means the project changed. */
+export async function refreshFavoriteMedia(project: MediaProjectIdentity): Promise<boolean> {
+  if (!isCurrentMediaProject(project)) return false;
+  await refreshMedia();
+  return isCurrentMediaProject(project);
+}
 
 function projectKey(project: MediaProjectIdentity): string {
   return JSON.stringify([project.projectEpoch, project.projectPath]);
@@ -51,7 +58,6 @@ export function applyFavoriteMigrationOutcome(
   outcome: FavoriteMigrationOutcome,
 ): boolean {
   if (!isCurrentMediaProject(project)) return false;
-  if (outcome.media && !applyMediaListForProject(project, outcome.media)) return false;
   if (outcome.failures.length > 0) {
     applyMediaErrorForProject(
       project,
@@ -92,10 +98,13 @@ export function migrateLocalFavorites(
   const matchingLegacyIds = [...legacyIds].filter((id) => projectIds.has(id));
   const operation = api
     .syncProjectFavorites(matchingLegacyIds, project)
-    .then((result): FavoriteMigrationOutcome => {
+    .then(async (result): Promise<FavoriteMigrationOutcome> => {
       if (!isCurrentMediaProject(project)) {
         return { synced: false, failures: [] };
       }
+      // The command's DTO may precede a concurrent generation completion.
+      // Fetch current state once for the shared migration, rather than replaying it.
+      if (!await refreshFavoriteMedia(project)) return { synced: false, failures: [] };
       removeMigratedLegacyIds(result.migratedLegacyAssetIds);
       if (result.failures.length === 0) {
         retryAfter.delete(key);
@@ -103,7 +112,7 @@ export function migrateLocalFavorites(
       } else {
         retryAfter.set(key, Date.now() + RETRY_BACKOFF_MS);
       }
-      return { synced: true, media: result.media, failures: result.failures };
+      return { synced: true, failures: result.failures };
     })
     .finally(() => {
       inFlight.delete(key);

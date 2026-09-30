@@ -711,6 +711,7 @@ describe("media grid interaction consistency", () => {
           <MediaCard
             item={{
               ...mediaItem("unknown"),
+              missing: true,
               generationStatus: "failed",
               generationErrorCode: code,
               generationInput: {
@@ -728,6 +729,8 @@ describe("media grid interaction consistency", () => {
       );
       expect(container.textContent).not.toContain(code);
       expect(container.textContent).toContain(help);
+      expect(container.textContent).not.toContain("媒体离线");
+      expect([...container.querySelectorAll("button")].some(button => button.textContent === "重新链接")).toBe(false);
       const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
         (button) => button.textContent === "重试",
       );
