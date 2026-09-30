@@ -10,6 +10,26 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class NativeEditInput {
+    [StructLayout(LayoutKind.Sequential)] private struct KeyInput {
+        public ushort virtualKey, scanCode;
+        public uint flags, time;
+        public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct MouseInput {
+        public int x, y;
+        public uint data, flags, time;
+        public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] private struct InputData {
+        [FieldOffset(0)] public KeyInput key;
+        [FieldOffset(0)] public MouseInput mouse;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct Input {
+        public uint type;
+        public InputData data;
+    }
+    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] inputs, int size);
+    [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint code, uint mapType);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
@@ -24,6 +44,22 @@ public static class NativeEditInput {
         if (state == uint.MaxValue) throw new InvalidOperationException("Native Edit item is absent");
         return (state & 3) == 0; // MF_DISABLED | MF_GRAYED
     }
+    private static Input Key(uint virtualKey, bool up) {
+        uint scan = MapVirtualKeyW(virtualKey, 0);
+        if (scan == 0) throw new InvalidOperationException("Test key has no scan code");
+        return new Input { type = 1, data = new InputData {
+            key = new KeyInput { scanCode = (ushort)scan, flags = 8u | (up ? 2u : 0u) }
+        } }; // KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+    }
+    private static void Send(Input[] inputs) {
+        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != inputs.Length)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public static void ControlKey(char key) {
+        uint code = (uint)char.ToUpperInvariant(key);
+        Send(new[] { Key(0x11, false), Key(code, false), Key(code, true), Key(0x11, true) });
+    }
+    public static void Backspace() { Send(new[] { Key(0x08, false), Key(0x08, true) }); }
     public static void Click(int x, int y) {
         if (!SetCursorPos(x, y)) throw new InvalidOperationException("Cannot position the test pointer");
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
@@ -77,7 +113,13 @@ function Click-Element($Element) {
     )
 }
 
-function Send-Keys([string]$Keys) { [System.Windows.Forms.SendKeys]::SendWait($Keys) }
+function Send-Keys([string]$Keys) {
+    # SendKeys omits scan codes. Browser text editing accepts its virtual keys,
+    # while the editor's event.code contract requires physical keyboard events.
+    if ($Keys -match '^\^([a-z])$') { [NativeEditInput]::ControlKey($Matches[1][0]) }
+    elseif ($Keys -eq '{BACKSPACE}') { [NativeEditInput]::Backspace() }
+    else { [System.Windows.Forms.SendKeys]::SendWait($Keys) }
+}
 
 function Read-Value($Element) {
     $pattern = $null
