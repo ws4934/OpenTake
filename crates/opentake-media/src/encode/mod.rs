@@ -9,6 +9,7 @@
 
 pub mod mix;
 pub mod preset;
+mod recovery;
 
 pub use mix::{mix_clips, mono_f32_to_s16le, ClipAudio, MIX_SAMPLE_RATE};
 pub use preset::{even_dimension, ExportPreset, ExportResolution, VideoCodec};
@@ -167,6 +168,7 @@ pub struct VideoEncoder {
 
 /// Cleanup uses retained directory handles so a replaced pathname is left alone.
 struct EncodeWorkspace {
+    recovery: Option<recovery::RecoveryRecord>,
     /// Retained no-follow handle of the directory.
     directory: File,
     path: PathBuf,
@@ -184,6 +186,9 @@ impl EncodeWorkspace {
     }
 
     fn in_directory(parent: &Path) -> Result<Self> {
+        if let Err(error) = recovery::recover(parent) {
+            tracing::warn!(%error, "could not scan encode recovery receipts");
+        }
         #[cfg(unix)]
         let parent_handle = open_directory_nofollow(parent)?;
         let mut builder = tempfile::Builder::new();
@@ -198,7 +203,8 @@ impl EncodeWorkspace {
         // Disable TempDir's recursive path cleanup before retaining the handle.
         let path = builder.tempdir_in(parent).map_err(MediaError::Io)?.keep();
         let directory = open_directory_nofollow(&path)?;
-        let workspace = Self {
+        let mut workspace = Self {
+            recovery: None,
             directory,
             path,
             #[cfg(unix)]
@@ -207,10 +213,24 @@ impl EncodeWorkspace {
         // Visibility is cosmetic: a volume that rejects DOS attributes must
         // not make an otherwise valid export fail or weaken its retained lease.
         #[cfg(windows)]
-        if let Err(error) = workspace.hide_directory() {
+        if let Err(error) = Self::hide_file(&workspace.directory) {
             tracing::warn!(%error, "could not hide the encode workspace");
         }
+        workspace.recovery = match recovery::RecoveryRecord::create(&workspace) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                tracing::warn!(%error, "could not register encode workspace for crash recovery");
+                None
+            }
+        };
         Ok(workspace)
+    }
+
+    fn configure_child(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        if let Some(record) = &self.recovery {
+            record.configure_child(command)?;
+        }
+        Ok(())
     }
 
     fn path(&self) -> &Path {
@@ -230,6 +250,7 @@ impl EncodeWorkspace {
             "audio.pcm",
             "muxed.mp4",
             "muxed.mov",
+            recovery::MARKER,
         ] {
             match self.remove_file(std::ffi::OsStr::new(name)) {
                 Ok(()) => {}
@@ -245,6 +266,10 @@ impl Drop for EncodeWorkspace {
     fn drop(&mut self) {
         if let Err(error) = self.cleanup() {
             tracing::warn!(path = %self.path.display(), %error, "failed to clean encode workspace");
+        } else if let Some(record) = &self.recovery {
+            if let Err(error) = record.remove() {
+                tracing::warn!(%error, "failed to remove completed encode receipt");
+            }
         }
     }
 }
@@ -300,14 +325,14 @@ impl EncodeWorkspace {
 
 #[cfg(windows)]
 impl EncodeWorkspace {
-    fn hide_directory(&self) -> std::io::Result<()> {
+    fn hide_file(file: &File) -> std::io::Result<()> {
         use std::os::windows::fs::MetadataExt;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             FileBasicInfo, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
             FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
         };
-        let attributes = self.directory.metadata()?.file_attributes();
+        let attributes = file.metadata()?.file_attributes();
         if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
             return Ok(());
         }
@@ -320,7 +345,7 @@ impl EncodeWorkspace {
         // access, layout and lifetime for this synchronous call.
         if unsafe {
             SetFileInformationByHandle(
-                self.directory.as_raw_handle(),
+                file.as_raw_handle(),
                 FileBasicInfo,
                 (&info as *const FILE_BASIC_INFO).cast(),
                 std::mem::size_of::<FILE_BASIC_INFO>() as u32,
@@ -491,6 +516,9 @@ impl VideoEncoder {
             ))
             .as_inner_mut()
             .current_dir(workspace.path());
+        workspace
+            .configure_child(command.as_inner_mut())
+            .map_err(MediaError::Io)?;
         let (mut child, mut process_tree) =
             spawn_encoder(&mut command).map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
         let stdin = child.take_stdin();
@@ -932,6 +960,11 @@ impl VideoEncoder {
             .args(args)
             .as_inner_mut()
             .current_dir(self.workspace_path()?);
+        self.workspace
+            .as_ref()
+            .expect("mux has a workspace")
+            .configure_child(command.as_inner_mut())
+            .map_err(MediaError::Io)?;
         let (mut child, mut process_tree) = spawn_encoder(&mut command)
             .map_err(|e| MediaError::Encode(format!("mux spawn: {e}")))?;
         let stdout = child.take_stdout().ok_or_else(|| {
@@ -1511,6 +1544,49 @@ mod tests {
     }
 
     #[test]
+    fn next_encode_recovers_a_crashed_workspace_but_preserves_active_and_foreign_dirs() {
+        const CHILD_ROOT: &str = "OPENTAKE_TEST_CRASH_WORKSPACE_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let workspace = EncodeWorkspace::in_directory(Path::new(&root)).unwrap();
+            std::fs::write(workspace.path().join("video.mp4"), b"unfinished encode").unwrap();
+            std::process::exit(0);
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "encode::tests::next_encode_recovers_a_crashed_workspace_but_preserves_active_and_foreign_dirs", "--test-threads=1"])
+            .env(CHILD_ROOT, parent.path())
+            .status().unwrap();
+        assert!(status.success());
+        let stale = std::fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        let foreign = parent
+            .path()
+            .join(format!("{ENCODE_WORKSPACE_PREFIX}foreign"));
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("video.mp4"), b"user data").unwrap();
+        let active = EncodeWorkspace::in_directory(parent.path()).unwrap();
+        std::fs::write(active.path().join("video.mp4"), b"active encode").unwrap();
+        let another = EncodeWorkspace::in_directory(parent.path()).unwrap();
+        assert!(
+            !stale.exists(),
+            "the abandoned owned workspace must be recovered"
+        );
+        assert_eq!(
+            std::fs::read(active.path().join("video.mp4")).unwrap(),
+            b"active encode"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("video.mp4")).unwrap(),
+            b"user data"
+        );
+        drop(another);
+        drop(active);
+    }
+
+    #[test]
     fn audio_chunks_spool_incrementally_without_retaining_the_timeline_mix() {
         assert!(crate::ff::ffmpeg_available(), "test requires FFmpeg");
         let temp = tempfile::tempdir().unwrap();
@@ -1672,7 +1748,10 @@ mod tests {
             .starts_with(ENCODE_WORKSPACE_PREFIX));
         assert_eq!(
             workspace_entries(encoded.directory_path()),
-            [encoded.name().to_string_lossy()]
+            [
+                recovery::MARKER.to_owned(),
+                encoded.name().to_string_lossy().into_owned()
+            ]
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"previous movie");
         assert_eq!(reports.borrow().last(), Some(&ENCODE_PROGRESS_TOTAL));
