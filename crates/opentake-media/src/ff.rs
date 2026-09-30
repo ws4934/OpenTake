@@ -788,6 +788,18 @@ pub fn ffmpeg_path() -> OsString {
     )
 }
 
+/// Keep an explicit relative executable bound to the application's directory
+/// when a helper runs inside a private media workspace. Bare names use PATH.
+pub(crate) fn ffmpeg_workspace_path() -> std::io::Result<OsString> {
+    let executable = ffmpeg_path();
+    let path = Path::new(&executable);
+    if path.is_relative() && path.components().count() > 1 {
+        Ok(std::path::absolute(path)?.into_os_string())
+    } else {
+        Ok(executable)
+    }
+}
+
 /// Path to `ffprobe`: explicit development override, packaged sidecar, then PATH.
 pub fn ffprobe_path() -> OsString {
     #[cfg(test)]

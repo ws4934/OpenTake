@@ -1251,6 +1251,33 @@ fn native_windows_path_inputs_preserve_the_original_file() {
     assert_eq!(actual, expected);
     drop(audio);
 
+    let raw_parent = temp
+        .path()
+        .join(std::ffi::OsString::from_wide(&[100, 105, 114, 45, 0xd800]));
+    std::fs::create_dir(&raw_parent).unwrap();
+    let trimmed = raw_parent.join(raw.file_name().unwrap());
+    opentake_media::trim_video_range(&raw, &trimmed, 0.2, 0.8, &cancel).unwrap();
+    assert!((probe(&trimmed).unwrap().duration_secs - 0.6).abs() < 0.02);
+    let audio_output = trimmed.with_extension("wav");
+    opentake_media::MediaEngine::new(temp.path(), temp.path())
+        .extract_audio(&raw, &audio_output)
+        .unwrap();
+    let audio_probe = probe(&audio_output).unwrap();
+    assert!(audio_probe.has_audio && !audio_probe.has_video);
+    assert!((audio_probe.duration_secs - 1.0).abs() < 0.03);
+    let proxy = raw_parent.join("proxy.mp4");
+    opentake_media::create_proxy(
+        opentake_media::ProxyRequest {
+            source: &raw,
+            output: &proxy,
+            max_size: (32, 24),
+        },
+        &cancel,
+        None,
+    )
+    .unwrap();
+    assert!((probe(&proxy).unwrap().duration_secs - 1.0).abs() < 0.03);
+
     std::fs::remove_file(&raw).unwrap();
     assert!(
         probe(&raw).is_err(),
@@ -1275,4 +1302,26 @@ fn native_windows_parent_directories_encode_without_replacement() {
     let file = std::fs::File::open(&output).unwrap();
     let probed = opentake_media::probe::probe_file(&file).unwrap();
     assert!((probed.duration_secs - 1.0).abs() < 0.01);
+
+    let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+    let mut encoder = VideoEncoder::new_in_workspace(&output, 64, 48, 10, &preset).unwrap();
+    encoder
+        .push_frame(&RgbaFrame::new(64, 48, [220, 60, 20, 255].repeat(64 * 48)))
+        .unwrap();
+    encoder
+        .push_audio(opentake_media::PcmBuffer {
+            spec: PcmSpec {
+                sample_rate: 48_000,
+                channels: 1,
+                format: PcmFormat::F32,
+            },
+            samples_f32: vec![0.25; 4_800],
+        })
+        .unwrap();
+    let encoded = encoder
+        .finish_in_workspace(&opentake_media::MediaCancelToken::new(), None)
+        .unwrap();
+    let probed = opentake_media::probe::probe_file(encoded.file()).unwrap();
+    assert!((probed.duration_secs - 0.1).abs() < 0.01);
+    assert!(probed.has_audio);
 }

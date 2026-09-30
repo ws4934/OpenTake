@@ -98,13 +98,16 @@ pub fn trim_video_range(
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let stage = media_output_stage(destination, "mp4")?;
+    let input = std::fs::File::open(source)?;
     let duration = end_seconds - start_seconds;
-    let mut child = opentake_process_tree::background_command(ff::ffmpeg_path())
+    let mut child = opentake_process_tree::background_command(ff::ffmpeg_workspace_path()?)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .arg("-ss")
         .arg(format!("{start_seconds:.6}"))
         .arg("-i")
-        .arg(source)
+        .arg("fd:")
+        .stdin(std::process::Stdio::from(input))
         .arg("-t")
         .arg(format!("{duration:.6}"))
         .args([
@@ -123,7 +126,8 @@ pub fn trim_video_range(
             "-movflags",
             "+faststart",
         ])
-        .arg(destination)
+        .arg(stage.path().file_name().expect("staging leaf"))
+        .current_dir(stage.path().parent().expect("staging parent"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -133,16 +137,16 @@ pub fn trim_video_range(
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(destination);
             return Err(MediaError::Cancelled);
         }
         if let Some(status) = child.try_wait()? {
-            if !status.success() || !destination.is_file() {
-                let _ = std::fs::remove_file(destination);
+            if !status.success() || stage.as_file().metadata()?.len() == 0 {
                 return Err(MediaError::Ffmpeg(
                     "trimmed generation source could not be materialized".to_string(),
                 ));
             }
+            stage.as_file().sync_all()?;
+            stage.persist(destination).map_err(|error| error.error)?;
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -416,6 +420,20 @@ fn audio_codec_args(ext: &str) -> Option<Vec<&'static str>> {
     }
 }
 
+// FFmpeg sees only a generated ASCII leaf. The OS receives the native parent
+// directory, and Rust publishes the finished file under the original name.
+fn media_output_stage(output: &Path, extension: &str) -> Result<tempfile::NamedTempFile> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tempfile::Builder::new()
+        .prefix(".opentake-media-")
+        .suffix(&format!(".{extension}"))
+        .tempfile_in(parent)
+        .map_err(MediaError::Io)
+}
+
 /// Run `ffmpeg -y -i <input> -vn <codec args> <output>` to mux the audio track
 /// into a standalone file. Codec is selected by `output`'s extension so the
 /// caller just picks a save-path filter in the native dialog and the right
@@ -430,13 +448,15 @@ fn extract_audio_file(input: &Path, output: &Path) -> Result<()> {
         ))
     })?;
 
-    let mut cmd = opentake_process_tree::background_command(ff::ffmpeg_path());
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(input)
+    let stage = media_output_stage(output, ext)?;
+    let input = std::fs::File::open(input)?;
+    let mut cmd = opentake_process_tree::background_command(ff::ffmpeg_workspace_path()?);
+    cmd.args(["-y", "-nostdin", "-i", "fd:"])
+        .stdin(std::process::Stdio::from(input))
         .arg("-vn")
         .args(&codec_args)
-        .arg(output);
+        .arg(stage.path().file_name().expect("staging leaf"))
+        .current_dir(stage.path().parent().expect("staging parent"));
 
     let out = cmd
         .output()
@@ -453,6 +473,13 @@ fn extract_audio_file(input: &Path, output: &Path) -> Result<()> {
             }
         )));
     }
+    if stage.as_file().metadata()?.len() == 0 {
+        return Err(MediaError::Ffmpeg(
+            "audio extraction produced no output".into(),
+        ));
+    }
+    stage.as_file().sync_all()?;
+    stage.persist(output).map_err(|error| error.error)?;
     Ok(())
 }
 
