@@ -2295,7 +2295,10 @@ pub(crate) fn run_export_with_control(
     let mut lottie = LottieMaterializer::new();
     let mut content_hashes = ContentHashCache::new();
     let mut video_streams = ExportVideoStreams::default();
-    for f in start_frame..end_frame {
+    let mut pending = None;
+    // The final iteration drains the last submission. At most two GPU frames
+    // are in flight, and pixels reach the encoder in timeline order.
+    for f in start_frame..=end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
                 .as_ref()
@@ -2310,58 +2313,69 @@ pub(crate) fn run_export_with_control(
             return Err(CANCELLED_SENTINEL.to_string());
         }
 
-        let mut frame_plan = plan.frame(timeline, f);
-        frame_plan.clear_rgba = export_clear_rgba(req.codec);
-        let video_frames = video_streams.prepare(
-            &frame_plan,
-            &media,
-            plan.fps,
-            (render_size.width, render_size.height),
-            &video_cancel,
-        )?;
-        let mut resolver = MediaResolver {
-            device: &dev.device,
-            queue: &dev.queue,
-            cache: &mut texture_cache,
-            lottie: &mut lottie,
-            content_hashes: &mut content_hashes,
-            media: &media,
-            text: &text,
-            text_rasterizer: &text_rasterizer,
-            render_box: (render_size.width, render_size.height),
-            project_root: project_root.as_ref(),
-            lut_cache: &mut lut_cache,
-            video_frames: &video_frames,
-            cancel: &video_cancel,
-            materialization_error: None,
-        };
-        let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
-        let composite = compositor
-            .render_to_rgba_with_interpolation(
-                &dev.device,
-                &dev.queue,
-                render_size,
+        let next = if f < end_frame {
+            let mut frame_plan = plan.frame(timeline, f);
+            frame_plan.clear_rgba = export_clear_rgba(req.codec);
+            let video_frames = video_streams.prepare(
                 &frame_plan,
-                &mut resolver,
-                interpolation,
-            )
-            .map_err(|e| format!("composite render failed at frame {f}: {e}"))?;
-        if let Some(error) = resolver.materialization_error.take() {
-            encoder.abort();
-            if error == CANCELLED_SENTINEL {
-                return Err(error);
+                &media,
+                plan.fps,
+                (render_size.width, render_size.height),
+                &video_cancel,
+            )?;
+            let mut resolver = MediaResolver {
+                device: &dev.device,
+                queue: &dev.queue,
+                cache: &mut texture_cache,
+                lottie: &mut lottie,
+                content_hashes: &mut content_hashes,
+                media: &media,
+                text: &text,
+                text_rasterizer: &text_rasterizer,
+                render_box: (render_size.width, render_size.height),
+                project_root: project_root.as_ref(),
+                lut_cache: &mut lut_cache,
+                video_frames: &video_frames,
+                cancel: &video_cancel,
+                materialization_error: None,
+            };
+            let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
+            let submitted = compositor
+                .render_pending_with_interpolation(
+                    &dev.device,
+                    &dev.queue,
+                    render_size,
+                    &frame_plan,
+                    &mut resolver,
+                    interpolation,
+                )
+                .map_err(|e| format!("composite render failed at frame {f}: {e}"))?;
+            if let Some(error) = resolver.materialization_error.take() {
+                encoder.abort();
+                if error == CANCELLED_SENTINEL {
+                    return Err(error);
+                }
+                return Err(format!(
+                    "export materialization failed at frame {f}: {error}"
+                ));
             }
-            return Err(format!(
-                "export materialization failed at frame {f}: {error}"
-            ));
-        }
+            Some((f, submitted))
+        } else {
+            None
+        };
+        let Some((frame_index, submitted)) = std::mem::replace(&mut pending, next) else {
+            continue;
+        };
+        let composite = submitted
+            .finish()
+            .map_err(|e| format!("composite readback failed at frame {frame_index}: {e}"))?;
         encoder
             .push_frame(&encoder_frame(req.codec, composite))
-            .map_err(|e| format!("encode frame {f} failed: {e}"))?;
+            .map_err(|e| format!("encode frame {frame_index} failed: {e}"))?;
 
         if let Some(emit) = &on_progress {
             let now = Instant::now();
-            let done = f - start_frame + 1;
+            let done = frame_index - start_frame + 1;
             let is_last = done == range_total;
             if is_last || progress_should_emit(last_progress_emit, now) {
                 let mapped = if range_total == 0 {

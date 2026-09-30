@@ -164,3 +164,67 @@ fn malformed_and_oversized_luts_fail_closed_and_valid_lut_matches_preview_export
         assert!((i16::from(*actual) - i16::from(expected)).abs() <= 2);
     }
 }
+
+#[test]
+fn replacing_or_removing_a_lut_invalidates_cached_bindings() {
+    let dev = match RenderDevice::try_new() {
+        Ok(dev) => dev,
+        Err(error) => {
+            assert!(
+                std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none(),
+                "GPU required: {error}"
+            );
+            eprintln!("[skip] LUT binding invalidation: no GPU device ({error})");
+            return;
+        }
+    };
+    let identity = CubeLut::parse(&cube(17, |r, g, b| [r, g, b])).unwrap();
+    let swapped = CubeLut::parse(&cube(17, |r, g, b| [b, g, r])).unwrap();
+    let reference = LutReference::new(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "LUT",
+        1.0,
+    )
+    .unwrap();
+    let mut timeline = timeline(reference);
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = LutResolver {
+        device: &dev.device,
+        queue: &dev.queue,
+        source: None,
+        lut: identity,
+        uploaded_lut: None,
+    };
+    let plan = build_render_plan(&timeline, RS, &Metrics);
+    let frame = plan.frame(&timeline, 0);
+    let first = compositor
+        .render_to_rgba(&dev.device, &dev.queue, RS, &frame, &mut resolver)
+        .unwrap();
+    let repeated = compositor
+        .render_to_rgba(&dev.device, &dev.queue, RS, &frame, &mut resolver)
+        .unwrap();
+    assert_eq!(first.rgba, repeated.rgba);
+    assert_eq!(compositor.resource_stats().bind_groups_created, 1);
+
+    resolver.lut = swapped.clone();
+    resolver.uploaded_lut = None;
+    let changed = compositor
+        .render_to_rgba(&dev.device, &dev.queue, RS, &frame, &mut resolver)
+        .unwrap();
+    assert_ne!(changed.rgba, first.rgba);
+    assert_eq!(changed.rgba, render(&dev, &timeline, swapped).rgba);
+    assert_eq!(compositor.resource_stats().bind_groups_created, 2);
+
+    timeline.tracks[0].clips[0].lut = None;
+    let plan = build_render_plan(&timeline, RS, &Metrics);
+    let frame = plan.frame(&timeline, 0);
+    let removed = compositor
+        .render_to_rgba(&dev.device, &dev.queue, RS, &frame, &mut resolver)
+        .unwrap();
+    let cold = Compositor::new(&dev.device)
+        .render_to_rgba(&dev.device, &dev.queue, RS, &frame, &mut resolver)
+        .unwrap();
+    assert_eq!(removed.rgba, cold.rgba);
+    assert_ne!(removed.rgba, changed.rgba);
+    assert_eq!(compositor.resource_stats().bind_groups_created, 3);
+}

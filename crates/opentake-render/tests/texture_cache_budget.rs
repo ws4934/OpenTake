@@ -48,7 +48,7 @@ fn blank_texture(device: &wgpu::Device, width: u32, height: u32) -> GpuTexture {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     GpuTexture {
         texture,
-        view,
+        view: view.into(),
         width,
         height,
     }
