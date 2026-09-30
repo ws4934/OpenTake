@@ -31,6 +31,10 @@ jobs:
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 10
+      - name: Set up JPEG SIMD assembler
+        run: |
+          pwsh -File scripts/setup_jpeg_simd.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'JPEG SIMD setup failed' }
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         id: native-cache
         with:
