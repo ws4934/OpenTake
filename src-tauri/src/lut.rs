@@ -82,7 +82,8 @@ pub fn import_lut(
 }
 
 fn import_lut_impl(core: &AppCore, path: &str) -> Result<LutReference, String> {
-    let source_path = Path::new(path);
+    let source_path = opentake_domain::native_path::decode(path).map_err(str::to_owned)?;
+    let source_path = source_path.as_path();
     let bytes = read_source(source_path)?;
     CubeLut::parse(&bytes).map_err(|error| format!("invalid LUT: {error}"))?;
     let id = sha256_hex(&bytes);

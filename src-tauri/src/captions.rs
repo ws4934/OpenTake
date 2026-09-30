@@ -752,7 +752,7 @@ mod tests {
             name: id.into(),
             kind,
             source: MediaSource::External {
-                absolute_path: format!("/{id}"),
+                absolute_path: format!("/{id}").into(),
             },
             duration: 1.0,
             generation_input: None,

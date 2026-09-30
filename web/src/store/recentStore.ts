@@ -1,3 +1,4 @@
+import { joinNativePath, nativePathName } from "../lib/nativePath";
 /**
  * Home recent-project mirror. The native registry is authoritative in the
  * desktop app; localStorage remains a compatible startup cache for browser
@@ -81,12 +82,15 @@ export function decodeRecentProjects(raw: string | null): RecentProject[] {
       if (!candidate || typeof candidate !== "object") continue;
       const source = candidate as Partial<RecentProject>;
       const path = source.path;
+      let name: string;
+      try { name = typeof path === "string" ? nativePathName(path) : ""; }
+      catch { continue; }
       if (
         typeof path !== "string"
         || path.length === 0
         || path.length > MAX_RECENT_PATH_CHARS
         || path.includes("\0")
-        || !/\.opentake$/i.test(path)
+        || !/\.opentake$/i.test(name)
         || seen.has(path)
       ) {
         continue;
@@ -133,7 +137,7 @@ function persist(list: RecentProject[]) {
 /** Derive a display name from a bundle path (its last path segment, minus the
  *  `.opentake` extension). */
 export function projectNameFromPath(path: string): string {
-  const segment = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  const segment = nativePathName(path);
   return segment.replace(/\.opentake$/i, "");
 }
 
@@ -160,8 +164,7 @@ function hasTauriRuntime(): boolean {
 }
 
 export function projectThumbnailPath(path: string): string {
-  const separator = path.includes("\\") && !path.includes("/") ? "\\" : "/";
-  return `${path.replace(/[\\/]+$/, "")}${separator}thumbnail.jpg`;
+  return joinNativePath(path, "thumbnail.jpg");
 }
 
 export const useRecentStore = create<RecentState>((set, get) => ({

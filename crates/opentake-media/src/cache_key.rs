@@ -43,7 +43,7 @@ fn file_identity_parts(path: &Path) -> Option<(String, f64, u64)> {
     let size = meta.len();
     let mtime = meta.modified().ok()?;
     Some((
-        path.to_string_lossy().into_owned(),
+        opentake_domain::NativePath::from(path).to_wire(),
         foundation_unix_seconds(mtime),
         size,
     ))
@@ -390,5 +390,29 @@ mod tests {
     fn file_identity_key_missing_file_is_none() {
         let key = file_identity_key(Path::new("/nonexistent/xyz.never"));
         assert!(key.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_and_replacement_names_with_equal_metadata_have_distinct_keys() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"clip-\xff.mp4"));
+        let shadow = std::path::PathBuf::from(native.to_string_lossy().as_ref());
+        let modified = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for path in [&native, &shadow] {
+            std::fs::write(path, b"same length").unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        assert_ne!(file_identity_key(&native), file_identity_key(&shadow));
+        assert_ne!(
+            visual_file_identity_key(&native),
+            visual_file_identity_key(&shadow)
+        );
     }
 }

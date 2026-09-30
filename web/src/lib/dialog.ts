@@ -7,13 +7,12 @@
  */
 
 import type { message as TauriMessage, open as TauriOpen } from "@tauri-apps/plugin-dialog";
-import { isTauri, pickSavePath, type SaveDialogRequest, type SavePurpose } from "./api";
+import { isTauri, pickOpenPaths, pickSavePath, type SaveDialogRequest, type SavePurpose } from "./api";
 
 /** The typed `open` from the dialog plugin, or null outside Tauri. */
 export async function openDialog(): Promise<typeof TauriOpen | null> {
   if (!isTauri) return null;
-  const mod = await import("@tauri-apps/plugin-dialog");
-  return mod.open;
+  return pickOpenPaths as typeof TauriOpen;
 }
 
 /** A save dialog whose result the backend may write for one purpose. */

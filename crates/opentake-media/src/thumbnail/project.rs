@@ -349,7 +349,7 @@ mod tests {
             name: id.into(),
             kind,
             source: MediaSource::External {
-                absolute_path: abs_path.to_string_lossy().into_owned(),
+                absolute_path: abs_path.into(),
             },
             duration: 1.0,
             generation_input: None,

@@ -127,10 +127,15 @@ fn main_window_capability_exposes_no_shell_or_filesystem_commands() {
             && !permission.starts_with("process:")
     }));
 
-    // Save dialogs run through the backend `pick_save_path` command, which
-    // issues the single-use write grants; the plugin's own save command (and
-    // `dialog:default`, which includes it) would only widen the read scope.
-    assert!(permissions.contains(&"dialog:allow-open"));
+    // Host pickers preserve native paths and purpose-bound write grants. The
+    // plugin's open/save commands would grant Unicode replacement aliases or
+    // widen read scope instead of recording the required write authorization.
+    assert!(
+        !permissions.contains(&"dialog:allow-open"),
+        "the plugin picker grants lossy native-path aliases"
+    );
+    let shell = include_str!("../src/lib.rs");
+    assert!(shell.contains("dialog_output::pick_open_paths"));
     // The failed-save prompt (Save As / Don't Save / Cancel) is a message
     // dialog; allowing it grants no filesystem scope.
     assert!(permissions.contains(&"dialog:allow-message"));

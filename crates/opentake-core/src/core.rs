@@ -1068,7 +1068,7 @@ impl AppCore {
         }
         if let Some(written) = written {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: written.to_string_lossy().into_owned(),
+                path: opentake_domain::NativePath::new(&written).to_wire(),
                 project_epoch: expected_project_epoch,
             });
         }
@@ -1142,7 +1142,7 @@ impl AppCore {
         }
         if let Some(written) = written {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: written.to_string_lossy().into_owned(),
+                path: opentake_domain::NativePath::new(&written).to_wire(),
                 project_epoch,
             });
         }
@@ -1253,7 +1253,7 @@ impl AppCore {
         drop(_identity);
         self.announce_project_identity_transition(false);
         self.events.emit(&CoreEvent::ProjectOpened {
-            path: prepared.path.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(prepared.path).to_wire(),
             project_epoch: snapshot.project_epoch,
             version: snapshot.version,
         });
@@ -1412,7 +1412,7 @@ impl AppCore {
         }
         let (written, project_epoch) = result?;
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(&written).to_wire(),
             project_epoch,
         });
         Ok(written)
@@ -1676,7 +1676,7 @@ impl AppCore {
         }
         if let Some(written) = committed.written {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: written?.to_string_lossy().into_owned(),
+                path: opentake_domain::NativePath::new(written?).to_wire(),
                 project_epoch,
             });
         }
@@ -2088,7 +2088,7 @@ impl AppCore {
             count,
         });
         events.push(CoreEvent::ProjectSaved {
-            path: written?.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(written?).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(commit)
@@ -2172,7 +2172,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written?.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(written?).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(imports)
@@ -2247,7 +2247,7 @@ impl AppCore {
         });
         saved?;
         events.push(CoreEvent::ProjectSaved {
-            path: expected_project_dir.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(expected_project_dir).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(entry)
@@ -2321,7 +2321,7 @@ impl AppCore {
             count,
         });
         events.push(CoreEvent::ProjectSaved {
-            path: expected_project_dir.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(expected_project_dir).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(CapabilityImportCommit { entry, warning })
@@ -2404,7 +2404,7 @@ impl AppCore {
             count,
         });
         events.push(CoreEvent::ProjectSaved {
-            path: expected_project_dir.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(expected_project_dir).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(CapabilityImportCommit { entry, warning })
@@ -2502,7 +2502,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written?.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(written?).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(entry)
@@ -2546,7 +2546,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written?.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(written?).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(Some(entry))
@@ -2593,7 +2593,7 @@ impl AppCore {
             count,
         });
         self.events.emit(&CoreEvent::ProjectSaved {
-            path: written?.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(written?).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(true)
@@ -2754,7 +2754,7 @@ impl AppCore {
             session.editor.save_media_manifest()?
         };
         events.push(CoreEvent::ProjectSaved {
-            path: written.to_string_lossy().into_owned(),
+            path: opentake_domain::NativePath::new(&written).to_wire(),
             project_epoch: expected_project_epoch,
         });
         Ok(written)
@@ -2871,7 +2871,7 @@ impl AppCore {
         });
         if let Some(saved) = saved {
             self.events.emit(&CoreEvent::ProjectSaved {
-                path: saved?.to_string_lossy().into_owned(),
+                path: opentake_domain::NativePath::new(saved?).to_wire(),
                 project_epoch,
             });
         }

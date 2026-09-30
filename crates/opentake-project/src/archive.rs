@@ -179,7 +179,7 @@ pub fn archive(
 /// `.project` → joined onto `source_bundle` (or `None` without one).
 fn resolve_source(source: &MediaSource, source_bundle: Option<&Path>) -> Option<PathBuf> {
     match source {
-        MediaSource::External { absolute_path } => Some(PathBuf::from(absolute_path)),
+        MediaSource::External { absolute_path } => absolute_path.as_path().map(Path::to_path_buf),
         MediaSource::Project { relative_path } => {
             source_bundle.map(|base| base.join(relative_path))
         }

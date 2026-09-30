@@ -1,3 +1,4 @@
+import { displayNativePath } from "../../lib/nativePath";
 /**
  * Inspector (SPEC §6). Title bar + one of four content states: marquee summary,
  * clip inspector (with Text/Video/Audio/AI Edit tabs), media-asset source, or project
@@ -2712,7 +2713,7 @@ function MediaAssetSource({ asset, t }: { asset: MediaItem; t: TFunction }) {
         {asset.fileSize != null && (
           <MetaRow label={t("inspector.source.size")} value={formatFileSize(asset.fileSize)} />
         )}
-        {asset.path && <MetaRow label={t("inspector.source.path")} value={asset.path} />}
+        {asset.path && <MetaRow label={t("inspector.source.path")} value={displayNativePath(asset.path)} />}
         {asset.isHdr && (
           <MetaRow
             label={t("inspector.source.hdr")}

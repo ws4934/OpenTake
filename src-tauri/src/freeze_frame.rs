@@ -129,7 +129,11 @@ pub async fn prepare_freeze_frame<R: Runtime>(
             project_epoch: expected_project_epoch,
             version: expected_timeline_version,
         },
-        project_path: expected_project_path.map(PathBuf::from),
+        project_path: expected_project_path
+            .as_deref()
+            .map(opentake_domain::native_path::decode)
+            .transpose()
+            .map_err(|reason| validation(reason.to_owned()))?,
         clip_id,
         at_frame,
         duration_frames,
@@ -278,7 +282,7 @@ mod tests {
             binding
                 .project_path
                 .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+                .map(|path| opentake_domain::NativePath::new(path).to_wire()),
         )
     }
 

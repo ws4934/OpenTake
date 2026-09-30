@@ -520,7 +520,7 @@ mod aligned_stem_track_tests {
             name: id.into(),
             kind: ClipType::Audio,
             source: opentake_domain::MediaSource::External {
-                absolute_path: format!("/{id}.wav"),
+                absolute_path: format!("/{id}.wav").into(),
             },
             duration: 10.0,
             generation_input: None,

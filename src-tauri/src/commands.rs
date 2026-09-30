@@ -197,7 +197,7 @@ pub fn undo(
             project_epoch: expected_project_epoch,
             version: expected_timeline_version,
         },
-        expected_project_path.as_deref().map(std::path::Path::new),
+        decode_optional_path(expected_project_path.as_deref())?.as_deref(),
         EditCommand::Undo,
     )
 }
@@ -217,7 +217,7 @@ pub fn redo(
             project_epoch: expected_project_epoch,
             version: expected_timeline_version,
         },
-        expected_project_path.as_deref().map(std::path::Path::new),
+        decode_optional_path(expected_project_path.as_deref())?.as_deref(),
         EditCommand::Redo,
     )
 }
@@ -484,8 +484,9 @@ pub async fn project_open<R: tauri::Runtime>(
     // cloneable lifecycle lease crosses into the blocking filesystem prepare.
     app.state::<crate::playback::PlaybackState>()
         .ensure_project_transition_available()?;
-    let path = std::path::PathBuf::from(path);
-    if !crate::safe_asset_protocol::scope_allows_lexical_path(&app.asset_protocol_scope(), &path) {
+    let path = opentake_domain::native_path::decode(&path)
+        .map_err(crate::playback::session::PlaybackCommandError::engine)?;
+    if !crate::safe_asset_protocol::asset_scope_snapshot(&app).allows(&path) {
         return Err(crate::playback::session::PlaybackCommandError::engine(
             "project path has not been approved by a native file dialog",
         ));
@@ -537,10 +538,11 @@ pub(crate) fn project_open_with_playback_and_prewarm(
     prewarm: &crate::media::prewarm::PrewarmScheduler,
 ) -> Result<TimelineSnapshotDto, crate::playback::session::PlaybackCommandError> {
     playback.ensure_project_transition_available()?;
-    let prepared =
-        AppCore::prepare_project_open(std::path::PathBuf::from(path)).map_err(|error| {
-            crate::playback::session::PlaybackCommandError::engine(error.to_string())
-        })?;
+    let prepared = AppCore::prepare_project_open(
+        opentake_domain::native_path::decode(&path)
+            .map_err(crate::playback::session::PlaybackCommandError::engine)?,
+    )
+    .map_err(|error| crate::playback::session::PlaybackCommandError::engine(error.to_string()))?;
     commit_prepared_project_open_with_playback_and_prewarm(core, prepared, playback, prewarm)
 }
 
@@ -573,8 +575,8 @@ pub async fn project_open<R: tauri::Runtime>(
     )?;
     let coordinator = app.state::<ProjectLifecycleCoordinator>();
     let lifecycle = coordinator.try_acquire()?;
-    let path = std::path::PathBuf::from(path);
-    if !crate::safe_asset_protocol::scope_allows_lexical_path(&app.asset_protocol_scope(), &path) {
+    let path = opentake_domain::native_path::decode(&path).map_err(str::to_owned)?;
+    if !crate::safe_asset_protocol::asset_scope_snapshot(&app).allows(&path) {
         return Err("project path has not been approved by a native file dialog".into());
     }
     let admission = coordinator.try_admit_prepare(&path)?;
@@ -751,10 +753,10 @@ pub(crate) fn authorize_project_dialog_path(
 /// is already on disk, so a failed grant only means reopening needs the Open
 /// dialog.
 fn grant_saved_project_bundle<R: tauri::Runtime>(app: &AppHandle<R>, bundle: &std::path::Path) {
-    if crate::safe_asset_protocol::scope_allows_lexical_path(&app.asset_protocol_scope(), bundle) {
+    if crate::safe_asset_protocol::asset_scope_snapshot(app).allows(bundle) {
         return;
     }
-    if let Err(error) = app.asset_protocol_scope().allow_file(bundle) {
+    if let Err(error) = crate::native_read_scope::allow_file(app, bundle) {
         eprintln!("[project] could not remember the saved project for reopening: {error}");
     }
 }
@@ -768,7 +770,7 @@ pub(crate) async fn save_project_with_composite_cover<R: tauri::Runtime>(
     let path = path
         .map(|raw| {
             authorize_project_dialog_path(&app.state::<crate::dialog_output::SaveGrants>(), &raw)
-                .map(|target| target.to_string_lossy().into_owned())
+                .map(|target| opentake_domain::NativePath::from(target).to_wire())
                 .map_err(validation_error)
         })
         .transpose()?;
@@ -803,7 +805,11 @@ pub(crate) async fn save_project_with_composite_cover<R: tauri::Runtime>(
     )
     .await?;
     if let Some(app) = grant_app {
-        grant_saved_project_bundle(&app, std::path::Path::new(&saved));
+        grant_saved_project_bundle(
+            &app,
+            &opentake_domain::native_path::decode(&saved)
+                .map_err(|reason| validation_error(reason.to_owned()))?,
+        );
     }
     Ok(saved)
 }
@@ -831,7 +837,11 @@ pub(crate) async fn save_current_project_before_exit<R: tauri::Runtime>(
             .save_project_before_exit_if(|| {
                 std::time::Instant::now() < deadline && worker_gate.begin_commit()
             })
-            .map(|path| path.map_or_else(String::new, |path| path.to_string_lossy().into_owned()))
+            .map(|path| {
+                path.map_or_else(String::new, |path| {
+                    opentake_domain::NativePath::new(path).to_wire()
+                })
+            })
             .map_err(CmdError::from)
     });
     await_project_cover_save_worker(
@@ -1015,7 +1025,9 @@ fn authorize_composite_sources<R: tauri::Runtime>(
     {
         let retained = match &entry.source {
             opentake_domain::MediaSource::External { absolute_path } => {
-                let requested = std::path::Path::new(absolute_path);
+                let Some(requested) = absolute_path.as_path() else {
+                    continue;
+                };
                 if !scope.allows(requested) {
                     continue;
                 }
@@ -1142,7 +1154,7 @@ fn project_save_for_project_with_commit_gate(
     let snapshot = core.runtime_snapshot();
     if snapshot.project_epoch != expected_project_epoch
         || snapshot.project_dir.as_deref()
-            != expected_project_path.as_deref().map(std::path::Path::new)
+            != decode_optional_path(expected_project_path.as_deref())?.as_deref()
     {
         return Err(CmdError::from(opentake_core::CoreError::StaleProject));
     }
@@ -1156,10 +1168,10 @@ fn project_save_for_project_with_commit_gate(
             "project cover save was cancelled before precommit",
         ));
     }
-    let target = path.map(std::path::PathBuf::from);
+    let target = decode_optional_path(path.as_deref())?;
     core.save_project_with_thumbnail_update_for_project_if(
         expected_project_epoch,
-        expected_project_path.as_deref().map(std::path::Path::new),
+        decode_optional_path(expected_project_path.as_deref())?.as_deref(),
         target,
         thumbnail,
         || {
@@ -1167,7 +1179,7 @@ fn project_save_for_project_with_commit_gate(
             can_commit() && gate.begin_commit()
         },
     )
-    .map(|p| p.to_string_lossy().into_owned())
+    .map(|p| opentake_domain::NativePath::from(p).to_wire())
     .map_err(CmdError::from)
 }
 
@@ -1187,7 +1199,7 @@ pub fn get_default_project_dir(
         .map_err(|e| e.to_string())?
         .join("OpenTake");
     ensure_default_project_dir(&dir, &admission)?;
-    Ok(dir.to_string_lossy().into_owned())
+    Ok(opentake_domain::NativePath::from(dir).to_wire())
 }
 
 fn ensure_default_project_dir(
@@ -1529,7 +1541,7 @@ fn write_subtitles(
     };
     crate::dialog_output::write_file_atomically(&output, body.as_bytes())?;
     Ok(SubtitleExportSummary {
-        out_path: output.path.to_string_lossy().into_owned(),
+        out_path: opentake_domain::NativePath::from(output.path).to_wire(),
         cue_count,
     })
 }
@@ -1586,9 +1598,7 @@ pub fn edit_apply(
                     project_epoch: expected_project_epoch,
                     version: expected_timeline_version,
                 },
-                project_path: expected_project_path
-                    .as_deref()
-                    .map(std::path::PathBuf::from),
+                project_path: decode_optional_path(expected_project_path.as_deref())?,
                 clip_id: clip_id.clone(),
                 at_frame,
                 duration_frames,
@@ -1613,7 +1623,7 @@ pub fn edit_apply(
             project_epoch: expected_project_epoch,
             version: expected_timeline_version,
         },
-        expected_project_path.as_deref().map(std::path::Path::new),
+        decode_optional_path(expected_project_path.as_deref())?.as_deref(),
         cmd,
     );
     if result.is_ok() {
@@ -1626,8 +1636,16 @@ pub fn edit_apply(
 
 /// `check_path_exists`: checks if a path (e.g. project bundle folder) exists on disk.
 #[tauri::command]
-pub fn check_path_exists(path: String) -> bool {
-    std::path::Path::new(&path).exists()
+pub fn check_path_exists(path: String) -> Result<bool, String> {
+    Ok(opentake_domain::native_path::decode(&path)
+        .map_err(str::to_owned)?
+        .exists())
+}
+
+fn decode_optional_path(path: Option<&str>) -> Result<Option<std::path::PathBuf>, CmdError> {
+    path.map(opentake_domain::native_path::decode)
+        .transpose()
+        .map_err(|reason| validation_error(reason.to_owned()))
 }
 
 fn validation_error(message: String) -> CmdError {
@@ -3276,7 +3294,7 @@ mod project_open_async_tests {
                 name: format!("m-{index}"),
                 kind: ClipType::Image,
                 source: MediaSource::External {
-                    absolute_path: path.to_string_lossy().into_owned(),
+                    absolute_path: path.into(),
                 },
                 duration: 1.0,
                 source_width: Some(64),
@@ -3425,7 +3443,9 @@ mod project_open_async_tests {
             let opentake_domain::MediaSource::External { absolute_path } = &entry.source else {
                 continue;
             };
-            let requested = std::path::Path::new(absolute_path);
+            let Some(requested) = absolute_path.as_path() else {
+                continue;
+            };
             if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, requested) {
                 continue;
             }
@@ -3687,7 +3707,7 @@ mod project_open_async_tests {
             name: "media".into(),
             kind,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 1.0,
             source_width: Some(64),
@@ -3798,7 +3818,7 @@ mod project_open_async_tests {
             name: "media".into(),
             kind: ClipType::Image,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 1.0,
             source_width: Some(32),
@@ -3877,7 +3897,7 @@ mod project_open_async_tests {
             name: id.into(),
             kind,
             source: MediaSource::External {
-                absolute_path: path.to_string_lossy().into_owned(),
+                absolute_path: path.into(),
             },
             duration: 2.0,
             generation_input: None,
@@ -4048,7 +4068,7 @@ mod project_open_async_tests {
             name: "blue".into(),
             kind: ClipType::Image,
             source: MediaSource::External {
-                absolute_path: image_path.to_string_lossy().into_owned(),
+                absolute_path: image_path.clone().into(),
             },
             duration: 1.0,
             generation_input: None,
@@ -4189,7 +4209,7 @@ mod project_open_async_tests {
             name: "camera".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: video.to_string_lossy().into_owned(),
+                absolute_path: video.clone().into(),
             },
             duration: 2.0,
             generation_input: None,
@@ -5967,7 +5987,7 @@ mod xmeml_timecode_tests {
             name: name.into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: path.to_string_lossy().into_owned(),
+                absolute_path: path.into(),
             },
             duration: 0.2,
             generation_input: None,

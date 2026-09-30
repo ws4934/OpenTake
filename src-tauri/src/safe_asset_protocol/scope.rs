@@ -25,6 +25,7 @@ use std::sync::Mutex;
 pub(crate) struct ScopeSnapshot {
     allowed: Arc<AllowedPatterns>,
     forbidden: PatternSet,
+    native: Arc<crate::native_read_scope::NativeScopeSnapshot>,
 }
 
 /// The allowed half of a snapshot, shared between requests until the scope
@@ -57,6 +58,7 @@ impl ScopeSnapshot {
         Self {
             allowed: Arc::new(AllowedPatterns::capture(scope)),
             forbidden: PatternSet::new(scope.forbidden_patterns()),
+            native: Arc::new(crate::native_read_scope::NativeScopeSnapshot::default()),
         }
     }
 
@@ -64,19 +66,26 @@ impl ScopeSnapshot {
     /// precedence, then any allowed pattern must match the normalized path.
     pub(crate) fn allows(&self, path: &Path) -> bool {
         let normalized: PathBuf = path.components().collect();
-        !self.forbidden.matches(&normalized) && self.allowed.patterns.matches(&normalized)
+        !self.forbids(&normalized)
+            && (self.allowed.patterns.matches(&normalized) || self.native.allows(&normalized))
     }
 
     pub(crate) fn forbids(&self, path: &Path) -> bool {
         let normalized: PathBuf = path.components().collect();
-        self.forbidden.matches(&normalized)
+        self.native.forbids(&normalized)
+            || self.forbidden.matches(&normalized)
+            || (normalized.to_str().is_none() && self.forbidden.native_globs.is_none())
     }
 
     /// Same decision as `scope_has_exact_file_grant`: an allowed pattern whose
     /// text is exactly the escaped normalized path, not a directory glob.
     pub(crate) fn has_exact_file_grant(&self, path: &Path) -> bool {
-        let escaped = Pattern::escape(normalized_path(path).to_string_lossy().as_ref());
-        self.allowed.exact.contains(&exact_grant_key(&escaped))
+        self.native.has_file(path)
+            || normalized_path(path).to_str().is_some_and(|text| {
+                self.allowed
+                    .exact
+                    .contains(&exact_grant_key(&Pattern::escape(text)))
+            })
     }
 
     /// Test hook: whether two snapshots share one cached allowed set.
@@ -89,6 +98,7 @@ impl ScopeSnapshot {
 struct PatternSet {
     literals: HashSet<String>,
     globs: Vec<Pattern>,
+    native_globs: Option<Vec<Pattern>>,
 }
 
 impl PatternSet {
@@ -103,13 +113,24 @@ impl PatternSet {
                 None => globs.push(pattern),
             }
         }
-        Self { literals, globs }
+        // Glob syntax/separators are ASCII. A native byte/unit per character
+        // preserves Unicode literal prefixes without replacing invalid names.
+        let native_globs = globs.iter().map(native_pattern).collect::<Option<Vec<_>>>();
+        Self {
+            literals,
+            globs,
+            native_globs,
+        }
     }
 
     fn matches(&self, normalized: &Path) -> bool {
-        // `Pattern::matches_path_with` never matches a non-UTF-8 path either.
         let Some(text) = normalized.to_str() else {
-            return false;
+            let native = PathBuf::from(native_match_text(normalized.as_os_str()));
+            return self.native_globs.as_ref().is_some_and(|patterns| {
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.matches_path_with(&native, scope_match_options()))
+            });
         };
         let options = scope_match_options();
         self.literals.contains(&literal_match_key(text))
@@ -118,6 +139,57 @@ impl PatternSet {
                 .iter()
                 .any(|pattern| pattern.matches_path_with(normalized, options))
     }
+}
+
+fn native_pattern(pattern: &Pattern) -> Option<Pattern> {
+    // Unicode classes cannot be expanded into independent native units: [é]
+    // would become a choice of its UTF-8 bytes rather than their sequence.
+    // Recognize class boundaries exactly as glob does, including []] and [!]].
+    let chars: Vec<_> = pattern.as_str().chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1 + usize::from(chars.get(index + 1) == Some(&'!'));
+        let end = start + 1 + chars.get(start + 1..)?.iter().position(|ch| *ch == ']')?;
+        if chars[start..end].iter().any(|ch| {
+            if cfg!(windows) {
+                ch.len_utf16() > 1
+            } else {
+                ch.len_utf8() > 1
+            }
+        }) {
+            return None;
+        }
+        index = end + 1;
+    }
+    Pattern::new(&native_match_text(std::ffi::OsStr::new(pattern.as_str()))).ok()
+}
+
+#[cfg(unix)]
+fn native_match_text(text: &std::ffi::OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    text.as_bytes()
+        .iter()
+        .map(|byte| char::from(*byte))
+        .collect()
+}
+
+#[cfg(windows)]
+fn native_match_text(text: &std::ffi::OsStr) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    text.encode_wide()
+        .map(|unit| {
+            if unit < 128 {
+                char::from(unit as u8)
+            } else {
+                char::from_u32(0x10000 + u32::from(unit))
+                    .expect("mapped UTF-16 units are Unicode scalar values")
+            }
+        })
+        .collect()
 }
 
 /// The literal path a pattern matches, when it contains no wildcard.
@@ -225,6 +297,7 @@ pub(crate) fn asset_scope_snapshot<R: Runtime>(app: &AppHandle<R>) -> ScopeSnaps
     ScopeSnapshot {
         allowed: cached_allowed_patterns(app, &scope),
         forbidden: PatternSet::new(scope.forbidden_patterns()),
+        native: crate::native_read_scope::snapshot(app),
     }
 }
 
@@ -266,6 +339,86 @@ pub(crate) fn asset_scope_snapshot_captures<R: Runtime>(app: &AppHandle<R>) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_patterns_keep_literals_but_reject_multi_unit_classes() {
+        for pattern in ["/é/[a-z]*", "/é/[!a-z]*", "/é/[[]box[]]/**/*", "/é/[]]/*"] {
+            assert!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_some(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["/approved/[🐎]*", "/approved/[!🐎]*"] {
+            assert!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_none(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["/approved/[é]*", "/approved/[!é]*"] {
+            assert_eq!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_some(),
+                cfg!(windows)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_classes_never_authorize_their_partial_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let native = Path::new("/approved").join(std::ffi::OsStr::from_bytes(b"\xc3\xff.mp4"));
+        let pattern = Pattern::new("/approved/[é]*").unwrap();
+        let set = PatternSet::new(HashSet::from([pattern]));
+        assert!(set.matches(Path::new("/approved/é.mp4")));
+        assert!(!set.matches(&native));
+
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_directory("/approved", true).unwrap();
+        let mut snapshot = ScopeSnapshot::capture(&scope);
+        snapshot.forbidden = set;
+        assert!(
+            snapshot.forbids(&native),
+            "unsupported deny classes fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicode_classes_never_authorize_an_unpaired_surrogate() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<_> = r"C:\approved\".encode_utf16().collect();
+        units.push(0xd83d);
+        units.extend(".mp4".encode_utf16());
+        let native = PathBuf::from(std::ffi::OsString::from_wide(&units));
+        let set = PatternSet::new(HashSet::from([Pattern::new(r"C:\approved\[🐎]*").unwrap()]));
+        assert!(set.matches(Path::new(r"C:\approved\🐎.mp4")));
+        assert!(!set.matches(&native));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_patterns_match_native_names_without_replacement_aliases() {
+        use std::os::unix::ffi::OsStrExt;
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        let root = Path::new("/approved/片段");
+        let native = root.join(std::ffi::OsStr::from_bytes(b"clip-\xff.mp4"));
+        let shadow = PathBuf::from(native.to_string_lossy().as_ref());
+        scope.allow_directory(root, true).unwrap();
+        scope.forbid_file(&shadow).unwrap();
+        let snapshot = asset_scope_snapshot(app.handle());
+        assert!(snapshot.allows(&native));
+        assert!(!snapshot.allows(&shadow));
+        scope.forbid_directory(root, true).unwrap();
+        assert!(!asset_scope_snapshot(app.handle()).allows(&native));
+
+        let bad_parent = Path::new("/approved").join(std::ffi::OsStr::from_bytes(b"parent-\xff"));
+        scope
+            .allow_directory(PathBuf::from(bad_parent.to_string_lossy().as_ref()), true)
+            .unwrap();
+        assert!(!asset_scope_snapshot(app.handle()).allows(&bad_parent.join("clip.mp4")));
+    }
 
     #[test]
     fn literal_detection_matches_glob_escape_and_rejects_wildcards() {

@@ -947,7 +947,12 @@ fn project_media(
     let mut media: HashMap<String, MediaInfo> = HashMap::new();
     for entry in &manifest.entries {
         let path = match &entry.source {
-            MediaSource::External { absolute_path } => PathBuf::from(absolute_path),
+            MediaSource::External { absolute_path } => {
+                let Some(path) = absolute_path.as_path() else {
+                    continue;
+                };
+                path.to_path_buf()
+            }
             MediaSource::Project { relative_path } => match project_dir {
                 Some(base) => base.join(relative_path),
                 None => continue,
@@ -1767,7 +1772,7 @@ fn authorize_export_output(
             foreign: crate::dialog_output::ForeignExtension::Append,
         },
     )
-    .map(|output| output.path.to_string_lossy().into_owned())
+    .map(|output| opentake_domain::NativePath::new(&output.path).to_wire())
 }
 
 /// `export_video`: render the whole timeline to a video file on disk.
@@ -2185,7 +2190,7 @@ pub(crate) fn run_export_with_control(
     let on_progress = options.on_progress;
     let defer_completion = options.defer_completion;
     let reserved_output = options.output_file.is_some();
-    let out_path = PathBuf::from(&req.out_path);
+    let out_path = opentake_domain::native_path::decode(&req.out_path).map_err(str::to_owned)?;
     let preset = resolve_preset(req.codec, req.quality, &out_path)?;
 
     let text = project_text(timeline);
@@ -3658,7 +3663,7 @@ fn save_range_as_media_workflow<R: Runtime>(
         }
     });
     let req = ExportRequest {
-        out_path: out_path.to_string_lossy().into_owned(),
+        out_path: opentake_domain::NativePath::new(&out_path).to_wire(),
         codec: ExportCodec::H264,
         quality: ExportQuality::P1080,
     };
@@ -3763,7 +3768,7 @@ pub fn run_bundle_export(
     out_path: String,
 ) -> Result<BundleReportDto, String> {
     compatibility.ensure_writable().map_err(|e| e.to_string())?;
-    let dest = PathBuf::from(&out_path);
+    let dest = opentake_domain::native_path::decode(&out_path).map_err(str::to_owned)?;
     let report =
         opentake_project::archive(timeline, manifest, generation_log, source_bundle, &dest)
             .map_err(|e| e.to_string())?;
@@ -3821,7 +3826,7 @@ mod tests {
             name: "dc".into(),
             kind: ClipType::Audio,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 2.0,
             generation_input: None,
@@ -4082,7 +4087,7 @@ mod tests {
             name: "uhd.mp4".into(),
             kind: ClipType::Video,
             source: opentake_domain::MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: f64::from(frames) / 30.0,
             generation_input: None,
@@ -4392,7 +4397,7 @@ mod tests {
             name: "scene".into(),
             kind: ClipType::Video,
             source: MediaSource::External {
-                absolute_path: source.to_string_lossy().into_owned(),
+                absolute_path: source.clone().into(),
             },
             duration: 10.0,
             generation_input: None,
