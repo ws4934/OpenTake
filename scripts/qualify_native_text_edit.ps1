@@ -13,6 +13,17 @@ public static class NativeEditInput {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
+    [DllImport("user32.dll")] private static extern IntPtr GetMenu(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetSubMenu(IntPtr menu, int position);
+    [DllImport("user32.dll")] private static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
+    public static bool EditItemEnabled(IntPtr window, uint position) {
+        // The application menu contract is App, File, Edit, View, Help.
+        IntPtr edit = GetSubMenu(GetMenu(window), 2);
+        if (edit == IntPtr.Zero) throw new InvalidOperationException("Native Edit menu is absent");
+        uint state = GetMenuState(edit, position, 0x400); // MF_BYPOSITION
+        if (state == uint.MaxValue) throw new InvalidOperationException("Native Edit item is absent");
+        return (state & 3) == 0; // MF_DISABLED | MF_GRAYED
+    }
     public static void Click(int x, int y) {
         if (!SetCursorPos(x, y)) throw new InvalidOperationException("Cannot position the test pointer");
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
@@ -214,12 +225,23 @@ try {
     Click-Element $clip
     $clip.SetFocus()
     Wait-Until { $clip.Current.HasKeyboardFocus } 'timeline clip keyboard focus'
+    # Menu enablement crosses asynchronous IPC. Wait for the real native
+    # command to become available instead of racing the focus notification.
+    Wait-Until {
+        [NativeEditInput]::EditItemEnabled($script:window.Current.NativeWindowHandle, 4)
+    } 'native timeline copy enabled'
     Send-Keys '^c'
+    Wait-Until {
+        [NativeEditInput]::EditItemEnabled($script:window.Current.NativeWindowHandle, 5)
+    } 'native timeline paste enabled after copy'
     Click-Element (Find-Names @('Jump to End', '跳到结尾'))
     Send-Keys '^v'
     Wait-Until { @(Clip-Elements).Count -eq 2 } 'timeline copy and paste'
     Write-Output 'PASS: timeline copy and paste'
-    Click-Element (@(Clip-Elements)[1])
+    $clip = @(Clip-Elements)[1]
+    Click-Element $clip
+    $clip.SetFocus()
+    Wait-Until { $clip.Current.HasKeyboardFocus } 'pasted clip keyboard focus'
     Send-Keys '^x'
     Wait-Until { @(Clip-Elements).Count -eq 1 } 'timeline cut'
     Write-Output 'PASS: timeline cut'
