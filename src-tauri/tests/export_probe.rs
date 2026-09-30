@@ -147,3 +147,108 @@ fn probe_export_h265() {
 fn probe_export_prores() {
     run_one(ExportCodec::Prores, "mov", "prores");
 }
+
+/// The performance acceptance from #3: compare the complete, shipped GPU export
+/// with a sequential FFmpeg decode of the same long-GOP 1080p source.
+#[test]
+#[ignore = "real-device release benchmark: GPU + pinned FFmpeg"]
+fn probe_export_long_gop_budget() {
+    use std::time::Instant;
+    if cfg!(debug_assertions) {
+        panic!("run this qualification with --release");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("long-gop.mp4");
+    let mut generate = Command::new("ffmpeg");
+    opentake_media::process_tree::configure_command(&mut generate);
+    let result = generate
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=30:duration=10",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-g",
+            "250",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "fixture generation: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut timeline = Timeline::new();
+    timeline.fps = 30;
+    timeline.width = 1920;
+    timeline.height = 1080;
+    let mut track = Track::new("video", ClipType::Video);
+    track.clips.push(Clip::new("clip", "source", 0, 300));
+    timeline.tracks.push(track);
+    let manifest: MediaManifest = serde_json::from_value(serde_json::json!({
+        "entries": [{ "id": "source", "name": "long-gop.mp4", "type": "video",
+            "source": { "external": { "absolutePath": source.to_str().unwrap() } },
+            "duration": 10.0, "sourceWidth": 1920, "sourceHeight": 1080,
+            "sourceFPS": 30.0, "hasAudio": false }],
+        "folders": [], "favorites": []
+    }))
+    .unwrap();
+    let mut baseline = Vec::new();
+    let mut exports = Vec::new();
+    for iteration in 0..3 {
+        let mut null = Command::new("ffmpeg");
+        opentake_media::process_tree::configure_command(&mut null);
+        let start = Instant::now();
+        let result = null
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+            .arg(&source)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "null decode: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        baseline.push(start.elapsed().as_secs_f64());
+        let request = ExportRequest {
+            out_path: root
+                .path()
+                .join(format!("export-{iteration}.mp4"))
+                .to_str()
+                .unwrap()
+                .into(),
+            codec: ExportCodec::H264,
+            quality: ExportQuality::P1080,
+        };
+        let start = Instant::now();
+        let summary = run_export(&timeline, &manifest, &None, &request).unwrap();
+        exports.push(start.elapsed().as_secs_f64());
+        eprintln!(
+            "long-GOP iteration {iteration}: null {:.3}s, export {:.3}s, summary {summary:?}",
+            baseline[iteration], exports[iteration]
+        );
+    }
+    baseline.sort_by(f64::total_cmp);
+    exports.sort_by(f64::total_cmp);
+    let ratio = exports[1] / baseline[1];
+    eprintln!(
+        "long-GOP median: null {:.3}s, export {:.3}s, ratio {ratio:.3}x",
+        baseline[1], exports[1]
+    );
+    assert!(
+        ratio <= 5.0,
+        "export exceeds the 5x sequential decode budget: {ratio:.3}x"
+    );
+}
