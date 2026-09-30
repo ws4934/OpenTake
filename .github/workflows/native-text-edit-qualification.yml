@@ -43,11 +43,15 @@ jobs:
         run: |
           python scripts/provision_ffmpeg_sidecars.py --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg provisioning failed' }
+          foreach ($tool in @('ffmpeg', 'ffprobe')) {
+            $sidecar = Join-Path $env:GITHUB_WORKSPACE "src-tauri/binaries/$tool-x86_64-pc-windows-msvc.exe"
+            "OPENTAKE_$($tool.ToUpperInvariant())=$sidecar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
       - name: Build the packaged frontend and native shell
         run: |
           pnpm -C web install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { throw 'Frontend installation failed' }
-          ./web/node_modules/.bin/tauri build --debug --bundles nsis
+          ./web/node_modules/.bin/tauri.cmd build --debug --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'Native package build failed' }
       - name: Qualify native text and document shortcuts
         run: |
