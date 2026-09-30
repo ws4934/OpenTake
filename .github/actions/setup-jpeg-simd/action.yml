@@ -3,19 +3,9 @@ description: Make NASM available for the statically bundled x86 JPEG encoder
 runs:
   using: composite
   steps:
-    - if: runner.os == 'Linux'
+    - if: runner.os != 'Windows'
       shell: bash
-      run: |
-        if ! command -v nasm >/dev/null; then
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends nasm
-        fi
-    - if: runner.os == 'macOS'
-      shell: bash
-      run: |
-        if ! command -v nasm >/dev/null; then
-          brew install nasm
-        fi
+      run: bash "${{ github.action_path }}/../../../scripts/setup_jpeg_simd.sh"
     - if: runner.os == 'Windows'
       shell: pwsh
       run: |
