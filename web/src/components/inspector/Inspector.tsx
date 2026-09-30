@@ -42,7 +42,7 @@ import { useMediaStore } from "../../store/mediaStore";
 import * as edit from "../../store/editActions";
 import * as api from "../../lib/api";
 import { openDialog } from "../../lib/dialog";
-import { formatTimecode } from "../../lib/geometry";
+import { formatTimecode, playheadFrame } from "../../lib/geometry";
 import { assetUrl } from "../../lib/asset";
 import {
   cropAt,
@@ -296,7 +296,7 @@ function KeyframeRowControls({
   t: TFunction;
 }) {
   const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
-  const editFrame = Math.round(activeFrame);
+  const editFrame = playheadFrame(activeFrame);
   const inRange = clipContainsFrame(clip, editFrame);
   const onKeyframe = hasKeyframeAt(clip, property, editFrame);
   const prev = previousKeyframeFrame(clip, property, editFrame);
@@ -420,7 +420,7 @@ function ClipInspector({
   // Live sampling: read the current playhead frame so every numeric field shows
   // the value at the playhead (upstream `InspectorView.livePreview`).
   const activeFrame = useEditorUiStore((s) => s.activeFrame);
-  const editFrame = Math.round(activeFrame);
+  const editFrame = playheadFrame(activeFrame);
   const rootTimeline = useProjectStore((s) => s.timeline);
   const activeNestedSequenceId = useEditorUiStore((s) => s.activeNestedSequenceId);
   const timeline =
@@ -752,7 +752,7 @@ function PositionSection({
 }) {
   // Editing top-left x/y writes back through `transform.centerX/centerY`. The
   // size is preserved from the current transform (scale track writes via scale).
-  const editFrame = Math.round(activeFrame);
+  const editFrame = playheadFrame(activeFrame);
   const [w, h] = [clip.transform.width, clip.transform.height];
   return (
     <section>
@@ -840,7 +840,7 @@ function CropSection({
   sourcePixelAspect: number | null;
   t: TFunction;
 }) {
-  const editFrame = Math.round(activeFrame);
+  const editFrame = playheadFrame(activeFrame);
   const cropEditingActive = useEditorUiStore((s) => s.cropEditingActive);
   const toggleCropEditingActive = useEditorUiStore((s) => s.toggleCropEditingActive);
   const cropAspectLock = useEditorUiStore((s) => s.cropAspectLock);
@@ -1587,7 +1587,7 @@ function StemSeparationSection({
       await api.importStemsToTracks(
         result.vocalsAssetId,
         result.accompanimentAssetId,
-        Math.max(0, Math.round(activeFrame)),
+        playheadFrame(activeFrame),
       );
       setImported(true);
     } catch (reason) {

@@ -77,7 +77,7 @@ export function TimelinePlayback({
   // entering a clip (or starting playback mid-timeline) shows the correct frame
   // instead of the source's frame 0.
   const seekOnLoad = (clip: Clip) => (e: React.SyntheticEvent<HTMLMediaElement>) => {
-    const f = Math.max(0, Math.floor(useEditorUiStore.getState().activeFrame));
+    const f = playbackFrameFromActiveFrame(useEditorUiStore.getState().activeFrame);
     e.currentTarget.currentTime = sourceTimeSec(clip, f, fpsRef.current > 0 ? fpsRef.current : 30);
   };
 

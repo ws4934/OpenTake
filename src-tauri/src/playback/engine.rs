@@ -311,6 +311,12 @@ fn frame_at_elapsed(base_frame: i32, elapsed_secs: f64, fps: i32) -> i32 {
     base_frame + (elapsed_secs.max(0.0) * fps as f64) as i32
 }
 
+fn next_render_deadline(previous: Instant, period: Duration, now: Instant) -> Instant {
+    // Keep the cadence when a timer wakes late. A render that misses the next
+    // deadline starts its successor immediately so the media clock can catch up.
+    (previous + period).max(now)
+}
+
 /// Clamp the clock's frame to the drawable range and decide whether playback has
 /// reached the end. Returns `(target, done)`: `target` is the frame to render,
 /// `done` is true once the clock hits the last frame (→ auto-stop). Pure so the
@@ -1151,6 +1157,7 @@ fn run_render_loop<R: FrameRenderer>(
         clock.seek(frame);
     }
     let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let mut frame_deadline = Instant::now();
     let mut paused = false;
     let mut paused_frame = initial_frame;
     let mut buffered_first: Option<(i32, DecodedFrame)> = None;
@@ -1182,6 +1189,7 @@ fn run_render_loop<R: FrameRenderer>(
                         sink.push_frame(buffered_frame, image);
                     }
                     paused = false;
+                    frame_deadline = Instant::now();
                     pause_requested.store(false, Ordering::Release);
                     let _ = reply.send(());
                 }
@@ -1198,7 +1206,6 @@ fn run_render_loop<R: FrameRenderer>(
             }
             continue;
         }
-        let tick = Instant::now();
 
         // Drain pending control messages first.
         loop {
@@ -1217,6 +1224,7 @@ fn run_render_loop<R: FrameRenderer>(
                     }
                     clock.seek(frame);
                     clock.resumed();
+                    frame_deadline = Instant::now();
                     resume_decode_streams(Some(current_frame), frame, || renderer.seek());
                     pause_requested.store(false, Ordering::Release);
                     let _ = reply.send(());
@@ -1320,15 +1328,12 @@ fn run_render_loop<R: FrameRenderer>(
             continue;
         }
 
-        // Sleep only the remainder of the frame budget (#192): the target
-        // frame comes from the audio-master clock (absolute time), so when a
-        // render overruns `frame_dur` we don't sleep at all and `loop_step`
-        // catches up on the next iteration. Sleeping the full `frame_dur`
-        // unconditionally here previously stacked render time on top of the
-        // frame period and capped playback at ~22fps regardless of target fps.
-        let elapsed = tick.elapsed();
-        if elapsed < frame_dur {
-            thread::sleep(frame_dur - elapsed);
+        // A relative sleep accumulates timer wakeup delays on every frame.
+        // Anchor ticks to the cadence; retain immediate catch-up for overruns.
+        let now = Instant::now();
+        frame_deadline = next_render_deadline(frame_deadline, frame_dur, now);
+        if frame_deadline > now {
+            thread::sleep(frame_deadline - now);
         }
     }
 }
@@ -1336,6 +1341,28 @@ fn run_render_loop<R: FrameRenderer>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_timer_wakeups_do_not_accumulate_in_render_cadence() {
+        let origin = Instant::now();
+        let period = Duration::from_millis(10);
+        let mut deadline = origin;
+        for tick in 1..=100 {
+            let completed = origin + period * (tick - 1) + Duration::from_millis(6);
+            deadline = next_render_deadline(deadline, period, completed);
+            assert_eq!(deadline, origin + period * tick);
+        }
+    }
+
+    #[test]
+    fn an_overrun_keeps_immediate_clock_catchup() {
+        let origin = Instant::now();
+        let completed = origin + Duration::from_millis(40);
+        assert_eq!(
+            next_render_deadline(origin, Duration::from_millis(33), completed),
+            completed
+        );
+    }
 
     use std::sync::atomic::AtomicI32;
 

@@ -23,7 +23,7 @@ import { resolveEffectivePreviewState, useEditorUiStore } from "../../store/uiSt
 import { useMediaStore, refreshMedia } from "../../store/mediaStore";
 import { existingFolderId } from "../../lib/folderTree";
 import { useSettingsStore } from "../../store/settingsStore";
-import { formatTimecode, totalFrames } from "../../lib/geometry";
+import { formatTimecode, playheadFrame, totalFrames } from "../../lib/geometry";
 import { currentTimelineOf } from "../../lib/timelineScope";
 import { snapFrameToEdge } from "../../lib/snap";
 import { maybeSnapFeedback } from "../../lib/haptic";
@@ -120,9 +120,9 @@ export function Preview() {
   const timeline = currentTimelineOf(rootTimeline, activeNestedSequenceId);
   const projectEpoch = useProjectStore((s) => s.projectEpoch);
   const timelineVersion = useProjectStore((s) => s.timelineVersion);
-  // Whole frames: every consumer below floors or rounds the playhead, and a
-  // fractional subscription would re-render the whole preview per rAF tick.
-  const activeFrame = useEditorUiStore((s) => Math.floor(s.activeFrame));
+  // Subscribe to the displayed whole frame; fractional clock updates would
+  // otherwise re-render the whole preview on every animation tick.
+  const activeFrame = useEditorUiStore((s) => playheadFrame(s.activeFrame));
   const setCurrentFrame = useEditorUiStore((s) => s.setCurrentFrame);
   const isPlaying = useEditorUiStore((s) => s.isPlaying);
   const isScrubbing = useEditorUiStore((s) => s.isScrubbing);
@@ -483,7 +483,7 @@ export function Preview() {
   const captureFrame = async () => {
     if (!canCapture) return;
     const onVideoTab = canCaptureVideoTab;
-    const frame = Math.max(0, Math.floor(onVideoTab ? activeShownFrame : activeFrame));
+    const frame = playheadFrame(onVideoTab ? activeShownFrame : activeFrame);
     // nameBase: "Frame" on the timeline tab, the asset's name on the video tab.
     const nameBase = onVideoTab ? (previewItem?.name ?? "Frame") : "Frame";
     const sourceMediaId = onVideoTab ? (previewItem?.id ?? null) : null;
@@ -675,7 +675,7 @@ export function Preview() {
                     engineDriving={playbackRoute.kind === "rust" && isPlaying}
                     stillFrame={
                       playbackRoute.kind !== "unsupported" && !isPlaying && !isScrubbing
-                        ? Math.max(0, Math.floor(activeFrame))
+                        ? playheadFrame(activeFrame)
                         : null
                     }
                     requestCompositeStill={requestCompositeStill}

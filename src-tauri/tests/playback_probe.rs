@@ -494,3 +494,154 @@ fn probe_color_grade_visible_in_playback() {
         "saturation=0 grade not applied in playback (max channel dev {max_dev})"
     );
 }
+
+/// #186: measure real 4K long-GOP reverse decode, including held source frames.
+#[test]
+#[ignore = "real-device release probe: GPU + pinned FFmpeg"]
+fn probe_reverse_long_gop_4k() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashSet;
+    use std::hash::Hasher;
+
+    if cfg!(debug_assertions) {
+        panic!("run this qualification with --release");
+    }
+    struct ReverseProbe {
+        frames: Mutex<Vec<(i32, u64, Instant)>>,
+        errors: Mutex<Vec<String>>,
+        terminal: AtomicI32,
+    }
+    impl FrameSink for ReverseProbe {
+        fn push_frame(&self, playhead: i32, frame: DecodedFrame) {
+            let mut hash = DefaultHasher::new();
+            // Sample the moving fixture across the full picture, without
+            // adding a second full-frame readback or retaining image buffers.
+            for byte in frame.rgba.iter().step_by(257) {
+                hash.write_u8(*byte);
+            }
+            self.frames
+                .lock()
+                .unwrap()
+                .push((playhead, hash.finish(), Instant::now()));
+        }
+        fn push_terminal(&self, playhead: i32) {
+            self.terminal.store(playhead, Ordering::SeqCst);
+        }
+    }
+    impl PlaybackErrorSink for ReverseProbe {
+        fn report(&self, failure: PlaybackFailure) {
+            self.errors.lock().unwrap().push(format!("{failure:?}"));
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("reverse-4k-long-gop.mp4");
+    let mut generate = opentake_media::process_tree::background_command("ffmpeg");
+    let generated = generate
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=3840x2160:rate=30:duration=10",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-g",
+            "250",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "fixture generation: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let mut timeline = Timeline::new();
+    timeline.fps = 30;
+    timeline.width = 3840;
+    timeline.height = 2160;
+    let mut track = Track::new("video", ClipType::Video);
+    let mut clip = video_clip("reversed", "source", 0, 300);
+    clip.reversed = true;
+    track.clips.push(clip);
+    timeline.tracks.push(track);
+    let media = HashMap::from([("source".into(), MediaInfo { path: source })]);
+    let sizes = HashMap::from([("source".into(), (3840, 2160))]);
+    // Exercise the production no-audio clock. The separate device probe above
+    // qualifies audio callback pacing; it must not obscure reverse decode lag.
+    let clock = Arc::new(opentake_tauri_lib::playback::InstantClock::new(0));
+    let sink = Arc::new(ReverseProbe {
+        frames: Mutex::new(Vec::new()),
+        errors: Mutex::new(Vec::new()),
+        terminal: AtomicI32::new(-1),
+    });
+    let start = Instant::now();
+    let engine = PlaybackEngine::spawn_ready(
+        timeline,
+        media,
+        HashMap::new(),
+        sizes,
+        RenderSize::new(1920, 1080),
+        clock,
+        sink.clone(),
+        sink.clone(),
+        0,
+    )
+    .expect("prepare real GPU reverse playback");
+    let bootstrap = start.elapsed();
+    engine.resume(0).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(9);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    engine.stop();
+    let errors = sink.errors.lock().unwrap();
+    assert!(errors.is_empty(), "reverse playback failed: {errors:?}");
+    let frames = sink.frames.lock().unwrap();
+    assert!(!frames.is_empty(), "reverse playback published no picture");
+    let unique = frames
+        .iter()
+        .map(|frame| frame.1)
+        .collect::<HashSet<_>>()
+        .len();
+    let gap = frames
+        .windows(2)
+        .map(|frames| frames[1].2.duration_since(frames[0].2))
+        .max()
+        .unwrap_or_default();
+    let mut held_since = frames[0].2;
+    let mut held = Duration::ZERO;
+    for pair in frames.windows(2) {
+        if pair[0].1 != pair[1].1 {
+            held_since = pair[1].2;
+        } else {
+            held = held.max(pair[1].2.duration_since(held_since));
+        }
+    }
+    let playhead = frames.last().unwrap().0;
+    eprintln!("[probe] 4K GOP250 reverse -> 1080p30: bootstrap={bootstrap:?}, frames={}, distinct={unique}, playhead={playhead}, max_publication_gap={gap:?}, max_unchanged_picture={held:?}", frames.len());
+    assert!(
+        frames.len() >= 240,
+        "fewer than 240 rendered frames in 9 seconds"
+    );
+    assert!(
+        unique >= 240,
+        "reverse decoder held too many source frames: {unique}"
+    );
+    assert!(
+        held <= Duration::from_millis(200),
+        "reverse decoder held a picture for {held:?}"
+    );
+}

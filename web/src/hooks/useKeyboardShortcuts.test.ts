@@ -325,13 +325,13 @@ describe("native keyboard-control ownership", () => {
 });
 
 describe("frame stepping during WebKit playback", () => {
-  it("rounds the active frame before applying the arrow-key step", async () => {
+  it("steps from the displayed frame during fractional playback", async () => {
     const endFrame = vi.spyOn(edit, "currentTimelineEndFrame").mockReturnValue(30);
     useEditorUiStore.setState({
       view: "editor",
       focusedPanel: "timeline",
       previewMediaId: null,
-      activeFrame: 10.4,
+      activeFrame: 10.8,
       currentFrame: 10,
       settingsOpen: false,
       exportDialogOpen: false,
