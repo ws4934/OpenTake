@@ -510,8 +510,11 @@ async function installNativeApplicationMenu(): Promise<() => void> {
   });
   handles.texts.set("group:help", { item: helpMenu, labelKey: "menu.help" });
   const menu = await Menu.new({ items: [appMenu, fileMenu, editMenu, viewMenu, helpMenu] });
+  const textMenu = textEditMenu
+    ? await Menu.new({ items: [appMenu, fileMenu, textEditMenu, viewMenu, helpMenu] })
+    : undefined;
   await menu.setAsAppMenu();
-  let displayedEditMenu: typeof editMenu | null = editMenu;
+  let displayedMenu = menu;
 
   let syncQueue = Promise.resolve();
   let stateSignature = "";
@@ -526,14 +529,12 @@ async function installNativeApplicationMenu(): Promise<() => void> {
     syncQueue = syncQueue
       .then(async () => {
         if (disposed) return;
-        const nextEditMenu = snapshot.textEntryFocus && textEditMenu ? textEditMenu : editMenu;
-        if (displayedEditMenu !== nextEditMenu) {
-          if (displayedEditMenu) {
-            await menu.remove(displayedEditMenu);
-            displayedEditMenu = null;
-          }
-          await menu.insert(nextEditMenu, 2);
-          displayedEditMenu = nextEditMenu;
+        // Both menus share the same command handles. One native replacement
+        // keeps the old complete menu intact if switching fails.
+        const nextMenu = snapshot.textEntryFocus && textMenu ? textMenu : menu;
+        if (displayedMenu !== nextMenu) {
+          await nextMenu.setAsAppMenu();
+          displayedMenu = nextMenu;
         }
         await applyNativeApplicationMenuState(handles, snapshot);
       })

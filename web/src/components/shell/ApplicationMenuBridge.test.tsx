@@ -12,11 +12,9 @@ const native = vi.hoisted(() => {
     setEnabled: ReturnType<typeof vi.fn>;
     setText: ReturnType<typeof vi.fn>;
     setChecked: ReturnType<typeof vi.fn>;
-    remove: (item: Item) => Promise<void>;
-    insert: (item: Item, index: number) => Promise<void>;
-    setAsAppMenu: () => Promise<void>;
+    setAsAppMenu: ReturnType<typeof vi.fn>;
   };
-  const state = { menu: null as Item | null, predefined: [] as string[] };
+  const state = { menu: null as Item | null, menus: [] as Item[], predefined: [] as string[] };
   function item(options: { id?: string; items?: Item[]; item?: string }): Item {
     const handle: Item = {
       id: options.id ?? options.item ?? "predefined",
@@ -25,15 +23,10 @@ const native = vi.hoisted(() => {
       setEnabled: vi.fn().mockResolvedValue(undefined),
       setText: vi.fn().mockResolvedValue(undefined),
       setChecked: vi.fn().mockResolvedValue(undefined),
-      remove: async (removed) => {
-        const index = handle.children.indexOf(removed);
-        if (index < 0) throw new Error("menu item is absent");
-        handle.children.splice(index, 1);
-      },
-      insert: async (added, index) => { handle.children.splice(index, 0, added); },
-      setAsAppMenu: async () => { state.menu = handle; },
+      setAsAppMenu: vi.fn(async () => { state.menu = handle; }),
     };
     if (typeof options.item === "string") state.predefined.push(options.item);
+    if (!options.id && options.items) state.menus.push(handle);
     return handle;
   }
   return { state, item };
@@ -52,6 +45,7 @@ vi.mock("../../lib/api", async (importOriginal) => ({
 }));
 
 import { ApplicationMenuBridge } from "./ViewMenu";
+import { useEditorUiStore } from "../../store/uiStore";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let root: Root | undefined;
@@ -63,6 +57,7 @@ afterEach(async () => {
   root = undefined;
   host = undefined;
   native.state.menu = null;
+  native.state.menus = [];
   native.state.predefined = [];
   vi.restoreAllMocks();
 });
@@ -79,21 +74,37 @@ async function mount(platform: string) {
 describe("native text editing menu", () => {
   it("routes focused macOS inputs and textareas to the native responder menu", async () => {
     await mount("MacIntel");
-    const menu = native.state.menu!;
-    const documentMenu = menu.children[2]!;
+    const documentMenu = native.state.menu!;
     for (const tag of ["input", "textarea"] as const) {
       const input = document.createElement(tag);
       host!.append(input);
       await act(async () => input.focus());
-      await vi.waitFor(() => expect(menu.children[2]?.id).toBe("editText"));
-      expect(menu.children[2]!.children.map(({ predefined }) => predefined)).toEqual([
+      await vi.waitFor(() => expect(native.state.menu?.children[2]?.id).toBe("editText"));
+      expect(native.state.menu!.children[2]!.children.map(({ predefined }) => predefined)).toEqual([
         "Undo", "Redo", "Separator", "Cut", "Copy", "Paste", "SelectAll",
       ]);
       await act(async () => input.blur());
-      await vi.waitFor(() => expect(menu.children[2]).toBe(documentMenu));
-      expect(menu.children.map(({ id }) => id)).toEqual(["app", "file", "edit", "view", "help"]);
+      await vi.waitFor(() => expect(native.state.menu).toBe(documentMenu));
+      expect(documentMenu.children.map(({ id }) => id)).toEqual(["app", "file", "edit", "view", "help"]);
       input.remove();
     }
+  });
+
+  it("preserves the complete previous menu when native replacement fails", async () => {
+    await mount("MacIntel");
+    const previous = native.state.menu!;
+    const textMenu = native.state.menus.find((menu) => menu.children[2]?.id === "editText")!;
+    const reported = vi.spyOn(console, "error").mockImplementation(() => {});
+    textMenu.setAsAppMenu.mockRejectedValueOnce(new Error("native menu unavailable"));
+    const input = document.createElement("input");
+    host!.append(input);
+    await act(async () => input.focus());
+    await vi.waitFor(() => expect(reported).toHaveBeenCalledOnce());
+    expect(native.state.menu).toBe(previous);
+    expect(previous.children.map(({ id }) => id)).toEqual(["app", "file", "edit", "view", "help"]);
+    expect(useEditorUiStore.getState().toast).not.toBeNull();
+    await act(async () => { input.blur(); input.focus(); });
+    await vi.waitFor(() => expect(native.state.menu).toBe(textMenu));
   });
 
   it("keeps the document menu and browser text handling on Windows", async () => {
