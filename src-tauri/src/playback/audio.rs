@@ -21,7 +21,8 @@
 //! The clock reports what is audible, not what was handed to the device: each
 //! callback publishes the frames it wrote plus the output latency derived from
 //! its `OutputCallbackInfo` timestamps, and [`AudioClock`] subtracts that
-//! delay from the device position (#69).
+//! delay from the device position (#69). CPAL 0.18 includes CoreAudio device
+//! latency/safety offset and WASAPI hardware pipeline latency in those timestamps.
 //!
 //! Stereo is mixed once and mapped to the device's channel count in the callback
 //! (mono downmix / >2 zero-fill). The mix itself is the export's: the render
@@ -89,18 +90,9 @@ type DeviceJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Serializes CPAL device discovery on one process-lifetime thread.
 ///
-/// CPAL 0.15's WASAPI backend caches its `IMMDeviceEnumerator` process-wide,
-/// while COM initialization is thread-local. Rust's test harness (and Tokio in
-/// production) may invoke playback setup from successive short-lived threads;
-/// allowing the thread which first created the enumerator to exit can leave the
-/// cached COM object with no live originating apartment and the next query can
-/// terminate the process with `STATUS_ACCESS_VIOLATION`. Keeping discovery on a
-/// dedicated thread both preserves that COM lifetime and prevents concurrent
-/// default-device queries from racing. The default rate probe and the
-/// default-device check on resume both run there. Opening a stream cannot:
-/// `cpal::Stream` is `!Send`, so it is built on (and never leaves) the
-/// session's own `opentake-audio` thread, as it was before device checks
-/// existed.
+/// A long-lived thread preserves the Windows COM apartment and bounds discovery
+/// even when callers use short-lived threads. Rate and device-identity queries
+/// run there; the session's output thread owns stream creation and rebuilding.
 static AUDIO_DEVICE_THREAD: OnceLock<Option<SyncSender<DeviceJob>>> = OnceLock::new();
 
 struct AudioPrepareJob<T> {
@@ -867,9 +859,8 @@ impl AudioControl {
     }
 }
 
-/// Owns the cpal output thread for a playback session. The cpal `Stream` is
-/// `!Send` on macOS, so it lives entirely on that thread; this handle drives a
-/// cooperative stop. Dropping it stops audio and joins the thread.
+/// Owns the session's output stream and serializes pause, rebuild and stop on
+/// one thread. Dropping this handle stops audio and joins the thread.
 pub struct AudioPlayback {
     control: AudioControl,
     handle: Option<JoinHandle<()>>,
@@ -920,7 +911,7 @@ impl OutputBackend for CpalBackend {
     type Stream = cpal::Stream;
 
     fn default_device_id(&self) -> Option<String> {
-        on_audio_device_thread(query_default_output_device_name)
+        on_audio_device_thread(query_default_output_device_id)
     }
 
     fn open(&self, shared: &OutputShared) -> Result<(cpal::Stream, Option<String>), String> {
@@ -1160,7 +1151,7 @@ impl Drop for AudioPlayback {
 }
 
 /// Spawn the output thread for `samples` and wait until its first stream is
-/// live. `backend` is constructed on that thread (cpal handles may be `!Send`).
+/// live. `backend` is constructed on that thread.
 fn spawn_output<B, F>(
     backend: F,
     samples: AudioStreamConsumer,
@@ -1202,7 +1193,7 @@ where
 }
 
 /// The audio thread: build + play the output stream, report the result, then park
-/// (holding the `!Send` stream alive) until a stop is requested. A resume
+/// (holding the stream alive) until a stop is requested. A resume
 /// rebuilds the stream on the current default device when the device changed
 /// or the stream failed, so a retained session follows the system output.
 fn audio_thread<B: OutputBackend>(
@@ -1261,7 +1252,10 @@ fn build_and_play(shared: &OutputShared) -> Result<(cpal::Stream, Option<String>
     let device = host
         .default_output_device()
         .ok_or_else(|| "no default audio output device".to_string())?;
-    let device_id = device.name().ok();
+    let device_id = device
+        .id()
+        .map_err(|e| format!("output device identity: {e}"))?
+        .to_string();
     let supported = output_config_at_rate(&device, shared.rate)?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
@@ -1274,14 +1268,14 @@ fn build_and_play(shared: &OutputShared) -> Result<(cpal::Stream, Option<String>
     let before = shared.callback_epoch.load(Ordering::Acquire);
     stream.play().map_err(|e| format!("stream play: {e}"))?;
     require_callback_after(&shared.callback_epoch, before, CALLBACK_START_TIMEOUT)?;
-    Ok((stream, device_id))
+    Ok((stream, Some(device_id)))
 }
 
 /// The device's default output config, or — when the device (for example one
 /// the user just switched to) defaults to another rate — a supported config at
 /// the rate the session's audio was mixed at.
 ///
-/// On macOS, CPAL 0.15 opens a stream at a non-default rate by setting the
+/// On macOS, CPAL opens a stream at a non-default rate by setting the
 /// device's nominal sample rate (`kAudioDevicePropertyNominalSampleRate`),
 /// which applies system-wide until something changes it back. Other apps on
 /// that device then run at the session's rate; restarting playback after the
@@ -1293,20 +1287,20 @@ fn output_config_at_rate(
     let default = device
         .default_output_config()
         .map_err(|e| format!("default output config: {e}"))?;
-    if default.sample_rate().0 == rate {
+    if default.sample_rate() == rate {
         return Ok(default);
     }
     device
         .supported_output_configs()
         .map_err(|e| format!("supported output configs: {e}"))?
-        .filter(|range| range.min_sample_rate().0 <= rate && rate <= range.max_sample_rate().0)
+        .filter(|range| range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
         .max_by_key(|range| {
             (
                 range.channels() == default.channels(),
                 range.sample_format() == default.sample_format(),
             )
         })
-        .map(|range| range.with_sample_rate(cpal::SampleRate(rate)))
+        .map(|range| range.with_sample_rate(rate))
         .ok_or_else(|| format!("the default output device does not support {rate} Hz"))
 }
 
@@ -1339,10 +1333,12 @@ fn build_stream(
         cpal::SampleFormat::F64 => out_stream::<f64>(device, config, shared),
         cpal::SampleFormat::I8 => out_stream::<i8>(device, config, shared),
         cpal::SampleFormat::I16 => out_stream::<i16>(device, config, shared),
+        cpal::SampleFormat::I24 => out_stream::<cpal::I24>(device, config, shared),
         cpal::SampleFormat::I32 => out_stream::<i32>(device, config, shared),
         cpal::SampleFormat::I64 => out_stream::<i64>(device, config, shared),
         cpal::SampleFormat::U8 => out_stream::<u8>(device, config, shared),
         cpal::SampleFormat::U16 => out_stream::<u16>(device, config, shared),
+        cpal::SampleFormat::U24 => out_stream::<cpal::U24>(device, config, shared),
         cpal::SampleFormat::U32 => out_stream::<u32>(device, config, shared),
         cpal::SampleFormat::U64 => out_stream::<u64>(device, config, shared),
         other => Err(format!("unsupported cpal sample format: {other}")),
@@ -1378,7 +1374,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let channels = (config.channels as usize).max(1);
-    let device_rate = config.sample_rate.0;
+    let device_rate = config.sample_rate;
     let OutputShared {
         samples,
         pos,
@@ -1396,7 +1392,7 @@ where
     };
     device
         .build_output_stream(
-            config,
+            *config,
             move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
                 callback_epoch.fetch_add(1, Ordering::Release);
                 let latency = output_latency_frames(info.timestamp(), device_rate);
@@ -1456,7 +1452,12 @@ fn publish_output_delay(
 /// Output frames between the start of a callback's block and its playback,
 /// from the callback's timestamps; zero when the backend reports none.
 fn output_latency_frames(timestamp: cpal::OutputStreamTimestamp, rate: u32) -> u64 {
-    latency_frames(timestamp.playback.duration_since(&timestamp.callback), rate)
+    latency_frames(
+        timestamp
+            .playback
+            .checked_duration_since(timestamp.callback),
+        rate,
+    )
 }
 
 fn latency_frames(latency: Option<Duration>, rate: u32) -> u64 {
@@ -1599,19 +1600,20 @@ fn run_device_jobs(job_rx: Receiver<DeviceJob>) {
     }
 }
 
-/// Name of the current default output device. CPAL 0.15 exposes no stable
-/// device id, so two identical devices (two headsets of one model) share a
-/// name and a switch between them is not detected until the stream reports
-/// an error.
-fn query_default_output_device_name() -> Option<String> {
-    cpal::default_host().default_output_device()?.name().ok()
+/// Stable identity distinguishes separate devices with the same display name.
+fn query_default_output_device_id() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()?
+        .id()
+        .ok()
+        .map(|id| id.to_string())
 }
 
 fn query_default_output_rate() -> Option<u32> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
     let config = device.default_output_config().ok()?;
-    Some(config.sample_rate().0)
+    Some(config.sample_rate())
 }
 
 fn timeline_audio_frames(timeline: &Timeline, rate: u32) -> Result<u64, MediaError> {
@@ -4478,6 +4480,54 @@ mod tests {
         assert_eq!(
             latency_frames(Some(Duration::from_secs(60)), 48_000),
             48_000
+        );
+    }
+
+    #[test]
+    fn backend_timestamp_preserves_buffer_and_hardware_latency() {
+        let callback = cpal::StreamInstant::ZERO;
+        let timestamp = cpal::OutputStreamTimestamp {
+            callback,
+            playback: callback + Duration::from_millis(170),
+        };
+        // The backend's delay includes a 20 ms buffer and 150 ms device path.
+        assert_eq!(output_latency_frames(timestamp, 48_000), 8_160);
+    }
+
+    #[test]
+    #[ignore = "requires a real output device; writes only silent samples"]
+    fn probe_native_output_delay() {
+        let rate = default_output_rate().expect("default output rate");
+        let (sender, receiver) = bounded(1);
+        let control = Arc::new(AudioStreamControl::new(0));
+        sender
+            .send(AudioStreamChunk {
+                generation: 0,
+                start_frame: 0,
+                samples: vec![0.0; rate as usize * 2 * 4],
+            })
+            .unwrap();
+        let pos = Arc::new(AtomicU64::new(0));
+        let delay = Arc::new(AtomicU64::new(0));
+        let output = Arc::new(OutputState::new(false));
+        let (commands, worker) = spawn_output(
+            || CpalBackend,
+            test_consumer(receiver, control),
+            rate,
+            pos.clone(),
+            delay.clone(),
+            &output,
+        )
+        .expect("live native output stream");
+        let observed_delay = delay.load(Ordering::Acquire);
+        let played = pos.load(Ordering::Acquire);
+        commands.send(AudioCmd::Stop).unwrap();
+        worker.join().unwrap();
+        eprintln!("native output: {rate} Hz, position={played}, queued_delay={observed_delay} frames ({:.3} ms)", observed_delay as f64 * 1000.0 / rate as f64);
+        assert!(played > 0, "the device consumed silent timeline samples");
+        assert!(
+            observed_delay > 0,
+            "the backend must report buffered output"
         );
     }
 
