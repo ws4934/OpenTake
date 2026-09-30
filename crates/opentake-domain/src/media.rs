@@ -112,6 +112,17 @@ pub struct MediaProxy {
     pub height: u32,
 }
 
+/// Credential ownership, never the credential itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GenerationCredentialSource {
+    Managed,
+    Byok,
+}
+
+/// A recoverable watch interruption while the provider task remains generating.
+pub const GENERATION_POLL_INTERRUPTED: &str = "GENERATION_POLL_INTERRUPTED";
+
 /// Full serializable input snapshot for a generated asset. 1:1 port of
 /// `GenerationInput`. `prompt` / `model` / `duration` / `aspect_ratio` are
 /// required upstream; everything else is optional.
@@ -187,6 +198,10 @@ pub struct GenerationInput {
     /// Non-secret provider routing prefix (`fal`, `replicate`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Non-secret route selected by the host when the task was submitted.
+    /// Missing on older tasks, whose credentials cannot be inferred from settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<GenerationCredentialSource>,
     /// Provider job identity required for restart recovery. This is not a
     /// credential and must never contain a result URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,7 +211,7 @@ pub struct GenerationInput {
     /// Normalized 0..1 progress. Providers without progress report phase-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<f64>,
-    /// Fixed application-owned failure code; provider messages are never stored.
+    /// Fixed application-owned state code; provider messages are never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Stable ordered output index for N-result generation.
@@ -840,6 +855,21 @@ mod tests {
         assert!(json.contains("\"aspectRatio\":\"16:9\""));
         let back: GenerationInput = serde_json::from_str(&json).unwrap();
         assert_eq!(gi, back);
+    }
+
+    #[test]
+    fn generation_credential_source_survives_serialization() {
+        for source in ["managed", "byok"] {
+            let input: GenerationInput = serde_json::from_value(serde_json::json!({
+                "prompt": "test", "model": "test", "duration": 1,
+                "aspectRatio": "1:1", "credentialSource": source,
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(input).unwrap()["credentialSource"],
+                source
+            );
+        }
     }
 
     #[test]

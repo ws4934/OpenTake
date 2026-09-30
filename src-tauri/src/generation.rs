@@ -25,7 +25,10 @@ use opentake_agent::tools::args::{
 use opentake_core::{
     AppCore, GenerationStateUpdate, PreparedGenerationJob, PreparedGenerationOutput, ProbedMedia,
 };
-use opentake_domain::{ClipType, GenerationInput, GenerationJobStatus, MediaResolver, Timeline};
+use opentake_domain::{
+    ClipType, GenerationCredentialSource, GenerationInput, GenerationJobStatus, MediaResolver,
+    Timeline, GENERATION_POLL_INTERRUPTED as POLL_INTERRUPTED,
+};
 use opentake_gen::catalog::cost::cost_for_input;
 use opentake_gen::upscale::VIDEO_UPSCALE_DEFAULT_RESOLUTION;
 use opentake_gen::{
@@ -132,6 +135,8 @@ enum JobStop {
     /// written: the placeholders keep Generating and the provider job id, and
     /// `recover_current_project` resumes them (upstream "retry on reopen").
     Detached,
+    /// The provider job remains live, but this watch exhausted its network budget.
+    Interrupted,
 }
 
 impl From<String> for JobStop {
@@ -506,6 +511,110 @@ enum RecoveryClaim {
 }
 
 impl TauriGenerationBridge {
+    fn recovery_records(&self) -> Result<Vec<GenerationRecoveryRecord>, String> {
+        let mut records = self
+            .orphans
+            .list()?
+            .into_iter()
+            .map(|entry| (entry.job_id.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        records.extend(
+            self.runtime
+                .orphaned_submissions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone())),
+        );
+        let mut active = self
+            .runtime
+            .jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        active.extend(
+            self.runtime
+                .exiting
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned(),
+        );
+        let mut records = records
+            .into_values()
+            .map(|entry| {
+                let byte_size = entry.held_results.iter().try_fold(0u64, |sum, held| {
+                    sum.checked_add(held.byte_size)
+                        .ok_or("held result size exceeds the supported range")
+                })?;
+                Ok(GenerationRecoveryRecord {
+                    active: active.contains(&entry.job_id),
+                    job_id: entry.job_id,
+                    project_path: entry.project_path,
+                    recorded_at: entry.recorded_at,
+                    result_count: entry.held_results.len(),
+                    byte_size,
+                    outcome_unknown: entry.provider_job_id.is_none(),
+                    discard_incomplete: entry.discarded,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        records.sort_by(|a, b| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then_with(|| a.job_id.cmp(&b.job_id))
+        });
+        Ok(records)
+    }
+
+    fn discard_recovery(
+        &self,
+        job_id: &str,
+        confirmed: bool,
+    ) -> Result<Vec<GenerationRecoveryRecord>, String> {
+        if !confirmed {
+            return Err("removing saved generation results requires confirmation".into());
+        }
+        let _activity = self.admission.begin_activity()?;
+        let _registration = self
+            .runtime
+            .registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let jobs = self.runtime.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let exiting = self
+            .runtime
+            .exiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if jobs.contains_key(job_id) || exiting.contains_key(job_id) {
+            return Err("this generation task is still active".into());
+        }
+        drop(exiting);
+        drop(jobs);
+        let memory_record = self
+            .runtime
+            .orphaned_submissions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(job_id)
+            .cloned();
+        if let Some(record) = memory_record {
+            self.orphans.record(record)?;
+            // The durable record owns recovery from here, including any
+            // cleanup tombstone. A stale memory copy must not revive it.
+            self.runtime
+                .orphaned_submissions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(job_id);
+        }
+        self.orphans.remove(job_id)?;
+        self.recovery_records()
+    }
+
     /// Follow project identity transitions (see `on_project_identity_transition`).
     /// The listener holds the bridge weakly: the bridge holds the core.
     pub(crate) fn follow_project_identity(self: &Arc<Self>) {
@@ -858,6 +967,7 @@ impl TauriGenerationBridge {
             project_path,
             recorded_at: crate::voice_revocations::unix_now_seconds(),
             held_results: Vec::new(),
+            discarded: false,
         };
         let mut hold_error = None;
         if let Some(job) = terminal {
@@ -935,6 +1045,7 @@ impl TauriGenerationBridge {
             project_path: binding.state().project_dir.display().to_string(),
             recorded_at: crate::voice_revocations::unix_now_seconds(),
             held_results: Vec::new(),
+            discarded: false,
         };
         let recorded = tokio::task::spawn_blocking(move || orphans.record(record))
             .await
@@ -1312,20 +1423,9 @@ impl TauriGenerationBridge {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(job_id.to_string());
         drop(registration);
-        let recovered = self.recover_jobs(Some(job_id));
+        let recovered = self.reconnect_job(job_id);
         persisted.map_err(|error| error.to_string())?;
-        if recovered == 0
-            && !self
-                .runtime
-                .jobs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(job_id)
-        {
-            return Err(
-                "generation recovery did not start; reopen the project to resume it".into(),
-            );
-        }
+        recovered?;
         Ok(GenerationSubmission {
             job_id: job_id.to_string(),
             placeholder_asset_ids,
@@ -1342,6 +1442,24 @@ impl TauriGenerationBridge {
     /// is handed over once that task has exited.
     pub(crate) fn recover_current_project(&self) -> usize {
         self.recover_jobs(None)
+    }
+
+    fn reconnect_job(&self, job_id: &str) -> Result<usize, String> {
+        let started = self.recover_jobs(Some(job_id));
+        if started == 0
+            && !self
+                .runtime
+                .jobs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(job_id)
+        {
+            return Err(
+                "generation recovery did not start; check the task status and provider credentials"
+                    .into(),
+            );
+        }
+        Ok(started)
     }
 
     fn recover_jobs(&self, only: Option<&str>) -> usize {
@@ -2307,7 +2425,7 @@ impl TauriGenerationBridge {
                 .retry_resumed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if matches!(result, Err(JobStop::Detached)) {
+            if matches!(result, Err(JobStop::Detached | JobStop::Interrupted)) {
                 resumed.contains(local_job_id)
             } else {
                 resumed.remove(local_job_id)
@@ -2341,6 +2459,30 @@ impl TauriGenerationBridge {
                     .await;
             }
             Err(JobStop::Detached) => self.schedule_resume(local_job_id),
+            Err(JobStop::Interrupted) => {
+                let job_id = local_job_id.to_string();
+                if let Err(error) = self
+                    .bound_write(binding, move |core, epoch, path| {
+                        core.update_generation_job_for_project(
+                            epoch,
+                            path,
+                            &job_id,
+                            GenerationStateUpdate {
+                                status: GenerationJobStatus::Generating,
+                                progress: None,
+                                error_code: Some(POLL_INTERRUPTED.into()),
+                                provider_job_id: None,
+                                cost_credits: None,
+                                created_at: Some(now_apple_reference_seconds()),
+                            },
+                        )
+                    })
+                    .await
+                {
+                    eprintln!("[generation] job {local_job_id}: interrupted state was not persisted: {error:?}");
+                }
+                self.schedule_resume(local_job_id);
+            }
         }
     }
 
@@ -2658,21 +2800,24 @@ impl TauriGenerationBridge {
                         "[generation] job {local_job_id}: polling stopped before the provider \
                          finished ({reason:?})"
                     );
-                    return Err(JobStop::Detached);
+                    return Err(JobStop::Interrupted);
                 }
                 // The watch always ends with one of the events above; if it
                 // ever does not, the job must stay recoverable.
-                None => return Err(JobStop::Detached),
+                None => return Err(JobStop::Interrupted),
             };
             match job.status {
-                JobStatus::Queued => {}
-                JobStatus::Running => {
+                JobStatus::Queued | JobStatus::Running => {
                     // Identical polls are no-ops in the core and progress-only
                     // polls stay in memory, so this never rewrites the bundle.
                     // A failure here does not end the job, but is not silent.
                     let running = GenerationStateUpdate {
                         status: GenerationJobStatus::Generating,
-                        progress: Some(0.5),
+                        progress: Some(if job.status == JobStatus::Queued {
+                            0.15
+                        } else {
+                            0.5
+                        }),
                         error_code: None,
                         provider_job_id: Some(provider_job_id.to_string()),
                         cost_credits: None,
@@ -2969,7 +3114,12 @@ impl GenerationBridge for TauriGenerationBridge {
     ) -> Result<GenerationSubmission, String> {
         cancelled(cancel)?;
         let admission = self.admission.begin_activity()?;
-        let prepared = self.prepare(request)?;
+        let mut prepared = self.prepare(request)?;
+        prepared.plan.input.credential_source = Some(if prepared.managed {
+            GenerationCredentialSource::Managed
+        } else {
+            GenerationCredentialSource::Byok
+        });
         let snapshot = self.core.runtime_snapshot();
         let project_dir = snapshot
             .project_dir
@@ -3907,6 +4057,43 @@ pub async fn generation_cancel(
         .map_err(|error| format!("generation cancel worker failed: {error}"))?
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationRecoveryRecord {
+    job_id: String,
+    project_path: String,
+    recorded_at: u64,
+    result_count: usize,
+    byte_size: u64,
+    outcome_unknown: bool,
+    active: bool,
+    discard_incomplete: bool,
+}
+
+#[tauri::command]
+pub async fn generation_recoveries_list(
+    bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
+) -> Result<Vec<GenerationRecoveryRecord>, String> {
+    let bridge = Arc::clone(&bridge);
+    crate::media::run_background_io("list generation recovery", move || {
+        bridge.recovery_records()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn generation_recovery_discard(
+    bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
+    job_id: String,
+    confirmed: bool,
+) -> Result<Vec<GenerationRecoveryRecord>, String> {
+    let bridge = Arc::clone(&bridge);
+    crate::media::run_background_io("discard generation recovery", move || {
+        bridge.discard_recovery(&job_id, confirmed)
+    })
+    .await
+}
+
 /// Whether a retry of `job_id` resumes its accepted provider job (no cost)
 /// rather than submitting it again (after a cost confirmation).
 #[tauri::command]
@@ -3918,6 +4105,18 @@ pub async fn generation_retry_resumes(
     tauri::async_runtime::spawn_blocking(move || bridge.retry_resumes(&job_id))
         .await
         .map_err(|error| format!("generation retry worker failed: {error}"))
+}
+
+/// Reconnect a durable nonterminal task without submitting a new provider job.
+#[tauri::command]
+pub async fn generation_resume(
+    bridge: tauri::State<'_, Arc<TauriGenerationBridge>>,
+    job_id: String,
+) -> Result<usize, String> {
+    let bridge = Arc::clone(&bridge);
+    tauri::async_runtime::spawn_blocking(move || bridge.reconnect_job(&job_id))
+        .await
+        .map_err(|error| format!("generation reconnect worker failed: {error}"))?
 }
 
 /// Retrying commits new placeholders to the project (or writes the resumed
@@ -5514,7 +5713,14 @@ mod tests {
         );
         let input = placeholder_input(&core, &asset_id);
         assert_eq!(input.status, Some(GenerationJobStatus::Generating));
-        assert_eq!(input.error_code, None);
+        assert_eq!(
+            input.error_code.as_deref(),
+            Some("GENERATION_POLL_INTERRUPTED")
+        );
+        assert_eq!(
+            serde_json::to_value(&input).unwrap()["credentialSource"],
+            "byok"
+        );
         assert_eq!(
             input.provider_job_id.as_deref(),
             Some("fal::fal-ai/flux-pro/v1.1|offline-1")
@@ -5535,7 +5741,7 @@ mod tests {
         // The network is back: recovery takes the same provider job over,
         // without submitting again.
         mock.on(Method::Get, status, 200, json!({"status": "COMPLETED"}));
-        assert_eq!(bridge.recover_current_project(), 1);
+        assert_eq!(bridge.reconnect_job(&submitted.job_id).unwrap(), 1);
         let ready = wait_for_ready_model(&core, "fal:flux-pro").await;
         assert_eq!(ready.id, asset_id);
         assert_eq!(
@@ -7129,6 +7335,146 @@ mod tests {
         )
     }
 
+    fn saved_recovery(job_id: &str, bundle: &Path) -> OrphanedGeneration {
+        OrphanedGeneration {
+            job_id: job_id.into(),
+            provider_job_id: Some("fal::saved-provider-task".into()),
+            project_path: bundle.to_string_lossy().into_owned(),
+            recorded_at: 1,
+            held_results: Vec::new(),
+            discarded: false,
+        }
+    }
+
+    #[test]
+    fn recovery_discard_requires_confirmation_and_waits_for_the_task_to_exit() {
+        let (temp, bundle, core) = saved_core();
+        let bridge = outcome_bridge(&core, &bundle, &MockTransport::new());
+        let staged = temp.path().join("saved.png");
+        std::fs::write(&staged, png_bytes(2, 2)).unwrap();
+        let held = bridge.orphans.hold(&staged, "image/png").unwrap();
+        let mut entry = saved_recovery("saved", &bundle);
+        entry.held_results.push(held.clone());
+        bridge.orphans.record(entry.clone()).unwrap();
+        bridge
+            .orphans
+            .record(saved_recovery("other", &bundle))
+            .unwrap();
+
+        assert!(bridge.discard_recovery("saved", false).is_err());
+        assert_eq!(bridge.orphans.get("saved").unwrap(), Some(entry.clone()));
+        bridge.runtime.jobs.lock().unwrap().insert(
+            "saved".into(),
+            ActiveGenerationJob {
+                cancel: MediaCancelToken::new(),
+                binding: JobBinding::new(core.runtime_snapshot().project_epoch, bundle.clone()),
+                task: 1,
+                admission: bridge.admission.begin_activity().unwrap(),
+            },
+        );
+        assert!(
+            bridge
+                .recovery_records()
+                .unwrap()
+                .iter()
+                .find(|r| r.job_id == "saved")
+                .unwrap()
+                .active
+        );
+        assert!(bridge
+            .discard_recovery("saved", true)
+            .unwrap_err()
+            .contains("active"));
+        assert!(bridge.orphans.held_path(&held).exists());
+
+        let exiting = bridge
+            .runtime
+            .jobs
+            .lock()
+            .unwrap()
+            .remove("saved")
+            .unwrap()
+            .detach();
+        bridge
+            .runtime
+            .exiting
+            .lock()
+            .unwrap()
+            .insert("saved".into(), exiting);
+        assert!(bridge
+            .discard_recovery("saved", true)
+            .unwrap_err()
+            .contains("active"));
+        assert_eq!(bridge.orphans.get("saved").unwrap(), Some(entry));
+        bridge.runtime.exiting.lock().unwrap().remove("saved");
+
+        let records = bridge.discard_recovery("saved", true).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job_id, "other");
+        assert!(!bridge.orphans.held_path(&held).exists());
+    }
+
+    #[test]
+    fn recovery_management_uses_the_newer_in_memory_record_without_provider_details() {
+        let (_temp, bundle, core) = saved_core();
+        let bridge = outcome_bridge(&core, &bundle, &MockTransport::new());
+        let mut entry = saved_recovery("saved", &bundle);
+        bridge.orphans.record(entry.clone()).unwrap();
+        bridge
+            .orphans
+            .record(saved_recovery("other", &bundle))
+            .unwrap();
+        entry.provider_job_id = None;
+        entry.recorded_at = 2;
+        entry
+            .held_results
+            .push(crate::generation_orphans::HeldResult {
+                file: "held.result".into(),
+                media_type: "image/png".into(),
+                byte_size: 1024,
+            });
+        bridge
+            .runtime
+            .orphaned_submissions
+            .lock()
+            .unwrap()
+            .insert("saved".into(), entry);
+        let records = bridge.recovery_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].job_id, "saved");
+        assert!(records[0].outcome_unknown);
+        assert_eq!(records[0].result_count, 1);
+        assert_eq!(records[0].byte_size, 1024);
+        let value = serde_json::to_value(&records[0]).unwrap();
+        assert!(value.get("providerJobId").is_none());
+        assert!(value.get("heldResults").is_none());
+    }
+
+    #[test]
+    fn failed_recovery_cleanup_cannot_be_revived_by_an_in_memory_record() {
+        let (temp, bundle, core) = saved_core();
+        let bridge = outcome_bridge(&core, &bundle, &MockTransport::new());
+        let staged = temp.path().join("saved.png");
+        std::fs::write(&staged, png_bytes(2, 2)).unwrap();
+        let held = bridge.orphans.hold(&staged, "image/png").unwrap();
+        let held_path = bridge.orphans.held_path(&held);
+        std::fs::remove_file(&held_path).unwrap();
+        std::fs::create_dir(&held_path).unwrap();
+        let mut entry = saved_recovery("saved", &bundle);
+        entry.held_results.push(held);
+        bridge
+            .runtime
+            .orphaned_submissions
+            .lock()
+            .unwrap()
+            .insert("saved".into(), entry);
+        assert!(bridge.discard_recovery("saved", true).is_err());
+        assert!(bridge.recovery_records().unwrap()[0].discard_incomplete);
+        assert!(bridge.orphan_record("saved").is_none());
+        std::fs::remove_dir(held_path).unwrap();
+        assert!(bridge.discard_recovery("saved", true).unwrap().is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unknown_outcome_after_its_project_closed_is_reported_on_reopen() {
         let (temp, bundle, core) = saved_core();
@@ -7382,6 +7728,7 @@ mod tests {
                 project_path: bundle.display().to_string(),
                 recorded_at: 1,
                 held_results: held.clone(),
+                discarded: false,
             })
             .unwrap();
         (committed.job_id, committed.placeholder_asset_ids, held)

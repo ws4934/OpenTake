@@ -17,6 +17,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use cap_fs_ext::DirExt;
 use serde::{Deserialize, Serialize};
 
 use crate::durable_list::DurableJsonList;
@@ -41,6 +42,9 @@ pub(crate) struct OrphanedGeneration {
     /// under the store's `results/` directory in placeholder order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_results: Vec<HeldResult>,
+    /// Persisted before deletion so an interrupted cleanup can be retried.
+    #[serde(default)]
+    pub discarded: bool,
 }
 
 /// One result file held for a job.
@@ -79,15 +83,48 @@ impl OrphanedGenerationStore {
 
     pub(crate) fn get(&self, job_id: &str) -> Result<Option<OrphanedGeneration>, String> {
         Ok(self
-            .list
             .list()?
             .into_iter()
-            .find(|entry| entry.job_id == job_id))
+            .find(|entry| entry.job_id == job_id && !entry.discarded))
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<OrphanedGeneration>, String> {
+        let entries = self.list.list_strict()?;
+        for entry in &entries {
+            Self::validate_entry(entry)?;
+        }
+        Ok(entries)
+    }
+
+    fn validate_entry(entry: &OrphanedGeneration) -> Result<(), String> {
+        for held in &entry.held_results {
+            if held.file.is_empty()
+                || held.file == "."
+                || held.file == ".."
+                || held.file.contains(['/', '\\', ':', '\0'])
+            {
+                return Err("held generation result is not a file name".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn results_directory(&self) -> Result<cap_std::fs::Dir, String> {
+        let root = self.results_dir.parent().expect("store root");
+        let parent = root.parent().ok_or("generation store has no parent")?;
+        let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+            .map_err(|e| format!("open generation store parent: {e}"))?;
+        let root = parent
+            .open_dir_nofollow(root.file_name().ok_or("generation store has no name")?)
+            .map_err(|e| format!("open generation store: {e}"))?;
+        root.open_dir_nofollow("results")
+            .map_err(|e| format!("open held results: {e}"))
     }
 
     /// Record a job, replacing an earlier record of the same job (whose held
     /// files are removed unless the new record keeps them).
     pub(crate) fn record(&self, entry: OrphanedGeneration) -> Result<(), String> {
+        Self::validate_entry(&entry)?;
         #[cfg(test)]
         if self.fail_records.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("write orphaned generation jobs: no space left on device".to_string());
@@ -111,18 +148,42 @@ impl OrphanedGenerationStore {
         Ok(())
     }
 
-    /// Forget a job once its project records it, with its held files.
+    /// Forget a job and its held files. Failed cleanup retains a tombstone.
     pub(crate) fn remove(&self, job_id: &str) -> Result<(), String> {
-        let removed = self.list.update(|entries| {
-            let removed = entries
-                .iter()
-                .position(|entry| entry.job_id == job_id)
-                .map(|index| entries.remove(index));
-            (removed.is_some(), removed)
+        let Some(entry) = self
+            .list()?
+            .into_iter()
+            .find(|entry| entry.job_id == job_id)
+        else {
+            return Ok(());
+        };
+        let directory = if entry.held_results.is_empty() {
+            None
+        } else {
+            Some(self.results_directory()?)
+        };
+        self.list.update(|entries| {
+            let entry = entries.iter_mut().find(|entry| entry.job_id == job_id);
+            let changed = entry.as_ref().is_some_and(|entry| !entry.discarded);
+            if let Some(entry) = entry {
+                entry.discarded = true;
+            }
+            (changed, ())
         })?;
-        if let Some(removed) = removed {
-            self.remove_held_files(removed.held_results.iter());
+        if let Some(directory) = directory {
+            for held in &entry.held_results {
+                match directory.remove_file(&held.file) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("remove held generation result: {e}")),
+                }
+            }
         }
+        self.list.update(|entries| {
+            let old_len = entries.len();
+            entries.retain(|entry| entry.job_id != job_id || !entry.discarded);
+            (entries.len() != old_len, ())
+        })?;
         Ok(())
     }
 
@@ -194,7 +255,93 @@ mod tests {
             project_path: "/projects/A.opentake".into(),
             recorded_at: 1,
             held_results,
+            discarded: false,
         }
+    }
+
+    #[test]
+    fn management_preserves_and_reports_a_damaged_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OrphanedGenerationStore::new(root.path().to_path_buf());
+        let path = root.path().join("orphans.json");
+        for bytes in [
+            b"{".as_slice(),
+            br#"{"version":99,"orphans":[]}"#.as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(store.list().is_err());
+            assert!(store.get("job").is_err());
+            assert!(store.remove("job").is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_remains_visible_and_can_be_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OrphanedGenerationStore::new(root.path().join("orphans"));
+        let leaf = store.results_dir.join("held.result");
+        fs::create_dir_all(&leaf).unwrap();
+        store
+            .record(record(
+                "job",
+                vec![HeldResult {
+                    file: "held.result".into(),
+                    media_type: "image/png".into(),
+                    byte_size: 1,
+                }],
+            ))
+            .unwrap();
+        assert!(store.remove("job").is_err());
+        assert!(store.list().unwrap()[0].discarded);
+        assert!(store.get("job").unwrap().is_none());
+        fs::remove_dir(&leaf).unwrap();
+        store.remove("job").unwrap();
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn held_file_names_cannot_escape_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OrphanedGenerationStore::new(root.path().join("orphans"));
+        for file in ["../outside", "..\\outside", "C:outside", "/outside"] {
+            assert!(store
+                .record(record(
+                    "job",
+                    vec![HeldResult {
+                        file: file.into(),
+                        media_type: "image/png".into(),
+                        byte_size: 1
+                    }]
+                ))
+                .is_err());
+        }
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_rejects_a_replaced_results_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OrphanedGenerationStore::new(root.path().join("orphans"));
+        store
+            .record(record(
+                "job",
+                vec![HeldResult {
+                    file: "held.result".into(),
+                    media_type: "image/png".into(),
+                    byte_size: 1,
+                }],
+            ))
+            .unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("held.result"), b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&outside, &store.results_dir).unwrap();
+        assert!(store.remove("job").is_err());
+        assert_eq!(fs::read(outside.join("held.result")).unwrap(), b"unrelated");
+        assert!(!store.list().unwrap()[0].discarded);
     }
 
     #[test]

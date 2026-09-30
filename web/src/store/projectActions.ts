@@ -454,19 +454,20 @@ export async function openProjectPath(path: string): Promise<void> {
 /** Pick a project bundle with the native dialog, then open it. `.opentake`
  *  bundles are directories, so the picker is a directory chooser (mirrors
  *  upstream's package-as-folder open panel). */
-export async function openProjectViaDialog(): Promise<void> {
+export async function openProjectViaDialog(defaultPath?: string): Promise<boolean> {
   let delegatedToProjectOpen = false;
   try {
     const open = await openDialog();
     if (!open) {
       // Browser shell: no file system. Just enter the editor on the demo mirror.
       useEditorUiStore.getState().setView("editor");
-      return;
+      return false;
     }
-    const selected = await open({ directory: true, multiple: false, recursive: true });
-    if (typeof selected !== "string") return; // cancelled
+    const selected = await open({ directory: true, multiple: false, recursive: true, defaultPath });
+    if (typeof selected !== "string") return false; // cancelled
     delegatedToProjectOpen = true;
     await openProjectPath(selected);
+    return true;
   } catch (error) {
     // openProjectPath reports its own downstream failures. Dialog acquisition
     // and picker failures happen before delegation, so report them here.

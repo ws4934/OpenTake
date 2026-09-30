@@ -161,7 +161,7 @@ export function HomeView() {
 
   const runProjectAction = async (
     action: Exclude<ProjectAction, null>,
-    operation: () => Promise<void>,
+    operation: () => Promise<unknown>,
   ) => {
     if (projectActionRef.current) return;
     projectActionRef.current = action;

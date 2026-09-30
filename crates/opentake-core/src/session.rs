@@ -244,9 +244,14 @@ fn validate_generation_update(update: &GenerationStateUpdate) -> Result<()> {
             "failed generation status requires an error code".to_string(),
         ));
     }
-    if update.status != GenerationJobStatus::Failed && update.error_code.is_some() {
+    let interrupted_watch = update.status == GenerationJobStatus::Generating
+        && update.error_code.as_deref() == Some(opentake_domain::GENERATION_POLL_INTERRUPTED);
+    if update.status != GenerationJobStatus::Failed
+        && update.error_code.is_some()
+        && !interrupted_watch
+    {
         return Err(CoreError::Media(
-            "generation error code is only valid for failed status".to_string(),
+            "generation state code requires failed status or an interrupted watch".to_string(),
         ));
     }
     if let Some(provider_job_id) = update.provider_job_id.as_deref() {
@@ -1586,6 +1591,40 @@ pub(crate) fn test_media_entry(id: &str) -> opentake_domain::MediaManifestEntry 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_poll_interruption_can_carry_a_nonterminal_state_code() {
+        for status in [
+            GenerationJobStatus::Queued,
+            GenerationJobStatus::Generating,
+            GenerationJobStatus::Downloading,
+            GenerationJobStatus::Finalizing,
+            GenerationJobStatus::Ready,
+            GenerationJobStatus::Cancelled,
+        ] {
+            let update = GenerationStateUpdate {
+                status,
+                progress: None,
+                error_code: Some(opentake_domain::GENERATION_POLL_INTERRUPTED.into()),
+                provider_job_id: None,
+                cost_credits: None,
+                created_at: None,
+            };
+            assert_eq!(
+                validate_generation_update(&update).is_ok(),
+                status == GenerationJobStatus::Generating
+            );
+        }
+        let update = GenerationStateUpdate {
+            status: GenerationJobStatus::Generating,
+            progress: None,
+            error_code: Some("GENERATION_PROVIDER_FAILED".into()),
+            provider_job_id: None,
+            cost_credits: None,
+            created_at: None,
+        };
+        assert!(validate_generation_update(&update).is_err());
+    }
     use opentake_domain::ClipType;
     use opentake_ops::command::ClipEntry;
     use opentake_ops::SeqIdGen;
