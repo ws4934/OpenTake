@@ -60,6 +60,7 @@ public static class NativeEditInput {
         Send(new[] { Key(0x11, false), Key(code, false), Key(code, true), Key(0x11, true) });
     }
     public static void Backspace() { Send(new[] { Key(0x08, false), Key(0x08, true) }); }
+    public static void Enter() { Send(new[] { Key(0x0d, false), Key(0x0d, true) }); }
     public static void Click(int x, int y) {
         if (!SetCursorPos(x, y)) throw new InvalidOperationException("Cannot position the test pointer");
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
@@ -127,6 +128,7 @@ function Send-Keys([string]$Keys) {
     # while the editor's event.code contract requires physical keyboard events.
     if ($Keys -match '^\^([a-z])$') { [NativeEditInput]::ControlKey($Matches[1][0]) }
     elseif ($Keys -eq '{BACKSPACE}') { [NativeEditInput]::Backspace() }
+    elseif ($Keys -eq '{ENTER}') { [NativeEditInput]::Enter() }
     else { [System.Windows.Forms.SendKeys]::SendWait($Keys) }
 }
 
@@ -274,9 +276,11 @@ try {
     Wait-Until { @(Clip-Elements).Count -eq 1 } 'one added timeline clip'
     $clip = @(Clip-Elements)[0]
     Write-Output "Initial clip: $($clip.Current.Name)"
-    Click-Element $clip
     $clip.SetFocus()
     Wait-Until { $clip.Current.HasKeyboardFocus } 'timeline clip keyboard focus'
+    # Clip buttons expose pressed state and pass pointer events to the canvas.
+    # Activate them with the real keyboard instead of a pointer or InvokePattern.
+    Send-Keys '{ENTER}'
     # Menu enablement crosses asynchronous IPC. Wait for the real native
     # command to become available instead of racing the focus notification.
     Wait-Until {
@@ -300,9 +304,9 @@ try {
     Wait-Until { @(Clip-Elements).Count -eq 2 } 'timeline copy and paste'
     Write-Output 'PASS: timeline copy and paste'
     $clip = @(Clip-Elements)[1]
-    $clip.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
     $clip.SetFocus()
     Wait-Until { $clip.Current.HasKeyboardFocus } 'pasted clip keyboard focus'
+    Send-Keys '{ENTER}'
     Wait-Until {
         [NativeEditInput]::EditItemEnabled($script:window.Current.NativeWindowHandle, 3)
     } 'native timeline cut enabled'
