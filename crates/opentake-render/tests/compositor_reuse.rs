@@ -337,3 +337,113 @@ fn cached_bindings_still_apply_changed_uniforms() {
     assert_eq!(warm.rgba, cold.rgba);
     assert_eq!(compositor.resource_stats().bind_groups_created, LAYERS);
 }
+
+fn submit<'a>(
+    compositor: &'a Compositor,
+    dev: &'a RenderDevice,
+    resolver: &mut PreloadedResolver,
+    size: RenderSize,
+    timeline: &Timeline,
+) -> opentake_render::gpu::compositor::PendingReadback<'a> {
+    let plan = build_render_plan(timeline, size, &Metrics);
+    compositor
+        .render_pending_with_interpolation(
+            &dev.device,
+            &dev.queue,
+            size,
+            &plan.frame(timeline, 0),
+            resolver,
+            opentake_render::gpu::compositor::TextureInterpolationConfig::passthrough(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn pending_frames_preserve_their_own_pixels_and_uniforms() {
+    let Some(dev) = device_or_skip("pending_frames_preserve_their_own_pixels_and_uniforms") else {
+        return;
+    };
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = PreloadedResolver::new(&dev.device, &dev.queue, 32, 18);
+    let mut timeline = four_layer_timeline(SMALL);
+    let expected_first = render(&Compositor::new(&dev.device), &dev, &mut resolver, SMALL);
+    let first = submit(&compositor, &dev, &mut resolver, SMALL, &timeline);
+    timeline.tracks[0].clips[0].opacity = 0.1;
+    let replacement = DecodedFrame::new(32, 18, [0, 255, 0, 255].repeat(32 * 18), true);
+    resolver.textures.insert(
+        "asset2".into(),
+        Rc::new(upload_rgba(
+            &dev.device,
+            &dev.queue,
+            &replacement,
+            false,
+            None,
+        )),
+    );
+    let second = submit(&compositor, &dev, &mut resolver, SMALL, &timeline);
+    let cold = Compositor::new(&dev.device);
+    let expected_second = submit(&cold, &dev, &mut resolver, SMALL, &timeline)
+        .finish()
+        .unwrap();
+    assert_ne!(expected_first, expected_second.rgba);
+    assert_eq!(first.finish().unwrap().rgba, expected_first);
+    assert_eq!(second.finish().unwrap().rgba, expected_second.rgba);
+    assert_eq!(compositor.resource_stats().render_targets_created, 2);
+    assert_eq!(compositor.resource_stats().readback_buffers_created, 2);
+}
+
+#[test]
+fn pipelined_readback_reuses_two_targets_for_one_hundred_frames() {
+    let Some(dev) = device_or_skip("pipelined_readback_reuses_two_targets_for_one_hundred_frames")
+    else {
+        return;
+    };
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = PreloadedResolver::new(&dev.device, &dev.queue, 32, 18);
+    let timeline = four_layer_timeline(SMALL);
+    let expected = render(&Compositor::new(&dev.device), &dev, &mut resolver, SMALL);
+    let mut pending = None;
+    for _ in 0..100 {
+        let next = submit(&compositor, &dev, &mut resolver, SMALL, &timeline);
+        if let Some(previous) = pending.replace(next) {
+            assert_eq!(previous.finish().unwrap().rgba, expected);
+        }
+    }
+    assert_eq!(pending.unwrap().finish().unwrap().rgba, expected);
+    let stats = compositor.resource_stats();
+    assert_eq!(stats.render_targets_created, 2);
+    assert_eq!(stats.readback_buffers_created, 2);
+    assert_eq!(stats.uniform_buffers_created, LAYERS);
+    assert_eq!(stats.bind_groups_created, LAYERS);
+}
+
+#[test]
+fn abandoned_and_old_size_submissions_do_not_reenter_the_target_pool() {
+    let Some(dev) =
+        device_or_skip("abandoned_and_old_size_submissions_do_not_reenter_the_target_pool")
+    else {
+        return;
+    };
+    let compositor = Compositor::new(&dev.device);
+    let mut resolver = PreloadedResolver::new(&dev.device, &dev.queue, 32, 18);
+    let timeline = four_layer_timeline(SMALL);
+    drop(submit(&compositor, &dev, &mut resolver, SMALL, &timeline));
+    let small = submit(&compositor, &dev, &mut resolver, SMALL, &timeline);
+    let large_timeline = four_layer_timeline(ALIGNED);
+    let large = submit(&compositor, &dev, &mut resolver, ALIGNED, &large_timeline);
+    let small_frame = small.finish().unwrap();
+    let large_frame = large.finish().unwrap();
+    assert_eq!(
+        small_frame.rgba,
+        render(&Compositor::new(&dev.device), &dev, &mut resolver, SMALL)
+    );
+    assert_eq!(
+        large_frame.rgba,
+        render(&Compositor::new(&dev.device), &dev, &mut resolver, ALIGNED)
+    );
+    assert_eq!(compositor.resource_stats().render_targets_created, 3);
+    render(&compositor, &dev, &mut resolver, ALIGNED);
+    assert_eq!(compositor.resource_stats().render_targets_created, 3);
+    render(&compositor, &dev, &mut resolver, SMALL);
+    assert_eq!(compositor.resource_stats().render_targets_created, 4);
+}

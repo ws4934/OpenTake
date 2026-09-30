@@ -422,11 +422,33 @@ impl SizedTargets {
     }
 }
 
+/// One submitted frame with its own render target and readback buffer.
+/// Callers can prepare the next frame before finishing this one. Dropping a
+/// pending frame releases its resources without recycling an unfinished map.
+#[must_use = "finish the submitted frame to retrieve its pixels"]
+pub struct PendingReadback<'a> {
+    compositor: &'a Compositor,
+    device: &'a wgpu::Device,
+    submission: wgpu::SubmissionIndex,
+    targets: SizedTargets,
+}
+
+impl PendingReadback<'_> {
+    pub fn finish(self) -> Result<DecodedFrame, RenderError> {
+        let result = finish_read_back(self.device, self.submission, &self.targets);
+        if result.is_ok() {
+            self.compositor.recycle_targets(self.targets);
+        }
+        result
+    }
+}
+
 /// Resources reused across frames. `targets` is keyed by the canvas size;
 /// `uniforms[i]` backs draw slot `i` of a frame and is independent of size.
 #[derive(Default)]
 struct FrameResources {
-    targets: Option<SizedTargets>,
+    target_size: Option<RenderSize>,
+    targets: Vec<SizedTargets>,
     uniforms: Vec<wgpu::Buffer>,
     bindings: Vec<Option<CachedBindings>>,
 }
@@ -445,8 +467,8 @@ impl CachedBindings {
 }
 
 impl FrameResources {
-    /// Make the cached targets match `size` and the uniform pool hold at
-    /// least `layers` buffers, creating only what is missing.
+    /// Discard idle targets of another size and grow the uniform pool only
+    /// when the current frame needs additional draw slots.
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -467,10 +489,9 @@ impl FrameResources {
                 }));
             counters.uniform_buffers.fetch_add(1, Ordering::Relaxed);
         }
-        if self.targets.as_ref().is_none_or(|t| t.size != size) {
-            // Release the old size's resources before allocating the new ones.
-            self.targets = None;
-            self.targets = Some(SizedTargets::new(device, size, counters));
+        if self.target_size != Some(size) {
+            self.targets.clear();
+            self.target_size = Some(size);
         }
     }
 }
@@ -660,9 +681,19 @@ impl Compositor {
         }
     }
 
+    fn recycle_targets(&self, targets: SizedTargets) {
+        if let Some(mut cache) = self.try_lock_frame_cache() {
+            // Export keeps at most two submissions in flight. Synchronous
+            // preview calls still allocate and reuse just one target.
+            if cache.target_size == Some(targets.size) && cache.targets.len() < 2 {
+                cache.targets.push(targets);
+            }
+        }
+    }
+
     /// Lock the frame cache without blocking. `None` means another render
-    /// holds it. A poisoned cache is reset, since a render that panicked
-    /// midway may have left the readback buffer mapped or pending.
+    /// holds it. A poisoned cache is reset so a failed submission cannot
+    /// leave partially prepared bindings for the next frame.
     fn try_lock_frame_cache(&self) -> Option<MutexGuard<'_, FrameResources>> {
         match self.frame_cache.try_lock() {
             Ok(guard) => Some(guard),
@@ -712,6 +743,30 @@ impl Compositor {
         resolver: &mut dyn TextureResolver,
         interpolation: TextureInterpolationConfig,
     ) -> Result<DecodedFrame, RenderError> {
+        self.render_pending_with_interpolation(
+            device,
+            queue,
+            size,
+            frame_plan,
+            resolver,
+            interpolation,
+        )?
+        .finish()
+    }
+
+    /// Submit a frame without waiting for CPU readback. The caller must bound
+    /// its in-flight frames; export uses a two-frame pipeline. Uniform writes
+    /// and submissions stay ordered under the cache lock, while each pending
+    /// frame owns separate targets until its readback has been unmapped.
+    pub fn render_pending_with_interpolation<'a>(
+        &'a self,
+        device: &'a wgpu::Device,
+        queue: &wgpu::Queue,
+        size: RenderSize,
+        frame_plan: &FramePlan<'_>,
+        resolver: &mut dyn TextureResolver,
+        interpolation: TextureInterpolationConfig,
+    ) -> Result<PendingReadback<'a>, RenderError> {
         // Resolve textures + build uniforms up front, before touching the
         // frame cache, so resolver callbacks never run while it is locked.
         let mut prepared: Vec<PreparedDraw> = Vec::with_capacity(frame_plan.draws.len());
@@ -847,19 +902,19 @@ impl Compositor {
             Some(cached) => cached,
             None => &mut transient,
         };
-        let result =
-            self.encode_and_read_back(device, queue, size, frame_plan, &prepared, resources);
-        if result.is_err() {
-            // A failed map can leave the readback buffer pending or mapped;
-            // never hand it to the next frame.
-            resources.targets = None;
-        }
-        result
+        let (submission, targets) =
+            self.encode_and_submit(device, queue, size, frame_plan, &prepared, resources);
+        Ok(PendingReadback {
+            compositor: self,
+            device,
+            submission,
+            targets,
+        })
     }
 
     /// Write the prepared uniforms into the pooled buffers, record the pass
-    /// and the target -> readback copy, submit, and read the frame back.
-    fn encode_and_read_back(
+    /// and the target -> readback copy, then submit without waiting.
+    fn encode_and_submit(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -867,9 +922,12 @@ impl Compositor {
         frame_plan: &FramePlan<'_>,
         prepared: &[PreparedDraw],
         resources: &mut FrameResources,
-    ) -> Result<DecodedFrame, RenderError> {
+    ) -> (wgpu::SubmissionIndex, SizedTargets) {
         resources.prepare(device, size, prepared.len(), &self.counters);
-        let targets = resources.targets.as_ref().expect("targets prepared");
+        let targets = resources
+            .targets
+            .pop()
+            .unwrap_or_else(|| SizedTargets::new(device, size, &self.counters));
 
         // Each draw owns one pooled uniform buffer for this submission, so
         // every `write_buffer` lands before the submit that reads it and no
@@ -952,9 +1010,9 @@ impl Compositor {
             }
         }
 
-        encode_read_back(&mut encoder, targets);
+        encode_read_back(&mut encoder, &targets);
         let submission = queue.submit(Some(encoder.finish()));
-        finish_read_back(device, submission, targets)
+        (submission, targets)
     }
 }
 
