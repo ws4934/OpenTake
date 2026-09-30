@@ -3814,7 +3814,7 @@ fn save_clip_as_media_workflow_from_snapshot(
         Some(guard) => guard,
         None => control.try_begin(operation_id)?,
     };
-    let output =
+    let mut output =
         crate::export::reserve_project_media_output(&project_dir, &format!("clip_{clip_id}"), ext)?;
     let out_path = output.path().to_path_buf();
     let project_dir_option = Some(project_dir.clone());
@@ -3834,7 +3834,7 @@ fn save_clip_as_media_workflow_from_snapshot(
                 crate::export::ExportRunOptions {
                     control: Some(control),
                     on_progress: Some(Arc::clone(&on_progress)),
-                    output_file: Some(output.writer()?),
+                    project_output: Some(&mut output),
                     defer_completion: true,
                     ..crate::export::ExportRunOptions::default()
                 },
