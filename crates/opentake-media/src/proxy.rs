@@ -291,7 +291,7 @@ pub fn create_proxy(
         "scale=w={}:h={}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         request.max_size.0, request.max_size.1
     );
-    let mut child = opentake_process_tree::background_command(ff::ffmpeg_path())
+    let mut child = opentake_process_tree::background_command(ff::ffmpeg_workspace_path()?)
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
         .arg("-i")
         .arg("fd:")
@@ -313,7 +313,8 @@ pub fn create_proxy(
             "-f",
             "mp4",
         ])
-        .arg(stage.path())
+        .arg(stage.path().file_name().expect("private stage leaf"))
+        .current_dir(stage.path().parent().expect("private stage parent"))
         .stdin(Stdio::from(ffmpeg_source))
         .stdout(Stdio::null())
         .stderr(Stdio::null())

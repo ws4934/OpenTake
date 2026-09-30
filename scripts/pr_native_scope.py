@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GLOBAL_PATHS = (
     "Cargo.lock",
     "Cargo.toml",
+    "vendor/",
     "rust-toolchain.toml",
     ".cargo/",
     ".github/workflows/pr-native.yml",

@@ -230,17 +230,18 @@ fn run_video_stream(
         }
     };
     let args = video_stream_args_with_color(&req, color.as_ref());
-    let mut child = match ff::ffmpeg().args(args).spawn_counted() {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = send_with_backpressure(
-                &tx,
-                Err(MediaError::Ffmpeg(format!("spawn: {e}"))),
-                &control,
-            );
-            return;
-        }
-    };
+    let mut child =
+        match ff::ffmpeg_decode(args, &req.path).and_then(|mut command| command.spawn_counted()) {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = send_with_backpressure(
+                    &tx,
+                    Err(MediaError::Ffmpeg(format!("spawn: {e}"))),
+                    &control,
+                );
+                return;
+            }
+        };
 
     let iter = match child.iter() {
         Ok(iter) => iter,

@@ -666,7 +666,16 @@ fn run_ffprobe(
     let timeout = timeout.saturating_sub(queued_at.elapsed());
     let (operation_deadline, api_deadline) = probe_deadlines(timeout)?;
     let input = match (input_path, input_file) {
-        (Some(path), None) => ProbeInput::Path(path.to_path_buf()),
+        (Some(path), None) => {
+            #[cfg(windows)]
+            if path.to_str().is_none() {
+                ProbeInput::File(std::fs::File::open(path)?)
+            } else {
+                ProbeInput::Path(path.to_path_buf())
+            }
+            #[cfg(not(windows))]
+            ProbeInput::Path(path.to_path_buf())
+        }
         (None, Some(file)) => ProbeInput::File(file.try_clone().map_err(|error| {
             crate::error::MediaError::Ffmpeg(format!("ffprobe input clone: {error}"))
         })?),
@@ -779,6 +788,18 @@ pub fn ffmpeg_path() -> OsString {
     )
 }
 
+/// Keep an explicit relative executable bound to the application's directory
+/// when a helper runs inside a private media workspace. Bare names use PATH.
+pub(crate) fn ffmpeg_workspace_path() -> std::io::Result<OsString> {
+    let executable = ffmpeg_path();
+    let path = Path::new(&executable);
+    if path.is_relative() && path.components().count() > 1 {
+        Ok(std::path::absolute(path)?.into_os_string())
+    } else {
+        Ok(executable)
+    }
+}
+
 /// Path to `ffprobe`: explicit development override, packaged sidecar, then PATH.
 pub fn ffprobe_path() -> OsString {
     #[cfg(test)]
@@ -798,6 +819,39 @@ pub fn ffprobe_path() -> OsString {
 /// [`HelperProcessCount`].
 pub fn ffmpeg() -> FfmpegCommand {
     FfmpegCommand::new_with_path(ffmpeg_path())
+}
+
+/// Build a single-source decoder. Windows FFmpeg replaces unpaired UTF-16
+/// units in argv, so those inputs must cross the process boundary as files.
+/// The regular-file stdin remains seekable, including MP4 indexes at EOF.
+pub(crate) fn ffmpeg_decode(args: Vec<OsString>, path: &Path) -> std::io::Result<FfmpegCommand> {
+    let mut command = ffmpeg();
+    #[cfg(windows)]
+    let args = if path.to_str().is_none() {
+        let mut args = args;
+        let input = args
+            .windows(2)
+            .position(|pair| pair[0] == "-i" && pair[1] == path.as_os_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "decoder input path missing",
+                )
+            })?;
+        let file = std::fs::File::open(path)?;
+        args[input + 1] = "fd:".into();
+        command.arg("-nostdin");
+        command
+            .as_inner_mut()
+            .stdin(std::process::Stdio::from(file));
+        args
+    } else {
+        args
+    };
+    #[cfg(not(windows))]
+    let _ = path;
+    command.args(args);
+    Ok(command)
 }
 
 /// Spawning that counts the started FFmpeg process toward the calling thread's

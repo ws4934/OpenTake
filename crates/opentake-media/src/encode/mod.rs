@@ -435,8 +435,22 @@ impl VideoEncoder {
             "mp4"
         };
         let first_pass = workspace.path().join(format!("video.{extension}"));
-        let mut child = crate::ff::ffmpeg()
-            .args(encode_args(&first_pass, w, h, fps, preset))
+        // Private leaves are ASCII; the native working directory avoids
+        // Windows FFmpeg's lossy argv conversion for parent directories.
+        let mut command = ffmpeg_sidecar::command::FfmpegCommand::new_with_path(
+            crate::ff::ffmpeg_workspace_path()?,
+        );
+        command
+            .args(encode_args(
+                Path::new(&format!("video.{extension}")),
+                w,
+                h,
+                fps,
+                preset,
+            ))
+            .as_inner_mut()
+            .current_dir(workspace.path());
+        let mut child = command
             .spawn_counted()
             .map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
         let stdin = child.take_stdin();
@@ -861,15 +875,21 @@ impl VideoEncoder {
         );
         let video_duration = video_duration_arg(self.frames_written, self.fps);
         let args = mux_args(
-            &self.first_pass,
-            &audio.path,
-            &mux_path,
+            Path::new(self.first_pass.file_name().expect("private video leaf")),
+            Path::new(audio.path.file_name().expect("private audio leaf")),
+            Path::new(mux_path.file_name().expect("private mux leaf")),
             audio.spec.sample_rate,
             self.acodec,
             video_duration.as_deref(),
         );
-        let mut child = crate::ff::ffmpeg()
+        let mut command = ffmpeg_sidecar::command::FfmpegCommand::new_with_path(
+            crate::ff::ffmpeg_workspace_path()?,
+        );
+        command
             .args(args)
+            .as_inner_mut()
+            .current_dir(self.workspace_path()?);
+        let mut child = command
             .spawn_counted()
             .map_err(|e| MediaError::Encode(format!("mux spawn: {e}")))?;
         let stdout = child.take_stdout().ok_or_else(|| {
