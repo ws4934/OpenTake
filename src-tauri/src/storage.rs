@@ -27,7 +27,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager};
 
 use opentake_media::search::embed_store;
 use opentake_media::transcribe::cache as transcript_cache;
@@ -93,9 +93,13 @@ const OTHER_CACHE_SUBDIRS: [&str; 4] = [
 /// `storage_usage`: real per-category byte counts for the engine's cache root
 /// and models dir. Never mutates anything. Missing dirs read as 0 bytes.
 #[tauri::command]
-pub fn storage_usage(media: State<'_, MediaState>) -> StorageUsageDto {
-    let engine = media.engine();
-    usage_at(engine.cache_root(), engine.models_dir())
+pub async fn storage_usage(app: AppHandle) -> Result<StorageUsageDto, String> {
+    crate::media::run_background_io("storage usage", move || {
+        let media = app.state::<MediaState>();
+        let engine = media.engine();
+        Ok(usage_at(engine.cache_root(), engine.models_dir()))
+    })
+    .await
 }
 
 /// `storage_clear`: delete ONLY derived caches for the requested categories
@@ -104,15 +108,20 @@ pub fn storage_usage(media: State<'_, MediaState>) -> StorageUsageDto {
 /// `modelsConfirmed`. Project files, the global library, user media and
 /// credentials are never reachable from the two engine-owned roots.
 #[tauri::command]
-pub fn storage_clear(
-    media: State<'_, MediaState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn storage_clear(
+    app: AppHandle,
     request: StorageClearRequest,
 ) -> Result<StorageUsageDto, String> {
-    let _activity = crate::updater::begin_mutating_activity(&admission)?;
-    let engine = media.engine();
-    clear_at(engine.cache_root(), engine.models_dir(), &request)?;
-    Ok(usage_at(engine.cache_root(), engine.models_dir()))
+    crate::media::run_background_io("storage clear", move || {
+        let _activity = crate::updater::begin_mutating_activity(
+            &app.state::<crate::updater::InstallAdmissionGate>(),
+        )?;
+        let media = app.state::<MediaState>();
+        let engine = media.engine();
+        clear_at(engine.cache_root(), engine.models_dir(), &request)?;
+        Ok(usage_at(engine.cache_root(), engine.models_dir()))
+    })
+    .await
 }
 
 /// Pure usage computation (the testable seam — commands resolve the real

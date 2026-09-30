@@ -217,11 +217,6 @@ struct ResolvedAsset {
 /// path can't be resolved. Offline (missing) files are kept — indexing/search
 /// skip them at read time, matching upstream (a missing file simply yields no
 /// index rather than dropping the asset).
-fn resolve_assets(core: &AppCore) -> Vec<ResolvedAsset> {
-    let snapshot = core.runtime_snapshot();
-    resolve_assets_from_snapshot(&snapshot.media, snapshot.project_dir.as_deref())
-}
-
 fn resolve_assets_from_snapshot(
     manifest: &opentake_domain::MediaManifest,
     project_dir: Option<&std::path::Path>,
@@ -304,27 +299,52 @@ pub async fn download_search_model(
 /// The panel uses it to decide whether to offer "index now" and to show the
 /// progress ring's denominator.
 #[tauri::command]
-pub fn search_index_status(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-) -> SearchIndexStatusDto {
+pub async fn search_index_status(app: AppHandle) -> Result<SearchIndexStatusDto, String> {
+    let epoch = app.state::<AppCore>().project_revision().project_epoch;
+    let scheduler = app
+        .state::<crate::media::prewarm::PrewarmScheduler>()
+        .inner()
+        .clone();
+    scheduler
+        .request(
+            epoch,
+            crate::media::prewarm::PrewarmKind::TimelineVisuals,
+            "search-index-status".into(),
+            move |context| {
+                search_index_status_blocking(
+                    &app.state::<AppCore>(),
+                    &app.state::<MediaState>(),
+                    context,
+                )
+            },
+        )
+        .await
+}
+
+fn search_index_status_blocking(
+    core: &AppCore,
+    media: &MediaState,
+    context: &crate::media::prewarm::JobContext,
+) -> Result<SearchIndexStatusDto, String> {
     let engine = media.engine();
     let models_dir = engine.models_dir();
     let manifest = search_config::manifest();
     let model_installed =
         opentake_media::search::model_download::installed(models_dir, &manifest).is_some();
     let spec = search_config::embedder_spec();
-    let assets = resolve_assets(&core);
+    let snapshot = core.runtime_snapshot();
+    context.ensure_project(snapshot.project_epoch)?;
+    let assets = resolve_assets_from_snapshot(&snapshot.media, snapshot.project_dir.as_deref());
     let visual: Vec<&ResolvedAsset> = assets.iter().filter(|a| is_visual(a.kind)).collect();
     let indexed = visual
         .iter()
         .filter(|a| !opentake_media::search::needs_index(engine.cache_root(), &a.path, &spec))
         .count();
-    SearchIndexStatusDto {
+    Ok(SearchIndexStatusDto {
         model_installed,
         indexable: visual.len(),
         indexed,
-    }
+    })
 }
 
 fn with_verified_index_assets<T>(

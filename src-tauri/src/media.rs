@@ -57,12 +57,12 @@ use opentake_media::{
         StabilizationConfig, StemExecution, StemSeparationRequest,
     },
     cache_key::visual_file_identity_key,
-    create_proxy, decode_frame_at, decode_frame_at_cancellable, decode_frames_at,
-    decode_frames_at_cancellable, extract_pcm_cancellable_with_progress,
+    create_proxy, decode_frame_at_cancellable, decode_frames_at_cancellable,
+    extract_pcm_cancellable_with_progress,
     thumbnail::{
-        encode_sprite, representative_thumbnail_times, save_sprite, sprite::grid_geometry,
-        video_thumbnail_times, EncodedSpriteArtifact, ThumbnailCacheMeta, VideoThumb,
-        MAX_VIDEO_THUMBNAILS, THUMB_MAX_SIZE,
+        encode_sprite, representative_thumbnail_times, video_thumbnail_times,
+        EncodedSpriteArtifact, ThumbnailCacheMeta, VideoThumb, MAX_VIDEO_THUMBNAILS,
+        THUMB_MAX_SIZE,
     },
     waveform::store::CACHE_SUBDIR,
     FrameRequest, MediaEngine, MediaError, PcmFormat, PcmSpec, ProxyProgressCallback, ProxyRequest,
@@ -74,6 +74,26 @@ use opentake_project::ProjectRoot;
 use crate::library::LibraryState;
 
 pub mod prewarm;
+
+static BACKGROUND_IO_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Bounded filesystem/status work that is independent of the open project.
+pub(crate) async fn run_background_io<T, F>(operation: &'static str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let permit = BACKGROUND_IO_WORKERS
+        .acquire()
+        .await
+        .map_err(|error| format!("{operation} admission failed: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| format!("{operation} worker failed: {error}"))?
+}
 
 /// Managed-state wrapper over the media engine. The engine is read-only here
 /// (probe only) and shared across commands; `Send + Sync` so it lives in Tauri
@@ -890,6 +910,7 @@ impl StagedPoster {
     }
 }
 
+#[cfg(test)]
 fn write_png(path: &Path, frame: &RgbaFrame) -> Result<(), String> {
     if cached_poster_dimensions(path)?.is_some() {
         return Ok(());
@@ -953,6 +974,7 @@ fn decode_poster_to(
     poster_path: PathBuf,
     target: f64,
     max_size: (u32, u32),
+    context: &prewarm::JobContext,
 ) -> Result<(PathBuf, u32, u32, f64), String> {
     if let Some(cached) = read_cached_poster(&poster_path, target) {
         return cached;
@@ -963,8 +985,11 @@ fn decode_poster_to(
         max_size,
         apply_rotation: true,
     };
-    let (actual, frame) = decode_frame_at(path, &req).map_err(|e| e.to_string())?;
-    write_png(&poster_path, &frame)?;
+    let (actual, frame) = decode_frame_at_cancellable(path, &req, &context.cancel_token())
+        .map_err(|e| e.to_string())?;
+    if !context.commit_staged_poster(&poster_path, &encode_png(&frame)?)? {
+        return Err("poster generation cancelled by a project transition".into());
+    }
     Ok((poster_path, frame.width, frame.height, actual))
 }
 
@@ -973,10 +998,11 @@ fn video_poster(
     path: &Path,
     key: &str,
     time_secs: Option<f64>,
+    context: &prewarm::JobContext,
 ) -> Result<(PathBuf, u32, u32, f64), String> {
     let target = poster_target_time(time_secs);
     let poster_path = timed_poster_path_for(engine.cache_root(), key, target);
-    decode_poster_to(path, poster_path, target, THUMB_MAX_SIZE)
+    decode_poster_to(path, poster_path, target, THUMB_MAX_SIZE, context)
 }
 
 /// Hi-res first-frame poster for the single-media preview (see
@@ -986,10 +1012,11 @@ fn video_preview_poster(
     path: &Path,
     key: &str,
     time_secs: Option<f64>,
+    context: &prewarm::JobContext,
 ) -> Result<(PathBuf, u32, u32, f64), String> {
     let target = poster_target_time(time_secs);
     let poster_path = preview_poster_path_for(engine.cache_root(), key, target);
-    decode_poster_to(path, poster_path, target, PREVIEW_POSTER_MAX_SIZE)
+    decode_poster_to(path, poster_path, target, PREVIEW_POSTER_MAX_SIZE, context)
 }
 
 fn sprite_meta_path_for(cache_root: &Path, key: &str) -> PathBuf {
@@ -1069,6 +1096,7 @@ fn video_sprite(
     path: &Path,
     key: &str,
     max_frames: Option<usize>,
+    context: &prewarm::JobContext,
 ) -> Result<Option<ThumbnailCacheMeta>, String> {
     let limit = sprite_frame_limit(max_frames);
     if let Some(mut meta) = read_cached_sprite_meta(engine.cache_root(), key) {
@@ -1090,7 +1118,7 @@ fn video_sprite(
         apply_rotation: true,
     };
     let mut thumbs = Vec::with_capacity(times.len());
-    for result in decode_frames_at(path, &times, &req) {
+    for result in decode_frames_at_cancellable(path, &times, &req, &context.cancel_token()) {
         let (actual, frame) = result.map_err(|e| e.to_string())?;
         thumbs.push(VideoThumb {
             time_secs: actual,
@@ -1100,14 +1128,21 @@ fn video_sprite(
     if thumbs.is_empty() {
         return Ok(None);
     }
-    save_sprite(engine.cache_root(), key, &thumbs).map_err(|e| e.to_string())?;
-    let (columns, _) = grid_geometry(thumbs.len());
-    Ok(Some(ThumbnailCacheMeta {
-        tile_width: thumbs[0].image.width,
-        tile_height: thumbs[0].image.height,
-        columns,
-        times: thumbs.iter().map(|t| t.time_secs).collect(),
-    }))
+    if context.is_cancelled() {
+        return Err("sprite generation cancelled by a project transition".into());
+    }
+    let artifact = encode_sprite(&thumbs)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "sprite encoder returned no artifact for decoded frames".to_string())?;
+    if !commit_sprite_artifact(
+        context,
+        &sprite_path_for(engine.cache_root(), key),
+        &sprite_meta_path_for(engine.cache_root(), key),
+        &artifact,
+    )? {
+        return Err("sprite publication cancelled by a project transition".into());
+    }
+    Ok(Some(artifact.meta))
 }
 
 fn generate_thumbnail_for_entry(
@@ -1117,6 +1152,7 @@ fn generate_thumbnail_for_entry(
     time_secs: Option<f64>,
     max_frames: Option<usize>,
     include_sprite: bool,
+    context: &prewarm::JobContext,
 ) -> Result<ThumbnailDto, String> {
     if !path.is_file() {
         return Err(format!("source file not found: {}", path.display()));
@@ -1126,9 +1162,9 @@ fn generate_thumbnail_for_entry(
     match entry.kind {
         ClipType::Video => {
             let (poster_path, poster_w, poster_h, poster_time) =
-                video_poster(engine, path, &key, time_secs)?;
+                video_poster(engine, path, &key, time_secs, context)?;
             let sprite_meta = if include_sprite {
-                video_sprite(engine, entry, path, &key, max_frames)?
+                video_sprite(engine, entry, path, &key, max_frames, context)?
             } else {
                 None
             };
@@ -1158,13 +1194,20 @@ fn generate_thumbnail_for_entry(
         }
         ClipType::Image => {
             let poster_path = poster_path_for(engine.cache_root(), &key);
-            if cached_poster_dimensions(&poster_path)?.is_none() {
-                let frame = engine.image_thumbnail(path).map_err(|e| e.to_string())?;
-                write_png(&poster_path, &frame)?;
-            }
-            let (tile_width, tile_height) = image::image_dimensions(&poster_path)
-                .map(|(w, h)| (Some(w), Some(h)))
-                .unwrap_or((None, None));
+            let (width, height) = match cached_poster_dimensions(&poster_path)? {
+                Some(dimensions) => dimensions,
+                None => {
+                    if context.is_cancelled() {
+                        return Err("thumbnail generation cancelled by a project transition".into());
+                    }
+                    let frame = engine.image_thumbnail(path).map_err(|e| e.to_string())?;
+                    if !context.commit_staged_poster(&poster_path, &encode_png(&frame)?)? {
+                        return Err("thumbnail generation cancelled by a project transition".into());
+                    }
+                    (frame.width, frame.height)
+                }
+            };
+            let (tile_width, tile_height) = (Some(width), Some(height));
             Ok(ThumbnailDto {
                 media_ref: entry.id.clone(),
                 kind: entry.kind,
@@ -3938,47 +3981,98 @@ fn extract_audio_blocking(
 /// original (rejected otherwise), and the freshly probed metadata refreshes the
 /// entry. Returns the updated catalog (with `missing` recomputed → now `false`).
 #[tauri::command]
-pub fn relink_media(
-    app: AppHandle,
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
-    admission: State<'_, crate::updater::InstallAdmissionGate>,
+pub async fn relink_media<R: Runtime>(
+    app: AppHandle<R>,
     media_ref: String,
     new_path: String,
 ) -> Result<MediaListDto, String> {
-    let _activity = begin_direct_media_project_write(&admission)?;
-    let new = PathBuf::from(&new_path);
-    if !new.is_file() {
-        return Err(format!("file not found: {new_path}"));
-    }
-    let _identity = core.lock_project_identity_workflow();
-    let (project_dir, old_proxy) = relink_media_in_core(&core, media.engine(), &media_ref, &new)?;
-    if let (Some(project_dir), Some(proxy)) = (project_dir, old_proxy) {
-        if let Some(path) = trusted_project_proxy_path(&project_dir, &proxy.relative_path) {
-            let _ = std::fs::remove_file(&path);
-            revoke_proxy_asset_file(&app, &path);
-        }
-    }
-    Ok(MediaListDto::from_core(
-        &core,
-        Some(media.engine().cache_root()),
-    ))
+    let epoch = app.state::<AppCore>().project_revision().project_epoch;
+    let scheduler = app.state::<prewarm::PrewarmScheduler>().inner().clone();
+    let key = format!("relink:{}", uuid::Uuid::new_v4());
+    scheduler
+        .request_mutation(
+            epoch,
+            prewarm::PrewarmKind::TimelineVisuals,
+            key,
+            move |context| {
+                let core = app.state::<AppCore>();
+                let media = app.state::<MediaState>();
+                let _activity = begin_direct_media_project_write(
+                    &app.state::<crate::updater::InstallAdmissionGate>(),
+                )?;
+                context.ensure_project(core.project_revision().project_epoch)?;
+                let new = PathBuf::from(&new_path);
+                if !new.is_file() {
+                    return Err(format!("file not found: {new_path}"));
+                }
+                let (project_dir, old_proxy) =
+                    relink_media_in_core_with_probe(&core, &media_ref, &new, |path, kind| {
+                        if is_lottie_path(path) {
+                            return probe_lottie(path);
+                        }
+                        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+                        let probe = media.engine().probe_file_cancellable(
+                            &file,
+                            &context.cancel_token(),
+                            Duration::from_secs(30),
+                        );
+                        probe_result_for_import(Some(kind), probe.map(media_probe_to_core))
+                    })?;
+                if let (Some(project_dir), Some(proxy)) = (project_dir, old_proxy) {
+                    if let Some(path) =
+                        trusted_project_proxy_path(&project_dir, &proxy.relative_path)
+                    {
+                        if let Err(error) = std::fs::remove_file(&path) {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                eprintln!("relink proxy cleanup failed: {error}");
+                            }
+                        }
+                        revoke_proxy_asset_file(&app, &path);
+                    }
+                }
+                Ok(MediaListDto::from_core(
+                    &core,
+                    Some(media.engine().cache_root()),
+                ))
+            },
+        )
+        .await
 }
 
 /// The catalog half of [`relink_media`]: validate, probe and apply the relink,
 /// returning the project directory and the replaced proxy for cleanup. A probe
 /// failure rejects the relink before anything changes, so known-good metadata
 /// is never overwritten with zeros and `media.json` is not rewritten (#63).
+#[cfg(test)]
 fn relink_media_in_core(
     core: &AppCore,
     engine: &MediaEngine,
     media_ref: &str,
     new: &Path,
 ) -> Result<(Option<PathBuf>, Option<opentake_domain::MediaProxy>), String> {
+    relink_media_in_core_with_probe(core, media_ref, new, |path, kind| {
+        if is_lottie_path(path) {
+            probe_lottie(path)
+        } else {
+            probe_result_for_import(Some(kind), try_probe_media(engine, path))
+        }
+    })
+}
+
+fn relink_media_in_core_with_probe(
+    core: &AppCore,
+    media_ref: &str,
+    new: &Path,
+    probe: impl FnOnce(&Path, ClipType) -> Result<ProbedMedia, String>,
+) -> Result<(Option<PathBuf>, Option<opentake_domain::MediaProxy>), String> {
+    let authority = core.media_authority_revision();
     // Validate the target type matches before touching the catalog (upstream
     // rejects relinking across types). `relink_media_file` re-checks, but doing
     // it here yields a precise message and avoids a needless probe.
     let snapshot = core.runtime_snapshot();
+    if core.media_authority_revision() != authority {
+        return Err("project or media changed while reading the relink request".into());
+    }
     let entry = snapshot
         .media
         .entries
@@ -3997,12 +4091,7 @@ fn relink_media_in_core(
     // Same rule as imports: unreadable video and audio are refused so good
     // metadata is never overwritten with zeros, while images (for example HEIF
     // stills an older ffprobe cannot parse) relink without dimensions.
-    let probe = if is_lottie_path(new) {
-        probe_lottie(new)
-    } else {
-        probe_result_for_import(Some(new_kind), try_probe_media(engine, new))
-    }
-    .map_err(|error| {
+    let probe = probe(new, new_kind).map_err(|error| {
         format!(
             "cannot read media information from {}: {error}",
             display_file_name(new)
@@ -4022,7 +4111,7 @@ fn relink_media_in_core(
         )
         .map_err(|error| error.to_string())?;
     }
-    core.relink_media_file(media_ref, new, &probe)
+    core.relink_media_file_at_authority(authority, media_ref, new, &probe)
         .map_err(|e| e.to_string())?;
     Ok((snapshot.project_dir, old_proxy))
 }
@@ -4032,15 +4121,54 @@ fn relink_media_in_core(
 /// by timeline filmstrips is generated only when `include_sprite` is true, and
 /// is capped so long sources cannot enqueue thousands of decoded frames.
 #[tauri::command]
-pub fn generate_thumbnail(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
+pub async fn generate_thumbnail<R: Runtime>(
+    app: AppHandle<R>,
     media_ref: String,
     time_secs: Option<f64>,
     max_frames: Option<usize>,
     include_sprite: Option<bool>,
 ) -> Result<ThumbnailDto, String> {
+    let epoch = app.state::<AppCore>().project_revision().project_epoch;
+    let key = format!(
+        "thumbnail:{media_ref}:{}:{}:{}",
+        poster_target_time(time_secs),
+        include_sprite.unwrap_or(false),
+        sprite_frame_limit(max_frames)
+    );
+    let scheduler = app.state::<prewarm::PrewarmScheduler>().inner().clone();
+    scheduler
+        .request(
+            epoch,
+            prewarm::PrewarmKind::GridPoster,
+            key,
+            move |context| {
+                let core = app.state::<AppCore>();
+                let media = app.state::<MediaState>();
+                generate_thumbnail_blocking(
+                    &core,
+                    &media,
+                    &media_ref,
+                    time_secs,
+                    max_frames,
+                    include_sprite,
+                    context,
+                )
+            },
+        )
+        .await
+}
+
+fn generate_thumbnail_blocking(
+    core: &AppCore,
+    media: &MediaState,
+    media_ref: &str,
+    time_secs: Option<f64>,
+    max_frames: Option<usize>,
+    include_sprite: Option<bool>,
+    context: &prewarm::JobContext,
+) -> Result<ThumbnailDto, String> {
     let snapshot = core.runtime_snapshot();
+    context.ensure_project(snapshot.project_epoch)?;
     let manifest = snapshot.media;
     let entry = manifest
         .entries
@@ -4067,6 +4195,7 @@ pub fn generate_thumbnail(
         time_secs,
         max_frames,
         include_sprite,
+        context,
     )
     .map_err(|e| {
         eprintln!(
@@ -4257,13 +4386,41 @@ pub fn set_timeline_sprite_interactive(
 /// assets (images render straight from disk; audio has no frame). Errors only
 /// when the asset is unknown or its path can't be resolved.
 #[tauri::command]
-pub fn preview_poster(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
+pub async fn preview_poster<R: Runtime>(
+    app: AppHandle<R>,
     media_ref: String,
     time_secs: Option<f64>,
 ) -> Result<Option<String>, String> {
+    let epoch = app.state::<AppCore>().project_revision().project_epoch;
+    let key = format!("preview:{media_ref}:{}", poster_target_time(time_secs));
+    let scheduler = app.state::<prewarm::PrewarmScheduler>().inner().clone();
+    scheduler
+        .request(
+            epoch,
+            prewarm::PrewarmKind::GridPoster,
+            key,
+            move |context| {
+                preview_poster_blocking(
+                    &app.state::<AppCore>(),
+                    &app.state::<MediaState>(),
+                    &media_ref,
+                    time_secs,
+                    context,
+                )
+            },
+        )
+        .await
+}
+
+fn preview_poster_blocking(
+    core: &AppCore,
+    media: &MediaState,
+    media_ref: &str,
+    time_secs: Option<f64>,
+    context: &prewarm::JobContext,
+) -> Result<Option<String>, String> {
     let snapshot = core.runtime_snapshot();
+    context.ensure_project(snapshot.project_epoch)?;
     let manifest = snapshot.media;
     let entry = manifest
         .entries
@@ -4285,8 +4442,8 @@ pub fn preview_poster(
             .map(|(poster_path, _, _, _)| Some(poster_path.to_string_lossy().into_owned()));
     }
     let _activity = media.begin_cache_write()?;
-    let (poster_path, _, _, _) = video_preview_poster(media.engine(), &path, &key, time_secs)
-        .map_err(|e| {
+    let (poster_path, _, _, _) =
+        video_preview_poster(media.engine(), &path, &key, time_secs, context).map_err(|e| {
             eprintln!(
                 "preview_poster failed: media_ref={media_ref} path={} error={e}",
                 path.display()
@@ -4302,12 +4459,38 @@ pub fn preview_poster(
 /// sub-range into it (mirrors upstream `MediaVisualCache.waveform`). Errors when
 /// the asset is unknown, has no resolvable path, or carries no audio track.
 #[tauri::command]
-pub fn get_waveform(
-    core: State<'_, AppCore>,
-    media: State<'_, MediaState>,
+pub async fn get_waveform<R: Runtime>(
+    app: AppHandle<R>,
     media_ref: String,
 ) -> Result<Vec<f32>, String> {
+    let epoch = app.state::<AppCore>().project_revision().project_epoch;
+    let scheduler = app.state::<prewarm::PrewarmScheduler>().inner().clone();
+    let key = format!("waveform:{media_ref}");
+    scheduler
+        .request(
+            epoch,
+            prewarm::PrewarmKind::TimelineVisuals,
+            key,
+            move |context| {
+                get_waveform_blocking(
+                    &app.state::<AppCore>(),
+                    &app.state::<MediaState>(),
+                    &media_ref,
+                    context,
+                )
+            },
+        )
+        .await
+}
+
+fn get_waveform_blocking(
+    core: &AppCore,
+    media: &MediaState,
+    media_ref: &str,
+    context: &prewarm::JobContext,
+) -> Result<Vec<f32>, String> {
     let snapshot = core.runtime_snapshot();
+    context.ensure_project(snapshot.project_epoch)?;
     let manifest = snapshot.media;
     let entry = manifest
         .entries
@@ -4328,9 +4511,25 @@ pub fn get_waveform(
             return Ok(cached);
         }
         let _activity = media.begin_cache_write()?;
-        media.engine().waveform(&path, entry.duration)
+        let cancel = context.cancel_token();
+        let bytes = opentake_media::waveform::waveform_cache_bytes_cancellable(
+            &path,
+            entry.duration,
+            &cancel,
+        )
+        .map_err(|error| error.to_string())?;
+        let target = visual_cache_dir(media.engine().cache_root()).join(format!("{key}.waveform"));
+        if !context.commit_staged_bytes(&target, &bytes)? {
+            return Err("waveform generation cancelled by a project transition".into());
+        }
+        return opentake_media::waveform::store::load_waveform(media.engine().cache_root(), &key)
+            .ok_or_else(|| "published waveform cache could not be read".to_string());
     } else {
-        opentake_media::waveform::waveform(&path, entry.duration)
+        opentake_media::waveform::waveform_cancellable(
+            &path,
+            entry.duration,
+            &context.cancel_token(),
+        )
     };
     result.map_err(|e| {
         // Log server-side too (the frontend swallows the error into "no
@@ -8921,7 +9120,7 @@ mod tests {
     }
 
     #[test]
-    fn update_install_rejects_synchronous_cache_writers() {
+    fn update_install_rejects_background_cache_writers() {
         let temp = tempfile::tempdir().unwrap();
         let (core, _bundle, _source, asset_id) = saved_core_with_media(temp.path());
         let admission = crate::updater::InstallAdmissionGate::default();
@@ -8931,33 +9130,35 @@ mod tests {
             engine_for(temp.path()),
             admission.clone(),
         ));
+        app.manage(prewarm::PrewarmScheduler::new_with_admission(
+            app.state::<AppCore>().project_revision().project_epoch,
+            admission.clone(),
+        ));
         let install = admission.begin_install().expect("install starts");
         let expected = "app update installation is in progress";
 
         assert_eq!(
-            generate_thumbnail(
-                app.state::<AppCore>(),
-                app.state::<MediaState>(),
+            tauri::async_runtime::block_on(generate_thumbnail(
+                app.handle().clone(),
                 asset_id.clone(),
                 None,
                 None,
                 None,
-            )
+            ))
             .expect_err("thumbnail cache writer must fail closed"),
             expected
         );
         assert_eq!(
-            preview_poster(
-                app.state::<AppCore>(),
-                app.state::<MediaState>(),
+            tauri::async_runtime::block_on(preview_poster(
+                app.handle().clone(),
                 asset_id.clone(),
                 None,
-            )
+            ))
             .expect_err("preview-poster cache writer must fail closed"),
             expected
         );
         assert_eq!(
-            get_waveform(app.state::<AppCore>(), app.state::<MediaState>(), asset_id,)
+            tauri::async_runtime::block_on(get_waveform(app.handle().clone(), asset_id))
                 .expect_err("waveform cache writer must fail closed"),
             expected
         );
@@ -8990,45 +9191,46 @@ mod tests {
         let app = tauri::test::mock_app();
         app.manage(core);
         app.manage(MediaState::new_with_admission(engine, admission.clone()));
+        app.manage(prewarm::PrewarmScheduler::new_with_admission(
+            app.state::<AppCore>().project_revision().project_epoch,
+            admission.clone(),
+        ));
         let install = admission.begin_install().expect("install starts");
 
-        let thumbnail = generate_thumbnail(
-            app.state::<AppCore>(),
-            app.state::<MediaState>(),
+        let thumbnail = tauri::async_runtime::block_on(generate_thumbnail(
+            app.handle().clone(),
             video_id.clone(),
             None,
             None,
             Some(false),
-        )
+        ))
         .expect("cached thumbnail is read-only");
         assert_eq!(
             thumbnail.thumbnail_path.as_deref(),
             Some(thumbnail_path.to_string_lossy().as_ref())
         );
         assert_eq!(
-            preview_poster(
-                app.state::<AppCore>(),
-                app.state::<MediaState>(),
+            tauri::async_runtime::block_on(preview_poster(
+                app.handle().clone(),
                 video_id.clone(),
                 None,
-            )
+            ))
             .expect("cached preview is read-only")
             .as_deref(),
             Some(preview_path.to_string_lossy().as_ref())
         );
         assert_eq!(
-            get_waveform(app.state::<AppCore>(), app.state::<MediaState>(), video_id,)
+            tauri::async_runtime::block_on(get_waveform(app.handle().clone(), video_id))
                 .expect("cached waveform is read-only"),
             cached_waveform
         );
-        let audio_thumbnail = generate_thumbnail(
-            app.state::<AppCore>(),
-            app.state::<MediaState>(),
+        let audio_thumbnail = tauri::async_runtime::block_on(generate_thumbnail(
+            app.handle().clone(),
             audio_id,
             None,
             None,
             Some(false),
-        )
+        ))
         .expect("audio has no thumbnail cache write");
         assert_eq!(audio_thumbnail.kind, ClipType::Audio);
         assert_eq!(audio_thumbnail.thumbnail_path, None);
@@ -9549,6 +9751,73 @@ mod tests {
         assert!(error.contains("cannot read media information"), "{error}");
         assert_eq!(core.media(), before_live);
         assert_eq!(fs::read(bundle.join("media.json")).unwrap(), before_disk);
+    }
+
+    #[test]
+    fn delayed_relink_does_not_block_identity_changes_or_commit_stale_media() {
+        for change in ["new_project", "save_as", "media_change"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (core, bundle, _source, id) = saved_core_with_media(temp.path());
+            let core = Arc::new(core);
+            let moved = temp.path().join("moved.mp4");
+            fs::write(&moved, b"probe fixture").unwrap();
+            let original_disk = fs::read(bundle.join("media.json")).unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let worker_core = Arc::clone(&core);
+            let worker = std::thread::spawn(move || {
+                relink_media_in_core_with_probe(&worker_core, &id, &moved, |_, _| {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    Ok(ProbedMedia::default())
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let changed_core = Arc::clone(&core);
+            let other = temp.path().join("Other.opentake");
+            let extra = temp.path().join("extra.mp4");
+            fs::write(&extra, b"other source").unwrap();
+            let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+            let transition = std::thread::spawn(move || {
+                match change {
+                    "new_project" => {
+                        changed_core.new_project();
+                    }
+                    "save_as" => {
+                        changed_core.save_project(Some(other)).unwrap();
+                    }
+                    "media_change" => {
+                        changed_core
+                            .import_media_file(extra, "extra", &ProbedMedia::default())
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                changed_tx.send(changed_core.runtime_snapshot()).unwrap();
+            });
+            let changed = changed_rx.recv_timeout(Duration::from_millis(250));
+            resume_tx.send(()).unwrap();
+            transition.join().unwrap();
+            let error = worker
+                .join()
+                .unwrap()
+                .expect_err("stale relink must be rejected");
+            let changed = changed.expect("identity/media changes must not wait for a slow probe");
+            assert!(
+                error.contains("changed while preparing the relink"),
+                "{change}: {error}"
+            );
+            let current = core.runtime_snapshot();
+            assert_eq!(current.project_epoch, changed.project_epoch, "{change}");
+            assert_eq!(current.project_dir, changed.project_dir, "{change}");
+            assert_eq!(current.timeline, changed.timeline, "{change}");
+            assert_eq!(current.media, changed.media, "{change}");
+            assert_eq!(
+                fs::read(bundle.join("media.json")).unwrap(),
+                original_disk,
+                "{change}"
+            );
+        }
     }
 
     #[test]
