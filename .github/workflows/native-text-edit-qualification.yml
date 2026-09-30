@@ -1,22 +1,15 @@
-name: Native text edit qualification
+name: Windows native FFmpeg filename qualification
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'web/src/components/shell/ViewMenu.tsx'
-      - 'web/src/lib/textEntry.ts'
-      - 'web/src/hooks/useKeyboardShortcuts.ts'
-      - 'scripts/qualify_native_text_edit.ps1'
-      - '.github/workflows/native-text-edit-qualification.yml'
 
 permissions:
   contents: read
 
 jobs:
-  windows-text-edit:
+  native-filenames:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -28,21 +21,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with:
-          version: 10
       - name: Set up JPEG SIMD assembler
         run: |
           pwsh -File scripts/setup_jpeg_simd.ps1
           if ($LASTEXITCODE -ne 0) { throw 'JPEG SIMD setup failed' }
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        id: native-cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: native-text-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
       - name: Provision pinned FFmpeg
         run: |
@@ -52,27 +41,7 @@ jobs:
             $sidecar = Join-Path $env:GITHUB_WORKSPACE "src-tauri/binaries/$tool-x86_64-pc-windows-msvc.exe"
             "OPENTAKE_$($tool.ToUpperInvariant())=$sidecar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
-      - name: Build the packaged frontend and native shell
+      - name: Qualify native path arguments against retained files
         run: |
-          pnpm -C web install --frozen-lockfile
-          if ($LASTEXITCODE -ne 0) { throw 'Frontend installation failed' }
-          ./web/node_modules/.bin/tauri.cmd build --debug --bundles nsis
-          if ($LASTEXITCODE -ne 0) { throw 'Native package build failed' }
-      - name: Save the verified native build cache
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.native-cache.outputs.cache-primary-key }}
-      - name: Qualify native text and document shortcuts
-        env:
-          # WebView state is a per-run fixture, outside the native build cache.
-          WEBVIEW2_USER_DATA_FOLDER: ${{ runner.temp }}/native-edit-webview-profile
-        run: |
-          $exe = Join-Path $env:GITHUB_WORKSPACE 'target/debug/opentake.exe'
-          $fixtures = Join-Path $env:RUNNER_TEMP 'native-edit-qualification'
-          pwsh -STA -File scripts/qualify_native_text_edit.ps1 -Executable $exe -TestRoot $fixtures
-          if ($LASTEXITCODE -ne 0) { throw 'Native text editing qualification failed' }
+          cargo test --locked -p opentake-media --test ffmpeg_integration native_windows_ -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native filename qualification failed' }

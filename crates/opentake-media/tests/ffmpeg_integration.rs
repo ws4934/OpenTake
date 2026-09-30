@@ -1137,3 +1137,114 @@ fn non_utf8_file_names_encode_and_decode() {
     let mut streamed = Vec::new();
     assert!(pcm_stream.read(1_024, &mut streamed).unwrap() > 0);
 }
+
+#[cfg(windows)]
+fn native_windows_fixture(path: &Path, frames: usize, pixel: [u8; 4]) {
+    let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+    let mut encoder = VideoEncoder::new(path, 64, 48, 10, &preset).unwrap();
+    for _ in 0..frames {
+        encoder
+            .push_frame(&RgbaFrame::new(64, 48, pixel.repeat(64 * 48)))
+            .unwrap();
+    }
+    encoder
+        .push_audio(opentake_media::PcmBuffer {
+            spec: PcmSpec {
+                sample_rate: 48_000,
+                channels: 1,
+                format: PcmFormat::F32,
+            },
+            samples_f32: (0..frames * 4_800)
+                .map(|index| (index as f32 * 0.0575).sin() * 0.5)
+                .collect(),
+        })
+        .unwrap();
+    encoder.finish().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_path_inputs_preserve_the_original_file() {
+    use std::os::windows::ffi::OsStringExt;
+    assert!(ffmpeg_available() && ffprobe_available());
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original.mp4");
+    let raw = temp.path().join(std::ffi::OsString::from_wide(&[
+        99, 108, 105, 112, 45, 0xd800, 46, 109, 112, 52,
+    ]));
+    let shadow = temp.path().join("clip-�.mp4");
+    native_windows_fixture(&original, 10, [220, 60, 20, 255]);
+    native_windows_fixture(&shadow, 20, [20, 80, 220, 255]);
+    std::fs::copy(&original, &raw).unwrap();
+    assert!(raw.to_str().is_none());
+    let retained = std::fs::File::open(&raw).unwrap();
+    let request = FrameRequest::default();
+    let cancel = opentake_media::MediaCancelToken::new();
+    let retained_probe = opentake_media::probe_file(&retained).unwrap();
+    let retained_frame = decode_frame_file_at_cancellable(&retained, &request, &cancel)
+        .unwrap()
+        .1;
+    assert!((retained_probe.duration_secs - 1.0).abs() < 0.01);
+    assert_eq!(
+        retained_frame,
+        decode_frame_at(&original, &request).unwrap().1
+    );
+
+    let named_probe = probe(&raw);
+    let probe_matches = named_probe
+        .as_ref()
+        .is_ok_and(|probe| (probe.duration_secs - retained_probe.duration_secs).abs() < 0.01);
+    println!(
+        "retained_duration={}, named_duration={:?}",
+        retained_probe.duration_secs,
+        named_probe.as_ref().map(|probe| probe.duration_secs)
+    );
+    let named_frame = decode_frame_at(&raw, &request);
+    let frame_matches = named_frame
+        .as_ref()
+        .is_ok_and(|(_, frame)| *frame == retained_frame);
+    println!("pathname_frame_matches_retained={frame_matches}");
+    let stream = spawn_video_stream(VideoStreamRequest::new(raw.clone(), 10)).unwrap();
+    let streamed = stream
+        .receiver()
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let stream_matches = streamed
+        .as_ref()
+        .is_ok_and(|frame| frame.frame == retained_frame);
+    println!("pathname_stream_matches_retained={stream_matches}");
+    drop(stream);
+    let mono = PcmSpec {
+        sample_rate: 48_000,
+        channels: 1,
+        format: PcmFormat::F32,
+    };
+    let original_pcm = extract_pcm(&original, &mono, None).unwrap();
+    let named_pcm = extract_pcm(&raw, &mono, None);
+    let pcm_matches = named_pcm
+        .as_ref()
+        .is_ok_and(|pcm| pcm.samples_f32 == original_pcm.samples_f32);
+    println!(
+        "pathname_pcm_matches_original={pcm_matches}, expected_samples={}, actual_samples={:?}",
+        original_pcm.samples_f32.len(),
+        named_pcm.as_ref().map(|pcm| pcm.samples_f32.len())
+    );
+    assert!(probe_matches && frame_matches && stream_matches && pcm_matches, "pathname transport must read the original native filename, not its replacement-character shadow");
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_parent_directories_encode_without_replacement() {
+    use std::os::windows::ffi::OsStringExt;
+    assert!(ffmpeg_available() && ffprobe_available());
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp
+        .path()
+        .join(std::ffi::OsString::from_wide(&[100, 105, 114, 45, 0xd800]));
+    std::fs::create_dir(&parent).unwrap();
+    let output = parent.join("encoded.mp4");
+    native_windows_fixture(&output, 10, [220, 60, 20, 255]);
+    let file = std::fs::File::open(&output).unwrap();
+    let probed = opentake_media::probe_file(&file).unwrap();
+    assert!((probed.duration_secs - 1.0).abs() < 0.01);
+}
