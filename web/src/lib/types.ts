@@ -1173,6 +1173,7 @@ export interface GenerationInput {
   jobId?: string | null;
   provider?: string | null;
   providerJobId?: string | null;
+  credentialSource?: "managed" | "byok" | null;
   status?: "queued" | "generating" | "downloading" | "finalizing" | "ready" | "failed" | "cancelled";
   progress?: number | null;
   errorCode?: string | null;
@@ -1184,6 +1185,17 @@ export interface GenerationInput {
   estimatedCostCredits?: number | null;
   consentId?: string | null;
   requestHash?: string | null;
+}
+
+export interface GenerationRecoveryRecord {
+  jobId: string;
+  projectPath: string;
+  recordedAt: number;
+  resultCount: number;
+  byteSize: number;
+  outcomeUnknown: boolean;
+  active: boolean;
+  discardIncomplete: boolean;
 }
 
 /** A media-library folder (flat list; nest via `parentFolderId`). */
