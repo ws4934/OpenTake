@@ -273,6 +273,10 @@ Key files for comparison:
 
 ### Prerequisites
 
+Native preview JPEG encoding builds the bundled libjpeg-turbo with CMake.
+Install CMake and NASM for x86 builds; Apple Silicon uses the compiler's NEON
+assembler. The packaged application links the codec statically.
+
 - **Rust** ≥ 1.96 (via [rustup](https://rustup.rs))
 - **Node.js** ≥ 20 + **pnpm**
 - **Python** ≥ 3.10 (`python3`) — prepares checksum-pinned FFmpeg/ffprobe binaries automatically for Tauri dev/build; no system FFmpeg or Homebrew needed

@@ -19,6 +19,11 @@ MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
 CMAKE_POLICY_DEFAULT_CMP0091 = { value = "NEW", force = false }
 CMAKE_MSVC_RUNTIME_LIBRARY = { value = "MultiThreaded", force = false }
 
+# The preview codec is packaged with the app. Always build its pinned native
+# source and link it statically, rather than binding to a developer's dylib/DLL.
+TURBOJPEG_SOURCE = { value = "vendor", force = true }
+TURBOJPEG_STATIC = { value = "1", force = true }
+
 # Rust's MSVC target otherwise links VCRUNTIME/UCRT dynamically even when the
 # C++ libraries above use /MT. Keep the Windows executable self-contained and
 # make every cc-rs consumer observe the same crt-static target feature.

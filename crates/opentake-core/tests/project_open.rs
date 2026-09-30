@@ -5,11 +5,54 @@ use std::sync::{Arc, Mutex};
 
 use opentake_core::{AppCore, CoreError, CoreEvent, EditCommand, EditorSession, SeqIdGen};
 use opentake_domain::{
-    Clip, ClipType, GenerationInput, MediaManifestEntry, MediaSource, Timeline, Track,
+    Clip, ClipType, GenerationInput, MediaManifestEntry, MediaSource, NestedSequence, Timeline,
+    Track,
 };
 use opentake_project::{GenerationLog, GenerationLogEntry, Project, ProjectError};
 
 struct TempDir(PathBuf);
+
+#[test]
+fn malformed_clip_open_is_rejected_without_replacing_the_current_project() {
+    let temp = TempDir::new("malformed-frames");
+    let core = AppCore::new();
+    core.save_project(Some(temp.child("Current.opentake")))
+        .unwrap();
+    let before = core.runtime_snapshot();
+    for nested in [false, true] {
+        let bad = temp.child(if nested {
+            "Nested.opentake"
+        } else {
+            "Root.opentake"
+        });
+        let mut project = Project::new(&bad);
+        let mut track = Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("broken", "source", 0, 0));
+        let mut timeline = Timeline::new();
+        timeline.tracks.push(track);
+        let expected_path = if nested {
+            project
+                .timeline
+                .nested_sequences
+                .push(NestedSequence::new("sequence", "Nested", timeline));
+            "timeline.nestedSequences[0].timeline.tracks[0].clips[0]"
+        } else {
+            project.timeline = timeline;
+            "timeline.tracks[0].clips[0]"
+        };
+        project.save().unwrap();
+        let persisted = std::fs::read(bad.join("project.json")).unwrap();
+        let message = core
+            .open_project(&bad)
+            .expect_err("invalid frame arithmetic must be refused on open")
+            .to_string();
+        assert!(message.contains(expected_path), "{message}");
+        assert!(message.contains("durationFrames"), "{message}");
+        assert_eq!(core.runtime_snapshot().project_epoch, before.project_epoch);
+        assert_eq!(core.runtime_snapshot().project_dir, before.project_dir);
+        assert_eq!(std::fs::read(bad.join("project.json")).unwrap(), persisted);
+    }
+}
 
 impl TempDir {
     fn new(tag: &str) -> Self {
