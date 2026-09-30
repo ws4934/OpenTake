@@ -300,34 +300,15 @@ impl EncodeWorkspace {
 impl EncodeWorkspace {
     fn hide_directory(&self) -> std::io::Result<()> {
         use std::os::windows::fs::MetadataExt;
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            FileBasicInfo, ReOpenFile, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
-            FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_WRITE_ATTRIBUTES,
+            FileBasicInfo, SetFileInformationByHandle, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
         };
         let attributes = self.directory.metadata()?.file_attributes();
         if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
             return Ok(());
         }
-        // Reopen the retained object, never its mutable pathname. Share-delete
-        // permits the original handle's DELETE access without changing its lease.
-        // SAFETY: the original handle is live; backup semantics permit a directory.
-        let handle = unsafe {
-            ReOpenFile(
-                self.directory.as_raw_handle(),
-                FILE_WRITE_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: ReOpenFile returned a new valid handle owned by this scope.
-        let writable = unsafe { OwnedHandle::from_raw_handle(handle) };
         let info = FILE_BASIC_INFO {
             FileAttributes: (attributes & !FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_HIDDEN,
             // Zero timestamps preserve the existing values.
@@ -337,7 +318,7 @@ impl EncodeWorkspace {
         // access, layout and lifetime for this synchronous call.
         if unsafe {
             SetFileInformationByHandle(
-                writable.as_raw_handle(),
+                self.directory.as_raw_handle(),
                 FileBasicInfo,
                 (&info as *const FILE_BASIC_INFO).cast(),
                 std::mem::size_of::<FILE_BASIC_INFO>() as u32,
@@ -1168,13 +1149,15 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
         const FILE_SHARE_READ: u32 = 0x1;
         const FILE_SHARE_WRITE: u32 = 0x2;
         const DELETE: u32 = 0x0001_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         // Without delete sharing the workspace cannot be renamed or replaced
-        // while it is retained.
+        // while it is retained. Attribute access lets this same retained handle
+        // hide the directory without reopening it with different access rights.
         options
-            .access_mode(GENERIC_READ | DELETE)
+            .access_mode(GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -1223,6 +1206,7 @@ fn open_encoded_file(_directory: &File, path: &Path, name: &std::ffi::OsStr) -> 
     {
         use std::os::windows::fs::OpenOptionsExt;
         const DELETE: u32 = 0x0001_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const FILE_SHARE_READ: u32 = 0x1;
