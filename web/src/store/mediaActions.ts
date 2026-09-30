@@ -3,8 +3,8 @@
  * (tauri-plugin-dialog) to pick either a folder (`directory: true`) or one/many
  * files (`multiple: true`), then routes the selection to the Rust import
  * commands. Rust emits `media_changed`, which the media mirror listens for and
- * re-fetches — so these actions only need to start the import and surface
- * progress / errors; they never mutate the catalog directly.
+ * re-fetches. These actions apply the backend's returned catalog and surface
+ * progress / errors, keeping the store a read-only mirror.
  *
  * Outside Tauri the dialog plugin is unavailable; the actions degrade to no-ops
  * so the browser shell never throws.
@@ -13,6 +13,7 @@
 import * as api from "../lib/api";
 import {
   beginMediaImport,
+  applyMediaListForProject,
   endMediaImport,
   refreshMedia,
   useMediaStore,
@@ -155,7 +156,7 @@ export async function importFilesViaDialog(): Promise<void> {
     const list = await api.importMedia(paths);
     if (!isCurrentProject(project)) return;
     warmNewTimelineMedia(list, beforeIds);
-    await refreshMedia();
+    applyMediaListForProject(project, list);
     if (!isCurrentProject(project)) return;
     reportSkipped(list);
   } catch (error: unknown) {
