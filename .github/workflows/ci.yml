@@ -70,6 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: ./.github/actions/setup-jpeg-simd
 
       # The playback engine (#53) is now a DEFAULT feature, so the workspace
       # fmt/clippy/test steps below compile it (cpal + axum/tokio + the wgpu
@@ -178,6 +179,7 @@ jobs:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: ./.github/actions/setup-jpeg-simd
 
       - name: Assert exact checked-out SHA
         id: bind
@@ -651,6 +653,7 @@ jobs:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: ./.github/actions/setup-jpeg-simd
 
       - name: Assert exact Windows security checkout
         id: bind-security
@@ -1074,6 +1077,7 @@ jobs:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: ./.github/actions/setup-jpeg-simd
 
       - name: Assert exact Windows library checkout
         id: bind-library

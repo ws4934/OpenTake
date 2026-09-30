@@ -2,11 +2,16 @@
 //!
 //! Playback frames and paused still frames both paint onto an opaque canvas, so
 //! they are JPEG-encoded straight from the compositor's RGBA readback. The
-//! `jpeg-encoder` crate reads RGBA directly (alpha ignored) and has an AVX2 path,
-//! which avoids the per-frame RGBA→RGB repack and runs several times faster
-//! than `image`'s baseline encoder at the same quality.
+//! TurboJPEG reads RGBA directly (alpha ignored) and uses native SIMD on both
+//! x86 and ARM. Each encoding thread retains one compressor; there is no shared
+//! process-wide encoder lock or per-frame RGBA→RGB repack.
 
 use opentake_render::DecodedFrame;
+use std::cell::RefCell;
+
+thread_local! {
+    static ENCODER: RefCell<Option<turbojpeg::Compressor>> = const { RefCell::new(None) };
+}
 
 /// JPEG quality for preview frames (0–100). 75 is visually clean for a preview
 /// while keeping each frame small enough for a 30–60 fps loopback transport.
@@ -19,9 +24,64 @@ pub fn encode_rgba_jpeg(frame: &DecodedFrame, out: &mut Vec<u8>) -> Result<(), S
         .map_err(|_| format!("jpeg width {} exceeds 65535", frame.width))?;
     let height = u16::try_from(frame.height)
         .map_err(|_| format!("jpeg height {} exceeds 65535", frame.height))?;
-    jpeg_encoder::Encoder::new(out, PREVIEW_JPEG_QUALITY)
-        .encode(&frame.rgba, width, height, jpeg_encoder::ColorType::Rgba)
-        .map_err(|error| format!("jpeg encode: {error}"))
+    if width == 0 || height == 0 {
+        return Err("jpeg dimensions must be nonzero".into());
+    }
+    let width = usize::from(width);
+    let height = usize::from(height);
+    let pitch = width * 4;
+    let expected = pitch.checked_mul(height).ok_or("jpeg RGBA size overflow")?;
+    if frame.rgba.len() != expected {
+        return Err("jpeg RGBA length does not match its dimensions".into());
+    }
+    let bound = turbojpeg::compressed_buf_len(width, height, turbojpeg::Subsamp::Sub2x2)
+        .map_err(|error| format!("jpeg buffer size: {error}"))?;
+    let offset = out.len();
+    let required = offset
+        .checked_add(bound)
+        .ok_or("jpeg output size overflow")?;
+    ENCODER.with(|cached| {
+        let mut cached = cached
+            .try_borrow_mut()
+            .map_err(|_| "jpeg encoder is already in use")?;
+        if cached.is_none() {
+            let mut encoder =
+                turbojpeg::Compressor::new().map_err(|error| format!("jpeg init: {error}"))?;
+            encoder
+                .set_quality(i32::from(PREVIEW_JPEG_QUALITY))
+                .map_err(|error| format!("jpeg quality: {error}"))?;
+            encoder
+                .set_subsamp(turbojpeg::Subsamp::Sub2x2)
+                .map_err(|error| format!("jpeg sampling: {error}"))?;
+            *cached = Some(encoder);
+        }
+        // A borrowed, conservatively sized buffer cannot be reallocated by the
+        // native encoder. Rust owns and reuses the allocation across frames.
+        out.resize(required, 0);
+        let encoded = cached
+            .as_mut()
+            .expect("encoder initialized")
+            .compress_to_slice(
+                turbojpeg::Image {
+                    pixels: &frame.rgba,
+                    width,
+                    height,
+                    pitch,
+                    format: turbojpeg::PixelFormat::RGBA,
+                },
+                &mut out[offset..],
+            );
+        match encoded {
+            Ok(len) => {
+                out.truncate(offset + len);
+                Ok(())
+            }
+            Err(error) => {
+                out.truncate(offset);
+                Err(format!("jpeg encode: {error}"))
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -105,6 +165,33 @@ mod tests {
             .contains("65535"));
     }
 
+    #[test]
+    fn malformed_frame_is_rejected_without_panicking_or_changing_output() {
+        let frame = DecodedFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![0; 7],
+            premultiplied: false,
+        };
+        let mut out = b"prefix".to_vec();
+        assert!(encode_rgba_jpeg(&frame, &mut out)
+            .unwrap_err()
+            .contains("RGBA length"));
+        assert_eq!(out, b"prefix");
+    }
+
+    #[test]
+    fn reused_native_encoder_handles_alternating_dimensions_and_keeps_prefix() {
+        for (width, height) in [(33, 17), (128, 72), (7, 19), (33, 17)] {
+            let frame = noisy_frame(width, height);
+            let mut out = b"prefix".to_vec();
+            encode_rgba_jpeg(&frame, &mut out).unwrap();
+            assert_eq!(&out[..6], b"prefix");
+            let decoded = image::load_from_memory(&out[6..]).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (width, height));
+        }
+    }
+
     fn median(mut samples: Vec<Duration>) -> Duration {
         samples.sort();
         samples[samples.len() / 2]
@@ -139,7 +226,7 @@ mod tests {
                 after_len = out.len();
             }
             println!(
-                "{width}x{height} {content}: image 0.25 {:.1} ms / {} KB -> jpeg-encoder {:.1} ms / {} KB",
+                "{width}x{height} {content}: image 0.25 {:.3} ms / {} KB -> preview encoder {:.3} ms / {} KB",
                 median(before).as_secs_f64() * 1e3,
                 before_len / 1024,
                 median(after).as_secs_f64() * 1e3,

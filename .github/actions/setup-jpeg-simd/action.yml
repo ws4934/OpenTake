@@ -1,0 +1,28 @@
+name: Set up JPEG SIMD assembler
+description: Make NASM available for the statically bundled x86 JPEG encoder
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if ! command -v nasm >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nasm
+        fi
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if ! command -v nasm >/dev/null; then
+          brew install nasm
+        fi
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+          choco install nasm --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NASM installation failed' }
+          $nasm = Join-Path $env:ProgramFiles 'NASM'
+          if (-not (Test-Path (Join-Path $nasm 'nasm.exe'))) { throw 'NASM executable is absent' }
+          $nasm | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        }

@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-jpeg-simd
       - name: Record the reference machine
         run: |
           lscpu
@@ -42,7 +43,7 @@ jobs:
               '[package]\nname = "opentake-preview-jpeg-probe"\n'
               'version = "0.0.0"\nedition = "2021"\n'
               '[dependencies]\n'
-              f'jpeg-encoder = {{ version = "={versions["jpeg-encoder"]}", features = ["simd"] }}\n'
+              f'turbojpeg = {{ version = "={versions["turbojpeg"]}", default-features = false, features = ["cmake", "require-simd"] }}\n'
               f'image = {{ version = "={versions["image"]}", default-features = false, features = ["png", "jpeg"] }}\n'
           )
           # Compile the actual frame and encoder modules, including their
@@ -62,7 +63,7 @@ jobs:
           print(result.stdout, flush=True)
           result.check_returncode()
           timings = re.findall(
-              r'1280x720 (noisy|smooth):.*-> jpeg-encoder ([0-9.]+) ms', result.stdout
+              r'1280x720 (noisy|smooth):.*-> preview encoder ([0-9.]+) ms', result.stdout
           )
           if {content for content, _ in timings} != {'noisy', 'smooth'}:
               raise SystemExit('Both 720p benchmark cases must run')
