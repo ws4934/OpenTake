@@ -547,6 +547,8 @@ struct FramePublisher {
     publication: EncodedFramePublication,
     on_publish: PublishFn,
     encode: EncodeFn,
+    #[cfg(test)]
+    before_encode: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FramePublisher {
@@ -557,6 +559,13 @@ impl FramePublisher {
     ) -> Option<PlaybackFramePublication> {
         let (frame, jpeg) = match queued.job {
             EncodeJob::Frame { frame, image } => {
+                #[cfg(test)]
+                {
+                    let hook = self.before_encode.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 scratch.clear();
                 if let Err(error) = (self.encode)(&image, scratch) {
                     eprintln!("[preview] frame {frame} {error}");
@@ -593,6 +602,8 @@ impl MjpegSink {
             publication,
             on_publish,
             encode,
+            #[cfg(test)]
+            before_encode: Mutex::new(None),
         });
         let mailbox = Arc::new(EncoderMailbox::default());
         let worker_publisher = Arc::clone(&publisher);
@@ -831,6 +842,23 @@ mod tests {
     fn slow_encode(frame: &DecodedFrame, out: &mut Vec<u8>) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(150));
         crate::jpeg::encode_rgba_jpeg(frame, out)
+    }
+
+    fn hold_first_encode(
+        sink: &MjpegSink,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started_tx, started) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        *sink.publisher.before_encode.lock().unwrap() = Some(Box::new(move || {
+            started_tx.send(()).expect("test waits for the encoder");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases the held encoder job");
+        }));
+        (started, release)
     }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -1100,21 +1128,28 @@ mod tests {
             gate.clone(),
             1_000,
             on_publish,
-            slow_encode,
+            crate::jpeg::encode_rgba_jpeg,
         );
+        let (started, release) = hold_first_encode(&sink);
         // Frame 1 occupies the encoder; frame 2 waits in the mailbox.
         sink.push_frame(1, solid(4, 4));
-        std::thread::sleep(Duration::from_millis(20));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame is held in the encoder");
         sink.push_frame(2, solid(4, 4));
         gate.close();
         gate.reopen();
         sink.push_frame(30, solid(4, 4));
+        release.send(()).unwrap();
 
-        let mut seen = Vec::new();
-        while let Ok(publication) = published.recv_timeout(Duration::from_millis(600)) {
-            seen.push(publication.frame());
-        }
-        assert_eq!(seen, vec![30], "pre-pause frames must not publish");
+        let publication = published
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement frame is published");
+        assert_eq!(publication.frame(), 30, "pre-pause frames must not publish");
+        assert!(
+            published.try_recv().is_err(),
+            "only the replacement is queued"
+        );
     }
 
     #[test]
@@ -1128,27 +1163,35 @@ mod tests {
             gate.clone(),
             1_000,
             on_publish,
-            slow_encode,
+            crate::jpeg::encode_rgba_jpeg,
         );
+        let (started, release) = hold_first_encode(&sink);
         // Frame 100 occupies the encoder; frame 101 waits in the mailbox.
         sink.push_frame(100, solid(4, 4));
-        std::thread::sleep(Duration::from_millis(20));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame is held in the encoder");
         sink.push_frame(101, solid(4, 4));
         // The render thread consumes a seek to 500 while playing.
         sink.invalidate();
         assert!(gate.is_open(), "a seek keeps publication open");
         sink.push_frame(500, solid(4, 4));
         sink.push_frame(501, solid(4, 4));
+        release.send(()).unwrap();
 
-        let mut seen = Vec::new();
-        while let Ok(publication) = published.recv_timeout(Duration::from_millis(600)) {
-            seen.push(publication.frame());
-        }
+        let publication = published
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement frame is published");
         assert!(
-            seen.iter().all(|frame| *frame >= 500),
-            "pre-seek frames must not publish after the seek: {seen:?}"
+            publication.frame() >= 500,
+            "pre-seek frame published after the seek: {}",
+            publication.frame()
         );
-        assert_eq!(seen.last(), Some(&501));
+        assert_eq!(publication.frame(), 501);
+        assert!(
+            published.try_recv().is_err(),
+            "only the replacement is queued"
+        );
     }
 
     /// A report that records `message` into `reports` when it runs.
