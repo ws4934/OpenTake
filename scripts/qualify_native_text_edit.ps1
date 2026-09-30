@@ -282,6 +282,12 @@ try {
         [NativeEditInput]::EditItemEnabled($script:window.Current.NativeWindowHandle, 5)
     } 'native timeline paste enabled after copy'
     Click-Element (Find-Names @('Jump to End', '跳到结尾'))
+    Wait-Until {
+        $slider = Find-Names @('Preview playhead', '预览播放头')
+        if ($null -eq $slider) { return $false }
+        $range = $slider.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+        $range.Current.Maximum -gt 0 -and $range.Current.Value -eq $range.Current.Maximum
+    } 'preview playhead reaches the timeline end'
     Send-Keys '^v'
     Wait-Until { @(Clip-Elements).Count -eq 2 } 'timeline copy and paste'
     Write-Output 'PASS: timeline copy and paste'
