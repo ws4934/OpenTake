@@ -1180,7 +1180,7 @@ fn native_windows_path_inputs_preserve_the_original_file() {
     let retained = std::fs::File::open(&raw).unwrap();
     let request = FrameRequest::default();
     let cancel = opentake_media::MediaCancelToken::new();
-    let retained_probe = opentake_media::probe_file(&retained).unwrap();
+    let retained_probe = opentake_media::probe::probe_file(&retained).unwrap();
     let retained_frame = decode_frame_file_at_cancellable(&retained, &request, &cancel)
         .unwrap()
         .1;
@@ -1245,6 +1245,6 @@ fn native_windows_parent_directories_encode_without_replacement() {
     let output = parent.join("encoded.mp4");
     native_windows_fixture(&output, 10, [220, 60, 20, 255]);
     let file = std::fs::File::open(&output).unwrap();
-    let probed = opentake_media::probe_file(&file).unwrap();
+    let probed = opentake_media::probe::probe_file(&file).unwrap();
     assert!((probed.duration_secs - 1.0).abs() < 0.01);
 }
