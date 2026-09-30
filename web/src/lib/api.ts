@@ -20,6 +20,7 @@ import {
   isBoundedTerminalChatMessage,
 } from "./types";
 import type {
+  GenerationRecoveryRecord,
   AccountInfo,
   AccountStatus,
   AudioDenoise,
@@ -670,6 +671,25 @@ export async function cancelGeneration(jobId: string): Promise<boolean> {
   await ensureTauri();
   if (invokeImpl) return invokeImpl<boolean>("generation_cancel", { jobId });
   return false;
+}
+
+/** Reconnect an accepted task; this command never submits or authorizes a job. */
+export async function resumeGeneration(jobId: string): Promise<number> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl<number>("generation_resume", { jobId });
+  throw new Error("Generation recovery is available only in the desktop app");
+}
+
+export async function listGenerationRecoveries(): Promise<GenerationRecoveryRecord[]> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl("generation_recoveries_list");
+  throw new Error("Generation recovery is available only in the desktop app");
+}
+
+export async function discardGenerationRecovery(jobId: string, confirmed: boolean): Promise<GenerationRecoveryRecord[]> {
+  await ensureTauri();
+  if (invokeImpl) return invokeImpl("generation_recovery_discard", { jobId, confirmed });
+  throw new Error("Generation recovery is available only in the desktop app");
 }
 
 /** Whether retrying `jobId` resumes its accepted provider job, which costs

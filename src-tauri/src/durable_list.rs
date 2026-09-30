@@ -42,7 +42,13 @@ impl<T: Serialize + DeserializeOwned + Clone> DurableJsonList<T> {
             .lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.read_locked()
+        self.read_locked(true)
+    }
+
+    /// A management view must expose damaged records instead of showing empty.
+    pub(crate) fn list_strict(&self) -> Result<Vec<T>, String> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.read_locked(false)
     }
 
     /// Read, change and (when `change` says so) rewrite the list under one
@@ -55,7 +61,7 @@ impl<T: Serialize + DeserializeOwned + Clone> DurableJsonList<T> {
             .lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut entries = self.read_locked()?;
+        let mut entries = self.read_locked(true)?;
         let (write, result) = change(&mut entries);
         if write {
             self.write_locked(&entries)?;
@@ -63,7 +69,7 @@ impl<T: Serialize + DeserializeOwned + Clone> DurableJsonList<T> {
         Ok(result)
     }
 
-    fn read_locked(&self) -> Result<Vec<T>, String> {
+    fn read_locked(&self, recover_invalid: bool) -> Result<Vec<T>, String> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -72,6 +78,9 @@ impl<T: Serialize + DeserializeOwned + Clone> DurableJsonList<T> {
         match self.decode(&bytes) {
             Ok(entries) => Ok(entries),
             Err(reason) => {
+                if !recover_invalid {
+                    return Err(format!("{} could not be read: {reason}", self.label));
+                }
                 let kept = self.quarantine()?;
                 eprintln!(
                     "[opentake] {} at {} could not be read ({reason}); it was kept as {} and a \

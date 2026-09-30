@@ -49,6 +49,7 @@ vi.mock("../../lib/api", () => ({
   motionDocumentPatch: vi.fn(),
   motionPreview: vi.fn(),
   motionPreviewCancel: vi.fn().mockResolvedValue(false),
+  resumeGeneration: vi.fn().mockResolvedValue(1),
   generationRetryResumes: vi.fn().mockResolvedValue(false),
   retryGeneration: vi.fn().mockResolvedValue({ jobId: "job", placeholderAssetIds: [], status: "queued" }),
 }));
@@ -692,9 +693,14 @@ describe("media grid interaction consistency", () => {
     await act(async () => root.unmount());
   });
 
-  it.each(["GENERATION_SUBMIT_OUTCOME_UNKNOWN", "GENERATION_RESTART_RETRY_REQUIRED"])(
-    "tells the user to check the provider before retrying %s",
-    async (code) => {
+  it.each([
+    { code: "GENERATION_SUBMIT_OUTCOME_UNKNOWN", source: "byok" as const, help: "服务商控制台" },
+    { code: "GENERATION_RESTART_RETRY_REQUIRED", source: "byok" as const, help: "服务商控制台" },
+    { code: "GENERATION_SUBMIT_OUTCOME_UNKNOWN", source: "managed" as const, help: "托管账户" },
+    { code: "GENERATION_SUBMIT_OUTCOME_UNKNOWN", source: undefined, help: "任务状态和账单" },
+  ])(
+    "shows $source recovery help before retrying $code",
+    async ({ code, source, help }) => {
       const container = document.createElement("div");
       document.body.append(container);
       const root = createRoot(container);
@@ -705,6 +711,7 @@ describe("media grid interaction consistency", () => {
           <MediaCard
             item={{
               ...mediaItem("unknown"),
+              missing: true,
               generationStatus: "failed",
               generationErrorCode: code,
               generationInput: {
@@ -714,23 +721,46 @@ describe("media grid interaction consistency", () => {
                 aspectRatio: "16:9",
                 provider: "local",
                 jobId: "job-3",
+                credentialSource: source,
               },
             }}
           />,
         ),
       );
       expect(container.textContent).not.toContain(code);
-      expect(container.textContent).toContain("服务商控制台");
+      expect(container.textContent).toContain(help);
+      expect(container.textContent).not.toContain("媒体离线");
+      expect([...container.querySelectorAll("button")].some(button => button.textContent === "重新链接")).toBe(false);
       const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
         (button) => button.textContent === "重试",
       );
       await act(async () => retry?.click());
       expect(confirm).toHaveBeenCalledTimes(1);
-      expect(String((confirm.mock.calls[0] as unknown[])[0])).toContain("服务商控制台");
+      expect(String((confirm.mock.calls[0] as unknown[])[0])).toContain(help);
       vi.unstubAllGlobals();
       await act(async () => root.unmount());
     },
   );
+
+  it("shows an interrupted watch and reconnects without resubmitting", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<MediaCard item={{
+      ...mediaItem("interrupted"), generationStatus: "generating",
+      generationErrorCode: "GENERATION_POLL_INTERRUPTED",
+      generationInput: { prompt: "test", model: "test", duration: 1, aspectRatio: "1:1", jobId: "offline" },
+    }} />));
+    expect(container.textContent).toContain("连接中断");
+    const reconnect = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      button => button.textContent === "重新连接",
+    );
+    expect(reconnect).toBeDefined();
+    await act(async () => reconnect!.click());
+    expect(api.resumeGeneration).toHaveBeenCalledWith("offline");
+    expect(api.retryGeneration).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+  });
 
   it("resumes an accepted job without a cost confirmation and confirms a resubmission", async () => {
     const container = document.createElement("div");

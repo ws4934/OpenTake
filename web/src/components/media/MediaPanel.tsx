@@ -35,7 +35,6 @@ import {
   endMediaImport,
   refreshMedia,
   applyMediaErrorForProject,
-  applyMediaListForProject,
   captureMediaProjectIdentity,
   isCurrentMediaProject,
   useMediaStore,
@@ -79,6 +78,7 @@ import {
 import {
   importMedia,
   cancelGeneration,
+  resumeGeneration,
   generationRetryResumes,
   retryGeneration,
   extractAudio,
@@ -102,7 +102,7 @@ import { TransitionTab } from "./TransitionTab";
 import { CaptionsTab } from "./CaptionsTab";
 import { SmartPackTab } from "./SmartPackTab";
 import { MediaSearchResults } from "./MediaSearch";
-import { applyFavoriteMigrationOutcome, migrateLocalFavorites } from "./favorites";
+import { applyFavoriteMigrationOutcome, migrateLocalFavorites, refreshFavoriteMedia } from "./favorites";
 import { LibraryEntryGrid } from "./LibraryView";
 import { EFFECT_REGISTRY, newAdvertisedEffect, type AdvertisedEffectName } from "../../lib/effects";
 
@@ -2025,8 +2025,8 @@ export function MediaListRow({
           assetId={item.id}
           favorite={favorite}
           title={favorite ? t("media.unfavorite") : t("media.favorite")}
-          onSuccess={async (media, project) => {
-            if (!applyMediaListForProject(project, media)) return;
+          onSuccess={async (_media, project) => {
+            if (!await refreshFavoriteMedia(project)) return;
             await useLibraryStore.getState().refresh();
           }}
           onError={(message, project) => {
@@ -2455,6 +2455,14 @@ export function MediaCard({
     item.generationStatus === "failed" &&
     (item.generationErrorCode === "GENERATION_SUBMIT_OUTCOME_UNKNOWN" ||
       item.generationErrorCode === "GENERATION_RESTART_RETRY_REQUIRED");
+  const pollingInterrupted = generationActive && item.generationErrorCode === "GENERATION_POLL_INTERRUPTED";
+  const credentialSource = item.generationInput?.credentialSource;
+  const outcomeHelp = credentialSource === "managed"
+    ? "generation.managedOutcomeUnknown"
+    : credentialSource === "byok" ? "generation.byokOutcomeUnknown" : "generation.outcomeUnknown";
+  const outcomeConfirm = credentialSource === "managed"
+    ? "generation.managedOutcomeUnknownRetryConfirm"
+    : credentialSource === "byok" ? "generation.byokOutcomeUnknownRetryConfirm" : "generation.outcomeUnknownRetryConfirm";
   const thumbnailKey = mediaThumbnailKey(item);
   const [lazyThumbnail, setLazyThumbnail] = useState<string | null>(
     item.thumbnail ?? mediaThumbnailCache.get(thumbnailKey) ?? null,
@@ -2775,11 +2783,25 @@ export function MediaCard({
           >
             <Icon icon={Sparkles} size={18} />
             <span style={{ fontSize: "var(--fs-micro)", fontWeight: "var(--fw-medium)" }}>
-              {item.generationStatus === "downloading" ? "正在下载结果" : "正在生成"}
-              {typeof item.generationProgress === "number"
+              {pollingInterrupted ? t("generation.pollingInterrupted") : item.generationStatus === "downloading" ? "正在下载结果" : "正在生成"}
+              {!pollingInterrupted && typeof item.generationProgress === "number"
                 ? ` ${Math.round(item.generationProgress * 100)}%`
                 : ""}
             </span>
+            {pollingInterrupted && item.generationInput?.jobId && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void resumeGeneration(item.generationInput!.jobId!).catch(error =>
+                    useEditorUiStore.getState().pushToast(String(error)),
+                  );
+                }}
+                style={{ minWidth: 24, minHeight: 24, padding: "0 8px", fontSize: "var(--fs-micro)", background: "rgba(255,255,255,0.14)", color: "#fff", borderRadius: "var(--radius-xs)" }}
+              >
+                {t("generation.reconnect")}
+              </button>
+            )}
             {item.generationInput?.jobId && (
               <button
                 type="button"
@@ -2824,7 +2846,7 @@ export function MediaCard({
               {item.generationStatus === "cancelled"
                 ? "生成已取消"
                 : submitOutcomeUnknown
-                  ? t("generation.outcomeUnknown")
+                  ? t(outcomeHelp)
                   : item.generationErrorCode ?? "GENERATION_FAILED"}
             </span>
             {item.generationInput?.jobId && (
@@ -2844,7 +2866,7 @@ export function MediaCard({
                     // whose answer never arrived: retrying could pay twice.
                     const approved = window.confirm(
                       submitOutcomeUnknown
-                        ? t("generation.outcomeUnknownRetryConfirm")
+                        ? t(outcomeConfirm)
                         : "重试会再次调用生成服务并可能产生费用。是否继续？",
                     );
                     if (approved) await retryGeneration(jobId, true);
@@ -2867,7 +2889,7 @@ export function MediaCard({
         )}
         {/* Offline overlay: the source file is missing. Relink keeps the asset
             id, so the timeline clips referencing it recover (no re-import). */}
-        {item.missing && (
+        {item.missing && !generationActive && !generationFailed && (
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -2916,8 +2938,8 @@ export function MediaCard({
           assetId={item.id}
           favorite={favorite}
           title={favorite ? t("media.unfavorite") : t("media.favorite")}
-          onSuccess={async (media, project) => {
-            if (!applyMediaListForProject(project, media)) return;
+          onSuccess={async (_media, project) => {
+            if (!await refreshFavoriteMedia(project)) return;
             await useLibraryStore.getState().refresh();
           }}
           onError={(message, project) => {

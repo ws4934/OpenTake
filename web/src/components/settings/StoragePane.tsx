@@ -22,6 +22,7 @@ import type { StorageCategoryId, StorageUsage } from "../../lib/types";
 import { formatBytes } from "../../lib/storageFormat";
 import { Icon } from "../ui/Icon";
 import { Reveal } from "../ui/Reveal";
+import { GenerationRecoverySection } from "./GenerationRecoverySection";
 
 const controlStyle: CSSProperties = {
   background: "var(--home-hover)",
@@ -372,6 +373,7 @@ export function StoragePane() {
           {error}
         </div>
       )}
+      <GenerationRecoverySection />
     </Section>
   );
 }

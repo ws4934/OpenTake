@@ -438,6 +438,22 @@ describe("openProjectPath", () => {
     expect(srv.projectOpen).not.toHaveBeenCalled();
   });
 
+  it("preselects a recovery project and opens only the native selection", async () => {
+    const open = vi.fn(async () => "/tmp/chosen.opentake");
+    srv.openDialog.mockResolvedValueOnce(open);
+    await expect(openProjectViaDialog("/tmp/recovery.opentake")).resolves.toBe(true);
+    expect(open).toHaveBeenCalledWith({
+      directory: true, multiple: false, recursive: true, defaultPath: "/tmp/recovery.opentake",
+    });
+    expect(srv.projectOpen).toHaveBeenCalledWith("/tmp/chosen.opentake");
+  });
+
+  it("keeps a cancelled recovery selection outside the project-open boundary", async () => {
+    srv.openDialog.mockResolvedValueOnce(vi.fn(async () => null));
+    await expect(openProjectViaDialog("/tmp/recovery.opentake")).resolves.toBe(false);
+    expect(srv.projectOpen).not.toHaveBeenCalled();
+  });
+
   it("preserves media transient state when project open fails", async () => {
     const oldFolder = { id: "old-folder", name: "Old", parentFolderId: null };
     useMediaStore.setState({
