@@ -2432,7 +2432,12 @@ mod tests {
 
         // Neither composite path may build its own contract.
         let constructor = concat!("TextureInterpolationConfig", "::new(");
-        let constructions = |source: &str| source.matches(constructor).count();
+        let constructions = |source: &str| {
+            let (production, _) = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("the file has a separate test module");
+            production.matches(constructor).count()
+        };
         assert_eq!(constructions(include_str!("render.rs")), 1);
         assert_eq!(constructions(include_str!("export.rs")), 0);
         assert!(include_str!("export.rs")
