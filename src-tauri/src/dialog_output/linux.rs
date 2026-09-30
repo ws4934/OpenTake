@@ -162,7 +162,15 @@ mod tests {
         chooser.show();
         assert!(chooser.select_filename(&file));
         wait_for_paths(&chooser, kind, [file.clone()].into_iter().collect());
-        assert!(chooser.select_filename(&shadow));
+        // GTK's programmatic select_filename moves the cursor and replaces
+        // the current selection. Select all on the visible fallback dialog,
+        // as a user would, to exercise the native multiple-result getter.
+        let visible = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<gtk::FileChooserDialog>().ok())
+            .find(|dialog| dialog.is_visible())
+            .expect("visible GTK file chooser");
+        visible.select_all();
         let expected: std::collections::HashSet<_> = [file.clone(), shadow].into_iter().collect();
         wait_for_paths(&chooser, kind, expected);
         chooser.destroy();
