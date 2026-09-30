@@ -80,6 +80,7 @@ struct SchedulerInner {
     low_sender: SyncSender<PrewarmJob>,
     state: Mutex<SchedulerState>,
     admission: crate::updater::InstallAdmissionGate,
+    completed: tokio::sync::Notify,
 }
 
 type PrewarmWork = Box<dyn FnOnce(JobContext) + Send + 'static>;
@@ -89,7 +90,7 @@ struct PrewarmJob {
     token: MediaCancelToken,
     reservation: ReservationKey,
     low_priority: bool,
-    admission: crate::updater::ActivityLease,
+    admission: Option<crate::updater::ActivityLease>,
     work: PrewarmWork,
 }
 
@@ -131,6 +132,7 @@ impl PrewarmScheduler {
             sender,
             low_sender,
             admission,
+            completed: tokio::sync::Notify::new(),
             state: Mutex::new(SchedulerState {
                 active_epoch,
                 transitioning: false,
@@ -175,12 +177,14 @@ impl PrewarmScheduler {
                 *status = TimelineSpriteStatus::Cancelled;
             }
         }
+        drop(state);
+        self.inner.completed.notify_waiters();
         Ok(())
     }
 
     pub fn activate_project(&self, epoch: u64) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.transitioning && state.active_epoch == epoch {
+        if !state.transitioning && state.active_epoch == epoch && !state.cancel.is_cancelled() {
             return;
         }
         state.cancel.cancel();
@@ -191,6 +195,17 @@ impl PrewarmScheduler {
         state.low_cancel = MediaCancelToken::new();
         state.interactive = false;
         state.timeline_sprite_statuses.clear();
+        drop(state);
+        self.inner.completed.notify_waiters();
+    }
+
+    /// Core identity changes can also originate from MCP, outside UI commands.
+    pub fn invalidate_project(&self) {
+        let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.cancel.cancel();
+        state.low_cancel.cancel();
+        drop(state);
+        self.inner.completed.notify_waiters();
     }
 
     pub fn set_interactive(&self, active: bool) {
@@ -236,6 +251,22 @@ impl PrewarmScheduler {
         K: Into<String>,
         F: FnOnce(JobContext) + Send + 'static,
     {
+        self.schedule_impl(epoch, kind, cache_key, cached, true, work)
+    }
+
+    fn schedule_impl<F, K>(
+        &self,
+        epoch: u64,
+        kind: PrewarmKind,
+        cache_key: K,
+        cached: bool,
+        mutating: bool,
+        work: F,
+    ) -> PrewarmResult
+    where
+        K: Into<String>,
+        F: FnOnce(JobContext) + Send + 'static,
+    {
         let reservation = ReservationKey {
             kind,
             cache_key: cache_key.into(),
@@ -264,14 +295,19 @@ impl PrewarmScheduler {
             if state.in_flight.contains(&reservation) {
                 return PrewarmResult::Duplicate;
             }
-            let Ok(admission) = crate::updater::begin_mutating_activity(&self.inner.admission)
-            else {
-                if low_priority {
-                    state
-                        .timeline_sprite_statuses
-                        .insert(reservation.cache_key.clone(), TimelineSpriteStatus::Busy);
-                }
-                return PrewarmResult::Busy;
+            let admission = if mutating {
+                let Ok(admission) = crate::updater::begin_mutating_activity(&self.inner.admission)
+                else {
+                    if low_priority {
+                        state
+                            .timeline_sprite_statuses
+                            .insert(reservation.cache_key.clone(), TimelineSpriteStatus::Busy);
+                    }
+                    return PrewarmResult::Busy;
+                };
+                Some(admission)
+            } else {
+                None
             };
             state.in_flight.insert(reservation.clone());
             let token = if low_priority {
@@ -313,6 +349,91 @@ impl PrewarmScheduler {
                         );
                 }
                 PrewarmResult::Busy
+            }
+        }
+    }
+
+    /// Return a typed result from the existing bounded worker pool. Duplicate
+    /// requests wait for the owner, then recheck their cache on the worker.
+    pub async fn request<T, F>(
+        &self,
+        epoch: u64,
+        kind: PrewarmKind,
+        cache_key: String,
+        work: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: Fn(&JobContext) -> Result<T, String> + Send + Sync + 'static,
+    {
+        self.request_impl(epoch, kind, cache_key, true, work).await
+    }
+
+    /// A committed mutation owns its outcome: a subsequent project transition
+    /// must not turn a successful commit into a reported failure.
+    pub async fn request_mutation<T, F>(
+        &self,
+        epoch: u64,
+        kind: PrewarmKind,
+        cache_key: String,
+        work: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: Fn(&JobContext) -> Result<T, String> + Send + Sync + 'static,
+    {
+        self.request_impl(epoch, kind, cache_key, false, work).await
+    }
+
+    async fn request_impl<T, F>(
+        &self,
+        epoch: u64,
+        kind: PrewarmKind,
+        cache_key: String,
+        discard_cancelled_result: bool,
+        work: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: Fn(&JobContext) -> Result<T, String> + Send + Sync + 'static,
+    {
+        let work = Arc::new(work);
+        loop {
+            // Register before admission so a fast owner cannot finish between
+            // the duplicate decision and our first poll of this notification.
+            let completed = self.inner.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let worker = Arc::clone(&work);
+            let admitted = self.schedule_impl(
+                epoch,
+                kind,
+                cache_key.clone(),
+                false,
+                false,
+                move |context| {
+                    if send.is_closed() {
+                        return;
+                    }
+                    let result = worker(&context);
+                    let result = if discard_cancelled_result && context.is_cancelled() {
+                        Err("media resource request cancelled by a project transition".into())
+                    } else {
+                        result
+                    };
+                    // A caller that went away no longer needs its derived result.
+                    let _ = send.send(result);
+                },
+            );
+            match admitted {
+                PrewarmResult::Queued => {
+                    return receive.await.map_err(|_| {
+                        "media resource worker stopped without returning a result".to_string()
+                    })?
+                }
+                PrewarmResult::Duplicate => completed.await,
+                other => return Err(format!("media resource admission failed: {other:?}")),
             }
         }
     }
@@ -382,7 +503,7 @@ impl PrewarmScheduler {
                     }
                     _ => return,
                 };
-                let _ = context.commit_staged_bytes(&target, &bytes);
+                let _ = context.commit_staged_poster(&target, &bytes);
             },
         )
     }
@@ -394,6 +515,7 @@ impl PrewarmScheduler {
             .unwrap_or_else(|p| p.into_inner())
             .in_flight
             .remove(reservation);
+        self.inner.completed.notify_waiters();
     }
 
     #[cfg(test)]
@@ -415,6 +537,12 @@ impl PrewarmScheduler {
 }
 
 impl JobContext {
+    pub fn ensure_project(&self, epoch: u64) -> Result<(), String> {
+        if epoch != self.epoch || self.is_cancelled() {
+            return Err("media resource request belongs to a previous project".into());
+        }
+        Ok(())
+    }
     pub fn cancel_token(&self) -> MediaCancelToken {
         self.token.clone()
     }
@@ -453,27 +581,30 @@ impl JobContext {
             && !self.token.is_cancelled()
     }
 
+    /// PNG publication retains the validated cache directory and never replaces
+    /// a complete poster produced by another owner.
+    pub fn commit_staged_poster(&self, target: &Path, bytes: &[u8]) -> Result<bool, String> {
+        let staged = super::StagedPoster::new(target, bytes)?;
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(false);
+        };
+        let state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        let current = !state.transitioning
+            && state.active_epoch == self.epoch
+            && state.cancel.same_instance(&self.token)
+            && !self.token.is_cancelled();
+        if !current {
+            return Ok(false);
+        }
+        let published = staged.publish();
+        drop(state);
+        published.map(|()| true)
+    }
+
     /// Write to a unique sibling staging file and publish only while this job's
     /// epoch/token still owns the scheduler. Holding the state lock across the
     /// rename makes transition cancellation and cache publication ordered.
     pub fn commit_staged_bytes(&self, target: &Path, bytes: &[u8]) -> Result<bool, String> {
-        if self.reservation.kind == PrewarmKind::GridPoster {
-            let staged = super::StagedPoster::new(target, bytes)?;
-            let Some(inner) = self.inner.upgrade() else {
-                return Ok(false);
-            };
-            let state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
-            let current = !state.transitioning
-                && state.active_epoch == self.epoch
-                && state.cancel.same_instance(&self.token)
-                && !self.token.is_cancelled();
-            if !current {
-                return Ok(false);
-            }
-            let published = staged.publish();
-            drop(state);
-            return published.map(|()| true);
-        }
         let parent = target
             .parent()
             .ok_or_else(|| format!("prewarm cache target has no parent: {}", target.display()))?;
@@ -542,6 +673,8 @@ impl Drop for ReservationGuard {
                 }
             }
             state.in_flight.remove(&reservation);
+            drop(state);
+            inner.completed.notify_waiters();
         }
     }
 }
@@ -591,6 +724,133 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn response_worker_does_not_block_the_calling_runtime() {
+        let scheduler = PrewarmScheduler::new(10);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let started = Instant::now();
+            let pending = tokio::spawn(async move {
+                scheduler
+                    .request(10, PrewarmKind::GridPoster, "slow".into(), |_| {
+                        thread::sleep(Duration::from_millis(500));
+                        Ok(7)
+                    })
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "worker blocked the runtime"
+            );
+            assert!(!pending.is_finished());
+            assert_eq!(pending.await.unwrap().unwrap(), 7);
+        });
+    }
+
+    #[test]
+    fn committed_mutation_result_survives_a_subsequent_identity_transition() {
+        let scheduler = PrewarmScheduler::new(10);
+        let observer = scheduler.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let result = scheduler
+                .request_mutation(
+                    10,
+                    PrewarmKind::TimelineVisuals,
+                    "commit".into(),
+                    move |_| {
+                        // The core emits events after its atomic commit. Another client
+                        // can replace the project before this worker returns its reply.
+                        observer.invalidate_project();
+                        Ok(7)
+                    },
+                )
+                .await;
+            assert_eq!(result.unwrap(), 7);
+            assert!(scheduler
+                .request(
+                    10,
+                    PrewarmKind::TimelineVisuals,
+                    "cancelled".into(),
+                    |_| Ok(0)
+                )
+                .await
+                .is_err());
+            scheduler.activate_project(10);
+            assert_eq!(
+                scheduler
+                    .request(
+                        10,
+                        PrewarmKind::TimelineVisuals,
+                        "successor".into(),
+                        |_| Ok(9)
+                    )
+                    .await
+                    .unwrap(),
+                9
+            );
+        });
+    }
+
+    #[test]
+    fn duplicate_response_requests_recheck_cache_and_cancel_on_transition() {
+        let scheduler = PrewarmScheduler::new(10);
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let work = {
+                let decoded = Arc::clone(&decoded);
+                let cache = Arc::clone(&cache);
+                move |_: &JobContext| {
+                    if !cache.load(Ordering::Acquire) {
+                        decoded.fetch_add(1, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(50));
+                        cache.store(true, Ordering::Release);
+                    }
+                    Ok(9)
+                }
+            };
+            let (first, second) = tokio::join!(
+                scheduler.request(10, PrewarmKind::GridPoster, "same".into(), work.clone()),
+                scheduler.request(10, PrewarmKind::GridPoster, "same".into(), work),
+            );
+            assert_eq!(first.unwrap(), 9);
+            assert_eq!(second.unwrap(), 9);
+            assert_eq!(decoded.load(Ordering::Relaxed), 1);
+            let running =
+                scheduler.request(10, PrewarmKind::GridPoster, "cancel".into(), |context| {
+                    while !context.is_cancelled() {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(0)
+                });
+            tokio::pin!(running);
+            let observer = scheduler.clone();
+            let cancel = async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                observer.begin_project_transition().unwrap();
+            };
+            let (result, ()) = tokio::join!(running, cancel);
+            assert!(result.unwrap_err().contains("cancelled"));
+            assert!(scheduler
+                .request(10, PrewarmKind::GridPoster, "old".into(), |_| Ok(0))
+                .await
+                .unwrap_err()
+                .contains("StaleProject"));
+        });
+    }
+
+    #[test]
     fn grid_poster_second_producer_preserves_published_identity() {
         let scheduler = PrewarmScheduler::new(10);
         let dir = tempfile::tempdir().unwrap();
@@ -605,7 +865,7 @@ mod tests {
                 entered_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 done_tx
-                    .send(context.commit_staged_bytes(&queued_target, &second))
+                    .send(context.commit_staged_poster(&queued_target, &second))
                     .unwrap();
             }),
             PrewarmResult::Queued
@@ -658,7 +918,7 @@ mod tests {
             false,
             move |context| {
                 done_tx
-                    .send(context.commit_staged_bytes(&for_job, &bytes))
+                    .send(context.commit_staged_poster(&for_job, &bytes))
                     .unwrap();
             },
         );

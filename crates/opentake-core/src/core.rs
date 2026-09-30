@@ -2820,8 +2820,35 @@ impl AppCore {
         path: impl AsRef<std::path::Path>,
         probe: &ProbedMedia,
     ) -> Result<MediaManifestEntry> {
+        self.relink_media_file_checked(asset_id, path.as_ref(), probe, None)
+    }
+
+    /// Commit a relink prepared outside the core lock only while its original
+    /// media authority still owns the document. Failed persistence rolls back.
+    pub fn relink_media_file_at_authority(
+        &self,
+        expected: MediaAuthorityRevision,
+        asset_id: &str,
+        path: &Path,
+        probe: &ProbedMedia,
+    ) -> Result<MediaManifestEntry> {
+        self.relink_media_file_checked(asset_id, path, probe, Some(expected))
+    }
+
+    fn relink_media_file_checked(
+        &self,
+        asset_id: &str,
+        path: &Path,
+        probe: &ProbedMedia,
+        expected: Option<MediaAuthorityRevision>,
+    ) -> Result<MediaManifestEntry> {
         let (entry, count, project_epoch, saved) = {
             let mut session = self.lock();
+            if expected.is_some_and(|expected| media_authority_revision(&session) != expected) {
+                return Err(CoreError::Media(
+                    "project or media changed while preparing the relink".into(),
+                ));
+            }
             let before = session.editor.media();
             let entry = session.editor.relink_media_file(asset_id, path, probe)?;
             let count = session.editor.media_count();

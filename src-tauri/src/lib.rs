@@ -25,6 +25,7 @@ mod external_mcp;
 #[cfg(feature = "external-mcp-integration")]
 pub mod external_mcp;
 pub mod feedback;
+mod freeze_frame;
 mod fs_availability;
 mod generation;
 mod generation_availability;
@@ -361,6 +362,25 @@ pub fn run() {
                 initial_project_epoch,
                 install_admission.clone(),
             ));
+            app.manage(freeze_frame::FreezeFramePreparations::new());
+            let media_transition_handle = app.handle().clone();
+            app.state::<AppCore>()
+                .subscribe_project_identity_transition(move |pending| {
+                    let prewarm = media_transition_handle.state::<PrewarmScheduler>();
+                    if pending {
+                        prewarm.invalidate_project();
+                        media_transition_handle
+                            .state::<freeze_frame::FreezeFramePreparations>()
+                            .invalidate();
+                    } else {
+                        prewarm.activate_project(
+                            media_transition_handle
+                                .state::<AppCore>()
+                                .project_revision()
+                                .project_epoch,
+                        );
+                    }
+                });
             app.manage(library_state);
             // Lazily-acquired GPU context for timeline composite previews (#47).
             app.manage(render::RenderState::new());
@@ -392,6 +412,7 @@ pub fn run() {
             commands::get_timeline,
             commands::generation_log,
             commands::edit_apply,
+            freeze_frame::prepare_freeze_frame,
             commands::undo,
             commands::redo,
             commands::can_undo,

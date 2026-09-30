@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -2217,19 +2217,72 @@ fn freeze_capture_png_path(
 
 #[derive(Debug)]
 pub struct PreparedFreezeFrame {
-    pub path: PathBuf,
     pub media: opentake_domain::MediaManifestEntry,
+    file: FreezeCaptureFile,
+}
+
+#[derive(Debug)]
+struct FreezeCaptureFile {
+    path: PathBuf,
+    registered: bool,
+}
+
+impl Drop for FreezeCaptureFile {
+    fn drop(&mut self) {
+        if self.registered {
+            return;
+        }
+        let path = self.path.clone();
+        // Rejected or abandoned tickets can be dropped by synchronous edits.
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "failed to remove uncommitted freeze capture {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        });
+    }
+}
+
+impl PreparedFreezeFrame {
+    pub(crate) fn retain_after_commit(&mut self) {
+        self.file.registered = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(path: PathBuf, media: opentake_domain::MediaManifestEntry) -> Self {
+        Self {
+            media,
+            file: FreezeCaptureFile {
+                path,
+                registered: false,
+            },
+        }
+    }
 }
 
 pub fn capture_freeze_frame(
     core: &AppCore,
     render: &RenderState,
     media: &crate::media::MediaState,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
     clip_id: &str,
     at_frame: i32,
+    cancel: &MediaCancelToken,
 ) -> Result<PreparedFreezeFrame, String> {
     capture_freeze_frame_impl(core, || {
-        capture_freeze_frame_workflow(core, render, media.engine(), clip_id, at_frame)
+        capture_freeze_frame_workflow(
+            core,
+            render,
+            media.engine(),
+            snapshot,
+            clip_id,
+            at_frame,
+            cancel,
+        )
     })
 }
 
@@ -2245,10 +2298,11 @@ fn capture_freeze_frame_workflow(
     core: &AppCore,
     render: &RenderState,
     engine: &opentake_media::MediaEngine,
+    snapshot: opentake_core::ProjectRuntimeSnapshot,
     clip_id: &str,
     at_frame: i32,
+    cancel: &MediaCancelToken,
 ) -> Result<PreparedFreezeFrame, String> {
-    let snapshot = core.runtime_snapshot();
     let timeline = snapshot.timeline;
     let manifest = snapshot.media;
     let project_dir = snapshot.project_dir;
@@ -2261,14 +2315,39 @@ fn capture_freeze_frame_workflow(
         render,
         at_frame,
         0,
-        &MediaCancelToken::new(),
+        cancel,
     )?;
+    if cancel.is_cancelled() {
+        return Err("freeze-frame capture cancelled by a project transition".into());
+    }
     let captures_dir = engine.cache_root().join("captures");
     std::fs::create_dir_all(&captures_dir).map_err(|e| format!("create captures dir: {e}"))?;
     let png_path = freeze_capture_png_path(&captures_dir, clip_id, at_frame);
     let bytes = encode_png_bytes(&composite)?;
-    std::fs::write(&png_path, &bytes).map_err(|e| format!("write freeze png: {e}"))?;
-    let probe = crate::media::probe_media(engine, &png_path);
+    if cancel.is_cancelled() {
+        return Err("freeze-frame capture cancelled by a project transition".into());
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&png_path)
+        .map_err(|e| format!("create freeze png: {e}"))?;
+    let file = FreezeCaptureFile {
+        path: png_path.clone(),
+        registered: false,
+    };
+    output
+        .write_all(&bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|e| format!("write freeze png: {e}"))?;
+    drop(output);
+    // This PNG was just encoded from our own readback. Its metadata is known;
+    // another ffprobe would add an uncancellable subprocess to preparation.
+    let probe = opentake_core::ProbedMedia {
+        width: Some(i32::try_from(composite.width).map_err(|error| error.to_string())?),
+        height: Some(i32::try_from(composite.height).map_err(|error| error.to_string())?),
+        ..Default::default()
+    };
     let name = png_path
         .file_stem()
         .map(|value| value.to_string_lossy().into_owned())
@@ -2276,10 +2355,7 @@ fn capture_freeze_frame_workflow(
     let media = core
         .prepare_media_file_entry(&png_path, name, &probe)
         .map_err(|error| error.to_string())?;
-    Ok(PreparedFreezeFrame {
-        path: png_path,
-        media,
-    })
+    Ok(PreparedFreezeFrame { media, file })
 }
 
 fn build_freeze_capture_snapshot(
