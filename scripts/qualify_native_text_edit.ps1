@@ -75,6 +75,11 @@ function Wait-Until([scriptblock]$Check, [string]$Description) {
         catch [System.Windows.Automation.ElementNotAvailableException] {
             # A WebView rerender can replace the element between the query and read.
         }
+        catch [System.Runtime.InteropServices.ExternalException] {
+            # The browser briefly owns the clipboard while publishing a copy.
+            # Retry only CLIPBRD_E_CANT_OPEN; the deadline still fails the check.
+            if ($_.Exception.HResult -ne -2147221040) { throw }
+        }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
