@@ -23,6 +23,8 @@ use opentake_domain::NativePath;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod native_name;
 #[cfg(windows)]
 mod windows;
 use serde::Deserialize;
@@ -131,7 +133,7 @@ pub enum OpenSelection {
 }
 
 /// Intercept native results before plugin IPC serialization and scope grants.
-/// The plugin's Rust picker preserves `PathBuf`; its JS command does not.
+/// Platform pickers retain native paths; scope grants and IPC share that result.
 #[tauri::command]
 pub async fn pick_open_paths(
     window: tauri::Window,
