@@ -549,12 +549,19 @@ fn probe_project_entries_with(
 /// Grant exactly the requested cover and the path its retained handle resolves
 /// to. The two differ when an ancestor directory is a symlink, junction or
 /// `subst` drive; the cover itself is opened no-follow through its bundle.
-fn authorize_home_thumbnail(scope: &tauri::scope::fs::Scope, thumbnail: &Path) -> bool {
+fn authorize_home_thumbnail<R: tauri::Runtime>(app: &AppHandle<R>, thumbnail: &Path) -> bool {
     let Ok(final_path) = crate::safe_asset_protocol::validate_resident_home_thumbnail(thumbnail)
     else {
         return false;
     };
-    scope.allow_file(thumbnail).is_ok() && scope.allow_file(final_path).is_ok()
+    let snapshot = crate::safe_asset_protocol::asset_scope_snapshot(app);
+    let scope = app.asset_protocol_scope();
+    if !snapshot.has_exact_file_grant(thumbnail) && scope.allow_file(thumbnail).is_err() {
+        return false;
+    }
+    same_path(thumbnail, &final_path)
+        || snapshot.has_exact_file_grant(&final_path)
+        || scope.allow_file(final_path).is_ok()
 }
 
 async fn probe_project_entries_bounded<F>(
@@ -1244,6 +1251,7 @@ pub async fn home_projects_sync(
     )?;
     let scope = app.asset_protocol_scope();
     let registry_scope = scope.clone();
+    let probe_app = app.clone();
     let registry_entries = tauri::async_runtime::spawn_blocking(move || {
         let _activity = activity;
         let authorized_legacy = entries
@@ -1271,7 +1279,7 @@ pub async fn home_projects_sync(
         HOME_PROBE_TIMEOUT,
         move |entry| {
             probe_project_entry(entry, &mut |thumbnail| {
-                authorize_home_thumbnail(&scope, thumbnail)
+                authorize_home_thumbnail(&probe_app, thumbnail)
             })
         },
     )
@@ -1897,7 +1905,17 @@ mod tests {
         let app = tauri::test::mock_app();
         let scope = app.handle().asset_protocol_scope();
 
-        assert!(authorize_home_thumbnail(&scope, &thumbnail));
+        let grants = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = grants.clone();
+        scope.listen(move |event| {
+            if matches!(event, tauri::scope::fs::Event::PathAllowed(_)) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        assert!(authorize_home_thumbnail(app.handle(), &thumbnail));
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(authorize_home_thumbnail(app.handle(), &thumbnail));
+        assert_eq!(grants.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(crate::safe_asset_protocol::scope_allows_lexical_path(
             &scope, &thumbnail
         ));
@@ -1932,7 +1950,7 @@ mod tests {
         let app = tauri::test::mock_app();
         let scope = app.handle().asset_protocol_scope();
 
-        assert!(authorize_home_thumbnail(&scope, &thumbnail));
+        assert!(authorize_home_thumbnail(app.handle(), &thumbnail));
         assert!(scope_allows_lexical_path(&scope, &thumbnail));
         assert!(scope_allows_lexical_path(
             &scope,
@@ -1947,7 +1965,7 @@ mod tests {
             &real_project.join("project.json")
         ));
         assert!(
-            !authorize_home_thumbnail(&scope, &alias.join("thumbnail.jpg")),
+            !authorize_home_thumbnail(app.handle(), &alias.join("thumbnail.jpg")),
             "a symlinked bundle is not a Home cover"
         );
     }

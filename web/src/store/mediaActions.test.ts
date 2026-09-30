@@ -94,6 +94,8 @@ describe("mediaActions import warmup", () => {
     expect(srv.preloadMedia).toHaveBeenNthCalledWith(2, "fresh-audio");
     expect(srv.preloadMedia).not.toHaveBeenCalledWith("old");
     expect(srv.preloadMedia).not.toHaveBeenCalledWith("fresh-image");
+    expect(srv.getMedia).not.toHaveBeenCalled();
+    expect(useMediaStore.getState().items).toEqual(srv.imported.items);
   });
 
   it("does not publish an old project import failure after a project switch", async () => {
@@ -277,21 +279,17 @@ describe("mediaActions import warmup", () => {
     expect(message).toContain("cannot read media information");
   });
 
-  it("does not report skipped media after switching projects during refresh", async () => {
-    const pendingRefresh = deferred<MediaList>();
-    srv.importMedia.mockResolvedValueOnce({
-      ...srv.imported,
-      skipped: ["unsupported.bin"],
-    });
-    srv.getMedia.mockImplementationOnce(() => pendingRefresh.promise);
+  it("does not report skipped media after switching projects during import", async () => {
+    const pendingImport = deferred<MediaList>();
+    srv.importMedia.mockImplementationOnce(() => pendingImport.promise);
 
     const importing = importFilesViaDialog();
-    await vi.waitFor(() => expect(srv.getMedia).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(srv.importMedia).toHaveBeenCalledTimes(1));
     useProjectStore.setState({
       projectEpoch: 2,
       projectPath: "/tmp/project-b.opentake",
     });
-    pendingRefresh.resolve(srv.imported);
+    pendingImport.resolve({...srv.imported, skipped: ["unsupported.bin"]});
     await importing;
 
     expect(useEditorUiStore.getState().toast).toBeNull();
