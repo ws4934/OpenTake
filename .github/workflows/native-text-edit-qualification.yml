@@ -21,6 +21,8 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # WebView state is a per-run fixture, never part of the native build cache.
+      WEBVIEW2_USER_DATA_FOLDER: ${{ runner.temp }}/native-edit-webview-profile
     defaults:
       run:
         shell: pwsh
