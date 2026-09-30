@@ -8,6 +8,7 @@
 
 use crate::clip::Clip;
 use crate::clip_type::ClipType;
+use crate::timeline::Timeline;
 
 /// The first frame-arithmetic rule a clip, or a clip about to be created,
 /// breaks.
@@ -137,6 +138,27 @@ impl Clip {
             self.speed,
             self.media_type,
         )
+    }
+}
+
+impl Timeline {
+    /// Check every stored clip before loading or editing a document. Error
+    /// paths identify the exact clip without changing the persisted graph.
+    pub fn validate_frame_arithmetic(&self, label: &str) -> Result<(), String> {
+        for (track_index, track) in self.tracks.iter().enumerate() {
+            for (clip_index, clip) in track.clips.iter().enumerate() {
+                clip.frame_arithmetic().map_err(|error| {
+                    format!("{label}.tracks[{track_index}].clips[{clip_index}]: {error}")
+                })?;
+            }
+        }
+        for (index, sequence) in self.nested_sequences.iter().enumerate() {
+            sequence
+                .timeline
+                .validate_frame_arithmetic("timeline")
+                .map_err(|error| format!("{label}.nestedSequences[{index}].{error}"))?;
+        }
+        Ok(())
     }
 }
 

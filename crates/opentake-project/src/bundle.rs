@@ -286,6 +286,12 @@ impl Project {
         compatibility::repair_timeline_ids(&mut timeline, &timeline_document);
         compatibility::repair_timeline_settings(&mut timeline);
         timeline
+            .validate_frame_arithmetic("timeline")
+            .map_err(|reason| ProjectError::InvalidTimeline {
+                file: layout::TIMELINE_FILE,
+                reason,
+            })?;
+        timeline
             .validate_nested_sequences()
             .map_err(|reason| ProjectError::InvalidTimeline {
                 file: layout::TIMELINE_FILE,

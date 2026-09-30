@@ -2967,7 +2967,9 @@ fn validate_clip_frame_arithmetic(clip: &Clip, label: &str) -> Result<i32, EditE
 }
 
 fn validate_timeline_frame_arithmetic(timeline: &Timeline, label: &str) -> Result<(), EditError> {
-    validate_frame_arithmetic_except(timeline, label, &|_| false, None)
+    timeline
+        .validate_frame_arithmetic(label)
+        .map_err(EditError::Invalid)
 }
 
 /// [`validate_timeline_frame_arithmetic`] for everything except the child
