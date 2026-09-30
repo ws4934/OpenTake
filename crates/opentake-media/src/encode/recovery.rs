@@ -163,7 +163,9 @@ impl RecoveryRecord {
             #[cfg(unix)]
             {
                 workspace.directory.sync_all()?;
-                parent.try_clone()?.into_std_file().sync_all()?;
+                // A capability directory can be O_PATH on Linux. Open a
+                // readable descriptor through it before flushing the entry.
+                parent.open(".")?.sync_all()?;
             }
             Ok(())
         })();
