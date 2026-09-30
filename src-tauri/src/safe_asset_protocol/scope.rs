@@ -115,11 +115,7 @@ impl PatternSet {
         }
         // Glob syntax/separators are ASCII. A native byte/unit per character
         // preserves Unicode literal prefixes without replacing invalid names.
-        let native_globs = globs
-            .iter()
-            .map(|pattern| Pattern::new(&native_match_text(std::ffi::OsStr::new(pattern.as_str()))))
-            .collect::<Result<Vec<_>, _>>()
-            .ok();
+        let native_globs = globs.iter().map(native_pattern).collect::<Option<Vec<_>>>();
         Self {
             literals,
             globs,
@@ -143,6 +139,33 @@ impl PatternSet {
                 .iter()
                 .any(|pattern| pattern.matches_path_with(normalized, options))
     }
+}
+
+fn native_pattern(pattern: &Pattern) -> Option<Pattern> {
+    // Unicode classes cannot be expanded into independent native units: [é]
+    // would become a choice of its UTF-8 bytes rather than their sequence.
+    // Recognize class boundaries exactly as glob does, including []] and [!]].
+    let chars: Vec<_> = pattern.as_str().chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1 + usize::from(chars.get(index + 1) == Some(&'!'));
+        let end = start + 1 + chars.get(start + 1..)?.iter().position(|ch| *ch == ']')?;
+        if chars[start..end].iter().any(|ch| {
+            if cfg!(windows) {
+                ch.len_utf16() > 1
+            } else {
+                ch.len_utf8() > 1
+            }
+        }) {
+            return None;
+        }
+        index = end + 1;
+    }
+    Pattern::new(&native_match_text(std::ffi::OsStr::new(pattern.as_str()))).ok()
 }
 
 #[cfg(unix)]
@@ -316,6 +339,62 @@ pub(crate) fn asset_scope_snapshot_captures<R: Runtime>(app: &AppHandle<R>) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_patterns_keep_literals_but_reject_multi_unit_classes() {
+        for pattern in ["/é/[a-z]*", "/é/[!a-z]*", "/é/[[]box[]]/**/*", "/é/[]]/*"] {
+            assert!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_some(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["/approved/[🐎]*", "/approved/[!🐎]*"] {
+            assert!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_none(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["/approved/[é]*", "/approved/[!é]*"] {
+            assert_eq!(
+                native_pattern(&Pattern::new(pattern).unwrap()).is_some(),
+                cfg!(windows)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_classes_never_authorize_their_partial_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let native = Path::new("/approved").join(std::ffi::OsStr::from_bytes(b"\xc3\xff.mp4"));
+        let pattern = Pattern::new("/approved/[é]*").unwrap();
+        let set = PatternSet::new(HashSet::from([pattern]));
+        assert!(set.matches(Path::new("/approved/é.mp4")));
+        assert!(!set.matches(&native));
+
+        let app = tauri::test::mock_app();
+        let scope = app.handle().asset_protocol_scope();
+        scope.allow_directory("/approved", true).unwrap();
+        let mut snapshot = ScopeSnapshot::capture(&scope);
+        snapshot.forbidden = set;
+        assert!(
+            snapshot.forbids(&native),
+            "unsupported deny classes fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicode_classes_never_authorize_an_unpaired_surrogate() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<_> = r"C:\approved\".encode_utf16().collect();
+        units.push(0xd83d);
+        units.extend(".mp4".encode_utf16());
+        let native = PathBuf::from(std::ffi::OsString::from_wide(&units));
+        let set = PatternSet::new(HashSet::from([Pattern::new(r"C:\approved\[🐎]*").unwrap()]));
+        assert!(set.matches(Path::new(r"C:\approved\🐎.mp4")));
+        assert!(!set.matches(&native));
+    }
 
     #[cfg(unix)]
     #[test]
