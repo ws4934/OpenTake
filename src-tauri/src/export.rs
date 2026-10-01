@@ -1872,7 +1872,7 @@ pub(crate) struct ExportRunOptions<'a> {
     pub(crate) external_cancel: Option<MediaCancelToken>,
     pub(crate) on_progress: Option<AudioExportProgress>,
     pub(crate) frame_range: Option<(i32, i32)>,
-    pub(crate) output_file: Option<File>,
+    pub(crate) project_output: Option<&'a mut ProjectMediaOutput>,
     pub(crate) defer_completion: bool,
 }
 
@@ -2103,26 +2103,10 @@ impl ExportOutputCleanup {
         if visible_directory != retained_directory {
             return Err("export output parent changed during export".to_string());
         }
-        if let Some(encoded) = &self.adopted {
-            let visible_workspace = std::fs::symlink_metadata(encoded.directory_path())
-                .map_err(|error| format!("identify visible encode workspace: {error}"))?;
-            if metadata_is_symlink_or_reparse(&visible_workspace) || !visible_workspace.is_dir() {
-                return Err("encode workspace must remain a real directory".to_string());
-            }
-            let visible = FileIdentity::from_path(encoded.directory_path())
-                .map_err(|error| format!("identify visible encode workspace: {error}"))?;
-            let retained = FileIdentity::from_file(
-                encoded
-                    .directory()
-                    .try_clone()
-                    .map_err(|error| format!("clone retained encode workspace: {error}"))?,
-            )
-            .map_err(|error| format!("identify retained encode workspace: {error}"))?;
-            if visible != retained {
-                return Err("encode workspace changed during export".to_string());
-            }
-        }
         self.verify_target_identity()?;
+        if let Some(encoded) = &self.adopted {
+            return verify_encoded_identity(encoded);
+        }
         let partial_path = self.partial_path()?;
         let visible_file_metadata = std::fs::symlink_metadata(&partial_path)
             .map_err(|error| format!("identify visible export partial: {error}"))?;
@@ -2168,6 +2152,30 @@ impl Drop for ExportOutputCleanup {
     }
 }
 
+fn verify_encoded_identity(encoded: &opentake_media::encode::EncodedFile) -> Result<(), String> {
+    let path = encoded.path();
+    for (path, retained, is_directory) in [
+        (encoded.directory_path(), encoded.directory(), true),
+        (path.as_path(), encoded.file(), false),
+    ] {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|e| format!("inspect encoded output: {e}"))?;
+        if metadata_is_symlink_or_reparse(&metadata)
+            || (is_directory && !metadata.is_dir())
+            || (!is_directory && !metadata.is_file())
+        {
+            return Err("encoded output changed before publication".to_string());
+        }
+        let visible = FileIdentity::from_path(path).map_err(|e| e.to_string())?;
+        let retained = FileIdentity::from_file(retained.try_clone().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        if visible != retained {
+            return Err("encoded output changed before publication".to_string());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_export_with_control(
     timeline: &opentake_domain::Timeline,
     manifest: &opentake_domain::MediaManifest,
@@ -2189,8 +2197,23 @@ pub(crate) fn run_export_with_control(
     check_audio_cancel_with_external(control, external_cancel.as_ref())?;
     let on_progress = options.on_progress;
     let defer_completion = options.defer_completion;
-    let reserved_output = options.output_file.is_some();
+    let reserved_output = options.project_output.is_some();
+    let workspace_hint = options
+        .project_output
+        .as_deref()
+        .map(ProjectMediaOutput::rename_workspace_hint)
+        .transpose()?
+        .flatten();
+    let copy_reserved = reserved_output && workspace_hint.is_none();
     let out_path = opentake_domain::native_path::decode(&req.out_path).map_err(str::to_owned)?;
+    if let Some(output) = options.project_output.as_deref() {
+        if output.path() != out_path {
+            return Err(
+                "project media authority does not match the export destination".to_string(),
+            );
+        }
+        output.verify_identity()?;
+    }
     let preset = resolve_preset(req.codec, req.quality, &out_path)?;
 
     let text = project_text(timeline);
@@ -2261,28 +2284,28 @@ pub(crate) fn run_export_with_control(
     // Declare this before the encoder so Rust drops the encoder first (which
     // reaps ffmpeg) and only then removes an error/cancelled partial output.
     let mut output_cleanup = ExportOutputCleanup::new(out_path.clone(), !reserved_output)?;
-    // An ordinary export encodes in a private workspace next to the target
-    // and publishes the result by rename; a reserved output belongs to its
-    // outer owner and receives a copy through its retained handle.
-    let mut encoder = match options.output_file.take() {
-        Some(output) => {
-            output_cleanup.attach_output(output);
-            VideoEncoder::new_with_file(
-                &out_path,
-                output_cleanup.encoder_file()?,
-                render_size.width,
-                render_size.height,
-                plan.fps,
-                &preset,
-            )
-        }
-        None => VideoEncoder::new_in_workspace(
+    // Project encodes stage outside the bundle so Save As never copies live
+    // intermediates. A bundle that is itself a mount point must retain the
+    // cross-volume copy path; all co-located outputs publish the encoded inode.
+    let mut encoder = if copy_reserved {
+        let output = options.project_output.as_deref().expect("reserved output");
+        output_cleanup.attach_output(output.writer()?);
+        VideoEncoder::new_with_file(
             &out_path,
+            output_cleanup.encoder_file()?,
             render_size.width,
             render_size.height,
             plan.fps,
             &preset,
-        ),
+        )
+    } else {
+        VideoEncoder::new_in_workspace(
+            workspace_hint.as_deref().unwrap_or(&out_path),
+            render_size.width,
+            render_size.height,
+            plan.fps,
+            &preset,
+        )
     }
     .map_err(|e| format!("encoder init failed: {e}"))?;
 
@@ -2435,7 +2458,7 @@ pub(crate) fn run_export_with_control(
     let finalize_progress = finalize_progress
         .as_ref()
         .map(|callback| callback as &opentake_media::encode::EncodeProgressCallback);
-    let finished = if reserved_output {
+    let finished = if copy_reserved {
         encoder
             .finish_cancellable(&cancel, finalize_progress)
             .map(|()| None)
@@ -2445,7 +2468,14 @@ pub(crate) fn run_export_with_control(
             .map(Some)
     };
     match finished {
-        Ok(Some(encoded)) => output_cleanup.adopt_encoded(encoded)?,
+        Ok(Some(encoded)) => {
+            if let Some(output) = options.project_output.as_deref_mut() {
+                output.adopt_encoded(encoded)?;
+                output_cleanup.attach_output(output.writer()?);
+            } else {
+                output_cleanup.adopt_encoded(encoded)?;
+            }
+        }
         Ok(None) => {}
         Err(opentake_media::MediaError::Cancelled) => {
             return Err(CANCELLED_SENTINEL.to_string());
@@ -2461,9 +2491,16 @@ pub(crate) fn run_export_with_control(
     {
         return Err(CANCELLED_SENTINEL.to_string());
     }
+    let verify_output = || -> Result<(), String> {
+        output_cleanup.verify_visible_identity()?;
+        if let Some(output) = options.project_output.as_deref() {
+            output.verify_identity()?;
+        }
+        Ok(())
+    };
     // Bind the visible pathname to the retained output before any probe reads
     // it. Keep the second verification below as a post-probe race check.
-    output_cleanup.verify_visible_identity()?;
+    verify_output()?;
     // Post-encode verification (mirrors motion.rs's post-encode probe): the
     // ffmpeg child may exit 0 while the output is truncated or corrupt, so a
     // clean exit alone is not proof of a usable file. Probe the produced file
@@ -2490,7 +2527,7 @@ pub(crate) fn run_export_with_control(
             .and_then(|probe| validate_export_probe(&probe, &expectations));
         probe_result?;
     }
-    output_cleanup.verify_visible_identity()?;
+    verify_output()?;
     if !defer_completion {
         if let Some(control) = control {
             control.commit_active()?;
@@ -2504,7 +2541,7 @@ pub(crate) fn run_export_with_control(
     // Revalidate immediately after the cancellation commit as well. A path
     // replacement in either side of the final linearization fails closed and
     // leaves the retained original for the cleanup guard.
-    output_cleanup.verify_visible_identity()?;
+    verify_output()?;
     output_cleanup.publish()?;
     if let Some(emit) = &on_progress {
         emit(completion_progress(defer_completion), AUDIO_PROGRESS_TOTAL);
@@ -3252,6 +3289,97 @@ fn reserve_output_file(path: &Path, parent_handle: &File) -> Result<File, String
     Ok(file)
 }
 
+#[cfg(unix)]
+fn same_volume(a: &File, b: &File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(a.metadata()?.dev() == b.metadata()?.dev())
+}
+
+#[cfg(windows)]
+fn same_volume(a: &File, b: &File) -> io::Result<bool> {
+    Ok(ExportFileKey::from_file(a)?.volume == ExportFileKey::from_file(b)?.volume)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_volume(_a: &File, _b: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "volume identity is unavailable",
+    ))
+}
+
+#[cfg(unix)]
+fn publish_new_export_file(rename: ExportRename<'_>) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(rename.temporary.as_bytes())?;
+    let target = CString::new(rename.final_name.as_bytes())?;
+    // SAFETY: both descriptors are retained directories and both names are
+    // live single-component strings. Exclusive rename cannot replace a racer.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            rename.source_directory.as_raw_fd(),
+            source.as_ptr(),
+            rename.directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        ) as i32
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            rename.source_directory.as_raw_fd(),
+            source.as_ptr(),
+            rename.directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exclusive media rename unavailable",
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn publish_new_export_file(rename: ExportRename<'_>) -> io::Result<()> {
+    use windows_sys::Wdk::Storage::FileSystem::FileRenameInformation;
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    let status = rename_retained_file(
+        rename.directory,
+        rename.file,
+        rename.final_name,
+        FileRenameInformation,
+        0,
+    )?;
+    if status < 0 {
+        // SAFETY: status conversion reads no memory and consumes no handle.
+        Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_new_export_file(_rename: ExportRename<'_>) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exclusive media rename unavailable",
+    ))
+}
+
 pub(crate) struct ProjectMediaOutput {
     path: PathBuf,
     media_dir: PathBuf,
@@ -3261,11 +3389,77 @@ pub(crate) struct ProjectMediaOutput {
     directory_identity: FileIdentity,
     file_identity: FileIdentity,
     keep: bool,
+    adopted: Option<opentake_media::encode::EncodedFile>,
 }
 
 impl ProjectMediaOutput {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn rename_workspace_hint(&self) -> Result<Option<PathBuf>, String> {
+        let bundle = self
+            .media_dir
+            .parent()
+            .ok_or("project media has no bundle")?;
+        let parent = bundle
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let directory = open_media_directory_nofollow(parent)?;
+        if !same_volume(&directory, &self.directory)
+            .map_err(|e| format!("inspect staging volume: {e}"))?
+        {
+            return Ok(None);
+        }
+        Ok(Some(parent.join(&self.final_name)))
+    }
+
+    fn adopt_encoded(
+        &mut self,
+        encoded: opentake_media::encode::EncodedFile,
+    ) -> Result<(), String> {
+        self.adopt_encoded_with_hook(encoded, || {})
+    }
+
+    fn adopt_encoded_with_hook(
+        &mut self,
+        encoded: opentake_media::encode::EncodedFile,
+        before_rename: impl FnOnce(),
+    ) -> Result<(), String> {
+        self.verify_identity()?;
+        let file = encoded
+            .file()
+            .try_clone()
+            .map_err(|e| format!("retain encoded media: {e}"))?;
+        let identity = FileIdentity::from_file(file.try_clone().map_err(|e| e.to_string())?)
+            .map_err(|e| format!("identify encoded media: {e}"))?;
+        // Change cleanup authority before releasing the old reservation. A
+        // failed no-replace rename destroys only our new encoded inode.
+        let old_file = std::mem::replace(&mut self.file, file);
+        let old_identity = std::mem::replace(&mut self.file_identity, identity);
+        self.adopted = Some(encoded);
+        remove_reserved_output(&self.directory, &old_file, &self.final_name)
+            .map_err(|e| format!("release project media reservation: {e}"))?;
+        drop(old_identity);
+        drop(old_file);
+        before_rename();
+        let encoded = self.adopted.as_ref().expect("retained encoded media");
+        verify_encoded_identity(encoded)?;
+        publish_new_export_file(ExportRename {
+            source_directory: encoded.directory(),
+            directory: &self.directory,
+            file: &self.file,
+            temporary: encoded.name(),
+            final_name: &self.final_name,
+        })
+        .map_err(|e| format!("publish project media: {e}"))?;
+        self.verify_identity()?;
+        #[cfg(unix)]
+        self.directory
+            .sync_all()
+            .map_err(|e| format!("sync project media publication: {e}"))?;
+        Ok(())
     }
 
     pub(crate) fn writer(&self) -> Result<File, String> {
@@ -3531,6 +3725,7 @@ fn reserve_project_media_output_with_after_open(
                     directory_identity,
                     file_identity,
                     keep: false,
+                    adopted: None,
                 };
                 output.verify_identity()?;
                 return Ok(output);
@@ -3653,13 +3848,12 @@ fn save_range_as_media_workflow<R: Runtime>(
     let total_frames = snapshot.timeline.total_frames();
     validate_save_range(total_frames, in_frame, out_frame)?;
 
-    let output = reserve_project_media_output(
+    let mut output = reserve_project_media_output(
         &project_dir,
         &format!("range_{in_frame}_{out_frame}"),
         "mp4",
     )?;
     let out_path = output.path().to_path_buf();
-    let output_file = output.writer()?;
     let progress_app = app.clone();
     let progress_operation_id = guard.operation_id().to_string();
     let on_progress: AudioExportProgress = Arc::new(move |done: i32, total: i32| {
@@ -3692,7 +3886,7 @@ fn save_range_as_media_workflow<R: Runtime>(
             external_cancel: None,
             on_progress: Some(Arc::clone(&on_progress)),
             frame_range: Some((in_frame, out_frame)),
-            output_file: Some(output_file),
+            project_output: Some(&mut output),
             defer_completion: true,
         },
     )?;
@@ -5229,6 +5423,161 @@ mod tests {
         assert!(!moved.exists());
         drop(output);
         assert!(!visible_path.exists());
+    }
+
+    fn finished_project_video(output: &ProjectMediaOutput) -> opentake_media::encode::EncodedFile {
+        use opentake_media::encode::{ExportPreset, ExportResolution, VideoCodec};
+        let hint = output
+            .rename_workspace_hint()
+            .unwrap()
+            .expect("same volume");
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut encoder = VideoEncoder::new_in_workspace(&hint, 16, 16, 30, &preset).unwrap();
+        encoder
+            .push_frame(&opentake_media::RgbaFrame::new(
+                16,
+                16,
+                vec![0; 16 * 16 * 4],
+            ))
+            .unwrap();
+        encoder
+            .finish_in_workspace(&MediaCancelToken::new(), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn project_media_adopts_the_encoded_inode_outside_the_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let parent_name = {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                OsString::from_vec(b"parent-\xff".to_vec())
+            }
+            #[cfg(target_os = "macos")]
+            {
+                OsString::from("parent-片段")
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStringExt;
+                OsString::from_wide(&[112, 45, 0xd800])
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                OsString::from("parent")
+            }
+        };
+        let parent = root.path().join(parent_name);
+        fs::create_dir(&parent).unwrap();
+        let bundle = parent.join("movie.opentake");
+        fs::create_dir(&bundle).unwrap();
+        let mut output = reserve_project_media_output(&bundle, "range", "mp4").unwrap();
+        let encoded = finished_project_video(&output);
+        let identity = FileIdentity::from_file(encoded.file().try_clone().unwrap()).unwrap();
+        let workspace = encoded.directory_path().to_path_buf();
+        assert!(
+            !workspace.starts_with(&bundle),
+            "Save As must not copy intermediates"
+        );
+        output.adopt_encoded(encoded).unwrap();
+        assert!(
+            output.file_identity == identity,
+            "publication preserves the encoded inode"
+        );
+        drop(identity);
+        let path = output.keep().unwrap();
+        assert!(path.is_file());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn project_media_publication_preserves_a_racing_foreign_file() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("movie.opentake");
+        fs::create_dir(&bundle).unwrap();
+        let mut output = reserve_project_media_output(&bundle, "range", "mp4").unwrap();
+        let encoded = finished_project_video(&output);
+        let workspace = encoded.directory_path().to_path_buf();
+        let path = output.path().to_path_buf();
+        let error = output
+            .adopt_encoded_with_hook(encoded, || {
+                fs::write(&path, b"foreign output").unwrap();
+            })
+            .unwrap_err();
+        assert!(error.contains("publish project media"), "{error}");
+        drop(output);
+        assert_eq!(fs::read(path).unwrap(), b"foreign output");
+        assert!(!workspace.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_media_rejects_a_rebound_encoded_leaf_and_destroys_owned_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("movie.opentake");
+        fs::create_dir(&bundle).unwrap();
+        let mut output = reserve_project_media_output(&bundle, "range", "mp4").unwrap();
+        let encoded = finished_project_video(&output);
+        let source = encoded.path();
+        let moved = root.path().join("moved-encode.mp4");
+        let final_path = output.path().to_path_buf();
+        let error = output
+            .adopt_encoded_with_hook(encoded, || {
+                fs::rename(&source, &moved).unwrap();
+                fs::write(&source, b"replacement source").unwrap();
+            })
+            .unwrap_err();
+        assert!(error.contains("encoded output changed"), "{error}");
+        drop(output);
+        assert!(
+            !final_path.exists(),
+            "the replacement must never be published"
+        );
+        assert_eq!(
+            fs::metadata(moved).unwrap().len(),
+            0,
+            "destroy our moved inode on failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_video_export_replaces_the_reservation_without_copying() {
+        use std::os::unix::fs::MetadataExt;
+        if RenderDevice::try_new().is_err() {
+            assert!(std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none());
+            eprintln!("SKIP: no GPU adapter for project-media publication");
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut output = reserve_project_media_output(project.path(), "range", "mp4").unwrap();
+        let before = output.file.metadata().unwrap().ino();
+        let mut timeline = text_timeline(None);
+        timeline.width = 64;
+        timeline.height = 64;
+        run_export_with_control(
+            &timeline,
+            &opentake_domain::MediaManifest::default(),
+            &Some(project.path().to_path_buf()),
+            &ExportRequest {
+                out_path: opentake_domain::NativePath::new(output.path()).to_wire(),
+                codec: ExportCodec::H264,
+                quality: ExportQuality::P720,
+            },
+            ExportRunOptions {
+                project_output: Some(&mut output),
+                defer_completion: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        output.verify_identity().unwrap();
+        assert_ne!(
+            output.file.metadata().unwrap().ino(),
+            before,
+            "publish the encoded inode instead of copying into the reservation"
+        );
     }
 
     #[test]
