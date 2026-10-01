@@ -73,8 +73,10 @@ use opentake_media::{
     RgbaFrame, StreamVideoFrame, VideoCodec, VideoEncoder, VideoStream, VideoStreamRequest,
 };
 use opentake_project::ProjectRoot;
-use opentake_render::gpu::compositor::{TextureInterpolationMode, TextureResolveRequest};
-use opentake_render::gpu::texture::{upload_rgba, upload_rgba_bytes};
+use opentake_render::gpu::compositor::{
+    PendingReadback, TextureInterpolationMode, TextureResolveRequest,
+};
+use opentake_render::gpu::texture::{upload_rgba, upload_rgba_bytes, write_rgba_bytes};
 use opentake_render::{
     export_render_size, source_frame_index, try_build_render_plan, Compositor,
     CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, FramePlan,
@@ -575,7 +577,7 @@ struct MediaResolver<'d> {
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
-    video_frames: &'d HashMap<String, Arc<StreamVideoFrame>>,
+    video_textures: &'d HashMap<String, Rc<GpuTexture>>,
     cancel: &'d MediaCancelToken,
     materialization_error: Option<String>,
 }
@@ -731,12 +733,156 @@ impl ExportVideoStreams {
                 }
             }
             frames.insert(
-                format!("v:{media_ref}:{target}"),
+                video_frame_key(media_ref, target),
                 Arc::clone(state.last.as_ref().expect("frame was decoded")),
             );
         }
         Ok(frames)
     }
+}
+
+fn video_frame_key(media_ref: &str, frame: i64) -> String {
+    format!("v:{media_ref}:{frame}")
+}
+
+/// Bypass compositing only when the evaluated plan draws exactly the opaque
+/// decoded pixels over the full canvas. Timing and source sampling still use
+/// the same RenderPlan and sequential decoder as composited frames.
+fn identity_video_source<'a>(
+    plan: &FramePlan<'a>,
+    size: opentake_render::RenderSize,
+    codec: ExportCodec,
+    interpolation_mode: TextureInterpolationMode,
+) -> Option<(&'a str, i64)> {
+    let [draw] = plan.draws.as_slice() else {
+        return None;
+    };
+    let TextureSource::Decoded { media_ref } = draw.source else {
+        return None;
+    };
+    if interpolation_mode != TextureInterpolationMode::Nearest
+        || codec.preserves_alpha()
+        || draw.affine != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        || draw.nat_size != (f64::from(size.width), f64::from(size.height))
+        || draw.crop_uv != (0.0, 0.0, 1.0, 1.0)
+        || draw.opacity != 1.0
+        || draw.color_grade.is_some()
+        || draw.lut.is_some()
+        || draw.chroma_key.is_some()
+        || !draw.masks.is_empty()
+        || !draw.effects.is_empty()
+    {
+        return None;
+    }
+    Some((media_ref, draw.source_frame))
+}
+
+fn direct_video_frame(
+    plan: &FramePlan<'_>,
+    frames: &HashMap<String, Arc<StreamVideoFrame>>,
+    size: opentake_render::RenderSize,
+    codec: ExportCodec,
+    interpolation_mode: TextureInterpolationMode,
+) -> Option<Arc<StreamVideoFrame>> {
+    let (media_ref, source_frame) = identity_video_source(plan, size, codec, interpolation_mode)?;
+    let frame = frames.get(&video_frame_key(media_ref, source_frame))?;
+    if (frame.frame.width, frame.frame.height) != (size.width, size.height)
+        || frame
+            .frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 255)
+    {
+        return None;
+    }
+    Some(Arc::clone(frame))
+}
+
+fn continuous_video_source(
+    plan: &RenderPlan,
+    timeline: &opentake_domain::Timeline,
+    range: (i32, i32),
+    codec: ExportCodec,
+    mode: TextureInterpolationMode,
+    cancel: &MediaCancelToken,
+) -> Result<Option<(String, i64)>, String> {
+    let mut span: Option<(String, i64)> = None;
+    for (offset, frame) in (range.0..range.1).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(CANCELLED_SENTINEL.into());
+        }
+        let frame = plan.frame(timeline, frame);
+        let Some((media, source_frame)) =
+            identity_video_source(&frame, plan.render_size, codec, mode)
+        else {
+            return Ok(None);
+        };
+        if source_frame < 0 {
+            return Ok(None);
+        }
+        match &span {
+            Some((previous, first))
+                if previous != media || first.checked_add(offset as i64) != Some(source_frame) =>
+            {
+                return Ok(None)
+            }
+            Some(_) => {}
+            None => span = Some((media.to_owned(), source_frame)),
+        }
+    }
+    Ok(span)
+}
+
+enum ExportFrame<'a> {
+    Decoded(Arc<StreamVideoFrame>),
+    Composited(Box<PendingReadback<'a>>),
+}
+
+/// The previous frame has already been submitted on this queue. Reuse only
+/// obsolete video keys; current keys and caller-held textures keep their pixels.
+fn prepare_video_textures(
+    device: &opentake_render::wgpu::Device,
+    queue: &opentake_render::wgpu::Queue,
+    cache: &mut TextureCache,
+    frames: &HashMap<String, Arc<StreamVideoFrame>>,
+    previous_keys: &mut Vec<String>,
+) -> HashMap<String, Rc<GpuTexture>> {
+    let mut reusable = previous_keys
+        .drain(..)
+        .filter(|key| !frames.contains_key(key))
+        .filter_map(|key| cache.take_exclusive(&key))
+        .collect::<Vec<_>>();
+    *previous_keys = frames.keys().cloned().collect();
+    frames
+        .iter()
+        .map(|(key, frame)| {
+            let texture = cache.get(key).unwrap_or_else(|| {
+                let frame = &frame.frame;
+                let texture = match reusable.iter().position(|texture| {
+                    (texture.width, texture.height) == (frame.width, frame.height)
+                }) {
+                    Some(index) => {
+                        let texture = reusable.swap_remove(index);
+                        write_rgba_bytes(queue, &texture, &frame.rgba, false);
+                        texture
+                    }
+                    None => Rc::new(upload_rgba_bytes(
+                        device,
+                        queue,
+                        (frame.width, frame.height),
+                        &frame.rgba,
+                        false,
+                        false,
+                        Some("export-stream"),
+                    )),
+                };
+                cache.insert_shared(key.clone(), texture)
+            });
+            (key.clone(), texture)
+        })
+        .collect()
 }
 
 impl MediaResolver<'_> {
@@ -808,41 +954,26 @@ impl TextureResolver for MediaResolver<'_> {
         let Some(info) = self.media.get(media_ref) else {
             return self.fail_materialization(format!("media source {media_ref} is unavailable"));
         };
-        let key = if is_image {
-            let content_hash = match self.content_hashes.sha256(&info.path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    return self.fail_materialization(format!(
-                        "image source {media_ref} hashing failed: {error}"
-                    ));
-                }
-            };
-            format!("i:{content_hash}")
-        } else {
-            format!("v:{media_ref}:{source_frame}")
-        };
-
-        if let Some(tex) = self.cache.get(&key) {
-            return Some(tex);
-        }
-
         if !is_image {
-            let Some(frame) = self.video_frames.get(&key) else {
-                return self.fail_materialization(format!(
+            let key = video_frame_key(media_ref, source_frame);
+            return match self.video_textures.get(&key) {
+                Some(texture) => Some(Rc::clone(texture)),
+                None => self.fail_materialization(format!(
                     "video source {media_ref} frame {source_frame} was not prepared"
-                ));
+                )),
             };
-            let frame = &frame.frame;
-            let tex = upload_rgba_bytes(
-                self.device,
-                self.queue,
-                (frame.width, frame.height),
-                &frame.rgba,
-                false,
-                false,
-                Some("export-stream"),
-            );
-            return Some(self.cache.insert(key, tex));
+        }
+        let content_hash = match self.content_hashes.sha256(&info.path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return self.fail_materialization(format!(
+                    "image source {media_ref} hashing failed: {error}"
+                ));
+            }
+        };
+        let key = format!("i:{content_hash}");
+        if let Some(texture) = self.cache.get(&key) {
+            return Some(texture);
         }
 
         let req = FrameRequest {
@@ -976,11 +1107,13 @@ fn preflight_export_sources(
     plan: &RenderPlan,
     manifest: &opentake_domain::MediaManifest,
     media: &HashMap<String, MediaInfo>,
-    start_frame: i32,
-    end_frame: i32,
+    range: (i32, i32),
     cancel: &MediaCancelToken,
+    retain_source: Option<&str>,
     on_progress: &dyn Fn(usize, usize),
-) -> Result<(), String> {
+) -> Result<Option<opentake_media::encode::ProbedMediaFile>, String> {
+    let (start_frame, end_frame) = range;
+    let mut retained = None;
     let names: HashMap<&str, &str> = manifest
         .entries
         .iter()
@@ -1017,7 +1150,8 @@ fn preflight_export_sources(
     let sources: Vec<_> = sources
         .filter(|(media_ref, _, _)| checked.insert(*media_ref))
         .collect();
-    // A probe per source, plus a frame decode per visual source.
+    // A probe per source plus each separate visual decode. A retained direct
+    // source is decoded by its measured encode pass instead.
     let total = sources
         .iter()
         .map(|(_, kind, _)| match kind {
@@ -1026,10 +1160,11 @@ fn preflight_export_sources(
             _ => 2,
         })
         .sum::<usize>();
+    let total = std::cell::Cell::new(total);
     let mut done = 0;
     let mut step = || {
         done += 1;
-        on_progress(done, total);
+        on_progress(done, total.get());
     };
     for (media_ref, kind, first_frame) in sources {
         if cancel.is_cancelled() {
@@ -1057,8 +1192,18 @@ fn preflight_export_sources(
             opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
             error => format!("export source {label} cannot be {action}: {error}"),
         };
-        let probe = opentake_media::probe::probe_cancellable(&info.path, cancel)
+        let source = opentake_media::encode::ProbedMediaFile::probe(file, cancel)
             .map_err(|error| source_error("probed", error))?;
+        let probe = source.info();
+        // The direct source pass performs and validates this entire decode
+        // before publication; decoding its first frame here would repeat work.
+        let direct = retain_source == Some(media_ref)
+            && source.is_opaque_video()
+            && probe.width == Some(plan.render_size.width)
+            && probe.height == Some(plan.render_size.height);
+        if direct {
+            total.set(total.get() - 1);
+        }
         step();
         if kind == ClipType::Audio {
             if !probe.has_audio {
@@ -1069,6 +1214,10 @@ fn preflight_export_sources(
         if !probe.has_video {
             return Err(format!("export source {label} has no visual stream"));
         }
+        if direct {
+            retained = Some(source);
+            continue;
+        }
         let request = FrameRequest {
             time_secs: first_frame
                 .map(|frame| project_frame_time_secs(frame, plan.fps))
@@ -1076,14 +1225,22 @@ fn preflight_export_sources(
             max_size: (64, 64),
             apply_rotation: true,
         };
-        decode_frame_at_cancellable(&info.path, &request, cancel)
-            .map_err(|error| source_error("decoded", error))?;
+        opentake_media::decode::decode_frame_file_at_with_color_cancellable(
+            source.file(),
+            &request,
+            &opentake_media::decode::ColorHint::Known(probe.color.clone()),
+            cancel,
+        )
+        .map_err(|error| source_error("decoded", error))?;
+        source
+            .verify_unchanged()
+            .map_err(|error| source_error("verified", error))?;
         step();
     }
     if cancel.is_cancelled() {
         return Err(CANCELLED_SENTINEL.to_string());
     }
-    Ok(())
+    Ok(retained)
 }
 
 /// PCM spec the export decodes every audio source window into: mono f32 at the
@@ -2224,6 +2381,7 @@ pub(crate) fn run_export_with_control(
     let metrics = ManifestMetrics { sizes };
     let plan = try_build_render_plan(timeline, render_size, &metrics)
         .map_err(|error| format!("invalid timeline graph: {error}"))?;
+    let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
     let (start_frame, end_frame) = match options.frame_range {
         None => (0, plan.total_frames),
         Some((lo, hi)) => {
@@ -2234,13 +2392,25 @@ pub(crate) fn run_export_with_control(
     };
     let preflight_throttle =
         std::cell::RefCell::new(ProgressThrottle::new(PROGRESS_INTERVAL, PREFLIGHT_END));
-    preflight_export_sources(
+    let source_span = if copy_reserved {
+        None
+    } else {
+        continuous_video_source(
+            &plan,
+            timeline,
+            (start_frame, end_frame),
+            req.codec,
+            interpolation.mode,
+            &video_cancel,
+        )?
+    };
+    let source = preflight_export_sources(
         &plan,
         manifest,
         &media,
-        start_frame,
-        end_frame,
+        (start_frame, end_frame),
         &video_cancel,
+        source_span.as_ref().map(|(media, _)| media.as_str()),
         &|done, total| {
             let Some(emit) = &on_progress else {
                 return;
@@ -2254,29 +2424,42 @@ pub(crate) fn run_export_with_control(
             }
         },
     )?;
+    let source_request = match (&source, &source_span) {
+        (Some(_), Some((media_ref, first))) => {
+            let mut request = VideoStreamRequest::new(media[media_ref].path.clone(), plan.fps);
+            request.start_frame = *first;
+            request.end_frame = Some(
+                first
+                    .checked_add(i64::from(end_frame - start_frame))
+                    .ok_or_else(|| "source range overflow".to_string())?,
+            );
+            request.max_size = (render_size.width, render_size.height);
+            Some(request)
+        }
+        _ => None,
+    };
     let project_root = project_dir
         .as_ref()
         .map(ProjectRoot::open)
         .transpose()
         .map_err(|error| format!("open project LUT storage: {error}"))?;
 
-    // Acquire the GPU device + compositor for this export. Unlike the preview
-    // (which caches the context in Tauri state for repeated scrubs), an export is
-    // a one-shot batch, so a local context is simplest and avoids contending with
-    // the preview's lock.
-    let dev = RenderDevice::try_new().map_err(|e| format!("no GPU device: {e}"))?;
-    let compositor = Compositor::new(&dev.device);
-    let text_rasterizer = CosmicTextRasterizer::new();
-    if !text_rasterizer.has_fonts() {
-        eprintln!("[render] no system fonts discovered; text clips will render blank");
+    // Identity frames need neither a GPU batch context nor font discovery.
+    // Keep one context for the first frame that actually needs compositing.
+    let dev = std::cell::OnceCell::new();
+    let compositor = std::cell::OnceCell::new();
+    let text_rasterizer = (!plan.text_plans.is_empty()).then(CosmicTextRasterizer::new);
+    if let Some(rasterizer) = &text_rasterizer {
+        // Reject visible glyphs before encoding rather than publishing blank text.
+        ensure_text_export_fonts(
+            plan_draws_text(&plan, &text, (render_size.width, render_size.height)),
+            rasterizer,
+        )?;
     }
-    // Fail closed: a text-bearing export with no font faces would complete
-    // "successfully" with invisible text. Reject it before the encoder starts;
-    // the preview path (render.rs) deliberately stays lenient.
-    ensure_text_export_fonts(
-        plan_draws_text(&plan, &text, (render_size.width, render_size.height)),
-        &text_rasterizer,
-    )?;
+    let text_rasterizer: &dyn TextRasterizer = match &text_rasterizer {
+        Some(rasterizer) => rasterizer,
+        None => &opentake_render::NullTextRasterizer,
+    };
 
     // Declare this before the encoder so Rust drops the encoder first (which
     // reaps ffmpeg) and only then removes an error/cancelled partial output.
@@ -2284,7 +2467,17 @@ pub(crate) fn run_export_with_control(
     // Project encodes stage outside the bundle so Save As never copies live
     // intermediates. A bundle that is itself a mount point must retain the
     // cross-volume copy path; all co-located outputs publish the encoded inode.
-    let mut encoder = if copy_reserved {
+    let mut encoder = if let (Some(source), Some(request)) = (&source, &source_request) {
+        VideoEncoder::new_source_in_workspace(
+            workspace_hint.as_deref().unwrap_or(&out_path),
+            source
+                .try_clone()
+                .map_err(|error| format!("retain export source: {error}"))?,
+            request,
+            &preset,
+            &video_cancel,
+        )
+    } else if copy_reserved {
         let output = options.project_output.as_deref().expect("reserved output");
         output_cleanup.attach_output(output.writer()?);
         VideoEncoder::new_with_file(
@@ -2304,7 +2497,10 @@ pub(crate) fn run_export_with_control(
             &preset,
         )
     }
-    .map_err(|e| format!("encoder init failed: {e}"))?;
+    .map_err(|error| match error {
+        opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
+        error => format!("encoder init failed: {error}"),
+    })?;
 
     let range_total = end_frame - start_frame;
 
@@ -2316,100 +2512,150 @@ pub(crate) fn run_export_with_control(
     let mut content_hashes = ContentHashCache::new();
     let mut video_streams = ExportVideoStreams::default();
     let mut pending = None;
-    // The final iteration drains the last submission. At most two GPU frames
-    // are in flight, and pixels reach the encoder in timeline order.
-    for f in start_frame..=end_frame {
-        if control.is_some_and(|c| c.is_cancelled())
-            || external_cancel
-                .as_ref()
-                .is_some_and(MediaCancelToken::is_cancelled)
-        {
-            // `abort` kills + waits on the ffmpeg child (unlike a plain `drop`,
-            // which would orphan the process and race the file removal below).
-            encoder.abort();
-            // Best-effort cleanup of the partial file — a leftover half-encoded
-            // video must not look like a finished export. Missing/unwritable is
-            // not itself an error worth surfacing over the cancel.
-            return Err(CANCELLED_SENTINEL.to_string());
-        }
-
-        let next = if f < end_frame {
-            let mut frame_plan = plan.frame(timeline, f);
-            frame_plan.clear_rgba = export_clear_rgba(req.codec);
-            let video_frames = video_streams.prepare(
-                &frame_plan,
-                &media,
-                plan.fps,
-                (render_size.width, render_size.height),
-                &video_cancel,
-            )?;
-            let mut resolver = MediaResolver {
-                device: &dev.device,
-                queue: &dev.queue,
-                cache: &mut texture_cache,
-                lottie: &mut lottie,
-                content_hashes: &mut content_hashes,
-                media: &media,
-                text: &text,
-                text_rasterizer: &text_rasterizer,
-                render_box: (render_size.width, render_size.height),
-                project_root: project_root.as_ref(),
-                lut_cache: &mut lut_cache,
-                video_frames: &video_frames,
-                cancel: &video_cancel,
-                materialization_error: None,
-            };
-            let interpolation = crate::render::timeline_interpolation_config(plan.fps)?;
-            let submitted = compositor
-                .render_pending_with_interpolation(
-                    &dev.device,
-                    &dev.queue,
-                    render_size,
-                    &frame_plan,
-                    &mut resolver,
-                    interpolation,
-                )
-                .map_err(|e| format!("composite render failed at frame {f}: {e}"))?;
-            if let Some(error) = resolver.materialization_error.take() {
-                encoder.abort();
-                if error == CANCELLED_SENTINEL {
-                    return Err(error);
+    let mut previous_video_keys = Vec::new();
+    if source_request.is_some() {
+        let throttle =
+            std::cell::RefCell::new(ProgressThrottle::new(PROGRESS_INTERVAL, VIDEO_RENDER_END));
+        let source_progress = on_progress.clone();
+        let progress = move |done: usize, total: usize| {
+            if let Some(emit) = &source_progress {
+                let mapped = PREFLIGHT_END
+                    + (done.min(total) * (VIDEO_RENDER_END - PREFLIGHT_END) as usize / total)
+                        as i32;
+                if throttle.borrow_mut().admit(mapped, Instant::now()) {
+                    emit(mapped, AUDIO_PROGRESS_TOTAL);
                 }
-                return Err(format!(
-                    "export materialization failed at frame {f}: {error}"
-                ));
             }
-            Some((f, submitted))
-        } else {
-            None
         };
-        let Some((frame_index, submitted)) = std::mem::replace(&mut pending, next) else {
-            continue;
-        };
-        let composite = submitted
-            .finish()
-            .map_err(|e| format!("composite readback failed at frame {frame_index}: {e}"))?;
         encoder
-            .push_frame(&encoder_frame(req.codec, composite))
-            .map_err(|e| format!("encode frame {frame_index} failed: {e}"))?;
+            .finish_source_video(&video_cancel, Some(&progress))
+            .map_err(|error| match error {
+                opentake_media::MediaError::Cancelled => CANCELLED_SENTINEL.to_string(),
+                error => format!("source encode failed: {error}"),
+            })?;
+    }
+    if source_request.is_none() {
+        // The final iteration drains the last submission. At most two GPU frames
+        // are in flight, and pixels reach the encoder in timeline order.
+        for f in start_frame..=end_frame {
+            if control.is_some_and(|c| c.is_cancelled())
+                || external_cancel
+                    .as_ref()
+                    .is_some_and(MediaCancelToken::is_cancelled)
+            {
+                // `abort` kills + waits on the ffmpeg child (unlike a plain `drop`,
+                // which would orphan the process and race the file removal below).
+                encoder.abort();
+                // Best-effort cleanup of the partial file — a leftover half-encoded
+                // video must not look like a finished export. Missing/unwritable is
+                // not itself an error worth surfacing over the cancel.
+                return Err(CANCELLED_SENTINEL.to_string());
+            }
 
-        if let Some(emit) = &on_progress {
-            let now = Instant::now();
-            let done = frame_index - start_frame + 1;
-            let is_last = done == range_total;
-            if is_last || progress_should_emit(last_progress_emit, now) {
-                let mapped = if range_total == 0 {
-                    VIDEO_RENDER_END
-                } else {
-                    PREFLIGHT_END
-                        + done.saturating_mul(VIDEO_RENDER_END - PREFLIGHT_END) / range_total
+            let next = if f < end_frame {
+                let mut frame_plan = plan.frame(timeline, f);
+                frame_plan.clear_rgba = export_clear_rgba(req.codec);
+                let video_frames = video_streams.prepare(
+                    &frame_plan,
+                    &media,
+                    plan.fps,
+                    (render_size.width, render_size.height),
+                    &video_cancel,
+                )?;
+                let submitted = match direct_video_frame(
+                    &frame_plan,
+                    &video_frames,
+                    render_size,
+                    req.codec,
+                    interpolation.mode,
+                ) {
+                    Some(frame) => ExportFrame::Decoded(frame),
+                    None => {
+                        let dev = dev
+                            .get_or_init(RenderDevice::try_new)
+                            .as_ref()
+                            .map_err(|error| format!("no GPU device: {error}"))?;
+                        let compositor = compositor.get_or_init(|| Compositor::new(&dev.device));
+                        let video_textures = prepare_video_textures(
+                            &dev.device,
+                            &dev.queue,
+                            &mut texture_cache,
+                            &video_frames,
+                            &mut previous_video_keys,
+                        );
+                        let mut resolver = MediaResolver {
+                            device: &dev.device,
+                            queue: &dev.queue,
+                            cache: &mut texture_cache,
+                            lottie: &mut lottie,
+                            content_hashes: &mut content_hashes,
+                            media: &media,
+                            text: &text,
+                            text_rasterizer,
+                            render_box: (render_size.width, render_size.height),
+                            project_root: project_root.as_ref(),
+                            lut_cache: &mut lut_cache,
+                            video_textures: &video_textures,
+                            cancel: &video_cancel,
+                            materialization_error: None,
+                        };
+                        let submitted = compositor
+                            .render_pending_with_interpolation(
+                                &dev.device,
+                                &dev.queue,
+                                render_size,
+                                &frame_plan,
+                                &mut resolver,
+                                interpolation,
+                            )
+                            .map_err(|e| format!("composite render failed at frame {f}: {e}"))?;
+                        if let Some(error) = resolver.materialization_error.take() {
+                            encoder.abort();
+                            if error == CANCELLED_SENTINEL {
+                                return Err(error);
+                            }
+                            return Err(format!(
+                                "export materialization failed at frame {f}: {error}"
+                            ));
+                        }
+                        ExportFrame::Composited(Box::new(submitted))
+                    }
                 };
-                emit(mapped, AUDIO_PROGRESS_TOTAL);
-                last_progress_emit = now;
+                Some((f, submitted))
+            } else {
+                None
+            };
+            let Some((frame_index, submitted)) = std::mem::replace(&mut pending, next) else {
+                continue;
+            };
+            let encoded = match submitted {
+                ExportFrame::Decoded(frame) => encoder.push_frame(&frame.frame),
+                ExportFrame::Composited(frame) => {
+                    let composite = (*frame).finish().map_err(|error| {
+                        format!("composite readback failed at frame {frame_index}: {error}")
+                    })?;
+                    encoder.push_frame(&encoder_frame(req.codec, composite))
+                }
+            };
+            encoded.map_err(|error| format!("encode frame {frame_index} failed: {error}"))?;
+
+            if let Some(emit) = &on_progress {
+                let now = Instant::now();
+                let done = frame_index - start_frame + 1;
+                let is_last = done == range_total;
+                if is_last || progress_should_emit(last_progress_emit, now) {
+                    let mapped = if range_total == 0 {
+                        VIDEO_RENDER_END
+                    } else {
+                        PREFLIGHT_END
+                            + done.saturating_mul(VIDEO_RENDER_END - PREFLIGHT_END) / range_total
+                    };
+                    emit(mapped, AUDIO_PROGRESS_TOTAL);
+                    last_progress_emit = now;
+                }
             }
         }
     }
-
     #[cfg(test)]
     LAST_EXPORT_TEXTURE_PEAK.with(|peak| peak.set(Some(texture_cache.peak_bytes())));
     drop(texture_cache);
@@ -4204,6 +4450,446 @@ mod tests {
     }
 
     #[test]
+    fn continuous_video_source_requires_identity_and_contiguous_sampling() {
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.width = 16;
+        timeline.height = 16;
+        let mut clip = Clip::new("first", "video", 0, 30);
+        clip.trim_start_frame = 5;
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        track.clips.push(clip);
+        timeline.tracks.push(track);
+        let size = opentake_render::RenderSize::new(16, 16);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::from([("video".into(), (16, 16)), ("other".into(), (16, 16))]),
+        };
+        let cancel = MediaCancelToken::new();
+        let evaluate = |timeline: &opentake_domain::Timeline, range| {
+            let plan = try_build_render_plan(timeline, size, &metrics).unwrap();
+            continuous_video_source(
+                &plan,
+                timeline,
+                range,
+                ExportCodec::H264,
+                TextureInterpolationMode::Nearest,
+                &cancel,
+            )
+            .unwrap()
+        };
+        assert_eq!(evaluate(&timeline, (8, 28)), Some(("video".into(), 13)));
+        for speed in [0.0, 0.5, 2.0] {
+            let mut changed = timeline.clone();
+            changed.tracks[0].clips[0].speed = speed;
+            assert_eq!(evaluate(&changed, (8, 28)), None, "speed {speed}");
+        }
+        let mut changed = timeline.clone();
+        changed.tracks[0].clips[0].reversed = true;
+        assert_eq!(evaluate(&changed, (8, 28)), None);
+        let mut changed = timeline.clone();
+        changed.tracks[0].clips[0].opacity = 0.5;
+        assert_eq!(evaluate(&changed, (8, 28)), None);
+        assert_eq!(
+            evaluate(&timeline, (20, 31)),
+            None,
+            "a gap needs compositing"
+        );
+
+        // Adjacent clips are eligible only when the evaluated source continues
+        // across their boundary; matching media IDs alone are insufficient.
+        timeline.tracks[0].clips[0].duration_frames = 15;
+        let mut second = Clip::new("second", "video", 15, 15);
+        second.trim_start_frame = 20;
+        timeline.tracks[0].clips.push(second);
+        assert_eq!(evaluate(&timeline, (8, 28)), Some(("video".into(), 13)));
+        timeline.tracks[0].clips[1].trim_start_frame = 0;
+        assert_eq!(evaluate(&timeline, (8, 28)), None);
+        timeline.tracks[0].clips[1].trim_start_frame = 20;
+        timeline.tracks[0].clips[1].media_ref = "other".into();
+        assert_eq!(evaluate(&timeline, (8, 28)), None);
+
+        let plan = try_build_render_plan(&timeline, size, &metrics).unwrap();
+        cancel.cancel();
+        assert_eq!(
+            continuous_video_source(
+                &plan,
+                &timeline,
+                (8, 28),
+                ExportCodec::H264,
+                TextureInterpolationMode::Nearest,
+                &cancel,
+            ),
+            Err(CANCELLED_SENTINEL.into())
+        );
+    }
+
+    #[test]
+    fn video_upload_reuses_one_view_for_one_hundred_changing_frames() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none());
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let mut cache = TextureCache::with_byte_budget(64, TEXTURE_CACHE_BYTE_BUDGET);
+        let mut previous_keys = Vec::new();
+        let mut first_view = None;
+        for frame in 0..100 {
+            let key = format!("v:video:{frame}");
+            let frames = HashMap::from([(
+                key.clone(),
+                Arc::new(StreamVideoFrame {
+                    source_frame: frame,
+                    pts_secs: frame as f64 / 30.0,
+                    frame: RgbaFrame::new(16, 16, [frame as u8, 0, 0, 255].repeat(256)),
+                }),
+            )]);
+            let textures = prepare_video_textures(
+                &dev.device,
+                &dev.queue,
+                &mut cache,
+                &frames,
+                &mut previous_keys,
+            );
+            let view = &textures[&key].view;
+            if let Some(first) = &first_view {
+                assert!(
+                    Arc::ptr_eq(first, view),
+                    "frame {frame} allocates a new video view"
+                );
+            } else {
+                first_view = Some(Arc::clone(view));
+            }
+            assert_eq!(
+                cache.len(),
+                1,
+                "historical video frames must not accumulate"
+            );
+            assert_eq!(cache.bytes(), 16 * 16 * 4);
+        }
+    }
+
+    fn verify_video_frame_pipeline(mixed: bool) {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none());
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.width = 16;
+        timeline.height = 16;
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("clip", "video", 0, 100));
+        timeline.tracks.push(track);
+        let size = opentake_render::RenderSize::new(16, 16);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::from([("video".into(), (16, 16))]),
+        };
+        let plan = try_build_render_plan(&timeline, size, &metrics).unwrap();
+        let compositor = Compositor::new(&dev.device);
+        let media = HashMap::from([(
+            "video".into(),
+            MediaInfo {
+                path: PathBuf::from("prepared.mp4"),
+            },
+        )]);
+        let text = HashMap::new();
+        let mut cache = TextureCache::with_byte_budget(64, TEXTURE_CACHE_BYTE_BUDGET);
+        let mut previous_keys = Vec::new();
+        let mut lottie = LottieMaterializer::new();
+        let mut hashes = ContentHashCache::new();
+        let mut luts = HashMap::new();
+        let cancel = MediaCancelToken::new();
+        let colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let mut pending = None;
+        for frame in 0..100 {
+            let color = colors[frame as usize % colors.len()];
+            let frames = HashMap::from([(
+                format!("v:video:{frame}"),
+                Arc::new(StreamVideoFrame {
+                    source_frame: i64::from(frame),
+                    pts_secs: f64::from(frame) / 30.0,
+                    frame: RgbaFrame::new(16, 16, color.repeat(256)),
+                }),
+            )]);
+            let mut frame_plan = plan.frame(&timeline, frame);
+            let mut expected_color = color;
+            if mixed && frame % 2 == 1 {
+                frame_plan.draws[0].opacity = 0.5;
+                for channel in &mut expected_color[..3] {
+                    *channel = if *channel == 255 { 128 } else { 0 };
+                }
+            }
+            let next = if mixed {
+                direct_video_frame(
+                    &frame_plan,
+                    &frames,
+                    size,
+                    ExportCodec::H264,
+                    TextureInterpolationMode::Nearest,
+                )
+            } else {
+                None
+            };
+            let next = match next {
+                Some(frame) => ExportFrame::Decoded(frame),
+                None => {
+                    let textures = prepare_video_textures(
+                        &dev.device,
+                        &dev.queue,
+                        &mut cache,
+                        &frames,
+                        &mut previous_keys,
+                    );
+                    let mut resolver = MediaResolver {
+                        device: &dev.device,
+                        queue: &dev.queue,
+                        cache: &mut cache,
+                        lottie: &mut lottie,
+                        content_hashes: &mut hashes,
+                        media: &media,
+                        text: &text,
+                        text_rasterizer: &opentake_render::NullTextRasterizer,
+                        render_box: (16, 16),
+                        project_root: None,
+                        lut_cache: &mut luts,
+                        video_textures: &textures,
+                        cancel: &cancel,
+                        materialization_error: None,
+                    };
+                    let next = compositor
+                        .render_pending_with_interpolation(
+                            &dev.device,
+                            &dev.queue,
+                            size,
+                            &frame_plan,
+                            &mut resolver,
+                            crate::render::timeline_interpolation_config(plan.fps).unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(resolver.materialization_error, None);
+                    ExportFrame::Composited(Box::new(next))
+                }
+            };
+            if let Some((previous, expected)) = pending.replace((next, expected_color)) {
+                assert_eq!(video_pipeline_pixels(previous), expected.repeat(256));
+            }
+        }
+        let (last, expected) = pending.unwrap();
+        assert_eq!(video_pipeline_pixels(last), expected.repeat(256));
+        assert_eq!(compositor.resource_stats().bind_groups_created, 1);
+        assert_eq!(cache.peak_bytes(), 16 * 16 * 4);
+    }
+
+    fn video_pipeline_pixels(frame: ExportFrame<'_>) -> Vec<u8> {
+        match frame {
+            ExportFrame::Decoded(frame) => frame.frame.rgba.clone(),
+            ExportFrame::Composited(frame) => (*frame).finish().unwrap().rgba,
+        }
+    }
+
+    #[test]
+    fn reused_video_texture_keeps_submitted_frame_pixels_and_bindings() {
+        verify_video_frame_pipeline(false);
+    }
+
+    #[test]
+    fn alternating_direct_and_composited_frames_keep_timeline_order() {
+        verify_video_frame_pipeline(true);
+    }
+
+    #[test]
+    fn direct_video_frame_matches_gpu_pixels_and_rejects_pixel_operations() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none());
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let mut timeline = opentake_domain::Timeline::new();
+        timeline.width = 16;
+        timeline.height = 16;
+        let mut track = opentake_domain::Track::new("video", ClipType::Video);
+        track.clips.push(Clip::new("clip", "video", 0, 1));
+        timeline.tracks.push(track);
+        let size = opentake_render::RenderSize::new(16, 16);
+        let metrics = ManifestMetrics {
+            sizes: HashMap::from([("video".into(), (16, 16))]),
+        };
+        let plan = try_build_render_plan(&timeline, size, &metrics).unwrap();
+        let frame_plan = plan.frame(&timeline, 0);
+        let rgba = (0..16)
+            .flat_map(|y| (0..16).flat_map(move |x| [x * 16, y * 16, 127, 255]))
+            .collect::<Vec<u8>>();
+        let decoded = Arc::new(StreamVideoFrame {
+            source_frame: 0,
+            pts_secs: 0.0,
+            frame: RgbaFrame::new(16, 16, rgba.clone()),
+        });
+        let frames = HashMap::from([("v:video:0".into(), Arc::clone(&decoded))]);
+        let direct = direct_video_frame(
+            &frame_plan,
+            &frames,
+            size,
+            ExportCodec::H264,
+            TextureInterpolationMode::Nearest,
+        )
+        .unwrap();
+        assert!(direct_video_frame(
+            &frame_plan,
+            &frames,
+            size,
+            ExportCodec::H264,
+            TextureInterpolationMode::Blend
+        )
+        .is_none());
+        assert!(Arc::ptr_eq(&direct, &decoded));
+        struct Resolver(Rc<GpuTexture>);
+        impl TextureResolver for Resolver {
+            fn resolve(&mut self, _: &TextureSource, _: i64) -> Option<Rc<GpuTexture>> {
+                Some(Rc::clone(&self.0))
+            }
+        }
+        let mut resolver = Resolver(Rc::new(upload_rgba_bytes(
+            &dev.device,
+            &dev.queue,
+            (16, 16),
+            &rgba,
+            false,
+            false,
+            None,
+        )));
+        let composited = Compositor::new(&dev.device)
+            .render_to_rgba(&dev.device, &dev.queue, size, &frame_plan, &mut resolver)
+            .unwrap();
+        assert_eq!(direct.frame.rgba, composited.rgba);
+
+        let mut shifted = frame_plan.clone();
+        shifted.draws[0].affine[4] = 1.0;
+        let mut translucent = frame_plan.clone();
+        translucent.draws[0].opacity = 0.999;
+        let mut cropped = frame_plan.clone();
+        cropped.draws[0].crop_uv.0 = 0.1;
+        let grade = opentake_domain::ColorGrade::default();
+        let mut graded = frame_plan.clone();
+        graded.draws[0].color_grade = Some(&grade);
+        let mut multiple = frame_plan.clone();
+        multiple.draws.push(multiple.draws[0].clone());
+        for changed in [shifted, translucent, cropped, graded, multiple] {
+            assert!(direct_video_frame(
+                &changed,
+                &frames,
+                size,
+                ExportCodec::H264,
+                TextureInterpolationMode::Nearest
+            )
+            .is_none());
+        }
+        assert!(direct_video_frame(
+            &frame_plan,
+            &frames,
+            size,
+            ExportCodec::Prores4444,
+            TextureInterpolationMode::Nearest
+        )
+        .is_none());
+        assert!(direct_video_frame(
+            &frame_plan,
+            &frames,
+            opentake_render::RenderSize::new(32, 16),
+            ExportCodec::H264,
+            TextureInterpolationMode::Nearest
+        )
+        .is_none());
+        let mut alpha = rgba;
+        alpha[3] = 254;
+        let transparent = HashMap::from([(
+            "v:video:0".into(),
+            Arc::new(StreamVideoFrame {
+                source_frame: 0,
+                pts_secs: 0.0,
+                frame: RgbaFrame::new(16, 16, alpha),
+            }),
+        )]);
+        assert!(direct_video_frame(
+            &frame_plan,
+            &transparent,
+            size,
+            ExportCodec::H264,
+            TextureInterpolationMode::Nearest
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prepared_video_textures_preserve_live_versions_and_handle_resize() {
+        let Ok(dev) = RenderDevice::try_new() else {
+            assert!(std::env::var_os("OPENTAKE_REQUIRE_GPU").is_none());
+            eprintln!("skip: no GPU adapter available");
+            return;
+        };
+        let frames = |start: i64, width: u32| {
+            [start, start + 1]
+                .into_iter()
+                .map(|frame| {
+                    (
+                        format!("v:video:{frame}"),
+                        Arc::new(StreamVideoFrame {
+                            source_frame: frame,
+                            pts_secs: frame as f64 / 30.0,
+                            frame: RgbaFrame::new(
+                                width,
+                                16,
+                                [frame as u8, 0, 0, 255].repeat(width as usize * 16),
+                            ),
+                        }),
+                    )
+                })
+                .collect()
+        };
+        let mut cache = TextureCache::with_byte_budget(64, TEXTURE_CACHE_BYTE_BUDGET);
+        let mut previous_keys = Vec::new();
+        let first = prepare_video_textures(
+            &dev.device,
+            &dev.queue,
+            &mut cache,
+            &frames(0, 16),
+            &mut previous_keys,
+        );
+        assert!(!Rc::ptr_eq(&first["v:video:0"], &first["v:video:1"]));
+        // A retained prepared map must prevent its wrappers from being mutated.
+        let second = prepare_video_textures(
+            &dev.device,
+            &dev.queue,
+            &mut cache,
+            &frames(2, 16),
+            &mut previous_keys,
+        );
+        for old in first.values() {
+            for new in second.values() {
+                assert!(!Rc::ptr_eq(old, new));
+            }
+        }
+        drop(first);
+        let old_views = second
+            .values()
+            .map(|texture| Arc::clone(&texture.view))
+            .collect::<Vec<_>>();
+        drop(second);
+        let resized = prepare_video_textures(
+            &dev.device,
+            &dev.queue,
+            &mut cache,
+            &frames(4, 32),
+            &mut previous_keys,
+        );
+        for texture in resized.values() {
+            assert_eq!((texture.width, texture.height), (32, 16));
+            assert!(old_views
+                .iter()
+                .all(|view| !Arc::ptr_eq(view, &texture.view)));
+        }
+        assert!(cache.bytes() <= cache.byte_budget());
+    }
+
+    #[test]
     fn owned_export_lease_preserves_cancellation_across_worker_handoff() {
         let control = ExportControl::default();
         let guard = control.try_begin("worker-handoff").unwrap();
@@ -4249,15 +4935,14 @@ mod tests {
         assert!(elapsed < Duration::from_millis(100));
     }
 
-    #[test]
-    fn uhd_export_keeps_the_texture_cache_within_its_byte_budget() {
+    fn uhd_export_texture_peak(opacity: f64) -> Option<u64> {
         use std::process::Command;
 
         if !opentake_media::ffmpeg_status::ffmpeg_available()
             || !opentake_media::ffmpeg_status::ffprobe_available()
         {
             eprintln!("SKIP: ffmpeg sidecars are required for the 4K export test");
-            return;
+            return None;
         }
         if RenderDevice::try_new().is_err() {
             assert!(
@@ -4265,10 +4950,10 @@ mod tests {
                 "OPENTAKE_REQUIRE_GPU is set but no GPU adapter was found"
             );
             eprintln!("SKIP: no GPU adapter for the 4K export test");
-            return;
+            return None;
         }
-        // 24 distinct 4K frames: 759 MiB of video textures, more than the
-        // budget, and fewer entries than the count cap.
+        // Distinct 4K frames previously filled the byte budget with history.
+        // Sequential export must now retain only one reusable source texture.
         let frames = 24;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("uhd.mp4");
@@ -4295,7 +4980,9 @@ mod tests {
         timeline.width = 3840;
         timeline.height = 2160;
         let mut track = opentake_domain::Track::new("video", ClipType::Video);
-        track.clips.push(Clip::new("uhd", "uhd-source", 0, frames));
+        let mut clip = Clip::new("uhd", "uhd-source", 0, frames);
+        clip.opacity = opacity;
+        track.clips.push(clip);
         timeline.tracks.push(track);
         let mut manifest = opentake_domain::MediaManifest::default();
         manifest.entries.push(opentake_domain::MediaManifestEntry {
@@ -4337,12 +5024,28 @@ mod tests {
         let peak = LAST_EXPORT_TEXTURE_PEAK
             .with(std::cell::Cell::get)
             .expect("the export records its cache peak");
-        let frame_bytes = 3840 * 2160 * 4;
+        Some(peak)
+    }
+
+    #[test]
+    fn uhd_export_keeps_the_texture_cache_within_its_byte_budget() {
+        let Some(peak) = uhd_export_texture_peak(0.9) else {
+            return;
+        };
         assert!(peak <= TEXTURE_CACHE_BYTE_BUDGET, "peak {peak} bytes");
-        assert!(
-            peak > TEXTURE_CACHE_BYTE_BUDGET - frame_bytes,
-            "the budget, not the entry cap, bounded the cache: peak {peak} bytes"
+        assert_eq!(
+            peak,
+            3840 * 2160 * 4,
+            "compositing must reuse one 4K texture"
         );
+    }
+
+    #[test]
+    fn opaque_single_layer_export_bypasses_texture_upload() {
+        let Some(peak) = uhd_export_texture_peak(1.0) else {
+            return;
+        };
+        assert_eq!(peak, 0, "identity frames must bypass GPU texture upload");
     }
 
     #[test]
@@ -4409,9 +5112,9 @@ mod tests {
             &plan,
             &opentake_domain::MediaManifest::default(),
             &media,
-            0,
-            plan.total_frames,
+            (0, plan.total_frames),
             &MediaCancelToken::new(),
+            None,
             &|done, total| reports.borrow_mut().push((done, total)),
         )
         .unwrap();
@@ -4423,9 +5126,9 @@ mod tests {
             &plan,
             &opentake_domain::MediaManifest::default(),
             &media,
-            0,
-            plan.total_frames,
+            (0, plan.total_frames),
             &cancel,
+            None,
             &|done, total| {
                 cancelled_reports.borrow_mut().push((done, total));
                 cancel.cancel();
@@ -6986,7 +7689,7 @@ mod tests {
             ("visible".to_string(), info("visible", full)),
         ]);
         let media = HashMap::new();
-        let video_frames = HashMap::new();
+        let video_textures = HashMap::new();
         let mut cache = TextureCache::new(4);
         let mut lottie = LottieMaterializer::new();
         let mut content_hashes = ContentHashCache::new();
@@ -7004,7 +7707,7 @@ mod tests {
             render_box: (64, 64),
             project_root: None,
             lut_cache: &mut lut_cache,
-            video_frames: &video_frames,
+            video_textures: &video_textures,
             cancel: &MediaCancelToken::new(),
             materialization_error: None,
         };

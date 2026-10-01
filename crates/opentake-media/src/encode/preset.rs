@@ -79,9 +79,15 @@ impl ExportPreset {
     /// current FFmpeg/libx264, where stream flags alone leave primaries and
     /// transfer as `unknown` in the produced bitstream.
     pub fn color_args(&self) -> Vec<String> {
+        self.color_args_with_filters(&[])
+    }
+
+    pub(crate) fn color_args_with_filters(&self, filters: &[String]) -> Vec<String> {
+        let mut filters = filters.to_vec();
+        filters.push("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709".into());
         vec![
             "-vf".into(),
-            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709".into(),
+            filters.join(","),
             "-colorspace".into(),
             "bt709".into(),
             "-color_primaries".into(),

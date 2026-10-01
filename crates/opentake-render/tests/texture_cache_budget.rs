@@ -134,3 +134,30 @@ fn cache_hits_return_the_inserted_texture() {
     assert_eq!(cache.bytes(), 2 * 4);
     assert!(cache.get("missing").is_none());
 }
+
+#[test]
+fn exclusive_take_preserves_live_handles_and_byte_accounting() {
+    let Some(dev) = device_or_skip("exclusive_take_preserves_live_handles_and_byte_accounting")
+    else {
+        return;
+    };
+    let mut cache = TextureCache::with_byte_budget(4, BUDGET);
+    let held = cache.insert("old", blank_texture(&dev.device, 16, 16));
+    assert!(cache.take_exclusive("old").is_none());
+    assert_eq!((cache.len(), cache.bytes()), (1, 1024));
+    let view = held.view.clone();
+    drop(held);
+    let reusable = cache.take_exclusive("old").unwrap();
+    assert_eq!(
+        (cache.len(), cache.bytes(), cache.peak_bytes()),
+        (0, 0, 1024)
+    );
+    assert!(cache.get("old").is_none());
+    let restored = cache.insert_shared("new", reusable);
+    assert!(std::sync::Arc::ptr_eq(&view, &restored.view));
+    assert!(Rc::ptr_eq(&restored, &cache.get("new").unwrap()));
+    assert_eq!(
+        (cache.len(), cache.bytes(), cache.peak_bytes()),
+        (1, 1024, 1024)
+    );
+}

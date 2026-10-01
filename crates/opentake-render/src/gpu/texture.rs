@@ -169,6 +169,29 @@ pub fn upload_rgba_bytes(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let texture = GpuTexture {
+        texture,
+        view: Arc::new(view),
+        width,
+        height,
+    };
+    write_rgba_bytes(queue, &texture, pixels, premultiplied);
+    texture
+}
+
+/// Replace the pixels of an RGBA8 texture. Queue writes affect subsequent
+/// submissions; earlier submitted draws retain their previous pixel contents.
+pub fn write_rgba_bytes(
+    queue: &wgpu::Queue,
+    texture: &GpuTexture,
+    pixels: &[u8],
+    premultiplied: bool,
+) {
+    debug_assert_eq!(
+        pixels.len(),
+        texture.width as usize * texture.height as usize * 4
+    );
     let rgba = if premultiplied {
         Cow::Borrowed(pixels)
     } else {
@@ -176,7 +199,7 @@ pub fn upload_rgba_bytes(
     };
     queue.write_texture(
         wgpu::ImageCopyTexture {
-            texture: &texture,
+            texture: &texture.texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -184,18 +207,15 @@ pub fn upload_rgba_bytes(
         &rgba,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
+            bytes_per_row: Some(texture.width * 4),
+            rows_per_image: Some(texture.height),
         },
-        size,
+        wgpu::Extent3d {
+            width: texture.width,
+            height: texture.height,
+            depth_or_array_layers: 1,
+        },
     );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    GpuTexture {
-        texture,
-        view: Arc::new(view),
-        width,
-        height,
-    }
 }
 
 /// Premultiply straight RGBA8 (`c = round(c * a / 255)`), borrowing the input
@@ -357,10 +377,29 @@ impl TextureCache {
     /// entries until it fits under the count cap and the byte budget. Returns
     /// the shared handle.
     pub fn insert(&mut self, key: impl Into<String>, tex: GpuTexture) -> Rc<GpuTexture> {
+        self.insert_shared(key, Rc::new(tex))
+    }
+
+    /// Insert an existing shared texture with the same budget accounting.
+    pub fn insert_shared(&mut self, key: impl Into<String>, tex: Rc<GpuTexture>) -> Rc<GpuTexture> {
         let cost = texture_bytes(&tex);
-        let rc = Rc::new(tex);
-        self.inner.insert(key.into(), rc.clone(), cost);
-        rc
+        self.inner.insert(key.into(), tex.clone(), cost);
+        tex
+    }
+
+    /// Remove a texture only when no caller retains its wrapper. Export uses
+    /// this after the previous draw submission, before changing its pixels.
+    pub fn take_exclusive(&mut self, key: &str) -> Option<Rc<GpuTexture>> {
+        let (texture, _) = self.inner.map.get(key)?;
+        if Rc::strong_count(texture) != 1 {
+            return None;
+        }
+        let (texture, cost) = self.inner.map.remove(key)?;
+        self.inner.bytes -= cost;
+        if let Some(index) = self.inner.order.iter().position(|entry| entry == key) {
+            self.inner.order.remove(index);
+        }
+        Some(texture)
     }
 }
 
