@@ -1115,6 +1115,8 @@ impl LibraryStore {
                 // before removing any crash-recovery backup.
                 let bytes = read_nofollow(root, MANIFEST_NAME)?;
                 decode_manifest(&bytes)?;
+                // A previous commit may have kept recovery after a failed sync.
+                sync_committed_manifest_directory(root)?;
                 if let Ok(backups) = self.manifest_backups() {
                     for backup in backups {
                         if let Ok(backup) = OwnedLeaf::open_transaction(root, backup) {
@@ -1134,6 +1136,7 @@ impl LibraryStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Some((mut backup, _manifest)) = self.recoverable_manifest_backup()? {
                     rename_owned(root, &mut backup, Path::new(MANIFEST_NAME))?;
+                    sync_committed_manifest_directory(root)?;
                 }
             }
             Err(error) => return Err(MediaError::Io(error)),
@@ -3292,6 +3295,11 @@ mod tests {
         let bytes = read_nofollow(&store.capabilities().unwrap().root, &backups[0]).unwrap();
         assert_eq!(decode_manifest(&bytes).unwrap().entries, [first_entry]);
         let reopened = LibraryStore::new(root);
+        FAIL_MANIFEST_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        reopened
+            .reconcile_storage()
+            .expect_err("startup must persist the canonical name before deleting recovery");
+        assert_eq!(reopened.manifest_backups().unwrap().len(), 1);
         reopened.reconcile_storage().unwrap();
         assert!(reopened.manifest_backups().unwrap().is_empty());
         assert_eq!(reopened.entries().unwrap().len(), 2);
@@ -3376,9 +3384,6 @@ mod tests {
             .filter(|entry| is_manifest_backup(&entry.file_name()))
             .collect::<Vec<_>>();
         assert!(backups.is_empty(), "committed backups must not accumulate");
-        assert!(backups
-            .iter()
-            .all(|entry| entry.metadata().is_ok_and(|metadata| metadata.len() == 0)));
     }
 
     #[test]
