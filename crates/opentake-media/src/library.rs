@@ -56,6 +56,7 @@ const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 #[cfg(test)]
 std::thread_local! {
+    static FAIL_MANIFEST_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_COMMITTED_BACKUP_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -353,31 +354,13 @@ fn ensure_child_dir(parent: &Dir, name: impl AsRef<Path>) -> std::io::Result<()>
 struct OwnedLeaf {
     name: OsString,
     handle: Handle,
-    cleanup_on_drop: bool,
+    cleanup_directory: Option<Dir>,
 }
 
 impl OwnedLeaf {
     #[cfg(test)]
     fn create(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Self> {
-        let name = name.as_ref().as_os_str().to_owned();
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        #[cfg(windows)]
-        {
-            use cap_std::fs::OpenOptionsExt;
-            options.share_mode(0x1 | 0x2);
-        }
-        let file = dir.open_with(&name, &options)?;
-        let handle = Handle::from_file(file.into_std())?;
-        Ok(Self {
-            name,
-            handle,
-            cleanup_on_drop: true,
-        })
+        Self::create_transaction(dir, name)
     }
 
     fn open(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Self> {
@@ -400,7 +383,7 @@ impl OwnedLeaf {
         Ok(Self {
             name,
             handle,
-            cleanup_on_drop: false,
+            cleanup_directory: None,
         })
     }
 
@@ -423,11 +406,12 @@ impl OwnedLeaf {
         Ok(Self {
             name,
             handle: Handle::from_file(file.into_std())?,
-            cleanup_on_drop: false,
+            cleanup_directory: None,
         })
     }
 
     fn create_transaction(dir: &Dir, name: impl AsRef<Path>) -> std::io::Result<Self> {
+        let cleanup_directory = dir.try_clone()?;
         let name = name.as_ref().as_os_str().to_owned();
         let mut options = OpenOptions::new();
         options
@@ -450,7 +434,7 @@ impl OwnedLeaf {
         Ok(Self {
             name,
             handle: Handle::from_file(file.into_std())?,
-            cleanup_on_drop: true,
+            cleanup_directory: Some(cleanup_directory),
         })
     }
 
@@ -458,6 +442,12 @@ impl OwnedLeaf {
         let name = name.as_ref().as_os_str().to_owned();
         let mut options = OpenOptions::new();
         options.read(true).write(true).follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            // Inspect an unexpected special leaf without waiting on a FIFO.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
         #[cfg(windows)]
         {
             use cap_std::fs::OpenOptionsExt;
@@ -479,7 +469,7 @@ impl OwnedLeaf {
         Ok(Self {
             name,
             handle: Handle::from_file(file.into_std())?,
-            cleanup_on_drop: false,
+            cleanup_directory: None,
         })
     }
 
@@ -505,7 +495,7 @@ impl OwnedLeaf {
         Ok(Self {
             name,
             handle: Handle::from_file(file.into_std())?,
-            cleanup_on_drop: false,
+            cleanup_directory: None,
         })
     }
 
@@ -529,17 +519,89 @@ impl OwnedLeaf {
     }
 
     fn disarm_cleanup(&mut self) {
-        self.cleanup_on_drop = false;
+        self.cleanup_directory = None;
     }
 }
 
 impl Drop for OwnedLeaf {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = self.handle.as_file().set_len(0);
-            let _ = self.handle.as_file().sync_all();
+        if let Some(directory) = &self.cleanup_directory {
+            if let Err(error) = destroy_owned_leaf(directory, self) {
+                tracing::warn!(%error, "library: failed to clean an owned temporary leaf");
+            }
         }
     }
+}
+
+fn destroy_owned_leaf(directory: &Dir, leaf: &OwnedLeaf) -> std::io::Result<()> {
+    let truncate = if link_count(leaf.handle.as_file())? <= 1 {
+        leaf.truncate_exact()
+    } else {
+        Ok(())
+    };
+    let remove = unlink_owned_leaf(directory, leaf).and_then(|()| sync_dir(directory));
+    match (truncate, remove) {
+        (Err(a), Err(b)) => Err(std::io::Error::other(format!("truncate: {a}; unlink: {b}"))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn unlink_owned_leaf(directory: &Dir, leaf: &OwnedLeaf) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(leaf.name.as_bytes())?;
+    let mut retained = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the owned file descriptor and writable stat buffer stay live.
+    if unsafe { libc::fstat(leaf.handle.as_file().as_raw_fd(), retained.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized the complete stat buffer.
+    let retained = unsafe { retained.assume_init() };
+    let mut visible = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the retained directory and single-component name are live;
+    // nofollow inspects the entry itself and the output buffer is writable.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            visible.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: successful fstatat initialized the stat buffer.
+    let visible = unsafe { visible.assume_init() };
+    if visible.st_dev != retained.st_dev || visible.st_ino != retained.st_ino {
+        return Ok(());
+    }
+    // SAFETY: both authorities remain retained; only the identity-matched
+    // leaf is removed, never a rebound pathname or another hard link's bytes.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unlink_owned_leaf(_directory: &Dir, leaf: &OwnedLeaf) -> std::io::Result<()> {
+    delete_transaction_leaf_by_handle(leaf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlink_owned_leaf(_directory: &Dir, _leaf: &OwnedLeaf) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "retained library cleanup unavailable",
+    ))
 }
 
 fn stream_hash_copy(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<String> {
@@ -661,11 +723,17 @@ fn move_owned(from: &Dir, leaf: &mut OwnedLeaf, to: &Dir, target: &Path) -> std:
             "library leaf identity changed before move",
         ));
     }
+    let cleanup_directory = leaf
+        .cleanup_directory
+        .as_ref()
+        .map(|_| to.try_clone())
+        .transpose()?;
     #[cfg(not(windows))]
     from.rename(&leaf.name, to, target)?;
     #[cfg(windows)]
     rename_transaction_leaf_by_handle(to, leaf, target, false)?;
     let source_name = std::mem::replace(&mut leaf.name, target.as_os_str().to_owned());
+    leaf.cleanup_directory = cleanup_directory;
     if !leaf.matches_name(to)? {
         let quarantine = unique_atomic_artifact(&source_name, "quarantine");
         let _ = to.rename(target, from, Path::new(&quarantine));
@@ -838,11 +906,20 @@ fn commit_atomic_file(root: &Dir, target: &Path, tmp: &mut OwnedLeaf) -> std::io
     // The canonical rename is now verified. Disarm it before backup cleanup so
     // a cleanup error can never truncate the newly committed manifest on drop.
     tmp.disarm_cleanup();
+    // The new name must be durable before deleting the last recovery copy.
+    // The logical commit already happened: retain the backup and report the
+    // flush failure without making the caller discard committed media.
+    if let Err(error) = sync_committed_manifest_directory(root) {
+        tracing::warn!(%error, "library: keeping backup after manifest directory sync failed");
+        return Ok(());
+    }
     if let Some(backup) = backup.as_ref() {
         // The commit point has passed. Cleanup must never turn a successful
         // publication into an error: the caller could otherwise discard the
         // newly manifest-owned content while the manifest is already durable.
-        let _ = cleanup_committed_backup(backup);
+        if let Err(error) = cleanup_committed_backup(root, backup) {
+            tracing::warn!(%error, "library: committed backup cleanup failed");
+        }
     }
     Ok(())
 }
@@ -883,7 +960,17 @@ pub fn write_atomic_capability_file(
     Ok(())
 }
 
-fn cleanup_committed_backup(backup: &OwnedLeaf) -> std::io::Result<()> {
+fn sync_committed_manifest_directory(root: &Dir) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_MANIFEST_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected manifest directory sync failure",
+        ));
+    }
+    sync_dir(root)
+}
+
+fn cleanup_committed_backup(root: &Dir, backup: &OwnedLeaf) -> std::io::Result<()> {
     #[cfg(test)]
     if FAIL_COMMITTED_BACKUP_CLEANUP.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::new(
@@ -891,13 +978,10 @@ fn cleanup_committed_backup(backup: &OwnedLeaf) -> std::io::Result<()> {
             "injected committed-backup cleanup failure",
         ));
     }
-    #[cfg(windows)]
-    {
-        if delete_transaction_leaf_by_handle(backup).is_ok() {
-            return Ok(());
-        }
-    }
-    backup.truncate_exact()
+    // Unlink the old version without truncating a snapshot that a reader
+    // already holds, or bytes reachable through a hard link.
+    unlink_owned_leaf(root, backup)?;
+    sync_dir(root)
 }
 
 #[cfg(windows)]
@@ -1018,7 +1102,9 @@ impl LibraryStore {
                 if let Ok(backups) = self.manifest_backups() {
                     for backup in backups {
                         if let Ok(backup) = OwnedLeaf::open_transaction(root, backup) {
-                            let _ = cleanup_committed_backup(&backup);
+                            if let Err(error) = cleanup_committed_backup(root, &backup) {
+                                tracing::warn!(%error, "library: recovered backup cleanup failed");
+                            }
                         }
                     }
                 }
@@ -1177,7 +1263,7 @@ impl LibraryStore {
     }
 
     /// Stop `leaf` from claiming its content id without destroying data that
-    /// is reachable elsewhere. A file with a single link is truncated through
+    /// is reachable elsewhere. A file with a single link is truncated and unlinked through
     /// a handle proven to be the same file (empty leaves are ignored by
     /// [`Self::stored_index`]). A file with several links — two names in
     /// `files/` for one file, or a hard link from outside the library — only
@@ -1188,7 +1274,7 @@ impl LibraryStore {
         if link_count(leaf.handle.as_file())? <= 1 {
             match OwnedLeaf::open_writable(files, &leaf.name) {
                 Ok(writable) if writable.handle == leaf.handle => {
-                    return Ok(writable.truncate_exact()?);
+                    writable.truncate_exact()?;
                 }
                 Ok(_) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1205,9 +1291,10 @@ impl LibraryStore {
         let name = leaf.name.clone();
         // Windows cannot remove a name while this process holds the file
         // without delete sharing.
+        #[cfg(windows)]
         drop(leaf);
         match files.remove_file(&name) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_dir(files).map_err(Into::into),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -1312,14 +1399,47 @@ impl LibraryStore {
     /// Validate storage after a crash while leaving unknown mutable names
     /// untouched. A strictly valid manifest is required first; unknown leaves
     /// (staging leftovers, foreign files such as `.DS_Store`, directories)
-    /// stay hidden and never make the library unavailable. It reads no file
-    /// contents; see [`Self::resolve_duplicate_copies`] for duplicate claims.
+    /// stay hidden and never make the library unavailable. Known empty stored
+    /// leaves are reclaimed without reading media payloads; see
+    /// [`Self::resolve_duplicate_copies`] for duplicate claims.
     pub fn reconcile_storage(&self) -> Result<()> {
         let _guard = self.lock_writes();
         self.reconcile_manifest_artifacts()?;
         // A strictly valid manifest is required before anything else.
         self.load_manifest()?;
         let capabilities = self.capabilities()?;
+        let mut cleanup_needs_sync = false;
+        for entry in capabilities.files.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let file_type = entry.file_type()?;
+            if Self::content_id_from_name(&name).is_none()
+                || !file_type.is_file()
+                || file_type.is_symlink()
+                || entry.metadata()?.len() != 0
+            {
+                continue;
+            }
+            let cleanup = (|| -> std::io::Result<bool> {
+                let leaf = OwnedLeaf::open_transaction(&capabilities.files, &name)?;
+                if leaf.handle.as_file().metadata()?.len() == 0 {
+                    unlink_owned_leaf(&capabilities.files, &leaf)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            })();
+            match cleanup {
+                Ok(removed) => cleanup_needs_sync |= removed,
+                Err(error) => {
+                    tracing::warn!(%error, "library: could not reclaim an empty stored leaf")
+                }
+            }
+        }
+        if cleanup_needs_sync {
+            if let Err(error) = sync_dir(&capabilities.files) {
+                tracing::warn!(%error, "library: could not sync reclaimed stored leaves");
+            }
+        }
         let active_stages = self
             .active_stages
             .lock()
@@ -1771,7 +1891,7 @@ impl LibraryStore {
     ///
     /// Removal does not verify content: a damaged copy (bit rot, external
     /// edit, crash leftover) must stay deletable. Every nofollow regular leaf
-    /// claiming the id is opened before the commit and truncated after it.
+    /// claiming the id is opened before the commit and released after it.
     pub fn remove(&self, id: &str) -> Result<bool> {
         let _guard = self.lock_writes();
 
@@ -2303,8 +2423,8 @@ mod tests {
         let stored = store.stored_path(&id).unwrap().unwrap();
         assert_ne!(stored, orphan, "the mismatched orphan must not be adopted");
         assert_eq!(std::fs::read(stored).unwrap(), b"trusted bytes");
-        // Quarantined: truncated through its own handle, so it is hidden.
-        assert_eq!(std::fs::metadata(&orphan).unwrap().len(), 0);
+        // The mismatching owned copy is removed rather than adopted.
+        assert!(!orphan.exists());
         assert_eq!(store.stored_ids_verified().unwrap(), HashSet::from([id]));
     }
 
@@ -2324,7 +2444,7 @@ mod tests {
         assert_eq!(entry.id, id);
         assert_eq!(store.stored_path(&id).unwrap(), Some(first.clone()));
         assert_eq!(std::fs::read(&first).unwrap(), b"duplicate orphan bytes");
-        assert_eq!(std::fs::metadata(&second).unwrap().len(), 0);
+        assert!(!second.exists());
     }
 
     #[cfg(unix)]
@@ -2625,12 +2745,7 @@ mod tests {
             std::fs::read(&paths[&entry.id]).unwrap(),
             b"duplicate collision"
         );
-        assert_eq!(
-            std::fs::metadata(store.files_dir().join(format!("{}.mov", entry.id)))
-                .unwrap()
-                .len(),
-            0
-        );
+        assert!(!store.files_dir().join(format!("{}.mov", entry.id)).exists());
     }
 
     #[test]
@@ -2734,7 +2849,7 @@ mod tests {
         assert!(store.remove(&entry.id).unwrap());
 
         assert!(store.entries().unwrap().is_empty());
-        assert_eq!(std::fs::metadata(&stored).unwrap().len(), 0);
+        assert!(!stored.exists());
     }
 
     #[test]
@@ -2752,7 +2867,7 @@ mod tests {
 
         assert!(!outcome.created);
         assert_eq!(outcome.entry, entry);
-        assert_eq!(std::fs::metadata(&damaged).unwrap().len(), 0);
+        assert!(!damaged.exists());
         let repaired = store.stored_path(&entry.id).unwrap().unwrap();
         assert_eq!(std::fs::read(repaired).unwrap(), b"original bytes");
         assert_eq!(
@@ -2955,7 +3070,12 @@ mod tests {
         let store = LibraryStore::new(&lib);
         let e = store.favorite(&req(&a, "video", None)).unwrap();
 
+        let stored = store.stored_path(&e.id).unwrap().unwrap();
         assert!(store.remove(&e.id).unwrap());
+        assert!(
+            !stored.exists(),
+            "removal must unlink the stored copy, not leave a tombstone"
+        );
         assert!(store.entries().unwrap().is_empty());
         assert!(store.stored_path(&e.id).unwrap().is_none());
         // Removing again is a no-op.
@@ -3067,7 +3187,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_tombstone_is_invisible_and_does_not_block_refavorite() {
+    fn removed_copy_is_unlinked_and_does_not_block_refavorite() {
         let tmp = tempfile::tempdir().unwrap();
         let source = src_file(tmp.path(), "again.mp4", b"favorite again");
         let store = LibraryStore::new(tmp.path().join("lib"));
@@ -3075,7 +3195,7 @@ mod tests {
         let first_path = store.stored_path(&first.id).unwrap().unwrap();
 
         assert!(store.remove(&first.id).unwrap());
-        assert_eq!(std::fs::metadata(&first_path).unwrap().len(), 0);
+        assert!(!first_path.exists());
         assert!(store.entries().unwrap().is_empty());
         assert!(store.stored_path(&first.id).unwrap().is_none());
         assert!(store.stored_ids_verified().unwrap().is_empty());
@@ -3133,7 +3253,96 @@ mod tests {
     }
 
     #[test]
-    fn successful_manifest_commits_truncate_retained_backups() {
+    fn failed_directory_sync_keeps_backup_without_orphaning_committed_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib");
+        let store = LibraryStore::new(&root);
+        let first = src_file(tmp.path(), "first.mp4", b"first");
+        let second = src_file(tmp.path(), "second.mp4", b"second");
+        let first_entry = store.favorite(&req(&first, "video", None)).unwrap();
+        FAIL_MANIFEST_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let second_entry = store.favorite(&req(&second, "video", None)).unwrap();
+        assert_eq!(store.entries().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read(store.stored_path(&second_entry.id).unwrap().unwrap()).unwrap(),
+            b"second"
+        );
+        let backups = store.manifest_backups().unwrap();
+        assert_eq!(
+            backups.len(),
+            1,
+            "a failed namespace flush must preserve recovery"
+        );
+        let bytes = read_nofollow(&store.capabilities().unwrap().root, &backups[0]).unwrap();
+        assert_eq!(decode_manifest(&bytes).unwrap().entries, [first_entry]);
+        let reopened = LibraryStore::new(root);
+        reopened.reconcile_storage().unwrap();
+        assert!(reopened.manifest_backups().unwrap().is_empty());
+        assert_eq!(reopened.entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn backup_cleanup_keeps_an_existing_reader_snapshot_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let first = src_file(tmp.path(), "first.mp4", b"first version");
+        store.favorite(&req(&first, "video", None)).unwrap();
+        let path = store.root().join(MANIFEST_NAME);
+        let expected = std::fs::read(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let second = src_file(tmp.path(), "second.mp4", b"second version");
+        store.favorite(&req(&second, "video", None)).unwrap();
+        let mut snapshot = Vec::new();
+        reader.read_to_end(&mut snapshot).unwrap();
+        assert_eq!(
+            snapshot, expected,
+            "unlink must not truncate an active reader"
+        );
+    }
+
+    #[test]
+    fn startup_reclaims_known_empty_copies_but_preserves_foreign_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let source = src_file(tmp.path(), "keep.mp4", b"kept bytes");
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let legacy = store
+            .files_dir()
+            .join(format!("{}.legacy.mp4", "0".repeat(64)));
+        let foreign = store.files_dir().join("notes.txt");
+        std::fs::write(&legacy, []).unwrap();
+        std::fs::write(&foreign, []).unwrap();
+        store.reconcile_storage().unwrap();
+        assert!(!legacy.exists());
+        assert!(foreign.exists());
+        assert_eq!(
+            std::fs::read(store.stored_path(&entry.id).unwrap().unwrap()).unwrap(),
+            b"kept bytes"
+        );
+    }
+
+    #[test]
+    fn dropped_preparations_leave_no_staging_directory_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LibraryStore::new(tmp.path().join("lib"));
+        let source = src_file(tmp.path(), "unused.mp4", b"unpublished bytes");
+        for _ in 0..8 {
+            drop(
+                store
+                    .prepare_favorite(&req(&source, "video", None))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(store.files_dir().join(STAGING_SUBDIR))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn successful_manifest_commits_remove_retained_backups() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LibraryStore::new(tmp.path().join("lib"));
         for index in 0..8 {
@@ -3150,10 +3359,7 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter(|entry| is_manifest_backup(&entry.file_name()))
             .collect::<Vec<_>>();
-        #[cfg(not(windows))]
-        assert_eq!(backups.len(), 7);
-        #[cfg(windows)]
-        assert!(backups.is_empty());
+        assert!(backups.is_empty(), "committed backups must not accumulate");
         assert!(backups
             .iter()
             .all(|entry| entry.metadata().is_ok_and(|metadata| metadata.len() == 0)));
