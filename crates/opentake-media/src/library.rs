@@ -1072,22 +1072,38 @@ impl LibraryStore {
         Ok(backups)
     }
 
-    fn latest_valid_manifest_backup(&self) -> Result<Option<(OwnedLeaf, Manifest)>> {
+    fn recoverable_manifest_backup(&self) -> Result<Option<(OwnedLeaf, Manifest)>> {
         let root = &self.capabilities()?.root;
         let mut latest_error = None;
+        let mut candidate: Option<(OwnedLeaf, Manifest)> = None;
         for backup in self.manifest_backups()?.into_iter().rev() {
             let mut leaf = OwnedLeaf::open_transaction(root, &backup)?;
             let mut bytes = Vec::new();
             leaf.handle.as_file_mut().read_to_end(&mut bytes)?;
             match decode_manifest(&bytes) {
-                Ok(manifest) => return Ok(Some((leaf, manifest))),
+                Ok(manifest) => {
+                    if let Some((_, previous)) = &candidate {
+                        // Process IDs and per-process counters do not order commits.
+                        // Preserve distinct snapshots instead of guessing and losing data.
+                        if previous.version != manifest.version
+                            || previous.entries != manifest.entries
+                        {
+                            return Err(MediaError::Other(anyhow::anyhow!(
+                                "ambiguous library manifest backups: distinct valid snapshots"
+                            )));
+                        }
+                    } else {
+                        candidate = Some((leaf, manifest));
+                    }
+                }
                 Err(error) if latest_error.is_none() => latest_error = Some(error),
                 Err(_) => {}
             }
         }
-        match latest_error {
-            Some(error) => Err(error),
-            None => Ok(None),
+        match (candidate, latest_error) {
+            (Some(candidate), _) => Ok(Some(candidate)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
         }
     }
 
@@ -1116,7 +1132,7 @@ impl LibraryStore {
                 )))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some((mut backup, _manifest)) = self.latest_valid_manifest_backup()? {
+                if let Some((mut backup, _manifest)) = self.recoverable_manifest_backup()? {
                     rename_owned(root, &mut backup, Path::new(MANIFEST_NAME))?;
                 }
             }
@@ -1500,7 +1516,7 @@ impl LibraryStore {
         match read_nofollow(root, MANIFEST_NAME) {
             Ok(bytes) => decode_manifest(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some((_backup, manifest)) = self.latest_valid_manifest_backup()? {
+                if let Some((_backup, manifest)) = self.recoverable_manifest_backup()? {
                     Ok(manifest)
                 } else {
                     Ok(Manifest {
@@ -3406,6 +3422,59 @@ mod tests {
         assert_eq!(reopened.entries().unwrap(), vec![entry]);
         assert!(library_root.join(MANIFEST_NAME).is_file());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn conflicting_manifest_backups_are_preserved_without_guessing_pid_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library_root = tmp.path().join("lib");
+        let store = LibraryStore::new(&library_root);
+        let first = src_file(tmp.path(), "first.mp4", b"first snapshot");
+        let second = src_file(tmp.path(), "second.mp4", b"second snapshot");
+        store.favorite(&req(&first, "video", None)).unwrap();
+        let canonical = library_root.join(MANIFEST_NAME);
+        let older = std::fs::read(&canonical).unwrap();
+        store.favorite(&req(&second, "video", None)).unwrap();
+        let newer = std::fs::read(&canonical).unwrap();
+        let older_path =
+            library_root.join(format!(".{MANIFEST_NAME}.999.00000000000000000001.backup"));
+        let newer_path =
+            library_root.join(format!(".{MANIFEST_NAME}.100.00000000000000000001.backup"));
+        std::fs::write(&older_path, &older).unwrap();
+        std::fs::write(&newer_path, &newer).unwrap();
+        std::fs::remove_file(&canonical).unwrap();
+
+        let error = store
+            .reconcile_storage()
+            .expect_err("distinct snapshots are ambiguous");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        assert!(!canonical.exists());
+        assert_eq!(std::fs::read(older_path).unwrap(), older);
+        assert_eq!(std::fs::read(newer_path).unwrap(), newer);
+    }
+
+    #[test]
+    fn identical_manifest_backups_allow_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library_root = tmp.path().join("lib");
+        let store = LibraryStore::new(&library_root);
+        let source = src_file(tmp.path(), "clip.mp4", b"same snapshot");
+        let entry = store.favorite(&req(&source, "video", None)).unwrap();
+        let canonical = library_root.join(MANIFEST_NAME);
+        let bytes = std::fs::read(&canonical).unwrap();
+        for pid in [100, 999] {
+            let backup = library_root.join(format!(
+                ".{MANIFEST_NAME}.{pid}.00000000000000000001.backup"
+            ));
+            std::fs::write(backup, &bytes).unwrap();
+        }
+        std::fs::remove_file(&canonical).unwrap();
+
+        store.reconcile_storage().unwrap();
+        assert_eq!(store.entries().unwrap(), vec![entry]);
+        assert_eq!(std::fs::read(canonical).unwrap(), bytes);
+        store.reconcile_storage().unwrap();
+        assert!(store.manifest_backups().unwrap().is_empty());
     }
 
     #[test]
