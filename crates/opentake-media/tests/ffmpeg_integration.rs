@@ -1138,8 +1138,7 @@ fn non_utf8_file_names_encode_and_decode() {
     assert!(pcm_stream.read(1_024, &mut streamed).unwrap() > 0);
 }
 
-#[cfg(windows)]
-fn native_windows_fixture(path: &Path, frames: usize, pixel: [u8; 4]) {
+fn solid_av_fixture(path: &Path, frames: usize, pixel: [u8; 4]) {
     let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
     let mut encoder = VideoEncoder::new(path, 64, 48, 10, &preset).unwrap();
     for _ in 0..frames {
@@ -1162,6 +1161,42 @@ fn native_windows_fixture(path: &Path, frames: usize, pixel: [u8; 4]) {
     encoder.finish().unwrap();
 }
 
+#[test]
+fn batched_lossy_encoded_frames_match_corresponding_single_frames() {
+    if !ffmpeg_available() || !ffprobe_available() {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("solid.mp4");
+    solid_av_fixture(&path, 10, [220, 60, 20, 255]);
+    let request = FrameRequest::default();
+    let times = [0.0, 0.1, 0.2, 0.3];
+    assert_batch_matches_source(&path, &path, &times, &request);
+}
+
+fn assert_batch_matches_source(
+    path: &Path,
+    original: &Path,
+    times: &[f64],
+    request: &FrameRequest,
+) {
+    let batch = decode_frames_at(path, times, request);
+    assert_eq!(batch.len(), times.len());
+    for (&time, frame) in times.iter().zip(batch) {
+        // Lossy encoding can quantize I/P frames differently even for a solid
+        // input. Native transport must match the source at this timestamp.
+        let reference = FrameRequest {
+            time_secs: time,
+            ..request.clone()
+        };
+        let (expected_pts, expected) = decode_frame_at(original, &reference).unwrap();
+        let (actual_pts, actual) = frame.unwrap();
+        assert!((actual_pts - expected_pts).abs() < 1e-5, "PTS at {time}s");
+        assert_eq!(actual, expected, "batch pixels at {time}s");
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn native_windows_path_inputs_preserve_the_original_file() {
@@ -1173,8 +1208,8 @@ fn native_windows_path_inputs_preserve_the_original_file() {
         99, 108, 105, 112, 45, 0xd800, 46, 109, 112, 52,
     ]));
     let shadow = temp.path().join("clip-�.mp4");
-    native_windows_fixture(&original, 10, [220, 60, 20, 255]);
-    native_windows_fixture(&shadow, 20, [20, 80, 220, 255]);
+    solid_av_fixture(&original, 10, [220, 60, 20, 255]);
+    solid_av_fixture(&shadow, 20, [20, 80, 220, 255]);
     std::fs::copy(&original, &raw).unwrap();
     assert!(raw.to_str().is_none());
     let retained = std::fs::File::open(&raw).unwrap();
@@ -1231,11 +1266,7 @@ fn native_windows_path_inputs_preserve_the_original_file() {
     );
     assert!(probe_matches && frame_matches && stream_matches && pcm_matches, "pathname transport must read the original native filename, not its replacement-character shadow");
     let times = [0.0, 0.1, 0.2, 0.3];
-    let batch = decode_frames_at(&raw, &times, &request);
-    assert_eq!(batch.len(), times.len());
-    for frame in batch {
-        assert_eq!(frame.unwrap().1, retained_frame);
-    }
+    assert_batch_matches_source(&raw, &original, &times, &request);
     let stereo = PcmSpec {
         channels: 2,
         ..mono
@@ -1298,7 +1329,7 @@ fn native_windows_parent_directories_encode_without_replacement() {
         .join(std::ffi::OsString::from_wide(&[100, 105, 114, 45, 0xd800]));
     std::fs::create_dir(&parent).unwrap();
     let output = parent.join("encoded.mp4");
-    native_windows_fixture(&output, 10, [220, 60, 20, 255]);
+    solid_av_fixture(&output, 10, [220, 60, 20, 255]);
     let file = std::fs::File::open(&output).unwrap();
     let probed = opentake_media::probe::probe_file(&file).unwrap();
     assert!((probed.duration_secs - 1.0).abs() < 0.01);
