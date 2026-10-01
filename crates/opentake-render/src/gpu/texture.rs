@@ -125,14 +125,38 @@ pub fn upload_rgba(
     srgb: bool,
     label: Option<&str>,
 ) -> GpuTexture {
+    upload_rgba_bytes(
+        device,
+        queue,
+        (frame.width, frame.height),
+        &frame.rgba,
+        frame.premultiplied,
+        srgb,
+        label,
+    )
+}
+
+/// Upload borrowed, tightly packed RGBA8 pixels without copying them into an
+/// owned frame first. Premultiplication follows the same path as `upload_rgba`.
+pub fn upload_rgba_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    dimensions: (u32, u32),
+    pixels: &[u8],
+    premultiplied: bool,
+    srgb: bool,
+    label: Option<&str>,
+) -> GpuTexture {
+    let (width, height) = dimensions;
+    debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
     let format = if srgb {
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
     let size = wgpu::Extent3d {
-        width: frame.width,
-        height: frame.height,
+        width,
+        height,
         depth_or_array_layers: 1,
     };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -145,10 +169,10 @@ pub fn upload_rgba(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let rgba = if frame.premultiplied {
-        Cow::Borrowed(frame.rgba.as_slice())
+    let rgba = if premultiplied {
+        Cow::Borrowed(pixels)
     } else {
-        premultiply_rgba(&frame.rgba)
+        premultiply_rgba(pixels)
     };
     queue.write_texture(
         wgpu::ImageCopyTexture {
@@ -160,8 +184,8 @@ pub fn upload_rgba(
         &rgba,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: Some(frame.width * 4),
-            rows_per_image: Some(frame.height),
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
         },
         size,
     );
@@ -169,8 +193,8 @@ pub fn upload_rgba(
     GpuTexture {
         texture,
         view: Arc::new(view),
-        width: frame.width,
-        height: frame.height,
+        width,
+        height,
     }
 }
 

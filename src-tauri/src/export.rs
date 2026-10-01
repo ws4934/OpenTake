@@ -74,7 +74,7 @@ use opentake_media::{
 };
 use opentake_project::ProjectRoot;
 use opentake_render::gpu::compositor::{TextureInterpolationMode, TextureResolveRequest};
-use opentake_render::gpu::texture::upload_rgba;
+use opentake_render::gpu::texture::{upload_rgba, upload_rgba_bytes};
 use opentake_render::{
     export_render_size, source_frame_index, try_build_render_plan, Compositor,
     CosmicTextRasterizer, DecodedFrame, ExportResolution as RenderResolution, FramePlan,
@@ -575,14 +575,14 @@ struct MediaResolver<'d> {
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Arc<GpuLutTexture>>,
-    video_frames: &'d HashMap<String, RgbaFrame>,
+    video_frames: &'d HashMap<String, Arc<StreamVideoFrame>>,
     cancel: &'d MediaCancelToken,
     materialization_error: Option<String>,
 }
 
 struct ExportClipStream {
     stream: Option<VideoStream>,
-    last: Option<StreamVideoFrame>,
+    last: Option<Arc<StreamVideoFrame>>,
     last_target: i64,
     reversed: bool,
 }
@@ -615,7 +615,7 @@ impl ExportVideoStreams {
         fps: i32,
         render_box: (u32, u32),
         cancel: &MediaCancelToken,
-    ) -> Result<HashMap<String, RgbaFrame>, String> {
+    ) -> Result<HashMap<String, Arc<StreamVideoFrame>>, String> {
         let visible: HashSet<&str> = plan.draws.iter().map(|draw| draw.clip_id).collect();
         let departed = self
             .clips
@@ -690,11 +690,11 @@ impl ExportVideoStreams {
                 .map_err(|error| {
                     format!("export reversed video {media_ref} frame {target}: {error}")
                 })?;
-                state.last = Some(StreamVideoFrame {
+                state.last = Some(Arc::new(StreamVideoFrame {
                     source_frame: target,
                     pts_secs: project_frame_time_secs(target, fps),
                     frame,
-                });
+                }));
             } else if state
                 .last
                 .as_ref()
@@ -709,7 +709,7 @@ impl ExportVideoStreams {
                     match stream.receiver().recv_timeout(Duration::from_millis(25)) {
                         Ok(Ok(frame)) if frame.source_frame < target => continue,
                         Ok(Ok(frame)) if frame.source_frame == target => {
-                            state.last = Some(frame);
+                            state.last = Some(Arc::new(frame));
                             break;
                         }
                         Ok(Ok(frame)) => {
@@ -732,12 +732,7 @@ impl ExportVideoStreams {
             }
             frames.insert(
                 format!("v:{media_ref}:{target}"),
-                state
-                    .last
-                    .as_ref()
-                    .expect("frame was decoded")
-                    .frame
-                    .clone(),
+                Arc::clone(state.last.as_ref().expect("frame was decoded")),
             );
         }
         Ok(frames)
@@ -837,11 +832,13 @@ impl TextureResolver for MediaResolver<'_> {
                     "video source {media_ref} frame {source_frame} was not prepared"
                 ));
             };
-            let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba.clone(), false);
-            let tex = upload_rgba(
+            let frame = &frame.frame;
+            let tex = upload_rgba_bytes(
                 self.device,
                 self.queue,
-                &decoded,
+                (frame.width, frame.height),
+                &frame.rgba,
+                false,
                 false,
                 Some("export-stream"),
             );
@@ -4139,7 +4136,18 @@ mod tests {
             let prepared = streams
                 .prepare(&plan.frame(&timeline, frame), &media, 30, (64, 64), &cancel)
                 .unwrap_or_else(|error| panic!("frame {frame}: {error}"));
-            let video = &prepared[&format!("v:video-source:{frame}")];
+            let video = &prepared[&format!("v:video-source:{frame}")].frame;
+            assert_eq!(
+                video.rgba.as_ptr(),
+                streams.clips["first"]
+                    .last
+                    .as_ref()
+                    .unwrap()
+                    .frame
+                    .rgba
+                    .as_ptr(),
+                "prepared frames must share the decoder buffer rather than copying it"
+            );
             if matches!(frame, 0 | 149 | 299) {
                 let (_, direct) = decode_frame_at(
                     &source,
