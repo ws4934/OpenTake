@@ -1,11 +1,12 @@
-//! Video encoding back end for `opentake-render`'s export path. The wgpu
-//! compositor produces RGBA frames; this encoder pipes them to the system ffmpeg
-//! CLI and muxes them (with an optional audio track) into a container.
+//! Video encoding back end for `opentake-render`'s export path. Composited RGBA
+//! frames are piped to FFmpeg; an unchanged opaque video span can instead use
+//! the sequential decoder's filters inside the same encoding process. Both
+//! paths mux optional audio and publish through the retained workspace.
 //!
 //! `opentake-render` decides the (even) frame size, applies BT.709 instructions,
-//! and resolves keyframe ramps; this crate only encodes already-composited
-//! frames (SPEC §2.4 / §8.2). The arg builder ([`encode_args`]) is pure and
-//! unit-tested; the encode itself requires ffmpeg.
+//! and resolves keyframe ramps. The caller must establish pixel identity
+//! before selecting source encoding (SPEC §2.4 / §8.2). Arg builders are pure
+//! and unit-tested; the encode itself requires ffmpeg.
 
 pub mod mix;
 pub mod preset;
@@ -16,14 +17,19 @@ pub use preset::{even_dimension, ExportPreset, ExportResolution, VideoCodec};
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, ExitStatus};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::cancel::MediaCancelToken;
 use crate::decode::pcm::{PcmBuffer, PcmFormat, PcmSpec};
+use crate::decode::stream::{video_filters, video_input_args, VideoStreamRequest};
 use crate::error::{MediaError, Result};
 use crate::ff::SpawnCounted;
 use crate::frame::RgbaFrame;
@@ -49,17 +55,76 @@ fn encode_args(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> V
     args.push("-i".into());
     args.push("-".into());
 
-    // Video codec + pixel format.
-    args.push("-c:v".into());
-    args.push(preset.vcodec_arg().into());
-    args.push("-pix_fmt".into());
-    args.push(preset.pix_fmt_arg().into());
+    args.extend(video_encode_args(preset, &[]));
+
+    args.push(out.as_os_str().to_owned());
+    args
+}
+
+fn video_encode_args(preset: &ExportPreset, filters: &[String]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-c:v"),
+        preset.vcodec_arg().into(),
+        OsString::from("-pix_fmt"),
+        preset.pix_fmt_arg().into(),
+    ];
+    if preset.codec == VideoCodec::H264 {
+        // Favor export throughput. The explicit quality target is verified
+        // against the former medium/23 policy; faster compression costs bytes.
+        args.extend(["-preset", "ultrafast", "-crf", "22"].map(OsString::from));
+    }
     if preset.codec == VideoCodec::ProRes4444 {
         args.push("-profile:v".into());
         args.push("4444".into());
     }
-    args.extend(preset.color_args().into_iter().map(OsString::from));
+    args.extend(
+        preset
+            .color_args_with_filters(filters)
+            .into_iter()
+            .map(OsString::from),
+    );
 
+    args
+}
+
+fn source_encode_args(
+    out: &Path,
+    request: &VideoStreamRequest,
+    color: Option<&opentake_domain::MediaColorMetadata>,
+    preset: &ExportPreset,
+) -> Vec<OsString> {
+    let mut args = vec![OsString::from("-y")];
+    args.extend(video_input_args(request, color));
+    let mut filters = video_filters(request, color);
+    // Match the raw-RGBA boundary used by the compositor and reset the delivery
+    // origin/SAR that raw frames otherwise discard at that boundary.
+    filters.extend(["format=rgba", "setsar=1", "setpts=PTS-STARTPTS"].map(str::to_owned));
+    args.extend(video_encode_args(preset, &filters));
+    args.extend([
+        OsString::from("-r"),
+        request.timeline_fps.to_string().into(),
+        OsString::from("-enc_time_base"),
+        format!("1:{}", request.timeline_fps).into(),
+    ]);
+    args.extend(
+        [
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-metadata:s:v:0",
+            "rotate=0",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "0.2",
+            "-nostats",
+            "-nostdin",
+            "-fps_mode",
+            "cfr",
+        ]
+        .map(OsString::from),
+    );
     args.push(out.as_os_str().to_owned());
     args
 }
@@ -139,7 +204,7 @@ pub const ENCODE_WORKSPACE_PREFIX: &str = ".opentake-encode-";
 
 pub type EncodeProgressCallback = dyn Fn(usize, usize);
 
-/// A streaming RGBA → video encoder. FFmpeg writes only inside a private
+/// A streaming frame or retained-source encoder. FFmpeg writes only inside a
 /// private workspace and never reopens the final pathname. The finished file is either
 /// copied into the caller's retained output file ([`VideoEncoder::finish`])
 /// or handed over in place for the caller to publish by rename
@@ -152,6 +217,8 @@ pub struct VideoEncoder {
     stderr_pump: Option<JoinHandle<Result<Vec<u8>>>>,
     /// The end of the first pass's stderr, once its pump has been joined.
     stderr_tail: Vec<u8>,
+    source_progress: Option<Arc<AtomicU64>>,
+    source_input: Option<ProbedMediaFile>,
     expected_frame_bytes: usize,
     fps: i32,
     /// Frames fully written to the first pass; they fix the output duration.
@@ -437,6 +504,65 @@ struct PendingAudio {
     sample_count: u64,
 }
 
+/// A probed regular file retained as the authority for direct source encoding.
+/// Metadata and bytes always refer to this handle, never a later pathname.
+#[derive(Debug)]
+pub struct ProbedMediaFile {
+    file: File,
+    probe: crate::MediaProbe,
+    stamp: crate::identity::FileStamp,
+}
+
+impl ProbedMediaFile {
+    pub fn probe(file: File, cancel: &MediaCancelToken) -> Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(MediaError::Encode("source is not a regular file".into()));
+        }
+        let stamp = crate::identity::FileStamp::of_file(&file)?;
+        let probe = crate::probe::probe_file_cancellable(&file, cancel, Duration::from_secs(30))?;
+        let source = Self { file, probe, stamp };
+        source.verify_unchanged()?;
+        Ok(source)
+    }
+
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+    pub fn info(&self) -> &crate::MediaProbe {
+        &self.probe
+    }
+    pub fn is_opaque_video(&self) -> bool {
+        matches!(self.probe.video_codec.as_deref(), Some("h264" | "hevc"))
+    }
+    pub fn verify_unchanged(&self) -> Result<()> {
+        if crate::identity::FileStamp::of_file(&self.file)? != self.stamp {
+            return Err(MediaError::Encode("source changed after its probe".into()));
+        }
+        Ok(())
+    }
+    pub fn try_clone(&self) -> Result<Self> {
+        self.verify_unchanged()?;
+        Ok(Self {
+            file: self.file.try_clone()?,
+            probe: self.probe.clone(),
+            stamp: self.stamp,
+        })
+    }
+}
+
+enum EncoderInput<'a> {
+    Frames {
+        width: u32,
+        height: u32,
+        fps: i32,
+    },
+    Source {
+        request: &'a VideoStreamRequest,
+        color: Option<&'a opentake_domain::MediaColorMetadata>,
+        file: &'a File,
+    },
+}
+
 impl VideoEncoder {
     /// Start an encoder writing to `out`. `w`/`h` must already be even.
     pub fn new(out: &Path, w: u32, h: u32, fps: i32, preset: &ExportPreset) -> Result<Self> {
@@ -455,7 +581,16 @@ impl VideoEncoder {
         fps: i32,
         preset: &ExportPreset,
     ) -> Result<Self> {
-        Self::start(out_hint, None, w, h, fps, preset)
+        Self::start(
+            out_hint,
+            None,
+            EncoderInput::Frames {
+                width: w,
+                height: h,
+                fps,
+            },
+            preset,
+        )
     }
 
     /// Open and truncate a regular, non-link output file without following a
@@ -479,17 +614,75 @@ impl VideoEncoder {
     ) -> Result<Self> {
         output.set_len(0).map_err(MediaError::Io)?;
         output.seek(SeekFrom::Start(0)).map_err(MediaError::Io)?;
-        Self::start(out_hint, Some(output), w, h, fps, preset)
+        Self::start(
+            out_hint,
+            Some(output),
+            EncoderInput::Frames {
+                width: w,
+                height: h,
+                fps,
+            },
+            preset,
+        )
+    }
+
+    /// Transcode a bounded source span using the sequential decoder's exact
+    /// sampling/color filters, without transporting RGBA through two pipes.
+    pub fn new_source_in_workspace(
+        out_hint: &Path,
+        source: ProbedMediaFile,
+        request: &VideoStreamRequest,
+        preset: &ExportPreset,
+        cancel: &MediaCancelToken,
+    ) -> Result<Self> {
+        if cancel.checkpoint() {
+            return Err(MediaError::Cancelled);
+        }
+        request.validate()?;
+        if request.max_size.0 == 0 || request.max_size.1 == 0 || request.end_frame.is_none() {
+            return Err(MediaError::Encode(
+                "source encode requires dimensions and an exclusive end frame".into(),
+            ));
+        }
+        if !source.is_opaque_video() {
+            return Err(MediaError::Encode(
+                "source encode requires opaque H264/HEVC video".into(),
+            ));
+        }
+        source.verify_unchanged()?;
+        let mut request = request.clone();
+        request.path = PathBuf::from("fd:");
+        let mut encoder = Self::start(
+            out_hint,
+            None,
+            EncoderInput::Source {
+                request: &request,
+                color: source.info().color.as_ref(),
+                file: source.file(),
+            },
+            preset,
+        )?;
+        encoder.source_input = Some(source);
+        Ok(encoder)
     }
 
     fn start(
         out_hint: &Path,
         output: Option<File>,
-        w: u32,
-        h: u32,
-        fps: i32,
+        input: EncoderInput<'_>,
         preset: &ExportPreset,
     ) -> Result<Self> {
+        let (w, h, fps, frames_written) = match &input {
+            EncoderInput::Frames { width, height, fps } => (*width, *height, *fps, 0),
+            EncoderInput::Source { request, .. } => (
+                request.max_size.0,
+                request.max_size.1,
+                request.timeline_fps,
+                request.frame_limit().expect("source span is bounded") as u64,
+            ),
+        };
+        let source_progress =
+            matches!(&input, EncoderInput::Source { .. }).then(|| Arc::new(AtomicU64::new(0)));
         let workspace = if output.is_some() {
             EncodeWorkspace::in_directory(&std::env::temp_dir())?
         } else {
@@ -506,22 +699,36 @@ impl VideoEncoder {
         let mut command = ffmpeg_sidecar::command::FfmpegCommand::new_with_path(
             crate::ff::ffmpeg_workspace_path()?,
         );
-        command
-            .args(encode_args(
-                Path::new(&format!("video.{extension}")),
-                w,
-                h,
-                fps,
-                preset,
-            ))
-            .as_inner_mut()
-            .current_dir(workspace.path());
+        let leaf = format!("video.{extension}");
+        match input {
+            EncoderInput::Frames { .. } => {
+                command.args(encode_args(Path::new(&leaf), w, h, fps, preset));
+            }
+            EncoderInput::Source {
+                request,
+                color,
+                file,
+            } => {
+                let mut file = file.try_clone()?;
+                file.seek(SeekFrom::Start(0))?;
+                command.args(source_encode_args(Path::new(&leaf), request, color, preset));
+                command
+                    .as_inner_mut()
+                    .stdin(std::process::Stdio::from(file));
+            }
+        }
+        command.as_inner_mut().current_dir(workspace.path());
         workspace
             .configure_child(command.as_inner_mut())
             .map_err(MediaError::Io)?;
         let (mut child, mut process_tree) =
             spawn_encoder(&mut command).map_err(|e| MediaError::Encode(format!("spawn: {e}")))?;
-        let stdin = child.take_stdin();
+        let stdin = if source_progress.is_some() {
+            drop(child.take_stdin());
+            None
+        } else {
+            child.take_stdin()
+        };
         let stdout = child.take_stdout().ok_or_else(|| {
             terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("encoder stdout pipe missing".to_string())
@@ -530,10 +737,13 @@ impl VideoEncoder {
             terminate_child(&mut child, &mut process_tree);
             MediaError::Encode("encoder stderr pipe missing".to_string())
         })?;
+        let output_progress = source_progress.clone();
         let output_pump = match thread::Builder::new()
             .name("opentake-encoder-stdout".to_string())
-            .spawn(move || drain_stdout(stdout))
-        {
+            .spawn(move || match output_progress {
+                Some(frames) => drain_source_progress(stdout, &frames),
+                None => drain_stdout(stdout),
+            }) {
             Ok(pump) => pump,
             Err(error) => {
                 terminate_child(&mut child, &mut process_tree);
@@ -563,9 +773,11 @@ impl VideoEncoder {
             output_pump: Some(output_pump),
             stderr_pump: Some(stderr_pump),
             stderr_tail: Vec::new(),
+            source_progress,
+            source_input: None,
             expected_frame_bytes: w as usize * h as usize * 4,
             fps,
-            frames_written: 0,
+            frames_written,
             workspace: Some(workspace),
             first_pass,
             output,
@@ -780,14 +992,7 @@ impl VideoEncoder {
         progress: &DedupedProgress<'_>,
         mux_wait_hook: Option<&dyn Fn()>,
     ) -> Result<PathBuf> {
-        let status = self.wait_for_child(cancel, progress)?;
-        if !status.success() {
-            return Err(MediaError::Encode(with_stderr_tail(
-                format!("ffmpeg exited {status}"),
-                &self.stderr_tail,
-            )));
-        }
-        progress.report(FIRST_PASS_END);
+        self.finish_video_pass(cancel, progress)?;
 
         let finished = match self.pending_audio.take() {
             Some(audio) => {
@@ -809,6 +1014,56 @@ impl VideoEncoder {
             return Err(MediaError::Cancelled);
         }
         Ok(finished)
+    }
+
+    /// Finish source video before audio mixing, with measured frame progress.
+    pub fn finish_source_video(
+        &mut self,
+        cancel: &MediaCancelToken,
+        callback: Option<&(dyn Fn(usize, usize) + '_)>,
+    ) -> Result<()> {
+        if self.source_progress.is_none() {
+            return Err(MediaError::Encode(
+                "encoder has no source-video pass".into(),
+            ));
+        }
+        let mapped = |done: usize, _: usize| {
+            if let Some(callback) = callback {
+                callback(
+                    done.min(FIRST_PASS_END) * ENCODE_PROGRESS_TOTAL / FIRST_PASS_END,
+                    ENCODE_PROGRESS_TOTAL,
+                );
+            }
+        };
+        self.finish_video_pass(cancel, &DedupedProgress::new(Some(&mapped)))
+    }
+
+    fn finish_video_pass(
+        &mut self,
+        cancel: &MediaCancelToken,
+        progress: &DedupedProgress<'_>,
+    ) -> Result<()> {
+        let status = self.wait_for_child(cancel, progress)?;
+        if !status.success() {
+            return Err(MediaError::Encode(with_stderr_tail(
+                format!("ffmpeg exited {status}"),
+                &self.stderr_tail,
+            )));
+        }
+        if let Some(frames) = &self.source_progress {
+            let actual = frames.load(Ordering::Acquire);
+            if actual != self.frames_written {
+                return Err(MediaError::Encode(format!(
+                    "source encoded {actual} frames, expected {}",
+                    self.frames_written
+                )));
+            }
+        }
+        if let Some(source) = &self.source_input {
+            source.verify_unchanged()?;
+        }
+        progress.report(FIRST_PASS_END);
+        Ok(())
     }
 
     fn workspace_path(&self) -> Result<&Path> {
@@ -848,7 +1103,11 @@ impl VideoEncoder {
                 }
                 Ok(None) => {
                     polls = polls.saturating_add(1);
-                    if polls.is_multiple_of(20) {
+                    if let Some(frames) = &self.source_progress {
+                        let done = frames.load(Ordering::Acquire).min(self.frames_written);
+                        progress
+                            .report((done * FIRST_PASS_END as u64 / self.frames_written) as usize);
+                    } else if polls.is_multiple_of(20) {
                         progress.report((polls / 20).min(FIRST_PASS_END - 1));
                     }
                     thread::sleep(ENCODE_POLL_INTERVAL);
@@ -1087,6 +1346,33 @@ impl Drop for VideoEncoder {
     }
 }
 
+fn drain_source_progress(stdout: ChildStdout, frames: &AtomicU64) -> Result<()> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(4097)
+            .read_line(&mut line)
+            .map_err(MediaError::Io)?;
+        if read == 0 {
+            return Ok(());
+        }
+        if read > 4096 {
+            return Err(MediaError::Encode(
+                "source progress line exceeds 4096 bytes".into(),
+            ));
+        }
+        if let Some(value) = line.trim().strip_prefix("frame=") {
+            let value = value.trim().parse::<u64>().map_err(|error| {
+                MediaError::Encode(format!("invalid source progress frame: {error}"))
+            })?;
+            frames.store(value, Ordering::Release);
+        }
+    }
+}
+
 fn drain_stdout(mut stdout: ChildStdout) -> Result<()> {
     let mut bytes = [0_u8; OUTPUT_COPY_CHUNK];
     loop {
@@ -1152,12 +1438,12 @@ fn with_stderr_tail(message: String, stderr_tail: &[u8]) -> String {
 /// Forwards encode progress, dropping repeats of the last reported value:
 /// a large copy reports every 64 KiB, but only per-mille changes matter.
 struct DedupedProgress<'a> {
-    callback: Option<&'a EncodeProgressCallback>,
+    callback: Option<&'a (dyn Fn(usize, usize) + 'a)>,
     last: std::cell::Cell<Option<usize>>,
 }
 
 impl<'a> DedupedProgress<'a> {
-    fn new(callback: Option<&'a EncodeProgressCallback>) -> Self {
+    fn new(callback: Option<&'a (dyn Fn(usize, usize) + 'a)>) -> Self {
         DedupedProgress {
             callback,
             last: std::cell::Cell::new(None),
@@ -1397,7 +1683,7 @@ fn terminate_child(child: &mut ffmpeg_sidecar::child::FfmpegChild, process_tree:
     process_tree.disarm();
 }
 
-fn report_progress(progress: Option<&EncodeProgressCallback>, done: usize) {
+fn report_progress(progress: Option<&(dyn Fn(usize, usize) + '_)>, done: usize) {
     if let Some(report) = progress {
         report(done.min(ENCODE_PROGRESS_TOTAL), ENCODE_PROGRESS_TOTAL);
     }
@@ -1408,10 +1694,188 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn source_encode_fixture(dir: &Path) -> PathBuf {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(b"source-\xff.mp4".to_vec())
+        };
+        #[cfg(target_os = "macos")]
+        let name = OsString::from("source-native-name.mp4");
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[115, 114, 99, 0xd800, 46, 109, 112, 52])
+        };
+        #[cfg(not(any(unix, windows)))]
+        let name = OsString::from("source.mp4");
+        let path = dir.join(name);
+        // Windows FFmpeg cannot create that argv pathname, so rename a known
+        // ASCII fixture into its native name before retaining the file.
+        let generated = dir.join("generated.mp4");
+        let status = crate::ff::ffmpeg()
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=24",
+                "-frames:v",
+                "12",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&generated)
+            .as_inner_mut()
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::rename(generated, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn source_encoder_matches_sequential_frame_sampling_and_retains_native_input() {
+        if !crate::ff::ffprobe_available() {
+            eprintln!("skip: FFmpeg sidecars unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = source_encode_fixture(dir.path());
+        let cancel = MediaCancelToken::new();
+        let source = ProbedMediaFile::probe(File::open(&path).unwrap(), &cancel).unwrap();
+        let mut request = VideoStreamRequest::new(path.clone(), 30);
+        request.start_frame = 2;
+        request.end_frame = Some(8);
+        request.max_size = (64, 64);
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let direct_path = dir.path().join("direct.mp4");
+        let mut direct =
+            VideoEncoder::new_source_in_workspace(&direct_path, source, &request, &preset, &cancel)
+                .unwrap();
+        let reports = std::cell::RefCell::new(Vec::new());
+        direct
+            .finish_source_video(
+                &cancel,
+                Some(&|done, total| reports.borrow_mut().push((done, total))),
+            )
+            .unwrap();
+        let reports = reports.into_inner();
+        assert_eq!(
+            reports.last(),
+            Some(&(ENCODE_PROGRESS_TOTAL, ENCODE_PROGRESS_TOTAL))
+        );
+        assert!(reports.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        let direct = direct.finish_in_workspace(&cancel, None).unwrap();
+        let raw_path = dir.path().join("raw.mp4");
+        let mut raw = VideoEncoder::new_in_workspace(&raw_path, 64, 64, 30, &preset).unwrap();
+        let stream = crate::decode::spawn_video_stream(request).unwrap();
+        for _ in 0..6 {
+            let frame = stream
+                .receiver()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            raw.push_frame(&frame.frame).unwrap();
+        }
+        stream.join().unwrap();
+        let raw = raw.finish_in_workspace(&cancel, None).unwrap();
+        let info = crate::probe::probe_file(direct.file()).unwrap();
+        assert_eq!((info.width, info.height), (Some(64), Some(64)));
+        assert!((info.duration_secs - 0.2).abs() < 0.01, "{info:?}");
+        for frame in [0, 2, 5] {
+            let req = crate::decode::FrameRequest {
+                time_secs: frame as f64 / 30.0,
+                max_size: (64, 64),
+                apply_rotation: true,
+            };
+            let (_, a) =
+                crate::decode::decode_frame_file_at_cancellable(direct.file(), &req, &cancel)
+                    .unwrap();
+            let (_, b) =
+                crate::decode::decode_frame_file_at_cancellable(raw.file(), &req, &cancel).unwrap();
+            assert_eq!(
+                a.rgba, b.rgba,
+                "source frame {frame} diverges from the sequential decoder"
+            );
+        }
+    }
+
+    #[test]
+    fn source_encoder_rejects_incomplete_changed_or_precancelled_inputs() {
+        if !crate::ff::ffprobe_available() {
+            eprintln!("skip: FFmpeg sidecars unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = source_encode_fixture(dir.path());
+        let cancel = MediaCancelToken::new();
+        let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
+        let mut request = VideoStreamRequest::new(path.clone(), 30);
+        request.end_frame = Some(100);
+        request.max_size = (64, 64);
+        let source = ProbedMediaFile::probe(File::open(&path).unwrap(), &cancel).unwrap();
+        let mut encoder = VideoEncoder::new_source_in_workspace(
+            &dir.path().join("short.mp4"),
+            source,
+            &request,
+            &preset,
+            &cancel,
+        )
+        .unwrap();
+        let error = encoder.finish_source_video(&cancel, None).unwrap_err();
+        assert!(error.to_string().contains("expected 100"), "{error}");
+        drop(encoder);
+
+        let source = ProbedMediaFile::probe(File::open(&path).unwrap(), &cancel).unwrap();
+        let cancelled = MediaCancelToken::new();
+        cancelled.cancel();
+        let count = crate::ff::HelperProcessCount::start();
+        assert!(matches!(
+            VideoEncoder::new_source_in_workspace(
+                &dir.path().join("cancelled.mp4"),
+                source,
+                &request,
+                &preset,
+                &cancelled,
+            ),
+            Err(MediaError::Cancelled)
+        ));
+        assert_eq!(
+            count.count(),
+            0,
+            "pre-cancelled source encoding must not spawn"
+        );
+        drop(count);
+
+        let source = ProbedMediaFile::probe(File::open(&path).unwrap(), &cancel).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(source.verify_unchanged().is_err());
+        assert!(VideoEncoder::new_source_in_workspace(
+            &dir.path().join("changed.mp4"),
+            source,
+            &request,
+            &preset,
+            &cancel
+        )
+        .is_err());
+    }
+
     #[cfg(unix)]
     fn process_is_running(pid: u32) -> bool {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     }
@@ -1420,6 +1884,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TreeExit {
         CancelEncode,
+        CancelSource,
         DropEncode,
         CancelMux,
     }
@@ -1428,6 +1893,16 @@ mod tests {
     #[test]
     fn cancelling_encoder_terminates_descendants_holding_its_pipes() {
         assert_encoder_tree_cleanup(TreeExit::CancelEncode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_source_encoder_terminates_descendants_holding_its_pipes() {
+        if !crate::ff::ffprobe_available() {
+            eprintln!("skip: FFmpeg sidecars unavailable");
+            return;
+        }
+        assert_encoder_tree_cleanup(TreeExit::CancelSource);
     }
 
     #[cfg(unix)]
@@ -1462,6 +1937,18 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = temp.path().join("movie.mp4");
         let cancel = MediaCancelToken::new();
+        // Generate and probe with the real sidecars before the worker overrides
+        // only the encode process with a helper that holds inherited pipes.
+        let source = if matches!(exit, TreeExit::CancelSource) {
+            let path = source_encode_fixture(temp.path());
+            let file = ProbedMediaFile::probe(File::open(&path).unwrap(), &cancel).unwrap();
+            let mut request = VideoStreamRequest::new(path, 24);
+            request.end_frame = Some(12);
+            request.max_size = (64, 64);
+            Some((file, request))
+        } else {
+            None
+        };
         let worker_cancel = cancel.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let (drop_tx, drop_rx) = mpsc::channel();
@@ -1470,7 +1957,17 @@ mod tests {
                 crate::ff::test_seams::override_ffmpeg(Some(script.clone().into_os_string()));
             }
             let preset = ExportPreset::new(VideoCodec::H264, ExportResolution::P720);
-            let mut encoder = VideoEncoder::new_in_workspace(&output, 2, 2, 30, &preset).unwrap();
+            let mut encoder = match source {
+                Some((file, request)) => VideoEncoder::new_source_in_workspace(
+                    &output,
+                    file,
+                    &request,
+                    &preset,
+                    &worker_cancel,
+                )
+                .unwrap(),
+                None => VideoEncoder::new_in_workspace(&output, 2, 2, 30, &preset).unwrap(),
+            };
             let result = match exit {
                 TreeExit::DropEncode => {
                     drop_rx.recv().unwrap();
@@ -1480,6 +1977,7 @@ mod tests {
                 TreeExit::CancelEncode => encoder
                     .finish_in_workspace(&worker_cancel, None)
                     .map(|_| ()),
+                TreeExit::CancelSource => encoder.finish_source_video(&worker_cancel, None),
                 TreeExit::CancelMux => {
                     encoder
                         .push_frame(&RgbaFrame::new(2, 2, vec![0; 16]))
@@ -1541,6 +2039,16 @@ mod tests {
             expected,
             "cleanup must close descendant-held pipes promptly: {result:?}"
         );
+        for pid in members {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while process_is_running(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_is_running(pid),
+                "encoder tree member {pid} survived"
+            );
+        }
     }
 
     #[test]

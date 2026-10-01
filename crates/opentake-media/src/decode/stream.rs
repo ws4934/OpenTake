@@ -68,7 +68,7 @@ impl VideoStreamRequest {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.timeline_fps <= 0 {
             return Err(MediaError::Decode(format!(
                 "timeline_fps must be > 0, got {}",
@@ -101,7 +101,7 @@ impl VideoStreamRequest {
         frame_to_secs(self.start_frame, self.timeline_fps)
     }
 
-    fn frame_limit(&self) -> Option<i64> {
+    pub(crate) fn frame_limit(&self) -> Option<i64> {
         self.end_frame.map(|end| end - self.start_frame)
     }
 }
@@ -396,7 +396,7 @@ fn video_stream_args(req: &VideoStreamRequest) -> Vec<OsString> {
     video_stream_args_with_color(req, None)
 }
 
-fn video_stream_args_with_color(
+pub(crate) fn video_input_args(
     req: &VideoStreamRequest,
     color: Option<&MediaColorMetadata>,
 ) -> Vec<OsString> {
@@ -428,6 +428,13 @@ fn video_stream_args_with_color(
         args.push(frame_limit.to_string().into());
     }
 
+    args
+}
+
+pub(crate) fn video_filters(
+    req: &VideoStreamRequest,
+    color: Option<&MediaColorMetadata>,
+) -> Vec<String> {
     // `round=up` maps a source frame to the first slot at/after its pts, so
     // slot F shows the last frame with pts <= F / fps. The first decoded frame
     // is pulled back to half a slot before `start_frame` when it starts later
@@ -456,8 +463,16 @@ fn video_stream_args_with_color(
             "scale=w={mw}:h={mh}:force_original_aspect_ratio=decrease"
         ));
     }
+    filters
+}
+
+fn video_stream_args_with_color(
+    req: &VideoStreamRequest,
+    color: Option<&MediaColorMetadata>,
+) -> Vec<OsString> {
+    let mut args = video_input_args(req, color);
     args.push("-vf".into());
-    args.push(filters.join(",").into());
+    args.push(video_filters(req, color).join(",").into());
     args.push("-fps_mode".into());
     args.push("passthrough".into());
     args.push("-pix_fmt".into());
